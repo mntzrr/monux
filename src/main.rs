@@ -1,5 +1,6 @@
 mod devicewatch;
 mod logging;
+mod wg;
 
 use anyhow::{anyhow, bail, Result};
 use async_std::task;
@@ -72,6 +73,8 @@ impl DeviceHandler for ComboHandler {
 
 fn main() -> Result<()> {
     logging::init_logging();
+
+    wg::foo()?;
 
     // TODO args for user-specified key combos. require at least one key
     let combo_keys = vec![
