@@ -1,6 +1,8 @@
 mod certs;
+mod client;
 mod devicewatch;
 mod logging;
+mod server;
 mod transport;
 
 use anyhow::{anyhow, bail, Result};
@@ -76,16 +78,17 @@ fn main() -> Result<()> {
     logging::init_logging();
 
     let listen_addr: std::net::SocketAddr = "127.0.0.1:5000".parse()?;
+    let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse()?;
     let listen_addr2 = listen_addr.clone();
     let known_certs = certs::load_known_certs()?;
     let known_certs2 = known_certs.clone();
     task::spawn(async move {
-        if let Err(e) = transport::start_server(listen_addr, known_certs).await {
+        if let Err(e) = server::run_server(listen_addr, known_certs).await {
             error!("server fail: {}", e);
         }
     });
     task::block_on(async {
-        if let Err(e) = transport::start_client(listen_addr2, known_certs2).await {
+        if let Err(e) = client::run_client(bind_addr, listen_addr2, known_certs2).await {
             error!("client fail: {}", e);
         }
     });
