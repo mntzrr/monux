@@ -1,3 +1,4 @@
+mod certs;
 mod devicewatch;
 mod logging;
 mod transport;
@@ -76,7 +77,7 @@ fn main() -> Result<()> {
 
     let listen_addr: std::net::SocketAddr = "127.0.0.1:5000".parse()?;
     let listen_addr2 = listen_addr.clone();
-    let known_certs = transport::load_known_certs()?;
+    let known_certs = certs::load_known_certs()?;
     let known_certs2 = known_certs.clone();
     task::spawn(async move {
         if let Err(e) = transport::start_server(listen_addr, known_certs).await {
