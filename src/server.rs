@@ -23,6 +23,7 @@ pub async fn run_server(listen_addr: SocketAddr, known_client_certs: Vec<rustls:
 async fn handle_connection(conn: quinn::Connecting) -> Result<()> {
     let connection = conn.await?;
     loop {
+        info!("[server] waiting for stream to start");
         let stream = connection.accept_bi().await;
         let (send, recv) = match stream {
             Err(quinn::ConnectionError::ApplicationClosed { .. }) => {

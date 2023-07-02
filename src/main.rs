@@ -83,13 +83,13 @@ fn main() -> Result<()> {
     let known_certs = certs::load_known_certs()?;
     let known_certs2 = known_certs.clone();
     task::spawn(async move {
-        if let Err(e) = server::run_server(listen_addr, known_certs).await {
-            error!("server fail: {}", e);
-        }
-    });
-    task::block_on(async {
         if let Err(e) = client::run_client(bind_addr, listen_addr2, known_certs2).await {
             error!("client fail: {}", e);
+        }
+    });
+    task::block_on(async move {
+        if let Err(e) = server::run_server(listen_addr, known_certs).await {
+            error!("server fail: {}", e);
         }
     });
 

@@ -14,11 +14,6 @@ pub async fn run_client(bind_addr: SocketAddr, server_addr: SocketAddr, known_se
     send.write_all(b"bob burger").await.context("failed to send request")?;
     send.finish().await.context("failed to shutdown send stream")?;
     let resp = recv.read_to_end(usize::max_value()).await.context("failed to read response")?;
-    info!("[client] got data: {}", std::str::from_utf8(&resp)?);
-    // Dropping handles allows the corresponding objects to automatically shut down
-    drop(conn);
-    // Make sure the server has a chance to clean up
-    client_endpoint.wait_idle().await;
-    info!("[client] exiting");
+    info!("[client] got data, exiting: {}", std::str::from_utf8(&resp)?);
     Ok(())
 }
