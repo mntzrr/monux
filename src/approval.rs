@@ -1,10 +1,10 @@
 use anyhow::{bail, Context, Result};
 use async_std::io as aio;
 use async_std::task;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use std::io::{self, prelude::*};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
 use crate::certs;
@@ -13,14 +13,15 @@ const PROMPT_TIMEOUT_SECS: u64 = 60;
 
 pub struct ManualServerVerification {
     our_cert_fingerprint: String,
-    known_certs: Vec<rustls::Certificate>,
+    // Wrapped in a lock so that we can add newly approved entries immediately
+    known_certs: RwLock<Vec<rustls::Certificate>>,
 }
 
 impl ManualServerVerification {
     pub fn new(our_cert: &rustls::Certificate, known_certs: Vec<rustls::Certificate>) -> Arc<Self> {
         Arc::new(ManualServerVerification {
             our_cert_fingerprint: certs::fingerprint(our_cert),
-            known_certs,
+            known_certs: RwLock::new(known_certs),
         })
     }
 }
@@ -36,15 +37,22 @@ impl rustls::client::ServerCertVerifier for ManualServerVerification {
         _now: SystemTime,
     ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
         let server_cert_fingerprint = certs::fingerprint(&server_cert);
-        if self.known_certs.contains(server_cert) {
-            info!("Server has a saved certificate: {}", server_cert_fingerprint);
-            Ok(rustls::client::ServerCertVerified::assertion())
-        } else if prompt_unknown_server_cert(server_cert, &self.our_cert_fingerprint) {
-            info!("Server approved: {}", server_cert_fingerprint);
-            Ok(rustls::client::ServerCertVerified::assertion())
+        if let Ok(mut known_certs) = self.known_certs.write() {
+            if known_certs.contains(server_cert) {
+                info!("Server has a saved certificate: {}", server_cert_fingerprint);
+                Ok(rustls::client::ServerCertVerified::assertion())
+            } else if prompt_unknown_server_cert(server_cert, &self.our_cert_fingerprint) {
+                info!("Server approved: {}", server_cert_fingerprint);
+                // Store the approved cert so that we don't need to reload the whole list
+                known_certs.push(server_cert.clone());
+                Ok(rustls::client::ServerCertVerified::assertion())
+            } else {
+                info!("Server denied: {}", server_cert_fingerprint);
+                Err(rustls::Error::General(format!("Unknown server cert was denied: {}", server_cert_fingerprint)))
+            }
         } else {
-            info!("Server denied: {}", server_cert_fingerprint);
-            Err(rustls::Error::General(format!("Unknown server cert was denied: {}", server_cert_fingerprint)))
+            error!("Failed to get lock on known_certs");
+            Err(rustls::Error::General("Failed to lock known certs".to_string()))
         }
     }
 }
@@ -77,14 +85,15 @@ Confirm new connection and save certificate as approved? ({}s timeout) [y/N]", s
 
 pub struct ManualClientVerification {
     our_cert_fingerprint: String,
-    known_certs: Vec<rustls::Certificate>,
+    // Wrapped in a lock so that we can add newly approved entries immediately
+    known_certs: RwLock<Vec<rustls::Certificate>>,
 }
 
 impl ManualClientVerification {
     pub fn new(our_cert: &rustls::Certificate, known_certs: Vec<rustls::Certificate>) -> Arc<Self> {
         Arc::new(ManualClientVerification {
             our_cert_fingerprint: certs::fingerprint(our_cert),
-            known_certs,
+            known_certs: RwLock::new(known_certs),
         })
     }
 }
@@ -101,15 +110,22 @@ impl rustls::server::ClientCertVerifier for ManualClientVerification {
         _now: SystemTime,
     ) -> Result<rustls::server::ClientCertVerified, rustls::Error> {
         let client_cert_fingerprint = certs::fingerprint(&client_cert);
-        if self.known_certs.contains(client_cert) {
-            info!("Client has a saved certificate: {}", client_cert_fingerprint);
-            Ok(rustls::server::ClientCertVerified::assertion())
-        } else if prompt_unknown_client_cert(client_cert, &self.our_cert_fingerprint) {
-            info!("Client approved: {}", client_cert_fingerprint);
-            Ok(rustls::server::ClientCertVerified::assertion())
+        if let Ok(mut known_certs) = self.known_certs.write() {
+            if known_certs.contains(client_cert) {
+                info!("Client has a saved certificate: {}", client_cert_fingerprint);
+                Ok(rustls::server::ClientCertVerified::assertion())
+            } else if prompt_unknown_client_cert(client_cert, &self.our_cert_fingerprint) {
+                info!("Client approved: {}", client_cert_fingerprint);
+                // Store the approved cert so that we don't need to reload the whole list
+                known_certs.push(client_cert.clone());
+                Ok(rustls::server::ClientCertVerified::assertion())
+            } else {
+                info!("Client denied: {}", client_cert_fingerprint);
+                Err(rustls::Error::General(format!("Unknown client cert was denied: {}", client_cert_fingerprint)))
+            }
         } else {
-            info!("Client denied: {}", client_cert_fingerprint);
-            Err(rustls::Error::General(format!("Unknown client cert was denied: {}", client_cert_fingerprint)))
+            error!("Failed to get lock on known_certs");
+            Err(rustls::Error::General("Failed to lock known certs".to_string()))
         }
     }
 }
