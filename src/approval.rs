@@ -39,7 +39,7 @@ impl rustls::client::ServerCertVerifier for ManualServerVerification {
         let server_cert_fingerprint = certs::fingerprint(&server_cert);
         if let Ok(mut known_certs) = self.known_certs.write() {
             if known_certs.contains(server_cert) {
-                info!("Server has a saved certificate: {}", server_cert_fingerprint);
+                info!("Server has a known certificate: {}", server_cert_fingerprint);
                 Ok(rustls::client::ServerCertVerified::assertion())
             } else if prompt_unknown_server_cert(server_cert, &self.our_cert_fingerprint) {
                 info!("Server approved: {}", server_cert_fingerprint);
@@ -112,7 +112,7 @@ impl rustls::server::ClientCertVerifier for ManualClientVerification {
         let client_cert_fingerprint = certs::fingerprint(&client_cert);
         if let Ok(mut known_certs) = self.known_certs.write() {
             if known_certs.contains(client_cert) {
-                info!("Client has a saved certificate: {}", client_cert_fingerprint);
+                info!("Client has a known certificate: {}", client_cert_fingerprint);
                 Ok(rustls::server::ClientCertVerified::assertion())
             } else if prompt_unknown_client_cert(client_cert, &self.our_cert_fingerprint) {
                 info!("Client approved: {}", client_cert_fingerprint);

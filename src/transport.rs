@@ -12,7 +12,7 @@ const ALPN_QUIC_HTTP: &[&[u8]] = &[b"hq-29"];
 const KEEPALIVE_MILLIS: u64 = 25000; // value recommended by wireguard across NATs/firewalls
 const TIMEOUT_MILLIS: u32 = 65000; // must be larger than keepalive to avoid spurious timeouts
 
-pub fn build_client(bind_addr: SocketAddr, known_server_certs: Vec<rustls::Certificate>) -> Result<quinn::Endpoint> {
+pub fn build_client(bind_addr: &SocketAddr, known_server_certs: Vec<rustls::Certificate>) -> Result<quinn::Endpoint> {
     let (client_cert, client_privkey) = certs::load_keypair().context("Failed to load client keypair")?;
     let mut rustls_config = rustls::ClientConfig::builder()
         .with_safe_defaults()
@@ -28,12 +28,12 @@ pub fn build_client(bind_addr: SocketAddr, known_server_certs: Vec<rustls::Certi
     client_config
         .transport_config(Arc::new(transport_config));
 
-    let mut client_endpoint = Endpoint::client(bind_addr)?;
+    let mut client_endpoint = Endpoint::client(bind_addr.clone())?;
     client_endpoint.set_default_client_config(client_config);
     Ok(client_endpoint)
 }
 
-pub fn build_server(listen_addr: SocketAddr, known_client_certs: Vec<rustls::Certificate>) -> Result<quinn::Endpoint> {
+pub fn build_server(listen_addr: &SocketAddr, known_client_certs: Vec<rustls::Certificate>) -> Result<quinn::Endpoint> {
     let (server_cert, server_privkey) = certs::load_keypair().context("Failed to load server keypair")?;
     let mut rustls_config = rustls::ServerConfig::builder()
         .with_safe_defaults() // includes TLS1.3 required by QUIC
@@ -50,5 +50,5 @@ pub fn build_server(listen_addr: SocketAddr, known_client_certs: Vec<rustls::Cer
     server_config
         .use_retry(true)
         .transport_config(Arc::new(transport_config));
-    Ok(Endpoint::server(server_config, listen_addr)?)
+    Ok(Endpoint::server(server_config, listen_addr.clone())?)
 }

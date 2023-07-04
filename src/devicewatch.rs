@@ -8,6 +8,8 @@ use tracing::{debug, info, trace, warn};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::deviceoutput;
+
 #[derive(Debug)]
 enum DeviceEventKind {
     Created,
@@ -20,6 +22,7 @@ struct DeviceEvent {
     pub path: PathBuf,
 }
 
+/// Trait for watching the addition and removal of devices from the machine
 pub trait DeviceHandler: Send + 'static {
     fn handle_device_stream(&mut self, stream: EventStream) -> Result<task::JoinHandle<()>>;
 }
@@ -44,8 +47,8 @@ pub async fn watch_loop<F: DeviceHandler>(mut handler: F) -> Result<()> {
     // Scan current devices
     let mut devices = HashMap::new();
     for (path, device) in evdev::enumerate() {
-        // enumerate already filters for 'event*' filenames
-        if !compatible_device_events(&device) {
+        // enumerate() already filters for 'event*' filenames
+        if !compatible_device(&device) {
             trace!("Ignoring incompatible device: {} @ {}", device.name().unwrap_or("(Unnamed device)"), path.to_string_lossy());
         }
         let stream = start_device_stream(device, &path)?;
@@ -61,12 +64,12 @@ pub async fn watch_loop<F: DeviceHandler>(mut handler: F) -> Result<()> {
         info!("device file event: {:?}", event);
         match event.kind {
             DeviceEventKind::Created => {
-                if !compatible_device_path(&event.path) {
+                if !compatible_path(&event.path) {
                     continue;
                 }
                 match Device::open(&event.path) {
                     Ok(device) => {
-                        if !compatible_device_events(&device) {
+                        if !compatible_device(&device) {
                             trace!("Ignoring incompatible device: {} @ {}", device.name().unwrap_or("(Unnamed device)"), event.path.to_string_lossy());
                             continue;
                         }
@@ -106,14 +109,21 @@ pub async fn watch_loop<F: DeviceHandler>(mut handler: F) -> Result<()> {
     Ok(())
 }
 
-fn compatible_device_path(path: &PathBuf) -> bool {
+fn compatible_path(path: &PathBuf) -> bool {
     // Filename should be 'event<N>', like 'event3' or 'event14'
     path.file_name()
         .filter(|f| f.to_string_lossy().starts_with("event"))
         .is_some()
 }
 
-fn compatible_device_events(d: &Device) -> bool {
+fn compatible_device(d: &Device) -> bool {
+    // Avoid a situation where we're consuming our own virtual output device, risking an infinite loop.
+    // This should only occur if the client and server are both running on the same machine (e.g. for testing)
+    if let Some(name) = d.name() {
+        if name.contains(deviceoutput::VIRTUAL_DEVICE_NAME_PREFIX) {
+            return false;
+        }
+    }
     // We care about these kinds of devices: keyboard, touchpad, and mouse, respectively
     let evts = d.supported_events();
     evts.contains(EventType::KEY) || evts.contains(EventType::ABSOLUTE) || evts.contains(EventType::RELATIVE)
@@ -136,7 +146,7 @@ fn start_device_stream(device: Device, path: &PathBuf) -> Result<EventStream> {
 fn send_device_events(event: notify::Event, device_event_tx: &async_channel::Sender<DeviceEvent>) {
     match event.kind {
         notify::EventKind::Create(notify::event::CreateKind::File) => {
-            debug!("file created: {:?}", event);
+            debug!("File created: {:?}", event);
             task::block_on(async {
                 for path in event.paths {
                     if let Err(e) = device_event_tx.send(DeviceEvent{kind: DeviceEventKind::Created, path}).await {
@@ -146,7 +156,7 @@ fn send_device_events(event: notify::Event, device_event_tx: &async_channel::Sen
             });
         },
         notify::EventKind::Remove(notify::event::RemoveKind::File) => {
-            debug!("file deleted: {:?}", event);
+            debug!("File deleted: {:?}", event);
             task::block_on(async {
                 for path in event.paths {
                     if let Err(e) = device_event_tx.send(DeviceEvent{kind: DeviceEventKind::Deleted, path}).await {
@@ -155,6 +165,6 @@ fn send_device_events(event: notify::Event, device_event_tx: &async_channel::Sen
                 }
             })
         },
-        _ => trace!("other filesystem event: {:?}", event),
+        _ => trace!("Other filesystem event: {:?}", event),
     }
 }

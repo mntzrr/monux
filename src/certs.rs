@@ -35,22 +35,30 @@ pub fn load_keypair() -> Result<(rustls::Certificate, rustls::PrivateKey)> {
                     key = Some(rustls::PrivateKey(filekey));
                 },
                 _ => {
+                    // Avoid logging the content in case its a privkey
                     warn!("Unexpected item in {}", file_path.display());
                 },
             }
         }
         if let (Some(cert), Some(key)) = (cert, key) {
+            info!("Read our cert from {}: {}", file_path.display(), fingerprint(&cert));
             return Ok((cert, key));
         } else {
             bail!("Incomplete cert/key content in {}", file_path.display());
         }
     } else {
         let cert = rcgen::generate_simple_self_signed(vec![]).context("Failed to generate self-signed cert")?;
+        let rustls_cert = rustls::Certificate(cert.serialize_der()?);
+
+        // Just compress into a single write
+        let pem_content = format!("{}{}", cert.serialize_pem()?, cert.serialize_private_key_pem());
+
+        info!("Writing our cert to {}: {}", file_path.display(), fingerprint(&rustls_cert));
         let mut outfile = fs::File::create(&file_path).with_context(|| format!("Failed to open keypair file for writing: {}", file_path.display()))?;
         ensure_permissions(&file_path, 0o600).with_context(|| format!("Failed to set permissions on keypair file: {}", file_path.display()))?;
-        outfile.write_all(cert.serialize_pem()?.as_bytes()).with_context(|| format!("Failed to write cert to keypair file: {}", file_path.display()))?;
-        outfile.write_all(cert.serialize_private_key_pem().as_bytes()).with_context(|| format!("Failed to write key to keypair file: {}", file_path.display()))?;
-        Ok((rustls::Certificate(cert.serialize_der()?), rustls::PrivateKey(cert.serialize_private_key_der())))
+        outfile.write_all(pem_content.as_bytes()).with_context(|| format!("Failed to write keypair to file: {}", file_path.display()))?;
+
+        Ok((rustls_cert, rustls::PrivateKey(cert.serialize_private_key_der())))
     }
 }
 
