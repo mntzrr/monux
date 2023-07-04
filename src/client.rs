@@ -49,32 +49,3 @@ pub async fn run_client(bind_addr: &SocketAddr, server_addr: &SocketAddr, known_
         bytes.clear();
     }
 }
-
-// ref https://www.kernel.org/doc/html/latest/input/uinput.html
-
-pub struct timeval {
-    pub tv_sec: i64,
-    pub tv_usec: i64,
-}
-
-pub struct input_event {
-    pub time: timeval,
-    pub type_: u16,
-    pub code: u16,
-    pub value: i32,
-}
-
-pub struct input_id {
-    pub bustype: u16,
-    pub vendor: u16,
-    pub product: u16,
-    pub version: u16,
-}
-
-// if uinput version from UI_GET_VERSION is >= 5:
-#[repr(C)]
-pub struct uinput_setup {
-    pub id: input_id,
-    pub name: [libc::c_char; 80],
-    pub ff_effects_max: u32,
-}

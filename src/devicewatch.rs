@@ -132,12 +132,14 @@ fn compatible_device(d: &Device) -> bool {
 fn start_device_stream(device: Device, path: &PathBuf) -> Result<EventStream> {
     let device_name = device.name().unwrap_or("(Unnamed device)").to_string();
     info!(
-        "Input device: {} @ {}, {:?}, {:?}, {:?}",
+        "Input device: {} @ {}, props={:?}, events={:?}, keys={:?}, rel={:?}, abs={:?}",
         device_name,
         path.to_string_lossy(),
         device.properties(),
         device.supported_events(),
-        device.supported_keys()
+        device.supported_keys(),
+        device.supported_relative_axes(),
+        device.supported_absolute_axes(),
     );
     device.into_event_stream()
         .with_context(|| format!("Failed to initialize async fd for device: {} @ {}", device_name, path.to_string_lossy()))
