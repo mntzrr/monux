@@ -20,6 +20,12 @@ fn main() -> Result<()> {
 
     logging::init_logging();
 
+    //let _keyboard = deviceoutput::keyboard(true)?;
+    //let _mouse = deviceoutput::mouse(true)?;
+    //let _touchpad = deviceoutput::touchpad(true)?;
+    //deviceoutput::print_virtual_devices();
+    //bail!("ok cya");
+
     let listen_addr: std::net::SocketAddr = "127.0.0.1:5000".parse()?;
     let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse()?;
     let listen_addr2 = listen_addr.clone();

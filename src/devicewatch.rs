@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use async_std::task;
-use evdev::{Device, EventStream, EventType};
+use evdev::{Device, EvdevEnum, EventStream, EventType};
 use futures::StreamExt;
 use notify::Watcher;
 use tracing::{debug, info, trace, warn};
@@ -49,7 +49,8 @@ pub async fn watch_loop<F: DeviceHandler>(mut handler: F) -> Result<()> {
     for (path, device) in evdev::enumerate() {
         // enumerate() already filters for 'event*' filenames
         if !compatible_device(&device) {
-            trace!("Ignoring incompatible device: {} @ {}", device.name().unwrap_or("(Unnamed device)"), path.to_string_lossy());
+            trace!("Ignoring device: {} @ {}", device.name().unwrap_or("(Unnamed device)"), path.to_string_lossy());
+            continue;
         }
         let stream = start_device_stream(device, &path)?;
         devices.insert(path, handler.handle_device_stream(stream)?);
@@ -70,7 +71,7 @@ pub async fn watch_loop<F: DeviceHandler>(mut handler: F) -> Result<()> {
                 match Device::open(&event.path) {
                     Ok(device) => {
                         if !compatible_device(&device) {
-                            trace!("Ignoring incompatible device: {} @ {}", device.name().unwrap_or("(Unnamed device)"), event.path.to_string_lossy());
+                            debug!("Ignoring device: {} @ {}", device.name().unwrap_or("(Unnamed device)"), event.path.to_string_lossy());
                             continue;
                         }
                         match start_device_stream(device, &event.path) {
@@ -118,31 +119,58 @@ fn compatible_path(path: &PathBuf) -> bool {
 
 fn compatible_device(d: &Device) -> bool {
     // Avoid a situation where we're consuming our own virtual output device, risking an infinite loop.
-    // This should only occur if the client and server are both running on the same machine (e.g. for testing)
+    // This could happen if client and server are running on the same machine (e.g. for testing)
     if let Some(name) = d.name() {
         if name.contains(deviceoutput::VIRTUAL_DEVICE_NAME_PREFIX) {
             return false;
         }
     }
-    // We care about these kinds of devices: keyboard, touchpad, and mouse, respectively
+    // We care about these kinds of devices: keyboard, mouse, and touchpad, respectively
     let evts = d.supported_events();
-    evts.contains(EventType::KEY) || evts.contains(EventType::ABSOLUTE) || evts.contains(EventType::RELATIVE)
+    evts.contains(EventType::KEY) || evts.contains(EventType::RELATIVE) || evts.contains(EventType::ABSOLUTE)
 }
 
-fn start_device_stream(device: Device, path: &PathBuf) -> Result<EventStream> {
+pub fn log_device(device: &Device, path: &PathBuf) {
+    //info!("device {}", device);
     let device_name = device.name().unwrap_or("(Unnamed device)").to_string();
+    let mut abs_entries = vec![];
+    if let Some(abs_axes) = device.supported_absolute_axes() {
+        if let Ok(state) = device.get_abs_state() {
+            let mut i = 0;
+            for s in state {
+                let type_ = evdev::AbsoluteAxisType::from_index(i);
+                if abs_axes.contains(type_) {
+                    abs_entries.push(format!("{:?}:{:?}", type_, s));
+                }
+                i += 1;
+            }
+        }
+    }
     info!(
-        "Input device: {} @ {}, props={:?}, events={:?}, keys={:?}, rel={:?}, abs={:?}",
+        "Input device: {} @ {}:
+  props: {:?}
+  misc: {:?}
+  events: {:?}
+  keys: {:?}
+  leds: {:?}
+  rel: {:?}
+  abs: {:?}",
         device_name,
         path.to_string_lossy(),
         device.properties(),
+        device.misc_properties(),
         device.supported_events(),
         device.supported_keys(),
+        device.supported_leds(),
         device.supported_relative_axes(),
-        device.supported_absolute_axes(),
+        abs_entries,
     );
+}
+
+fn start_device_stream(device: Device, path: &PathBuf) -> Result<EventStream> {
+    log_device(&device, path);
     device.into_event_stream()
-        .with_context(|| format!("Failed to initialize async fd for device: {} @ {}", device_name, path.to_string_lossy()))
+        .with_context(|| format!("Failed to initialize async fd for device: {}", path.to_string_lossy()))
 }
 
 fn send_device_events(event: notify::Event, device_event_tx: &async_channel::Sender<DeviceEvent>) {

@@ -1,197 +1,210 @@
 use anyhow::Result;
-use input_linux::{
-    AbsoluteAxis,
-    AbsoluteEvent,
-    AbsoluteInfo,
-    AbsoluteInfoSetup,
-    EventKind,
-    EventTime,
-    InputEvent,
-    InputId,
-    InputProperty,
-    Key,
-    KeyEvent,
-    KeyState,
-    RelativeAxis,
-    RelativeEvent,
-    SynchronizeEvent,
-    SynchronizeKind,
-    UInputHandle,
-};
-use libc::O_NONBLOCK;
 
-use std::fs;
-use std::os::unix::fs::OpenOptionsExt;
 use std::thread;
 use std::time::Duration;
 
-const ZERO: EventTime = EventTime::new(0, 0);
+use crate::devicewatch;
+
 pub const VIRTUAL_DEVICE_NAME_PREFIX: &str = "nikau virtual";
+pub const TOUCHPAD_SIZE: i32 = 65536;
 
-// TODO actually the evdev library has support for virtual devices, switch these demos to that:
-// - https://docs.rs/evdev/latest/evdev/uinput/index.html
-// - https://docs.rs/crate/evdev/latest/source/examples/virtual_keyboard.rs
-
-fn create_device() -> Result<UInputHandle<fs::File>> {
-    Ok(UInputHandle::new(
-        fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(O_NONBLOCK)
-            .open("/dev/uinput")?
-    ))
-}
-
-fn setup_device(uhandle: &UInputHandle<fs::File>, name: &str, abs: &[AbsoluteInfoSetup]) -> Result<()> {
-    let input_id = InputId {
-        bustype: input_linux::sys::BUS_USB,
-        vendor: 0x1234,
-        product: 0x5678,
-        version: 0,
-    };
-    let device_name = format!("{} {}", VIRTUAL_DEVICE_NAME_PREFIX, name);
-    if let Ok(version) = uhandle.version() {
-        if version >= input_linux::sys::UINPUT_VERSION as u32 {
-            // "new" API circa 08/13/2015
-            uhandle.create(&input_id, device_name.as_bytes(), 0, abs)?;
-
-            // This call to sleep was not necessary on my machine,
-            // but this translation is meant to match exactly
-            thread::sleep(Duration::from_secs(1));
-
-            return Ok(());
+pub fn print_virtual_devices() {
+    for (path, device) in evdev::enumerate() {
+        if let Some(name) = device.name() {
+            if name.starts_with(VIRTUAL_DEVICE_NAME_PREFIX) {
+                devicewatch::log_device(&device, &path);
+            }
         }
     }
-    // Version lookup failed, or version is old
-    uhandle.create_legacy(&input_id, device_name.as_bytes(), 0, abs)?;
-
-    // This call to sleep was not necessary on my machine,
-    // but this translation is meant to match exactly
-    thread::sleep(Duration::from_secs(1));
-
-    Ok(())
 }
 
-pub fn mouse() -> Result<()> {
-    let uhandle = create_device()?;
-
-    // Input device: DLL0945:00 06CB:CDE6 Mouse @ /dev/input/event8, props={}, events={SYNCHRONIZATION, KEY, RELATIVE, MISC}, keys=Some({BTN_LEFT, BTN_RIGHT}), rel=Some({REL_X, REL_Y}), abs=None
-
-    uhandle.set_evbit(EventKind::Key)?;
-    uhandle.set_keybit(Key::ButtonLeft)?;
-
-    uhandle.set_evbit(EventKind::Relative)?;
-    uhandle.set_relbit(RelativeAxis::X)?;
-    uhandle.set_relbit(RelativeAxis::Y)?;
-
-    setup_device(&uhandle, "mouse", &[])?;
-
-    for _ in 0..50 {
-        let events = [
-            *InputEvent::from(RelativeEvent::new(ZERO, RelativeAxis::X, 5)).as_raw(),
-            *InputEvent::from(RelativeEvent::new(ZERO, RelativeAxis::Y, 5)).as_raw(),
-            *InputEvent::from(SynchronizeEvent::new(ZERO, SynchronizeKind::Report, 0)).as_raw(),
-        ];
-        uhandle.write(&events)?;
-        thread::sleep(Duration::from_micros(15_000));
+pub fn keyboard(demo: bool) -> Result<evdev::uinput::VirtualDevice> {
+    let mut keys = evdev::AttributeSet::<evdev::Key>::new();
+    // Report as many keys as possible to emit by the virtual device.
+    for code in 1..195 {//(libc::KEY_MAX as u16) {
+        let key = evdev::Key::new(code);
+        // HACK: Include only known KEY_* keys, or else the keyboard will be ignored.
+        let key_name = format!("{:?}", key);
+        if key_name.starts_with("KEY_") {
+            keys.insert(key);
+        }
     }
 
-    // This call to sleep was not necessary on my machine,
-    // but this translation is meant to match exactly
-    thread::sleep(Duration::from_secs(1));
-    uhandle.dev_destroy()?;
+    let mut device = evdev::uinput::VirtualDeviceBuilder::new()?
+        .name(format!("{} keyboard", VIRTUAL_DEVICE_NAME_PREFIX).as_str())
+        .with_keys(&keys)?
+        .build()
+        .unwrap();
 
-    Ok(())
+    if demo {
+        // NOTE: many of the keypresses are missed without a sleep here... but this is just a demo
+        //thread::sleep(Duration::from_secs(1));
+
+        for _ in 0..50 {
+            // Each emit() call injects a sync event
+            device.emit(&[evdev::InputEvent::new(evdev::EventType::KEY, evdev::Key::KEY_R.code(), 1)]).unwrap();
+            device.emit(&[evdev::InputEvent::new(evdev::EventType::KEY, evdev::Key::KEY_R.code(), 0)]).unwrap();
+            thread::sleep(Duration::from_micros(5_000));
+        }
+    }
+
+    Ok(device)
 }
 
-pub fn keyboard() -> Result<()> {
-    let uhandle = create_device()?;
-
-    // Input device: AT Translated Set 2 keyboard @ /dev/input/event2, props={}, events={SYNCHRONIZATION, KEY, MISC, LED, REPEAT}, keys=Some({KEY_ESC, KEY_1, ...many entries..., KEY_BATTERY, KEY_UNKNOWN}), rel=None, abs=None
-
-    uhandle.set_evbit(EventKind::Key)?;
-    uhandle.set_keybit(Key::Space)?;
-
-    setup_device(&uhandle, "keyboard", &[])?;
-
-    for _ in 0..5 {
-        let events = [
-            *InputEvent::from(KeyEvent::new(ZERO, Key::Space, KeyState::PRESSED)).as_raw(),
-            *InputEvent::from(SynchronizeEvent::new(ZERO, SynchronizeKind::Report, 0)).as_raw(),
-            *InputEvent::from(KeyEvent::new(ZERO, Key::Space, KeyState::RELEASED)).as_raw(),
-            *InputEvent::from(SynchronizeEvent::new(ZERO, SynchronizeKind::Report, 0)).as_raw(),
-        ];
-        uhandle.write(&events)?;
-        thread::sleep(Duration::from_micros(15_000));
+pub fn mouse(demo: bool) -> Result<evdev::uinput::VirtualDevice> {
+    let mut keys = evdev::AttributeSet::<evdev::Key>::new();
+    for code in 1..(libc::KEY_MAX as u16) {
+        let key = evdev::Key::new(code);
+        // HACK: Include only BTN_* keys, and exclude BTN_TOOL_* or else the mouse is ignored.
+        let key_name = format!("{:?}", key);
+        if key_name.starts_with("BTN_") && !key_name.starts_with("BTN_TOOL_") {
+            keys.insert(key);
+        }
     }
 
-    // This call to sleep was not necessary on my machine,
-    // but this translation is meant to match exactly
-    thread::sleep(Duration::from_secs(1));
+    // Claim ALL axes. The mouse will be ignored if it claims keys that aren't relevant to claimed axes.
+    let mut axes = evdev::AttributeSet::<evdev::RelativeAxisType>::new();
+    for code in 0..(libc::REL_CNT as u16) {
+        axes.insert(evdev::RelativeAxisType(code));
+    }
 
-    // NOTE: if the device is left with a key held down, the key repeat automatically stops when the device is destroyed
-    uhandle.dev_destroy()?;
+    let mut device = evdev::uinput::VirtualDeviceBuilder::new()?
+        .name(format!("{} mouse", VIRTUAL_DEVICE_NAME_PREFIX).as_str())
+        .with_keys(&keys)?
+        .with_relative_axes(&axes)?
+        .build()
+        .unwrap();
 
-    Ok(())
+    if demo {
+        for _ in 0..50 {
+            // Each emit() call injects a sync event
+            device.emit(&[
+                evdev::InputEvent::new(evdev::EventType::RELATIVE, evdev::RelativeAxisType::REL_X.0, 5),
+                evdev::InputEvent::new(evdev::EventType::RELATIVE, evdev::RelativeAxisType::REL_Y.0, 5),
+            ]).unwrap();
+            thread::sleep(Duration::from_micros(5_000));
+        }
+    }
+
+    Ok(device)
 }
 
-pub fn touchpad() -> Result<()> {
-    let uhandle = create_device()?;
+pub fn touchpad(demo: bool) -> Result<evdev::uinput::VirtualDevice> {
+    let mut props = evdev::AttributeSet::<evdev::PropType>::new();
+    // Doesn't seem to be required, but real touchpads have it:
+    props.insert(evdev::PropType::BUTTONPAD);
+    // Required for movement events to be recognized:
+    props.insert(evdev::PropType::POINTER);
 
-    // Input device: DLL0945:00 06CB:CDE6 Touchpad @ /dev/input/event9, props={POINTER, BUTTONPAD}, events={SYNCHRONIZATION, KEY, ABSOLUTE, MISC}, keys=Some({BTN_LEFT, BTN_TOOL_FINGER, BTN_TOOL_QUINTTAP, BTN_TOUCH, BTN_TOOL_DOUBLETAP, BTN_TOOL_TRIPLETAP, BTN_TOOL_QUADTAP}), rel=None, abs=Some({ABS_X, ABS_Y, ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TOOL_TYPE, ABS_MT_TRACKING_ID})
-
-    uhandle.set_propbit(InputProperty::ButtonPad)?;
-    // Required for mouse movements to be recognized:
-    uhandle.set_propbit(InputProperty::Pointer)?;
-
-    uhandle.set_evbit(EventKind::Key)?;
-    uhandle.set_keybit(Key::ButtonLeft)?;
-
-    uhandle.set_evbit(EventKind::Absolute)?;
-    uhandle.set_absbit(AbsoluteAxis::X)?;
-    uhandle.set_absbit(AbsoluteAxis::Y)?;
-
-    let abs = [
-        AbsoluteInfoSetup {
-            axis: AbsoluteAxis::X,
-            info: AbsoluteInfo {
-                value: 0,
-                minimum: 0,
-                maximum: 255,
-                fuzz: 0,
-                flat: 0,
-                resolution: 0,
-            },
-        },
-        AbsoluteInfoSetup {
-            axis: AbsoluteAxis::Y,
-            info: AbsoluteInfo {
-                value: 0,
-                minimum: 0,
-                maximum: 255,
-                fuzz: 0,
-                flat: 0,
-                resolution: 0,
-            },
-        },
-    ];
-
-    setup_device(&uhandle, "touchpad", &abs)?;
-
-    for i in 100..200 {
-        let events = [
-            *InputEvent::from(AbsoluteEvent::new(ZERO, AbsoluteAxis::X, i)).as_raw(),
-            *InputEvent::from(AbsoluteEvent::new(ZERO, AbsoluteAxis::Y, i)).as_raw(),
-            *InputEvent::from(SynchronizeEvent::new(ZERO, SynchronizeKind::Report, 0)).as_raw(),
-        ];
-        uhandle.write(&events)?;
-        thread::sleep(Duration::from_micros(15_000));
+    let mut keys = evdev::AttributeSet::<evdev::Key>::new();
+    for code in 1..(libc::KEY_MAX as u16) {
+        let key = evdev::Key::new(code);
+        // HACK: Limit to only BTN_* keys or else the device won't work.
+        let key_name = format!("{:?}", key);
+        if key_name.starts_with("BTN_") {
+            keys.insert(key);
+        }
     }
 
-    // This call to sleep was not necessary on my machine,
-    // but this translation is meant to match exactly
-    thread::sleep(Duration::from_secs(1));
-    uhandle.dev_destroy()?;
+    let mut misc = evdev::AttributeSet::<evdev::MiscType>::new();
+    misc.insert(evdev::MiscType::MSC_TIMESTAMP);
 
-    Ok(())
+    let mut device = evdev::uinput::VirtualDeviceBuilder::new()?
+        .name(format!("{} multi touchpad", VIRTUAL_DEVICE_NAME_PREFIX).as_str())
+        .with_properties(&props)?
+        .with_keys(&keys)?
+        // TODO will need to scale these events relative to TOUCHPAD_SIZE:
+        .with_absolute_axis(&evdev::UinputAbsSetup::new(
+            evdev::AbsoluteAxisType::ABS_X,
+            evdev::AbsInfo::new(
+                0, // value
+                0, // min
+                TOUCHPAD_SIZE - 1, // max
+                0, // fuzz
+                0, // flat
+                1, // res
+            )
+        ))?
+        .with_absolute_axis(&evdev::UinputAbsSetup::new(
+            evdev::AbsoluteAxisType::ABS_Y,
+            evdev::AbsInfo::new(
+                0, // value
+                0, // min
+                TOUCHPAD_SIZE - 1, // max
+                0, // fuzz
+                0, // flat
+                1, // res
+            )
+        ))?
+        .with_absolute_axis(&evdev::UinputAbsSetup::new(
+            evdev::AbsoluteAxisType::ABS_MT_POSITION_X,
+            evdev::AbsInfo::new(
+                0, // value
+                0, // min
+                TOUCHPAD_SIZE - 1, // max
+                0, // fuzz
+                0, // flat
+                1, // res
+            )
+        ))?
+        .with_absolute_axis(&evdev::UinputAbsSetup::new(
+            evdev::AbsoluteAxisType::ABS_MT_POSITION_Y,
+            evdev::AbsInfo::new(
+                0, // value
+                0, // min
+                TOUCHPAD_SIZE - 1, // max
+                0, // fuzz
+                0, // flat
+                1, // res
+            )
+        ))?
+        .with_absolute_axis(&evdev::UinputAbsSetup::new(
+            evdev::AbsoluteAxisType::ABS_MT_SLOT,
+            evdev::AbsInfo::new(
+                0, // value
+                0, // min
+                32, // max
+                0, // fuzz
+                0, // flat
+                0, // res
+            )
+        ))?
+        .with_absolute_axis(&evdev::UinputAbsSetup::new(
+            evdev::AbsoluteAxisType::ABS_MT_TOOL_TYPE,
+            evdev::AbsInfo::new(
+                0, // value
+                0, // min
+                4095, // max
+                0, // fuzz
+                0, // flat
+                0, // res
+            )
+        ))?
+        .with_absolute_axis(&evdev::UinputAbsSetup::new(
+            evdev::AbsoluteAxisType::ABS_MT_TRACKING_ID,
+            evdev::AbsInfo::new(
+                0, // value
+                0, // min
+                65535, // max
+                0, // fuzz
+                0, // flat
+                0, // res
+            )
+        ))?
+        .with_msc(&misc)?
+        .build()
+        .unwrap();
+
+    if demo {
+        for i in 100..200 {
+            // Each emit() call injects a sync event
+            device.emit(&[
+                evdev::InputEvent::new(evdev::EventType::ABSOLUTE, evdev::AbsoluteAxisType::ABS_X.0, i * 100),
+                evdev::InputEvent::new(evdev::EventType::ABSOLUTE, evdev::AbsoluteAxisType::ABS_Y.0, i * 100),
+            ]).unwrap();
+            thread::sleep(Duration::from_micros(5_000));
+        }
+    }
+
+    Ok(device)
 }
