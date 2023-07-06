@@ -62,7 +62,7 @@ pub async fn watch_loop<F: DeviceHandler>(mut handler: F) -> Result<()> {
 
     // Start handler to consume new/removed device events
     while let Some(event) = device_event_rx.next().await {
-        info!("device file event: {:?}", event);
+        trace!("Device file event: {:?}", event);
         match event.kind {
             DeviceEventKind::Created => {
                 if !compatible_path(&event.path) {
@@ -74,12 +74,12 @@ pub async fn watch_loop<F: DeviceHandler>(mut handler: F) -> Result<()> {
                             debug!("Ignoring device: {} @ {}", device.name().unwrap_or("(Unnamed device)"), event.path.to_string_lossy());
                             continue;
                         }
+                        info!("Listening to new device: {} @ {}", device.name().unwrap_or("(Unnamed device)"), event.path.to_string_lossy());
                         match start_device_stream(device, &event.path) {
                             Ok(stream) => {
                                 match handler.handle_device_stream(stream) {
                                     Ok(join_handle) => {
                                         devices.insert(event.path, join_handle);
-                                        info!("Handling {} devices following addition", devices.len());
                                     },
                                     Err(e) => {
                                         warn!("Failed to start event handler for device {}: {}", event.path.to_string_lossy(), e);

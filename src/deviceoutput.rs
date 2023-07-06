@@ -1,25 +1,92 @@
 use anyhow::Result;
-use evdev::{uinput, AbsInfo, AbsoluteAxisType, AttributeSet, EvdevEnum, EventType, InputEvent, Key};
-
-use std::thread;
-use std::time::Duration;
+use evdev::{uinput, AbsInfo, AbsoluteAxisType, AttributeSet, EvdevEnum, InputEvent, Key};
+use tracing::{debug, info, warn};
 
 use crate::deviceutil;
+use crate::messages;
 
 pub const VIRTUAL_DEVICE_NAME_PREFIX: &str = "nikau virtual";
-pub const SCALED_DIM_SIZE: i32 = 65536;
+pub const SCALED_DIM_MIN: i32 = 0;
+pub const SCALED_DIM_MAX: i32 = 65535;
 
-pub fn print_virtual_devices() {
-    for (_path, device) in evdev::enumerate() {
-        if let Some(name) = device.name() {
-            if name.starts_with(VIRTUAL_DEVICE_NAME_PREFIX) {
-                let _ = deviceutil::device_info(&device);
+pub struct VirtualDevices {
+    key_events: Vec<InputEvent>,
+    rel_events: Vec<InputEvent>,
+    abs_events: Vec<InputEvent>,
+
+    key_device: uinput::VirtualDevice,
+    rel_device: uinput::VirtualDevice,
+    abs_device: uinput::VirtualDevice,
+}
+
+impl VirtualDevices {
+    pub fn new() -> Result<VirtualDevices> {
+        info!("Creating virtual devices: keyboard, mouse, touchpad");
+        Ok(VirtualDevices {
+            key_events: vec![],
+            rel_events: vec![],
+            abs_events: vec![],
+            key_device: keyboard()?,
+            rel_device: mouse()?,
+            abs_device: touchpad()?,
+        })
+    }
+
+    pub fn add_event(&mut self, net_event: messages::InputEventV1) -> Result<()> {
+        let (events, device) = match net_event.target {
+            messages::EventTargetV1::Key => (&mut self.key_events, &mut self.key_device),
+            messages::EventTargetV1::Rel => (&mut self.rel_events, &mut self.rel_device),
+            messages::EventTargetV1::Abs => (&mut self.abs_events, &mut self.abs_device),
+        };
+
+        if let Some(e) = net_event.f64event {
+            events.push(e.to_evdev(SCALED_DIM_MIN, SCALED_DIM_MAX));
+        } else if let Some(e) = net_event.i32event {
+            if e.type_ == evdev::EventType::SYNCHRONIZATION.0 {
+                // If it's a sync event, then flush the queued events.
+                // We only do this queueing because VirtualDevice::emit() internally
+                // writes its own sync event that we can't skip.
+                debug!("Sending {} events to {} device: {:?}", events.len(), net_event.target, events);
+                device.emit(&events)?;
+                events.clear();
+            } else {
+                events.push(e.to_evdev());
             }
+        } else {
+            warn!("Event missing either an i32 or an f64 value: {}", net_event);
         }
+
+        if events.len() >= 100 {
+            // Just in case, avoid the risk of collecting queued events forever
+            warn!("Forcing event flush due to lack of sync events");
+            device.emit(&events)?;
+            events.clear();
+        }
+
+        Ok(())
+    }
+
+    pub fn switch(&mut self, enabled: bool) -> Result<()> {
+        info!("Client is going {}", if enabled { "active" } else { "inactive" });
+        // TODO(feature): clear device state for client switches, to avoid e.g. leaving a device with a repeating key. but this requires subscribing and keeping track of device state.
+        // TODO(feature): flash LEDs on the OTHER, NON-virtual edvices when this client becomes enabled
+        if !self.key_events.is_empty() {
+            self.key_device.emit(&self.key_events)?;
+            self.key_events.clear();
+        }
+        if !self.rel_events.is_empty() {
+            self.rel_device.emit(&self.rel_events)?;
+            self.rel_events.clear();
+        }
+        if !self.abs_events.is_empty() {
+            self.abs_device.emit(&self.abs_events)?;
+            self.abs_events.clear();
+        }
+        Ok(())
     }
 }
 
-pub fn keyboard(demo: bool) -> Result<uinput::VirtualDevice> {
+pub fn keyboard() -> Result<uinput::VirtualDevice> {
     let mut keys = AttributeSet::<Key>::new();
     // Report as many keys as possible to emit by the virtual device.
     for code in 1..195 {//(libc::KEY_MAX as u16) {
@@ -31,28 +98,15 @@ pub fn keyboard(demo: bool) -> Result<uinput::VirtualDevice> {
         }
     }
 
-    let mut device = uinput::VirtualDeviceBuilder::new()?
+    let device = uinput::VirtualDeviceBuilder::new()?
+        // TODO include pid in device name
         .name(format!("{} keyboard", VIRTUAL_DEVICE_NAME_PREFIX).as_str())
         .with_keys(&keys)?
-        .build()
-        .unwrap();
-
-    if demo {
-        // NOTE: many of the keypresses are missed without a sleep here... but this is just a demo
-        //thread::sleep(Duration::from_secs(1));
-
-        for _ in 0..50 {
-            // Each emit() call injects a sync event
-            device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_R.code(), 1)]).unwrap();
-            device.emit(&[InputEvent::new(EventType::KEY, Key::KEY_R.code(), 0)]).unwrap();
-            thread::sleep(Duration::from_micros(5_000));
-        }
-    }
-
+        .build()?;
     Ok(device)
 }
 
-pub fn mouse(demo: bool) -> Result<uinput::VirtualDevice> {
+pub fn mouse() -> Result<uinput::VirtualDevice> {
     let mut keys = AttributeSet::<Key>::new();
     for code in 1..(libc::KEY_MAX as u16) {
         let key = Key::new(code);
@@ -69,28 +123,16 @@ pub fn mouse(demo: bool) -> Result<uinput::VirtualDevice> {
         axes.insert(evdev::RelativeAxisType(code));
     }
 
-    let mut device = uinput::VirtualDeviceBuilder::new()?
+    let device = uinput::VirtualDeviceBuilder::new()?
+        // TODO include pid in device name
         .name(format!("{} mouse", VIRTUAL_DEVICE_NAME_PREFIX).as_str())
         .with_keys(&keys)?
         .with_relative_axes(&axes)?
-        .build()
-        .unwrap();
-
-    if demo {
-        for _ in 0..50 {
-            // Each emit() call injects a sync event
-            device.emit(&[
-                InputEvent::new(EventType::RELATIVE, evdev::RelativeAxisType::REL_X.0, 5),
-                InputEvent::new(EventType::RELATIVE, evdev::RelativeAxisType::REL_Y.0, 5),
-            ]).unwrap();
-            thread::sleep(Duration::from_micros(5_000));
-        }
-    }
-
+        .build()?;
     Ok(device)
 }
 
-pub fn touchpad(demo: bool) -> Result<uinput::VirtualDevice> {
+pub fn touchpad() -> Result<uinput::VirtualDevice> {
     let mut props = AttributeSet::<evdev::PropType>::new();
     // Doesn't seem to be required, but real touchpads have it:
     props.insert(evdev::PropType::BUTTONPAD);
@@ -110,6 +152,7 @@ pub fn touchpad(demo: bool) -> Result<uinput::VirtualDevice> {
     let mut misc = AttributeSet::<evdev::MiscType>::new();
     misc.insert(evdev::MiscType::MSC_TIMESTAMP);
 
+    // TODO include pid in device name
     let name = format!("{} multi touchpad", VIRTUAL_DEVICE_NAME_PREFIX);
     let mut device_builder = uinput::VirtualDeviceBuilder::new()?
         .name(name.as_str())
@@ -121,7 +164,7 @@ pub fn touchpad(demo: bool) -> Result<uinput::VirtualDevice> {
             AbsInfo::new(
                 0, // value
                 0, // min
-                32, // max
+                32, // max (if this is too big then something panics)
                 0, // fuzz
                 0, // flat
                 0, // res
@@ -142,8 +185,8 @@ pub fn touchpad(demo: bool) -> Result<uinput::VirtualDevice> {
             AbsoluteAxisType::ABS_MT_BLOB_ID,
             AbsInfo::new(
                 0, // value
-                0, // min
-                65535, // max
+                -1, // min
+                1048576, // max (arbitrarily big in case some real device uses big IDs)
                 0, // fuzz
                 0, // flat
                 0, // res
@@ -153,14 +196,15 @@ pub fn touchpad(demo: bool) -> Result<uinput::VirtualDevice> {
             AbsoluteAxisType::ABS_MT_TRACKING_ID,
             AbsInfo::new(
                 0, // value
-                0, // min
-                65535, // max
+                -1, // min
+                1048576, // max (arbitrarily big in case some real device uses big IDs)
                 0, // fuzz
                 0, // flat
                 0, // res
             )
         ))?
         .with_msc(&misc)?;
+
     for i in 0..libc::ABS_MAX+1 {
         let axis = AbsoluteAxisType::from_index(i as usize);
         if deviceutil::is_scaled_axis(&axis) {
@@ -168,8 +212,8 @@ pub fn touchpad(demo: bool) -> Result<uinput::VirtualDevice> {
                 axis,
                 AbsInfo::new(
                     0, // value
-                    0, // min
-                    SCALED_DIM_SIZE - 1, // max
+                    SCALED_DIM_MIN, // min
+                    SCALED_DIM_MAX, // max
                     0, // fuzz
                     0, // flat
                     1, // res
@@ -177,18 +221,7 @@ pub fn touchpad(demo: bool) -> Result<uinput::VirtualDevice> {
             ))?;
         }
     }
-    let mut device = device_builder.build()?;
 
-    if demo {
-        for i in 100..200 {
-            // Each emit() call injects a sync event
-            device.emit(&[
-                InputEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_X.0, i * 100),
-                InputEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_Y.0, i * 100),
-            ])?;
-            thread::sleep(Duration::from_micros(5_000));
-        }
-    }
-
+    let device = device_builder.build()?;
     Ok(device)
 }

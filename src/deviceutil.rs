@@ -1,5 +1,5 @@
 use evdev::{AbsoluteAxisType, Device, EvdevEnum, EventType};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::messages;
 
@@ -51,7 +51,7 @@ pub fn device_info(device: &Device) -> (messages::EventTargetV1, BTreeMap<u16, (
     (target, dims)
 }
 
-pub fn log_device(device: &Device, target: &messages::EventTargetV1, dims: &BTreeMap<u16, (i32, i32)>) {
+fn log_device(device: &Device, target: &messages::EventTargetV1, dims: &BTreeMap<u16, (i32, i32)>) {
     let device_name = device.name().unwrap_or("(Unnamed device)").to_string();
     let mut abs_entries = vec![];
     if let Some(abs_axes) = device.supported_absolute_axes() {
@@ -66,8 +66,9 @@ pub fn log_device(device: &Device, target: &messages::EventTargetV1, dims: &BTre
             }
         }
     }
-    info!(
-        "Input {} device {}:
+    info!("Adding input {} device: {}", target, device_name);
+    debug!(
+        "{} details:
   props: {:?}
   misc: {:?}
   events: {:?}
@@ -76,7 +77,6 @@ pub fn log_device(device: &Device, target: &messages::EventTargetV1, dims: &BTre
   rel: {:?}
   abs: {:?}
   dims: {:?}",
-        target,
         device_name,
         device.properties(),
         device.misc_properties(),

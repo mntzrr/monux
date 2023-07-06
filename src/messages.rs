@@ -93,9 +93,9 @@ impl std::fmt::Display for EventTargetV1 {
 /// Omits the timestamp since it isn't required.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct I32EventV1 {
-    type_: u16,
-    code: u16,
-    value: i32,
+    pub type_: u16,
+    pub code: u16,
+    pub value: i32,
 }
 
 impl std::fmt::Display for I32EventV1 {
@@ -115,7 +115,7 @@ impl I32EventV1 {
 
     pub fn to_evdev(&self) -> evdev::InputEvent {
         evdev::InputEvent::new(
-            evdev::EventType{0:self.type_},
+            evdev::EventType{0: self.type_},
             self.code,
             self.value,
         )
@@ -129,9 +129,9 @@ impl I32EventV1 {
 /// Used for absolute coordinates, with a scale of [0.0, 1.0] to be resized by the client.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct F64EventV1 {
-    type_: u16,
-    code: u16,
-    value: f64,
+    pub type_: u16,
+    pub code: u16,
+    pub value: f64,
 }
 
 impl std::fmt::Display for F64EventV1 {
@@ -152,7 +152,7 @@ impl F64EventV1 {
 
     pub fn to_evdev(&self, min: i32, max: i32) -> evdev::InputEvent {
         evdev::InputEvent::new(
-            evdev::EventType{0:self.type_},
+            evdev::EventType{0: self.type_},
             self.code,
             // Inverse of from_evdev math:
             (self.value * ((max - min) as f64)) as i32 + min,

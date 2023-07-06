@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_lock::Mutex;
 use async_std::task;
 use futures::StreamExt;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace, warn};
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,6 +16,7 @@ pub enum Event {
     SwitchPrev,
 }
 
+#[derive(Debug)]
 struct ClientInfo {
     endpoint: SocketAddr,
     netmsg_tx: async_channel::Sender<messages::NetworkMessageV1>,
@@ -44,6 +45,8 @@ impl Rotation {
             Err(idx) => idx,
         };
         self.clients.insert(idx, ClientInfo{endpoint, netmsg_tx});
+
+        info!("Added client: current={:?} all={:?}", self.current_client, self.clients);
     }
 
     async fn prev_client(&mut self) {
@@ -110,6 +113,7 @@ impl Rotation {
     }
 
     async fn update_current_client(&mut self, new_client: Option<SocketAddr>) {
+        info!("Client switch: {:?} => {:?} (all: {:?}", self.current_client, new_client, self.clients);
         if let Some(_old_client) = self.current_client {
             // Try to send switch{false} to last current_client.
             // If it fails then current_client is cleaned up.
@@ -130,6 +134,7 @@ impl Rotation {
                 Ok(idx) => {
                     let netmsg_tx = &self.clients.get(idx).expect("missing current_client").netmsg_tx;
                     if let Err(_) = netmsg_tx.send(netmsg).await {
+                        info!("Client is no longer connected, reverting to local machine");
                         // Client is dead, remove it and switch to local machine
                         self.clients.remove(idx);
                         // TODO stop grab if switching to local machine
@@ -137,7 +142,8 @@ impl Rotation {
                     }
                 },
                 Err(_idx) => {
-                    // Shouldn't happen: current_client not found in map
+                    // Shouldn't happen
+                    warn!("Current client is not found in clients map");
                     self.current_client = None;
                 },
             };
@@ -223,7 +229,7 @@ async fn handle_connection(conn: quinn::Connecting, mut netmsg_rx: async_channel
             // Serialize message data: postcard with cobs encoding for event framing
             let serializedmsg = postcard::to_slice_cobs(&netmsg, &mut buf)
                 .map_err(|e| anyhow!("Failed to serialize message: {}", e))?;
-            debug!("Sending {} byte event: {:X?}", serializedmsg.len(), &serializedmsg);
+            trace!("Sending {} byte event: {:X?}", serializedmsg.len(), &serializedmsg);
             send.write_all(&serializedmsg).await.context("Failed to send network message")?;
         }
     }
