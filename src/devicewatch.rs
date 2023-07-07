@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use async_std::task;
 use evdev::{Device, EventStream, EventType};
-use futures::StreamExt;
+use futures::{select, StreamExt};
 use notify::Watcher;
 use tracing::{debug, info, trace, warn};
 
@@ -22,12 +22,26 @@ struct DeviceEvent {
     pub path: PathBuf,
 }
 
-/// Trait for watching the addition and removal of devices from the machine
-pub trait DeviceHandler: Send + 'static {
-    fn handle_device_stream(&mut self, stream: EventStream) -> Result<task::JoinHandle<()>>;
+#[derive(Clone, Debug)]
+pub enum GrabEvent {
+    Grab,
+    Ungrab,
 }
 
-pub async fn watch_loop<F: DeviceHandler>(mut handler: F) -> Result<()> {
+pub struct DeviceHandle {
+    pub handle: task::JoinHandle<()>,
+    pub grab_tx: async_channel::Sender<GrabEvent>,
+}
+
+/// Trait for watching the addition and removal of devices from the machine
+pub trait DeviceHandler: Send + 'static {
+    fn handle_device_stream(&mut self, stream: EventStream) -> Result<DeviceHandle>;
+}
+
+pub async fn watch_loop<F: DeviceHandler>(
+    mut handler: F,
+    mut grab_rx: async_channel::Receiver<GrabEvent>,
+) -> Result<()> {
     // Start watch for new and removed devices BEFORE scanning current devices.
     let (device_event_tx, mut device_event_rx): (
         async_channel::Sender<DeviceEvent>,
@@ -67,70 +81,93 @@ pub async fn watch_loop<F: DeviceHandler>(mut handler: F) -> Result<()> {
     }
 
     // Start handler to consume new/removed device events
-    while let Some(event) = device_event_rx.next().await {
-        trace!("Device file event: {:?}", event);
-        match event.kind {
-            DeviceEventKind::Created => {
-                if !compatible_path(&event.path) {
-                    continue;
-                }
-                match Device::open(&event.path) {
-                    Ok(device) => {
-                        if !compatible_device(&device) {
-                            debug!(
-                                "Ignoring device: {} @ {}",
-                                device.name().unwrap_or("(Unnamed device)"),
-                                event.path.to_string_lossy()
-                            );
-                            continue;
+    loop {
+        select! {
+            grab = grab_rx.next() => {
+                if let Some(grab) = grab {
+                    trace!("Updating {} devices with grab state: {:?}", devices.len(), grab);
+                    for device in devices.values() {
+                        if let Err(e) = device.grab_tx.send(grab.clone()).await {
+                            panic!("Failed to notify device of grab event, exiting server to avoid bad grab state: {}", e);
                         }
-                        info!(
-                            "Listening to new device: {} @ {}",
+                    }
+                }
+            },
+            device_event = device_event_rx.next() => {
+                if let Some(event) = device_event {
+                    handle_device_event(&mut handler, &mut devices, event).await;
+                }
+            },
+        };
+    }
+}
+
+async fn handle_device_event<F: DeviceHandler>(
+    handler: &mut F,
+    devices: &mut HashMap<PathBuf, DeviceHandle>,
+    event: DeviceEvent,
+) {
+    trace!("Device file event: {:?}", event);
+    match event.kind {
+        DeviceEventKind::Created => {
+            if !compatible_path(&event.path) {
+                return;
+            }
+            match Device::open(&event.path) {
+                Ok(device) => {
+                    if !compatible_device(&device) {
+                        debug!(
+                            "Ignoring device: {} @ {}",
                             device.name().unwrap_or("(Unnamed device)"),
                             event.path.to_string_lossy()
                         );
-                        match start_device_stream(device, &event.path) {
-                            Ok(stream) => match handler.handle_device_stream(stream) {
-                                Ok(join_handle) => {
-                                    devices.insert(event.path, join_handle);
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to start event handler for device {}: {}",
-                                        event.path.to_string_lossy(),
-                                        e
-                                    );
-                                }
-                            },
+                        return;
+                    }
+                    info!(
+                        "Listening to new device: {} @ {}",
+                        device.name().unwrap_or("(Unnamed device)"),
+                        event.path.to_string_lossy()
+                    );
+                    match start_device_stream(device, &event.path) {
+                        Ok(stream) => match handler.handle_device_stream(stream) {
+                            Ok(join_handle) => {
+                                devices.insert(event.path, join_handle);
+                            }
                             Err(e) => {
-                                // Avoid exiting loop and aborting program if a new device fails
                                 warn!(
-                                    "Failed to read device {}: {}",
+                                    "Failed to start event handler for device {}: {}",
                                     event.path.to_string_lossy(),
                                     e
                                 );
                             }
+                        },
+                        Err(e) => {
+                            // Avoid exiting loop and aborting program if a new device fails
+                            warn!(
+                                "Failed to read device {}: {}",
+                                event.path.to_string_lossy(),
+                                e
+                            );
                         }
                     }
-                    Err(e) => {
-                        // Avoid exiting loop and aborting program if a new device fails
-                        warn!(
-                            "Failed to init device {}: {}",
-                            event.path.to_string_lossy(),
-                            e
-                        );
-                    }
-                };
-            }
-            DeviceEventKind::Deleted => {
-                if let Some(join_handle) = devices.remove(&event.path) {
-                    info!("Removing device: {}", event.path.to_string_lossy());
-                    join_handle.cancel().await;
                 }
+                Err(e) => {
+                    // Avoid exiting loop and aborting program if a new device fails
+                    warn!(
+                        "Failed to init device {}: {}",
+                        event.path.to_string_lossy(),
+                        e
+                    );
+                }
+            };
+        }
+        DeviceEventKind::Deleted => {
+            if let Some(device_handle) = devices.remove(&event.path) {
+                info!("Removing device: {}", event.path.to_string_lossy());
+                device_handle.handle.cancel().await;
             }
         }
     }
-    Ok(())
 }
 
 fn compatible_path(path: &PathBuf) -> bool {

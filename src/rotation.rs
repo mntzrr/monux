@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use tracing::{info, warn};
 
-use crate::messages;
+use crate::{devicewatch, messages};
 
 #[derive(Debug)]
 struct ClientInfo {
@@ -11,25 +11,27 @@ struct ClientInfo {
 }
 
 pub struct Rotation {
+    grab_tx: async_channel::Sender<devicewatch::GrabEvent>,
     clients: Vec<ClientInfo>,
     current_client: Option<SocketAddr>,
 }
 
 impl Rotation {
-    pub fn new() -> Rotation {
+    pub fn new(grab_tx: async_channel::Sender<devicewatch::GrabEvent>) -> Rotation {
         Rotation {
+            grab_tx,
             clients: Vec::new(),
             current_client: None,
         }
     }
 
-    pub fn add_client(
+    pub async fn add_client(
         &mut self,
         endpoint: SocketAddr,
         netmsg_tx: async_channel::Sender<messages::NetworkMessageV1>,
     ) {
-        // Check for any dead clients before we add new ones
-        self.check_dead_clients();
+        // Check for any dead clients before we add new ones (e.g. client reconnecting)
+        self.check_dead_clients().await;
 
         // Sort clients by their endpoints as an arbitrary consistent order across sessions
         let idx = match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
@@ -46,13 +48,16 @@ impl Rotation {
 
         info!(
             "Client added to rotation: {:?}",
-            self.clients.iter().map(|c| c.endpoint).collect::<Vec<SocketAddr>>()
+            self.clients
+                .iter()
+                .map(|c| c.endpoint)
+                .collect::<Vec<SocketAddr>>()
         );
     }
 
     pub async fn prev_client(&mut self) {
         // Check for any dead clients before rotating
-        self.check_dead_clients();
+        self.check_dead_clients().await;
 
         if let Some(current_client) = &self.current_client {
             // Currently on remote machine, find its entry in the list and go to the prev one
@@ -80,7 +85,7 @@ impl Rotation {
 
     pub async fn next_client(&mut self) {
         // Check for any dead clients before rotating
-        self.check_dead_clients();
+        self.check_dead_clients().await;
 
         if let Some(current_client) = &self.current_client {
             // Currently on remote machine, find its entry in the list and go to the next one
@@ -101,7 +106,7 @@ impl Rotation {
         }
     }
 
-    fn check_dead_clients(&mut self) {
+    async fn check_dead_clients(&mut self) {
         // Closed channels: Nobody's listening
         let mut to_remove = vec![];
         for client in &self.clients {
@@ -112,7 +117,7 @@ impl Rotation {
         // Clean up current_client if it's to_remove
         if let Some(current_client) = &self.current_client {
             if to_remove.contains(current_client) {
-                self.current_client = None;
+                self.set_current_client(None).await;
             }
         }
         // Clean up vec entries that are to_remove
@@ -124,10 +129,6 @@ impl Rotation {
     }
 
     async fn update_current_client(&mut self, new_client: Option<SocketAddr>) {
-        info!(
-            "Client switch: {:?} (clients: {:?})",
-            new_client, self.clients.iter().map(|c| c.endpoint).collect::<Vec<SocketAddr>>()
-        );
         if let Some(_old_client) = self.current_client {
             // Try to send switch{false} to last current_client.
             // If it fails then current_client is cleaned up.
@@ -136,15 +137,33 @@ impl Rotation {
             ))
             .await;
         }
-        // TODO stop grab if switching to local machine (or start grab if switching to network)
-        self.current_client = new_client;
-        if self.current_client.is_some() {
-            // Try to send switch{true} to next current_client.
+
+        self.set_current_client(new_client).await;
+
+        if new_client.is_some() {
+            // Try to send switch{true} to the newly assigned current_client.
             // If it fails then current_client is cleaned up.
             self.send(messages::NetworkMessageV1::Switch(
                 messages::SwitchEventV1 { enabled: true },
             ))
             .await;
+
+            info!(
+                "Switched to client: {:?} (clients: {:?})",
+                new_client,
+                self.clients
+                    .iter()
+                    .map(|c| c.endpoint)
+                    .collect::<Vec<SocketAddr>>()
+            );
+        } else {
+            info!(
+                "Switched to local machine (clients: {:?})",
+                self.clients
+                    .iter()
+                    .map(|c| c.endpoint)
+                    .collect::<Vec<SocketAddr>>()
+            );
         }
     }
 
@@ -161,19 +180,37 @@ impl Rotation {
                         .expect("missing current_client")
                         .netmsg_tx;
                     if let Err(_) = netmsg_tx.send(netmsg).await {
-                        info!("Client has disconnected, reverting to local machine: {}", current_client);
+                        info!(
+                            "Client has disconnected, reverting to local machine: {}",
+                            current_client
+                        );
                         // Client is dead, remove it and switch to local machine
                         self.clients.remove(idx);
-                        // TODO stop grab if switching to local machine
-                        self.current_client = None;
+                        self.set_current_client(None).await;
                     }
                 }
                 Err(_idx) => {
                     // Shouldn't happen
                     warn!("Current client is not found in clients map");
-                    self.current_client = None;
+                    self.set_current_client(None).await;
                 }
             };
+        }
+    }
+
+    async fn set_current_client(&mut self, client: Option<SocketAddr>) {
+        self.current_client = client;
+        let grab = if client.is_some() {
+            devicewatch::GrabEvent::Grab
+        } else {
+            devicewatch::GrabEvent::Ungrab
+        };
+        if let Err(e) = self.grab_tx.send(grab).await {
+            // Avoid leaving devices in a bad grabbed state
+            panic!(
+                "Failed to update device grab, exiting server to avoid bad grab state: {}",
+                e
+            );
         }
     }
 }

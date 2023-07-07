@@ -7,14 +7,16 @@ use async_std::task;
 use futures::StreamExt;
 use tracing::{debug, error, info, trace};
 
-use crate::{approval, deviceinput, messages, rotation, transport};
+use crate::{approval, deviceinput, devicewatch, messages, rotation, transport};
 
 pub async fn run_server(
     listen_addr: &SocketAddr,
     cert_verifier: Arc<approval::NikauCertVerification>,
     mut input_rx: async_channel::Receiver<deviceinput::Event>,
+    grab_tx: async_channel::Sender<devicewatch::GrabEvent>,
 ) -> Result<()> {
-    let rotation: Arc<Mutex<rotation::Rotation>> = Arc::new(Mutex::new(rotation::Rotation::new()));
+    let rotation: Arc<Mutex<rotation::Rotation>> =
+        Arc::new(Mutex::new(rotation::Rotation::new(grab_tx)));
     let rotation2 = rotation.clone();
 
     task::spawn(async move {
@@ -47,7 +49,8 @@ pub async fn run_server(
         rotation
             .lock()
             .await
-            .add_client(conn.remote_address(), netmsg_tx);
+            .add_client(conn.remote_address(), netmsg_tx)
+            .await;
         task::spawn(async move {
             if let Err(e) = handle_connection(conn, netmsg_rx).await {
                 error!("Client connection error: {}", e);

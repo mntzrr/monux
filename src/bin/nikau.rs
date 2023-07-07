@@ -1,5 +1,6 @@
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use async_std::task;
@@ -49,7 +50,7 @@ struct ServerArgs {
     #[arg(long)]
     fingerprints: Option<Vec<String>>,
 
-    /// TODO Number of seconds to wait before automatically exiting the server, to safely test configuration
+    /// Number of seconds to wait before automatically exiting the server, to safely test configuration
     #[arg(long)]
     exit_secs: Option<u32>,
 }
@@ -69,19 +70,22 @@ struct ClientArgs {
 }
 
 /// Listens for SIGUSR1 and SIGUSR2, treating them as "switch to next client" and "switch to prev client" respectively.
-async fn handle_signals(mut signals: signal_hook_async_std::Signals, out: async_channel::Sender<deviceinput::Event>) {
+async fn handle_signals(
+    mut signals: signal_hook_async_std::Signals,
+    out: async_channel::Sender<deviceinput::Event>,
+) {
     while let Some(signal) = signals.next().await {
         match signal {
             signal::SIGUSR1 => {
                 if let Err(e) = out.send(deviceinput::Event::SwitchNext).await {
                     error!("Failed to submit SwitchNext event for SIGUSR1: {}", e);
                 }
-            },
+            }
             signal::SIGUSR2 => {
                 if let Err(e) = out.send(deviceinput::Event::SwitchPrev).await {
                     error!("Failed to submit SwitchPrev event for SIGUSR2: {}", e);
                 }
-            },
+            }
             _ => continue,
         }
     }
@@ -94,16 +98,24 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Server(args) => {
             let listen_addr = SocketAddr::new(args.listen, args.port);
-            let verifier = approval::NikauCertVerification::new(args.fingerprints.unwrap_or(vec![]))?;
-            server(listen_addr, &args.shortcut, args.shortcut_prev.as_deref(), verifier)
-        },
+            let verifier =
+                approval::NikauCertVerification::new(args.fingerprints.unwrap_or(vec![]))?;
+            server(
+                listen_addr,
+                &args.shortcut,
+                args.shortcut_prev.as_deref(),
+                args.exit_secs,
+                verifier,
+            )
+        }
         Commands::Client(args) => {
             let connect_addr: SocketAddr = if let Ok(host_ip) = args.host.parse::<IpAddr>() {
                 // It's an IP.
                 SocketAddr::new(host_ip, args.port)
             } else {
                 // Its a hostname? Try resolving it.
-                let mut socket_addrs = format!("{}:{}", args.host, args.port).to_socket_addrs()
+                let mut socket_addrs = format!("{}:{}", args.host, args.port)
+                    .to_socket_addrs()
                     .map_err(|e| anyhow!("Failed to resolve --host={}: {}", args.host, e))?;
                 if let Some(first) = socket_addrs.next() {
                     first
@@ -111,9 +123,10 @@ fn main() -> Result<()> {
                     bail!("Provided --host={} didn't resolve to an IP", args.host);
                 }
             };
-            let verifier = approval::NikauCertVerification::new(args.fingerprints.unwrap_or(vec![]))?;
+            let verifier =
+                approval::NikauCertVerification::new(args.fingerprints.unwrap_or(vec![]))?;
             client(connect_addr, verifier)
-        },
+        }
     }
 }
 
@@ -121,7 +134,8 @@ fn server(
     listen_addr: SocketAddr,
     next_keys: &str,
     prev_keys: Option<&str>,
-    verifier: Arc<approval::NikauCertVerification>
+    exit_secs: Option<u32>,
+    verifier: Arc<approval::NikauCertVerification>,
 ) -> Result<()> {
     let (event_tx, event_rx): (
         async_channel::Sender<deviceinput::Event>,
@@ -134,22 +148,38 @@ fn server(
         handle_signals(signals, event_tx2).await;
     });
 
+    let (grab_tx, grab_rx): (
+        async_channel::Sender<devicewatch::GrabEvent>,
+        async_channel::Receiver<devicewatch::GrabEvent>,
+    ) = async_channel::bounded(32);
+
     task::spawn(async move {
         info!("Listening for clients: {}", listen_addr);
-        if let Err(e) = server::run_server(&listen_addr, verifier, event_rx).await {
+        if let Err(e) = server::run_server(&listen_addr, verifier, event_rx, grab_tx).await {
             error!("server fail: {}", e);
         }
     });
 
     let input_handler = deviceinput::InputHandler::new(&next_keys, prev_keys, event_tx)?;
 
-    task::block_on(async move {
-        if let Err(e) = devicewatch::watch_loop(input_handler).await {
+    let watch_loop = async move {
+        if let Err(e) = devicewatch::watch_loop(input_handler, grab_rx).await {
             error!("Input device watch failure: {}", e);
         }
-    });
+    };
 
-    bail!("Exiting due to server failure")
+    if let Some(exit_secs) = exit_secs {
+        info!("Exiting in {} seconds...", exit_secs);
+        task::spawn(watch_loop);
+        task::block_on(async {
+            task::sleep(Duration::from_secs(exit_secs as u64)).await;
+        });
+        info!("Exiting following --exit-secs={}", exit_secs);
+        Ok(())
+    } else {
+        task::block_on(watch_loop);
+        bail!("Exiting due to server failure")
+    }
 }
 
 fn client(connect_addr: SocketAddr, verifier: Arc<approval::NikauCertVerification>) -> Result<()> {

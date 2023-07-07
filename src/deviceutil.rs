@@ -23,7 +23,12 @@ pub fn is_scaled_axis(axis: &AbsoluteAxisType) -> bool {
     }
 }
 
-pub fn device_info(device: &Device) -> (messages::EventTargetV1, BTreeMap<u16, (i32, i32)>) {
+pub struct DeviceInfo {
+    pub target: messages::EventTargetV1,
+    pub dims: BTreeMap<u16, (i32, i32)>,
+}
+
+pub fn device_info(device: &Device) -> DeviceInfo {
     let supported_events = device.supported_events();
     let mut dims = BTreeMap::new();
     let target = if supported_events.contains(EventType::ABSOLUTE) {
@@ -48,7 +53,7 @@ pub fn device_info(device: &Device) -> (messages::EventTargetV1, BTreeMap<u16, (
         messages::EventTargetV1::Key
     };
     log_device(device, &target, &dims);
-    (target, dims)
+    DeviceInfo { target, dims }
 }
 
 fn log_device(device: &Device, target: &messages::EventTargetV1, dims: &BTreeMap<u16, (i32, i32)>) {

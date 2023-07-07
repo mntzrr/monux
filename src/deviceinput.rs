@@ -3,12 +3,13 @@ use std::str::FromStr;
 use anyhow::{anyhow, bail, Result};
 use async_std::task;
 use evdev::{EventStream, EventType, InputEvent, Key};
-use futures::StreamExt;
-use tracing::{debug, warn};
+use futures::{select, FutureExt, StreamExt};
+use tracing::{debug, info, warn};
 
-use crate::devicewatch::DeviceHandler;
+use crate::devicewatch::{DeviceHandle, DeviceHandler, GrabEvent};
 use crate::{deviceutil, messages};
 
+#[derive(Debug)]
 pub enum Event {
     Input(messages::InputEventV1),
     SwitchNext,
@@ -62,81 +63,123 @@ impl InputHandler {
 }
 
 impl DeviceHandler for InputHandler {
-    fn handle_device_stream(&mut self, stream: EventStream) -> Result<task::JoinHandle<()>> {
+    /// Spawns a task for listening to a device's events and for controlling its grab state.
+    fn handle_device_stream(&mut self, mut stream: EventStream) -> Result<DeviceHandle> {
+        let (grab_tx, grab_rx): (
+            async_channel::Sender<GrabEvent>,
+            async_channel::Receiver<GrabEvent>,
+        ) = async_channel::bounded(32);
         let config = self.config.clone();
-        task::Builder::new()
+        let handle = task::Builder::new()
             .name(format!("device: {:?}", stream.device().name()))
-            .spawn(async move { read_device_events(stream, config).await })
-            .map_err(|e| anyhow!(e))
+            .spawn(async move { read_device_events(&mut stream, config, grab_rx).await })
+            .map_err(|e| anyhow!(e))?;
+        Ok(DeviceHandle { handle, grab_tx })
     }
 }
 
-async fn read_device_events(mut stream: EventStream, c: HandlerConfig) {
+async fn read_device_events(
+    stream: &mut EventStream,
+    c: HandlerConfig,
+    mut grab_rx: async_channel::Receiver<GrabEvent>,
+) {
     let mut pressed_keys_next = bit_vec::BitVec::from_elem(c.combo_keys_next.len(), false);
     let mut pressed_keys_prev = bit_vec::BitVec::from_elem(c.combo_keys_prev.len(), false);
-    let (device_target, device_dims) = deviceutil::device_info(&stream.device());
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(event) => {
-                // No short-circuit: Ensure that all pressed_keys_* state has a chance to be updated
-                let combo_next = check_combo(&event, &c.combo_keys_next, &mut pressed_keys_next);
-                let combo_prev = check_combo(&event, &c.combo_keys_prev, &mut pressed_keys_prev);
-                let event = if combo_next {
-                    Event::SwitchNext
-                } else if combo_prev {
-                    Event::SwitchPrev
-                } else {
-                    debug!(
-                        "{} event {:?}: {:?}",
-                        device_target,
-                        stream.device().name(),
-                        event
-                    );
-                    match event.kind() {
-                        evdev::InputEventKind::AbsAxis(axis) => {
-                            if let Some(axis_dims) = device_dims.get(&axis.0) {
-                                // Apply scaling to [0.0, 1.0]
-                                Event::Input(messages::InputEventV1 {
-                                    target: device_target.clone(),
-                                    i32event: None,
-                                    f64event: Some(messages::F64EventV1::from_evdev(
-                                        event,
-                                        axis_dims.0,
-                                        axis_dims.1,
-                                    )),
-                                })
-                            } else {
-                                // No scaling for this axis
-                                Event::Input(messages::InputEventV1 {
-                                    target: device_target.clone(),
-                                    i32event: Some(messages::I32EventV1::from_evdev(event)),
-                                    f64event: None,
-                                })
+    let device_info = deviceutil::device_info(&stream.device());
+    loop {
+        select! {
+            event = stream.next_event().fuse() => {
+                match event {
+                    Ok(event) => {
+                        read_device_event(event, &c, &stream.device(), &device_info, &mut pressed_keys_next, &mut pressed_keys_prev).await;
+                    },
+                    Err(e) => {
+                        // Common when the device has been unplugged.
+                        // We'll frequently get this error just as inotify is telling us the file is deleted.
+                        // Exit to avoid an infinite loop on trying to read the missing file.
+                        warn!(
+                            "Error event for {:?}, removing device: {}",
+                            stream.device().name(),
+                            e
+                        );
+                    }
+                }
+            },
+            grab = grab_rx.next() => {
+                if let Some(grab) = grab {
+                    match grab {
+                        GrabEvent::Grab => {
+                            info!("Grabbing device: {:?}", stream.device().name());
+                            if let Err(e) = stream.device_mut().grab() {
+                                panic!("Failed to grab device {:?}: {}", stream.device().name(), e);
+                            }
+                        },
+                        GrabEvent::Ungrab => {
+                            info!("Ungrabbing device: {:?}", stream.device().name());
+                            if let Err(e) = stream.device_mut().ungrab() {
+                                panic!("Failed to ungrab device {:?}: {}", stream.device().name(), e);
                             }
                         }
-                        _ => Event::Input(messages::InputEventV1 {
-                            target: device_target.clone(),
-                            i32event: Some(messages::I32EventV1::from_evdev(event)),
-                            f64event: None,
-                        }),
                     }
-                };
-                if let Err(e) = c.event_tx.send(event).await {
-                    warn!("Error trying to send event to server for routing: {}", e);
                 }
             }
-            Err(e) => {
-                // Common when the device has been unplugged.
-                // We'll frequently get this error just as inotify is telling us the file is deleted.
-                // Exit to avoid an infinite loop on trying to read the missing file.
-                warn!(
-                    "Error event for {:?}, removing device: {}",
-                    stream.device().name(),
-                    e
-                );
-                return;
-            }
         }
+    }
+}
+
+async fn read_device_event(
+    event: evdev::InputEvent,
+    c: &HandlerConfig,
+    device: &evdev::Device,
+    device_info: &deviceutil::DeviceInfo,
+    pressed_keys_next: &mut bit_vec::BitVec,
+    pressed_keys_prev: &mut bit_vec::BitVec,
+) {
+    // No short-circuit: Ensure that all pressed_keys_* state has a chance to be updated
+    let combo_next = check_combo(&event, &c.combo_keys_next, pressed_keys_next);
+    let combo_prev = check_combo(&event, &c.combo_keys_prev, pressed_keys_prev);
+    let event = if combo_next {
+        Event::SwitchNext
+    } else if combo_prev {
+        Event::SwitchPrev
+    } else {
+        debug!(
+            "{} event {:?}: {:?}",
+            device_info.target,
+            device.name(),
+            event
+        );
+        match event.kind() {
+            evdev::InputEventKind::AbsAxis(axis) => {
+                if let Some(axis_dims) = device_info.dims.get(&axis.0) {
+                    // Apply scaling to [0.0, 1.0]
+                    Event::Input(messages::InputEventV1 {
+                        target: device_info.target.clone(),
+                        i32event: None,
+                        f64event: Some(messages::F64EventV1::from_evdev(
+                            event,
+                            axis_dims.0,
+                            axis_dims.1,
+                        )),
+                    })
+                } else {
+                    // No scaling for this axis
+                    Event::Input(messages::InputEventV1 {
+                        target: device_info.target.clone(),
+                        i32event: Some(messages::I32EventV1::from_evdev(event)),
+                        f64event: None,
+                    })
+                }
+            }
+            _ => Event::Input(messages::InputEventV1 {
+                target: device_info.target.clone(),
+                i32event: Some(messages::I32EventV1::from_evdev(event)),
+                f64event: None,
+            }),
+        }
+    };
+    if let Err(e) = c.event_tx.send(event).await {
+        warn!("Error trying to send event to server for routing: {}", e);
     }
 }
 
