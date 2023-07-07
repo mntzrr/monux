@@ -41,7 +41,6 @@ pub async fn run_server(
 
     let server_endpoint = transport::build_server(listen_addr, cert_verifier)?;
     while let Some(conn) = server_endpoint.accept().await {
-        info!("Client connected: {}", conn.remote_address());
         let (netmsg_tx, netmsg_rx): (
             async_channel::Sender<messages::NetworkMessageV1>,
             async_channel::Receiver<messages::NetworkMessageV1>,
@@ -57,7 +56,7 @@ pub async fn run_server(
             }
         });
     }
-    info!("Exiting server");
+    error!("Exiting server");
     Ok(())
 }
 

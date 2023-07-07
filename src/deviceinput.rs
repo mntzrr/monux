@@ -78,20 +78,72 @@ impl DeviceHandler for InputHandler {
     }
 }
 
+/// Checks input events for a specified key combination.
+///
+/// For now we allow the keys to be pressed in any order, as long as there's a point where they're all being held down at the same time.
+///
+/// The key combination is only considered "complete" after the combo keys have all been released.
+/// This avoids issues around the server machine thinking device keys are still held down when we grab the device.
+struct ComboState {
+    /// The combo keys that we're looking for. Indexes are mapped to pressed_keys.
+    combo_keys: Vec<Key>,
+    pressed_keys: bit_vec::BitVec,
+    waiting_for_released_keys: bool,
+}
+
+impl ComboState {
+    fn new(combo_keys: Vec<Key>) -> ComboState {
+        let len = combo_keys.len();
+        ComboState {
+            combo_keys,
+            pressed_keys: bit_vec::BitVec::from_elem(len, false),
+            waiting_for_released_keys: false,
+        }
+    }
+
+    fn check_combo(&mut self, event: &InputEvent) -> bool {
+        if self.combo_keys.is_empty() {
+            return false;
+        }
+        if event.event_type() == EventType::KEY {
+            // Check if this key is one of our assigned combo keys.
+            // This search should be cheap as it's limited to the size of the key combo (2-4 keys?)
+            for (idx, combo_key) in self.combo_keys.iter().enumerate() {
+                if event.code() == combo_key.code() {
+                    // This event is for a combo key.
+                    self.pressed_keys.set(idx, event.value() >= 1);
+                    if self.waiting_for_released_keys {
+                        if self.pressed_keys.none() {
+                            // All of the keys are inactive, after previously all being active. The combo is complete.
+                            self.waiting_for_released_keys = false;
+                            return true;
+                        }
+                    } else if self.pressed_keys.all() {
+                        // All of the combo keys are active. Now we start waiting for them to be inactive.
+                        self.waiting_for_released_keys = true;
+                        return false;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
 async fn read_device_events(
     stream: &mut EventStream,
-    c: HandlerConfig,
+    mut c: HandlerConfig,
     mut grab_rx: async_channel::Receiver<GrabEvent>,
 ) {
-    let mut pressed_keys_next = bit_vec::BitVec::from_elem(c.combo_keys_next.len(), false);
-    let mut pressed_keys_prev = bit_vec::BitVec::from_elem(c.combo_keys_prev.len(), false);
+    let mut combo_state_next = ComboState::new(c.combo_keys_next.clone());
+    let mut combo_state_prev = ComboState::new(c.combo_keys_prev.clone());
     let device_info = deviceutil::device_info(&stream.device());
     loop {
         select! {
             event = stream.next_event().fuse() => {
                 match event {
                     Ok(event) => {
-                        read_device_event(event, &c, &stream.device(), &device_info, &mut pressed_keys_next, &mut pressed_keys_prev).await;
+                        read_device_event(event, &mut c.event_tx, &stream.device(), &device_info, &mut combo_state_next, &mut combo_state_prev).await;
                     },
                     Err(e) => {
                         // Common when the device has been unplugged.
@@ -129,19 +181,32 @@ async fn read_device_events(
 
 async fn read_device_event(
     event: evdev::InputEvent,
-    c: &HandlerConfig,
+    event_tx: &mut async_channel::Sender<Event>,
     device: &evdev::Device,
     device_info: &deviceutil::DeviceInfo,
-    pressed_keys_next: &mut bit_vec::BitVec,
-    pressed_keys_prev: &mut bit_vec::BitVec,
+    combo_state_next: &mut ComboState,
+    combo_state_prev: &mut ComboState,
 ) {
     // No short-circuit: Ensure that all pressed_keys_* state has a chance to be updated
-    let combo_next = check_combo(&event, &c.combo_keys_next, pressed_keys_next);
-    let combo_prev = check_combo(&event, &c.combo_keys_prev, pressed_keys_prev);
-    let event = if combo_next {
-        Event::SwitchNext
-    } else if combo_prev {
-        Event::SwitchPrev
+    let combo_next = combo_state_next.check_combo(&event);
+    let combo_prev = combo_state_prev.check_combo(&event);
+    let event = if combo_next || combo_prev {
+        // Combo has completed: User has pressed and released all of the combo keys (in any order)
+        // Pass through the released event so that the key doesn't appear held down indefinitely for the switch
+        let orig_event = Event::Input(messages::InputEventV1 {
+            target: device_info.target.clone(),
+            i32event: Some(messages::I32EventV1::from_evdev(event)),
+            f64event: None,
+        });
+        if let Err(e) = event_tx.send(orig_event).await {
+            warn!("Error trying to send event to server for routing: {}", e);
+        }
+        // Follow up with our injected switch event reflecting the combo completion
+        if combo_next {
+            Event::SwitchNext
+        } else {
+            Event::SwitchPrev
+        }
     } else {
         debug!(
             "{} event {:?}: {:?}",
@@ -178,33 +243,7 @@ async fn read_device_event(
             }),
         }
     };
-    if let Err(e) = c.event_tx.send(event).await {
+    if let Err(e) = event_tx.send(event).await {
         warn!("Error trying to send event to server for routing: {}", e);
     }
-}
-
-fn check_combo(event: &InputEvent, combo_keys: &Vec<Key>, keys_on: &mut bit_vec::BitVec) -> bool {
-    if combo_keys.is_empty() {
-        return false;
-    }
-    if event.event_type() == EventType::KEY {
-        // Check if this key is one of our assigned combo keys
-        for (idx, combo_key) in combo_keys.iter().enumerate() {
-            if event.code() == combo_key.code() {
-                if event.value() == 2 && keys_on.all() {
-                    // The key is being repeated (value=2) and we already have a combo.
-                    // Avoid repeating the combo event if the keys are being held down for too long.
-                    return false;
-                }
-                // We allow the combo to be reached in any order (e.g. alt+esc or esc+alt).
-                // If we wanted strict ordering then we could set keys_on to false for idx+1..combo_keys.len()
-                keys_on.set(idx, event.value() >= 1);
-                if keys_on.all() {
-                    // Combo has been reached.
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }

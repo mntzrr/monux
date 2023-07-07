@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use evdev::{AbsoluteAxisType, Device, EvdevEnum, EventType};
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 
 use crate::messages;
 
@@ -92,4 +92,6 @@ fn log_device(device: &Device, target: &messages::EventTargetV1, dims: &BTreeMap
         abs_entries,
         dims,
     );
+    // under trace, show evdev version of things too, but note that the abs values are missing:
+    trace!("{}", device);
 }
