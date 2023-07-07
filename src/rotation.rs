@@ -45,8 +45,8 @@ impl Rotation {
         );
 
         info!(
-            "Added client: current={:?} all={:?}",
-            self.current_client, self.clients
+            "Client added to rotation: {:?}",
+            self.clients.iter().map(|c| c.endpoint).collect::<Vec<SocketAddr>>()
         );
     }
 
@@ -125,8 +125,8 @@ impl Rotation {
 
     async fn update_current_client(&mut self, new_client: Option<SocketAddr>) {
         info!(
-            "Client switch: {:?} => {:?} (all: {:?})",
-            self.current_client, new_client, self.clients.iter().map(|c| c.endpoint).collect::<Vec<SocketAddr>>()
+            "Client switch: {:?} (clients: {:?})",
+            new_client, self.clients.iter().map(|c| c.endpoint).collect::<Vec<SocketAddr>>()
         );
         if let Some(_old_client) = self.current_client {
             // Try to send switch{false} to last current_client.
@@ -161,7 +161,7 @@ impl Rotation {
                         .expect("missing current_client")
                         .netmsg_tx;
                     if let Err(_) = netmsg_tx.send(netmsg).await {
-                        info!("Client is no longer connected, reverting to local machine");
+                        info!("Client has disconnected, reverting to local machine: {}", current_client);
                         // Client is dead, remove it and switch to local machine
                         self.clients.remove(idx);
                         // TODO stop grab if switching to local machine

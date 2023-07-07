@@ -34,7 +34,7 @@ struct ServerArgs {
     shortcut: String,
 
     /// Key shortcut for switching to the previous client
-    #[arg(long)]
+    #[arg(long, default_value = "leftalt,p")]
     shortcut_prev: Option<String>,
 
     /// Server listen IP
@@ -155,7 +155,6 @@ fn server(
 fn client(connect_addr: SocketAddr, verifier: Arc<approval::NikauCertVerification>) -> Result<()> {
     let bind_addr: SocketAddr = "0.0.0.0:0".parse()?;
     task::block_on(async move {
-        // TODO connection loop: handle server not up yet, or server restarting
         loop {
             let verifier2 = verifier.clone();
             info!("Connecting to server: {}", connect_addr);

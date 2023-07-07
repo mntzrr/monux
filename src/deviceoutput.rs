@@ -76,7 +76,7 @@ impl VirtualDevices {
 
     pub fn switch(&mut self, enabled: bool) -> Result<()> {
         info!(
-            "Client is going {}",
+            "Client is {}",
             if enabled { "active" } else { "inactive" }
         );
         // TODO(feature): clear device state for client switches, to avoid e.g. leaving a device with a repeating key. but this requires subscribing and keeping track of device state.
