@@ -1,32 +1,133 @@
+use std::io::{self, prelude::*};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime};
+
 use anyhow::{bail, Context, Result};
 use async_std::io as aio;
 use async_std::task;
 use tracing::{error, info, warn};
 
-use std::io::{self, prelude::*};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime};
-
 use crate::certs;
 
+const ALPN_QUIC_HTTP: &[&[u8]] = &[b"hq-29"];
 const PROMPT_TIMEOUT_SECS: u64 = 60;
 
-pub struct ManualServerVerification {
+pub fn rustls_client_config(
+    verifier: Arc<NikauCertVerification>,
+) -> Result<Arc<rustls::ClientConfig>> {
+    let mut rustls_config = rustls::ClientConfig::builder()
+        .with_safe_defaults()
+        .with_custom_certificate_verifier(verifier.clone())
+        .with_single_cert(
+            vec![verifier.our_cert.clone()],
+            verifier.our_privkey.clone(),
+        )?;
+    rustls_config.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
+    Ok(Arc::new(rustls_config))
+}
+
+pub fn rustls_server_config(
+    verifier: Arc<NikauCertVerification>,
+) -> Result<Arc<rustls::ServerConfig>> {
+    let mut rustls_config = rustls::ServerConfig::builder()
+        .with_safe_defaults() // includes TLS1.3 required by QUIC
+        .with_client_cert_verifier(verifier.clone())
+        .with_single_cert(
+            vec![verifier.our_cert.clone()],
+            verifier.our_privkey.clone(),
+        )?;
+    rustls_config.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
+    rustls_config.max_early_data_size = u32::MAX; // required by QUIC
+    Ok(Arc::new(rustls_config))
+}
+
+pub struct NikauCertVerification {
+    /// Used for building rustls configs
+    our_cert: rustls::Certificate,
+    /// Used for logging, calculated once up-front
     our_cert_fingerprint: String,
-    // Wrapped in a lock so that we can add newly approved entries immediately
+    /// Used for building rustls configs
+    our_privkey: rustls::PrivateKey,
+    /// Pre-approved cert fingerprints provided via commandline argument
+    approved_cert_fingerprints: Vec<String>,
+    /// Previously-approved certs found on disk, updated internally when approval prompts are confirmed
     known_certs: RwLock<Vec<rustls::Certificate>>,
 }
 
-impl ManualServerVerification {
-    pub fn new(our_cert: &rustls::Certificate, known_certs: Vec<rustls::Certificate>) -> Arc<Self> {
-        Arc::new(ManualServerVerification {
-            our_cert_fingerprint: certs::fingerprint(our_cert),
-            known_certs: RwLock::new(known_certs),
-        })
+impl NikauCertVerification {
+    pub fn new(approved_cert_fingerprints: Vec<String>) -> Result<Arc<Self>> {
+        let (our_cert, our_privkey) =
+            certs::load_keypair().context("Failed to load our keypair")?;
+        let our_cert_fingerprint = certs::fingerprint(&our_cert);
+        Ok(Arc::new(NikauCertVerification {
+            our_cert,
+            our_cert_fingerprint,
+            our_privkey,
+            approved_cert_fingerprints,
+            known_certs: RwLock::new(certs::load_known_certs()?),
+        }))
+    }
+
+    fn verify_cert<T>(
+        &self,
+        their_cert: &rustls::Certificate,
+        their_name: &str,
+        we_are_server: bool,
+        approve_response: T,
+    ) -> Result<T, rustls::Error> {
+        let their_cert_fingerprint = certs::fingerprint(&their_cert);
+        if let Ok(mut known_certs) = self.known_certs.write() {
+            if known_certs.contains(their_cert) {
+                info!(
+                    "{} has a known certificate: {}",
+                    their_name, their_cert_fingerprint
+                );
+                Ok(approve_response)
+            } else if self
+                .approved_cert_fingerprints
+                .contains(&their_cert_fingerprint)
+            {
+                info!(
+                    "{} approved via --approved-certs: {}",
+                    their_name, their_cert_fingerprint
+                );
+                // Don't save the cert to disk for --approved-certs.
+                // Saving to disk creates weird behavior if the user later changes the certs they approve.
+                // Maybe they don't WANT old certs to still be approved if the arg changes? Play it safe.
+                known_certs.push(their_cert.clone());
+                Ok(approve_response)
+            } else if prompt_unknown_cert(their_cert, &self.our_cert_fingerprint, we_are_server) {
+                if let Err(e) = certs::write_approved_cert(their_cert) {
+                    warn!(
+                        "{} approved, but couldn't save cert to disk: {}",
+                        their_name, e
+                    );
+                } else {
+                    info!(
+                        "{} approved and saved to known certs: {}",
+                        their_name, their_cert_fingerprint
+                    );
+                }
+                // Store the approved cert locally so that we don't e.g. reprompt on reconnect later on
+                known_certs.push(their_cert.clone());
+                Ok(approve_response)
+            } else {
+                info!("Server denied: {}", their_cert_fingerprint);
+                Err(rustls::Error::General(format!(
+                    "{} cert was denied: {}",
+                    their_name, their_cert_fingerprint
+                )))
+            }
+        } else {
+            error!("Failed to get lock on known_certs");
+            Err(rustls::Error::General(
+                "Failed to lock known certs".to_string(),
+            ))
+        }
     }
 }
 
-impl rustls::client::ServerCertVerifier for ManualServerVerification {
+impl rustls::client::ServerCertVerifier for NikauCertVerification {
     fn verify_server_cert(
         &self,
         server_cert: &rustls::Certificate,
@@ -36,69 +137,16 @@ impl rustls::client::ServerCertVerifier for ManualServerVerification {
         _ocsp_response: &[u8],
         _now: SystemTime,
     ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        let server_cert_fingerprint = certs::fingerprint(&server_cert);
-        if let Ok(mut known_certs) = self.known_certs.write() {
-            if known_certs.contains(server_cert) {
-                info!("Server has a known certificate: {}", server_cert_fingerprint);
-                Ok(rustls::client::ServerCertVerified::assertion())
-            } else if prompt_unknown_server_cert(server_cert, &self.our_cert_fingerprint) {
-                info!("Server approved: {}", server_cert_fingerprint);
-                // Store the approved cert so that we don't need to reload the whole list
-                known_certs.push(server_cert.clone());
-                Ok(rustls::client::ServerCertVerified::assertion())
-            } else {
-                info!("Server denied: {}", server_cert_fingerprint);
-                Err(rustls::Error::General(format!("Unknown server cert was denied: {}", server_cert_fingerprint)))
-            }
-        } else {
-            error!("Failed to get lock on known_certs");
-            Err(rustls::Error::General("Failed to lock known certs".to_string()))
-        }
+        self.verify_cert(
+            server_cert,
+            "Server",
+            false,
+            rustls::client::ServerCertVerified::assertion(),
+        )
     }
 }
 
-fn prompt_unknown_server_cert(server_cert: &rustls::Certificate, client_cert_fingerprint: &String) -> bool {
-    let server_cert_fingerprint = certs::fingerprint(&server_cert);
-    let message = format!("NEW UNKNOWN SERVER CONNECTION: Approval needed
-
-The client has connected to a new unknown server.
-Only approve this if you are expecting to be connecting to a new server.
-You will also likely need to confirm this connection on the server as well.
-
-Check that these fingerprints look the same on the server and on the client:
-- Server fingerprint: {}
-- Client fingerprint: {}
-
-Answering yes will allow the server connection to proceed, saving the server certificate as pre-approved for future connections.
-Answering no will deny the new server and close the connection.
-
-Confirm new connection and save certificate as approved? ({}s timeout) [y/N]", server_cert_fingerprint, client_cert_fingerprint, PROMPT_TIMEOUT_SECS);
-
-    let result = prompt_yn(&message, false);
-    if result {
-        if let Err(e) = certs::write_approved_cert(server_cert) {
-            warn!("Couldn't store server cert: {}", e);
-        }
-    }
-    result
-}
-
-pub struct ManualClientVerification {
-    our_cert_fingerprint: String,
-    // Wrapped in a lock so that we can add newly approved entries immediately
-    known_certs: RwLock<Vec<rustls::Certificate>>,
-}
-
-impl ManualClientVerification {
-    pub fn new(our_cert: &rustls::Certificate, known_certs: Vec<rustls::Certificate>) -> Arc<Self> {
-        Arc::new(ManualClientVerification {
-            our_cert_fingerprint: certs::fingerprint(our_cert),
-            known_certs: RwLock::new(known_certs),
-        })
-    }
-}
-
-impl rustls::server::ClientCertVerifier for ManualClientVerification {
+impl rustls::server::ClientCertVerifier for NikauCertVerification {
     fn client_auth_root_subjects(&self) -> &[rustls::DistinguishedName] {
         &[]
     }
@@ -109,29 +157,24 @@ impl rustls::server::ClientCertVerifier for ManualClientVerification {
         _intermediates: &[rustls::Certificate],
         _now: SystemTime,
     ) -> Result<rustls::server::ClientCertVerified, rustls::Error> {
-        let client_cert_fingerprint = certs::fingerprint(&client_cert);
-        if let Ok(mut known_certs) = self.known_certs.write() {
-            if known_certs.contains(client_cert) {
-                info!("Client has a known certificate: {}", client_cert_fingerprint);
-                Ok(rustls::server::ClientCertVerified::assertion())
-            } else if prompt_unknown_client_cert(client_cert, &self.our_cert_fingerprint) {
-                info!("Client approved: {}", client_cert_fingerprint);
-                // Store the approved cert so that we don't need to reload the whole list
-                known_certs.push(client_cert.clone());
-                Ok(rustls::server::ClientCertVerified::assertion())
-            } else {
-                info!("Client denied: {}", client_cert_fingerprint);
-                Err(rustls::Error::General(format!("Unknown client cert was denied: {}", client_cert_fingerprint)))
-            }
-        } else {
-            error!("Failed to get lock on known_certs");
-            Err(rustls::Error::General("Failed to lock known certs".to_string()))
-        }
+        self.verify_cert(
+            client_cert,
+            "Client",
+            true,
+            rustls::server::ClientCertVerified::assertion(),
+        )
     }
 }
 
-fn prompt_unknown_client_cert(client_cert: &rustls::Certificate, server_cert_fingerprint: &String) -> bool {
-    let message = format!("NEW UNKNOWN CLIENT CONNECTION: Approval needed
+fn prompt_unknown_cert(
+    their_cert: &rustls::Certificate,
+    our_cert_fingerprint: &String,
+    we_are_server: bool,
+) -> bool {
+    let their_cert_fingerprint = certs::fingerprint(&their_cert);
+    let message = if we_are_server {
+        format!(
+            "NEW UNKNOWN CLIENT CONNECTION: Approval needed
 
 The server has received a new connection from an unknown client.
 Only approve this if you are expecting a new client.
@@ -144,15 +187,27 @@ Check that the following hashes look the same on the server and on the client:
 Answering yes will allow the client to join and will save the client certificate as pre-approved for future connections.
 Answering no will deny the new client and close the client connection.
 
-Confirm new connection and save certificate as approved? ({}s timeout) [y/N]", server_cert_fingerprint, certs::fingerprint(&client_cert), PROMPT_TIMEOUT_SECS);
+Confirm new connection and save certificate as approved? ({}s timeout) [y/N]",
+            our_cert_fingerprint, their_cert_fingerprint, PROMPT_TIMEOUT_SECS)
+    } else {
+        format!(
+            "NEW UNKNOWN SERVER CONNECTION: Approval needed
 
-    let result = prompt_yn(&message, false);
-    if result {
-        if let Err(e) = certs::write_approved_cert(client_cert) {
-            warn!("Couldn't store client cert: {}", e);
-        }
-    }
-    result
+The client has connected to a new unknown server.
+Only approve this if you are expecting to be connecting to a new server.
+You will also likely need to confirm this connection on the server as well.
+
+Check that these fingerprints look the same on the server and on the client:
+- Server fingerprint: {}
+- Client fingerprint: {}
+
+Answering yes will allow the server connection to proceed, saving the server certificate as pre-approved for future connections.
+Answering no will deny the new server and close the connection.
+
+Confirm new connection and save certificate as approved? ({}s timeout) [y/N]",
+            their_cert_fingerprint, our_cert_fingerprint, PROMPT_TIMEOUT_SECS)
+    };
+    prompt_yn(&message, false)
 }
 
 fn prompt_yn(msg: &str, default: bool) -> bool {
@@ -165,9 +220,13 @@ fn prompt_yn(msg: &str, default: bool) -> bool {
                 'y' | 'Y' | 't' | 'T' => true,
                 _ => false,
             }
-        },
+        }
         Err(e) => {
-            warn!("Confirmation prompt failed, assuming '{}': {}", if default { "yes" } else { "no" }, e);
+            warn!(
+                "Confirmation prompt failed, assuming '{}': {}",
+                if default { "yes" } else { "no" },
+                e
+            );
             return default;
         }
     }
@@ -182,15 +241,20 @@ fn prompt_internal(msg: &str) -> Result<String> {
     stdout.flush().expect("Failed to flush stdout");
     let mut response = String::new();
     task::block_on(async {
-        match aio::timeout(Duration::from_secs(PROMPT_TIMEOUT_SECS), aio::stdin().read_line(&mut response)).await {
+        match aio::timeout(
+            Duration::from_secs(PROMPT_TIMEOUT_SECS),
+            aio::stdin().read_line(&mut response),
+        )
+        .await
+        {
             Ok(_) => {
                 return Ok(());
-            },
+            }
             Err(_e) => {
                 // Skip output to next line so that logs don't print on top of the prompt
                 println!("");
                 bail!("Prompt timed out after {}s", PROMPT_TIMEOUT_SECS)
-            },
+            }
         }
     })?;
     Ok(response.trim().to_string())

@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// The protocol version sent from the client to the server.
 /// If the message definitions below change, then this must change.
@@ -61,7 +61,13 @@ impl std::fmt::Display for InputEventV1 {
         } else {
             "".to_string()
         };
-        f.write_str(format!("InputEventV1(target={}{}{})", self.target, i32event, f64event).as_str())
+        f.write_str(
+            format!(
+                "InputEventV1(target={}{}{})",
+                self.target, i32event, f64event
+            )
+            .as_str(),
+        )
     }
 }
 
@@ -100,7 +106,13 @@ pub struct I32EventV1 {
 
 impl std::fmt::Display for I32EventV1 {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(format!("I32EventV1(type={}, code={}, value={})", self.type_, self.code, self.value).as_str())
+        f.write_str(
+            format!(
+                "I32EventV1(type={}, code={}, value={})",
+                self.type_, self.code, self.value
+            )
+            .as_str(),
+        )
     }
 }
 
@@ -114,11 +126,7 @@ impl I32EventV1 {
     }
 
     pub fn to_evdev(&self) -> evdev::InputEvent {
-        evdev::InputEvent::new(
-            evdev::EventType{0: self.type_},
-            self.code,
-            self.value,
-        )
+        evdev::InputEvent::new(evdev::EventType { 0: self.type_ }, self.code, self.value)
     }
 }
 
@@ -136,7 +144,13 @@ pub struct F64EventV1 {
 
 impl std::fmt::Display for F64EventV1 {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(format!("F64EventV1(type={}, code={}, value={})", self.type_, self.code, self.value).as_str())
+        f.write_str(
+            format!(
+                "F64EventV1(type={}, code={}, value={})",
+                self.type_, self.code, self.value
+            )
+            .as_str(),
+        )
     }
 }
 
@@ -152,7 +166,7 @@ impl F64EventV1 {
 
     pub fn to_evdev(&self, min: i32, max: i32) -> evdev::InputEvent {
         evdev::InputEvent::new(
-            evdev::EventType{0: self.type_},
+            evdev::EventType { 0: self.type_ },
             self.code,
             // Inverse of from_evdev math:
             (self.value * ((max - min) as f64)) as i32 + min,

@@ -1,4 +1,4 @@
-pub mod certs;
+pub mod approval;
 pub mod client;
 pub mod deviceinput;
 pub mod deviceoutput;
@@ -7,6 +7,7 @@ pub mod devicewatch;
 pub mod logging;
 pub mod server;
 
-mod approval;
+mod certs;
 mod messages;
+mod rotation;
 mod transport;

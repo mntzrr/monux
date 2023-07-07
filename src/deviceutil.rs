@@ -1,9 +1,9 @@
+use std::collections::BTreeMap;
+
 use evdev::{AbsoluteAxisType, Device, EvdevEnum, EventType};
 use tracing::{debug, info};
 
 use crate::messages;
-
-use std::collections::BTreeMap;
 
 pub fn is_scaled_axis(axis: &AbsoluteAxisType) -> bool {
     // HACK: Check for valid enum by looking at the name

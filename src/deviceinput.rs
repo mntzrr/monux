@@ -1,15 +1,19 @@
+use std::str::FromStr;
+
 use anyhow::{anyhow, bail, Result};
 use async_std::task;
 use evdev::{EventStream, EventType, InputEvent, Key};
 use futures::StreamExt;
 use tracing::{debug, info, warn};
 
-use std::str::FromStr;
-
-use crate::deviceutil;
 use crate::devicewatch::DeviceHandler;
-use crate::messages;
-use crate::server;
+use crate::{deviceutil, messages};
+
+pub enum Event {
+    Input(messages::InputEventV1),
+    SwitchNext,
+    SwitchPrev,
+}
 
 pub struct InputHandler {
     config: HandlerConfig,
@@ -19,28 +23,28 @@ pub struct InputHandler {
 struct HandlerConfig {
     combo_keys_next: Vec<Key>,
     combo_keys_prev: Vec<Key>,
-    event_tx: async_channel::Sender<server::Event>,
+    event_tx: async_channel::Sender<Event>,
 }
 
 impl InputHandler {
     pub fn new(
         keys_next: &str,
         keys_prev: Option<&str>,
-        event_tx: async_channel::Sender<server::Event>
+        event_tx: async_channel::Sender<Event>,
     ) -> Result<InputHandler> {
         let mut combo_keys_next = vec![];
         let mut combo_keys_prev = vec![];
         for key in keys_next.split(",") {
             combo_keys_next.push(
                 Key::from_str(format!("KEY_{}", key.trim().to_uppercase()).as_str())
-                    .map_err(|e| anyhow!("Unsupported key '{}': {:?}", key, e))?
+                    .map_err(|e| anyhow!("Unsupported key '{}': {:?}", key, e))?,
             );
         }
         if let Some(keys_prev) = keys_prev {
             for key in keys_prev.split(",") {
                 combo_keys_prev.push(
                     Key::from_str(format!("KEY_{}", key.trim().to_uppercase()).as_str())
-                        .map_err(|e| anyhow!("Unsupported key '{}': {:?}", key, e))?
+                        .map_err(|e| anyhow!("Unsupported key '{}': {:?}", key, e))?,
                 );
             }
         }
@@ -48,7 +52,7 @@ impl InputHandler {
             bail!("At least one key must be provided for switching between devices");
         }
         Ok(InputHandler {
-            config: HandlerConfig{
+            config: HandlerConfig {
                 combo_keys_next,
                 combo_keys_prev,
                 event_tx,
@@ -60,9 +64,10 @@ impl InputHandler {
 impl DeviceHandler for InputHandler {
     fn handle_device_stream(&mut self, stream: EventStream) -> Result<task::JoinHandle<()>> {
         let config = self.config.clone();
-        task::Builder::new().name(format!("device: {:?}", stream.device().name())).spawn(async move {
-            read_device_events(stream, config).await
-        }).map_err(|e| anyhow!(e))
+        task::Builder::new()
+            .name(format!("device: {:?}", stream.device().name()))
+            .spawn(async move { read_device_events(stream, config).await })
+            .map_err(|e| anyhow!(e))
     }
 }
 
@@ -78,50 +83,61 @@ async fn read_device_events(mut stream: EventStream, c: HandlerConfig) {
                 let combo_prev = check_combo(&event, &c.combo_keys_prev, &mut pressed_keys_prev);
                 let event = if combo_next {
                     info!("COMBO NEXT!!!!!");
-                    server::Event::SwitchNext
+                    Event::SwitchNext
                 } else if combo_prev {
                     info!("COMBO PREV!!!!!");
-                    server::Event::SwitchPrev
+                    Event::SwitchPrev
                 } else {
-                    debug!("event for {} {:?}: {:?}", device_target, stream.device().name(), event);
+                    debug!(
+                        "event for {} {:?}: {:?}",
+                        device_target,
+                        stream.device().name(),
+                        event
+                    );
                     match event.kind() {
                         evdev::InputEventKind::AbsAxis(axis) => {
                             if let Some(axis_dims) = device_dims.get(&axis.0) {
                                 // Apply scaling to [0.0, 1.0]
-                                server::Event::Input(messages::InputEventV1{
+                                Event::Input(messages::InputEventV1 {
                                     target: device_target.clone(),
                                     i32event: None,
-                                    f64event: Some(messages::F64EventV1::from_evdev(event, axis_dims.0, axis_dims.1)),
+                                    f64event: Some(messages::F64EventV1::from_evdev(
+                                        event,
+                                        axis_dims.0,
+                                        axis_dims.1,
+                                    )),
                                 })
                             } else {
                                 // No scaling for this axis
-                                server::Event::Input(messages::InputEventV1{
+                                Event::Input(messages::InputEventV1 {
                                     target: device_target.clone(),
                                     i32event: Some(messages::I32EventV1::from_evdev(event)),
                                     f64event: None,
                                 })
                             }
-                        },
-                        _ => {
-                            server::Event::Input(messages::InputEventV1{
-                                target: device_target.clone(),
-                                i32event: Some(messages::I32EventV1::from_evdev(event)),
-                                f64event: None,
-                            })
                         }
+                        _ => Event::Input(messages::InputEventV1 {
+                            target: device_target.clone(),
+                            i32event: Some(messages::I32EventV1::from_evdev(event)),
+                            f64event: None,
+                        }),
                     }
                 };
                 if let Err(e) = c.event_tx.send(event).await {
                     warn!("Error trying to send event to server for routing: {}", e);
                 }
-            },
+            }
             Err(e) => {
                 // Common when the device has been unplugged.
                 // We'll frequently get this error just as inotify is telling us the file is deleted.
                 // Exit to avoid an infinite loop on trying to read the missing file.
-                warn!("Error event for {:?}, removing device: {}", stream.device().name(), e);
+                warn!(
+                    "Error event for {:?}, removing device: {}",
+                    stream.device().name(),
+                    e
+                );
                 return;
-            },
+            }
         }
     }
 }

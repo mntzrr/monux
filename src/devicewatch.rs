@@ -1,12 +1,12 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use anyhow::{bail, Context, Result};
 use async_std::task;
 use evdev::{Device, EventStream, EventType};
 use futures::StreamExt;
 use notify::Watcher;
 use tracing::{debug, info, trace, warn};
-
-use std::collections::HashMap;
-use std::path::PathBuf;
 
 use crate::deviceoutput;
 
@@ -34,22 +34,28 @@ pub async fn watch_loop<F: DeviceHandler>(mut handler: F) -> Result<()> {
         async_channel::Receiver<DeviceEvent>,
     ) = async_channel::bounded(32);
     let mut watcher = notify::RecommendedWatcher::new(
-        move |res: Result<notify::Event, notify::Error>| {
-            match res {
-                Ok(event) => send_device_events(event, &device_event_tx),
-                Err(e) => warn!("filesystem watch error: {:?}", e),
-            }
+        move |res: Result<notify::Event, notify::Error>| match res {
+            Ok(event) => send_device_events(event, &device_event_tx),
+            Err(e) => warn!("filesystem watch error: {:?}", e),
         },
         notify::Config::default(),
-    ).context("failed to init watcher")?;
-    watcher.watch(std::path::Path::new("/dev/input"), notify::RecursiveMode::NonRecursive)?;
+    )
+    .context("failed to init watcher")?;
+    watcher.watch(
+        std::path::Path::new("/dev/input"),
+        notify::RecursiveMode::NonRecursive,
+    )?;
 
     // Scan current devices
     let mut devices = HashMap::new();
     for (path, device) in evdev::enumerate() {
         // enumerate() already filters for 'event*' filenames
         if !compatible_device(&device) {
-            trace!("Ignoring device: {} @ {}", device.name().unwrap_or("(Unnamed device)"), path.to_string_lossy());
+            trace!(
+                "Ignoring device: {} @ {}",
+                device.name().unwrap_or("(Unnamed device)"),
+                path.to_string_lossy()
+            );
             continue;
         }
         let stream = start_device_stream(device, &path)?;
@@ -71,40 +77,58 @@ pub async fn watch_loop<F: DeviceHandler>(mut handler: F) -> Result<()> {
                 match Device::open(&event.path) {
                     Ok(device) => {
                         if !compatible_device(&device) {
-                            debug!("Ignoring device: {} @ {}", device.name().unwrap_or("(Unnamed device)"), event.path.to_string_lossy());
+                            debug!(
+                                "Ignoring device: {} @ {}",
+                                device.name().unwrap_or("(Unnamed device)"),
+                                event.path.to_string_lossy()
+                            );
                             continue;
                         }
-                        info!("Listening to new device: {} @ {}", device.name().unwrap_or("(Unnamed device)"), event.path.to_string_lossy());
+                        info!(
+                            "Listening to new device: {} @ {}",
+                            device.name().unwrap_or("(Unnamed device)"),
+                            event.path.to_string_lossy()
+                        );
                         match start_device_stream(device, &event.path) {
-                            Ok(stream) => {
-                                match handler.handle_device_stream(stream) {
-                                    Ok(join_handle) => {
-                                        devices.insert(event.path, join_handle);
-                                    },
-                                    Err(e) => {
-                                        warn!("Failed to start event handler for device {}: {}", event.path.to_string_lossy(), e);
-                                    },
+                            Ok(stream) => match handler.handle_device_stream(stream) {
+                                Ok(join_handle) => {
+                                    devices.insert(event.path, join_handle);
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to start event handler for device {}: {}",
+                                        event.path.to_string_lossy(),
+                                        e
+                                    );
                                 }
                             },
                             Err(e) => {
                                 // Avoid exiting loop and aborting program if a new device fails
-                                warn!("Failed to read device {}: {}", event.path.to_string_lossy(), e);
+                                warn!(
+                                    "Failed to read device {}: {}",
+                                    event.path.to_string_lossy(),
+                                    e
+                                );
                             }
                         }
-                    },
+                    }
                     Err(e) => {
                         // Avoid exiting loop and aborting program if a new device fails
-                        warn!("Failed to init device {}: {}", event.path.to_string_lossy(), e);
+                        warn!(
+                            "Failed to init device {}: {}",
+                            event.path.to_string_lossy(),
+                            e
+                        );
                     }
                 };
-            },
+            }
             DeviceEventKind::Deleted => {
                 if let Some(join_handle) = devices.remove(&event.path) {
                     info!("Removing device: {}", event.path.to_string_lossy());
                     join_handle.cancel().await;
                 }
                 info!("Handling {} devices following removal", devices.len());
-            },
+            }
         }
     }
     Ok(())
@@ -127,12 +151,18 @@ fn compatible_device(d: &Device) -> bool {
     }
     // We care about these kinds of devices: keyboard, mouse, and touchpad, respectively
     let evts = d.supported_events();
-    evts.contains(EventType::KEY) || evts.contains(EventType::RELATIVE) || evts.contains(EventType::ABSOLUTE)
+    evts.contains(EventType::KEY)
+        || evts.contains(EventType::RELATIVE)
+        || evts.contains(EventType::ABSOLUTE)
 }
 
 fn start_device_stream(device: Device, path: &PathBuf) -> Result<EventStream> {
-    device.into_event_stream()
-        .with_context(|| format!("Failed to initialize async fd for device: {}", path.to_string_lossy()))
+    device.into_event_stream().with_context(|| {
+        format!(
+            "Failed to initialize async fd for device: {}",
+            path.to_string_lossy()
+        )
+    })
 }
 
 fn send_device_events(event: notify::Event, device_event_tx: &async_channel::Sender<DeviceEvent>) {
@@ -141,22 +171,34 @@ fn send_device_events(event: notify::Event, device_event_tx: &async_channel::Sen
             debug!("File created: {:?}", event);
             task::block_on(async {
                 for path in event.paths {
-                    if let Err(e) = device_event_tx.send(DeviceEvent{kind: DeviceEventKind::Created, path}).await {
+                    if let Err(e) = device_event_tx
+                        .send(DeviceEvent {
+                            kind: DeviceEventKind::Created,
+                            path,
+                        })
+                        .await
+                    {
                         warn!("Failed to queue device create event: {}", e);
                     }
                 }
             });
-        },
+        }
         notify::EventKind::Remove(notify::event::RemoveKind::File) => {
             debug!("File deleted: {:?}", event);
             task::block_on(async {
                 for path in event.paths {
-                    if let Err(e) = device_event_tx.send(DeviceEvent{kind: DeviceEventKind::Deleted, path}).await {
+                    if let Err(e) = device_event_tx
+                        .send(DeviceEvent {
+                            kind: DeviceEventKind::Deleted,
+                            path,
+                        })
+                        .await
+                    {
                         warn!("Failed to queue device delete event: {}", e);
                     }
                 }
             })
-        },
+        }
         _ => trace!("Other filesystem event: {:?}", event),
     }
 }
