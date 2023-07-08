@@ -9,7 +9,7 @@ description = "Linux network KVM for Wayland/X11/Console"
 documentation = "https://nikau.nickbp.com"
 homepage = "https://nikau.nickbp.com"
 repository = "https://sr.ht/~nickbp/nikau/"
-exclude = ["README.md"]
+exclude = ["README.md", "Dockerfile", ".build.yml", "*.sh"]
 
 [dependencies]
 anyhow = "1.0"
