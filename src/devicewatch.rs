@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use async_std::task;
-use evdev::{Device, EventStream, EventType};
+use evdev::{Device, EventStream, EventType, Key};
 use futures::{select, StreamExt};
 use notify::Watcher;
 use tracing::{debug, info, trace, warn};
@@ -75,7 +75,7 @@ pub async fn watch_loop<F: DeviceHandler>(
         let stream = start_device_stream(device, &path)?;
         devices.insert(path, handler.handle_device_stream(stream)?);
     }
-    info!("Handling {} initial devices", devices.len());
+    info!("Listening to {} input devices", devices.len());
     if devices.len() <= 0 {
         bail!("Didn't find any compatible devices, are you root?");
     }
@@ -117,14 +117,14 @@ async fn handle_device_event<F: DeviceHandler>(
                 Ok(device) => {
                     if !compatible_device(&device) {
                         debug!(
-                            "Ignoring device: {} @ {}",
+                            "Ignoring new device: {} @ {}",
                             device.name().unwrap_or("(Unnamed device)"),
                             event.path.to_string_lossy()
                         );
                         return;
                     }
                     info!(
-                        "Listening to new device: {} @ {}",
+                        "Listening to new input device: {} @ {}",
                         device.name().unwrap_or("(Unnamed device)"),
                         event.path.to_string_lossy()
                     );
@@ -185,11 +185,34 @@ fn compatible_device(d: &Device) -> bool {
             return false;
         }
     }
-    // We care about these kinds of devices: keyboard, mouse, and touchpad, respectively
+    // We care about these kinds of devices: keyboard, mouse, and touchpad
     let evts = d.supported_events();
-    evts.contains(EventType::KEY)
-        || evts.contains(EventType::RELATIVE)
-        || evts.contains(EventType::ABSOLUTE)
+    if evts.contains(EventType::ABSOLUTE) {
+        // Touchpad or joystick
+        true
+    } else if evts.contains(EventType::RELATIVE) {
+        // Mouse
+        true
+    } else if evts.contains(EventType::KEY) {
+        // Keyboard or utility keys
+        if let Some(keys) = d.supported_keys() {
+            // If the device only supports one or more of these keys, then ignore the device.
+            // If the user presses a power button on the server machine, then we shouldn't send the event to the client.
+            if keys
+                .iter()
+                .all(|key| key == Key::KEY_POWER || key == Key::KEY_SLEEP || key == Key::KEY_WAKEUP)
+            {
+                false
+            } else {
+                true
+            }
+        } else {
+            // Key device without any keys? Skip it
+            false
+        }
+    } else {
+        false
+    }
 }
 
 fn start_device_stream(device: Device, path: &PathBuf) -> Result<EventStream> {
