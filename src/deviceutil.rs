@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use evdev::{AbsoluteAxisType, Device, EvdevEnum, EventType};
+use evdev::{AbsoluteAxisType, Device, EvdevEnum, EventType, InputEvent, InputEventKind, Key};
 use tracing::{debug, trace};
 
 use crate::messages;
@@ -54,6 +54,17 @@ pub fn device_info(device: &Device) -> DeviceInfo {
     };
     log_device(device, &target, &dims);
     DeviceInfo { target, dims }
+}
+
+pub fn log_event(event: &InputEvent) -> String {
+    let kind = match event.kind() {
+        InputEventKind::Key(_key) => {
+            // Replace the key with an X to avoid logging passwords etc
+            InputEventKind::Key(Key::KEY_X)
+        },
+        k => k,
+    };
+    format!("{:?}={}", kind, event.value())
 }
 
 fn log_device(device: &Device, target: &messages::EventTargetV1, dims: &BTreeMap<u16, (i32, i32)>) {

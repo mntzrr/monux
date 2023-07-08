@@ -52,7 +52,7 @@ impl VirtualDevices {
                         "Sending {} events to {} device: {:?}",
                         events.len(),
                         net_event.target,
-                        events
+                        events.iter().map(|e| deviceutil::log_event(e)).collect::<Vec<String>>(),
                     );
                     device.emit(&events)?;
                     events.clear();

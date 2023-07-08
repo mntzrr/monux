@@ -7,8 +7,13 @@ use quinn::{ClientConfig, Endpoint, IdleTimeout, ServerConfig, TransportConfig, 
 
 use crate::approval;
 
-const KEEPALIVE_MILLIS: u64 = 8000; // 25000 recommended by wireguard across NATs/firewalls
-const TIMEOUT_MILLIS: u32 = 10000; // must be larger than keepalive to avoid spurious timeouts
+/// Wireguard recommends 25000 for spanning NATs/firewalls.
+/// Must be shorter than TIMEOUT_MILLIS to avoid spurious timeouts.
+const KEEPALIVE_MILLIS: u64 = 2000;
+
+/// This is the delay between a client losing connection and a server ungrabbing the keys.
+/// Keep this very short so that connection problems get resolved relatively quickly.
+const TIMEOUT_MILLIS: u32 = 3000;
 
 pub fn build_client(
     bind_addr: &SocketAddr,

@@ -209,10 +209,10 @@ async fn read_device_event(
         }
     } else {
         debug!(
-            "{} event {:?}: {:?}",
+            "{} event {:?}: {}",
             device_info.target,
-            device.name(),
-            event
+            device.name().unwrap_or("(Unnamed device)"),
+            deviceutil::log_event(&event),
         );
         match event.kind() {
             evdev::InputEventKind::AbsAxis(axis) => {
