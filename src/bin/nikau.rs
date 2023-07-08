@@ -134,13 +134,16 @@ fn main() -> Result<()> {
 }
 
 fn splash(label: &str) {
-    println!(r"
+    println!(
+        r"
 \\ //
  \V/
   U
   |
   | nikau {}
-", label);
+",
+        label
+    );
 }
 
 fn server(

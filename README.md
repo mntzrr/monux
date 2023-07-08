@@ -26,10 +26,12 @@ Key combinations are used to rotate between machines. The default is `LeftAlt+N`
 
 ## Getting started
 
-1. Install nikau to each of your systems.
+1. Install nikau to each of your systems using one of these methods:.
 
-    a. Latest stable release: `cargo install nikau`, and then use `~/.cargo/bin/nikau` to run the binary
-    b. Latest `main`: `git clone https://git.sr.ht/~nickbp/nikau && cd nikau && cargo build`, and then use `./target/debug/nikau` to run the binary
+    a. Stable release: `cargo install nikau`, and then use `~/.cargo/bin/nikau` to run the binary.
+
+    b. Latest `main`: `git clone https://git.sr.ht/~nickbp/nikau && cd nikau && cargo build`, and then use `./target/debug/nikau` to run the binary.
+
     c. Docker image: `docker-server.sh` and `docker-client.sh` provide example `docker run` commands. Note that `--privileged` is required and this has security implications. Get a list of available tags (based on commit SHAs) from [here](https://github.com/users/nickbp/packages/container/package/nikau).
 
 2. Run `nikau server` on your server machine
