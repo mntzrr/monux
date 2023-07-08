@@ -24,12 +24,14 @@ When a key is pressed or mouse is moved on the server, Nikau will encode and sen
 
 Key combinations are used to rotate between machines. The default is `LeftAlt+N` to go to the next machine, or `LeftAlt+P` to go to the previous machine. This is customized using commandline arguments on the server.
 
-## Quickstart
+## Getting started
 
 1. Install nikau to each of your systems.
+
     a. Latest stable release: `cargo install nikau`, and then use `~/.cargo/bin/nikau` to run the binary
     b. Latest `main`: `git clone https://git.sr.ht/~nickbp/nikau && cd nikau && cargo build`, and then use `./target/debug/nikau` to run the binary
     c. Docker image: `docker-server.sh` and `docker-client.sh` provide example `docker run` commands. Note that `--privileged` is required and this has security implications. Get a list of available tags (based on commit SHAs) from [here](https://github.com/users/nickbp/packages/container/package/nikau).
+
 2. Run `nikau server` on your server machine
 3. Run `nikau client <serverIP>` on your client machine(s)
 
