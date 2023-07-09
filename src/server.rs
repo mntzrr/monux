@@ -59,6 +59,8 @@ async fn handle_connection(
 ) -> Result<()> {
     let connection = conn.await?;
     loop {
+        // In practice the client should only open one stream per connection,
+        // but looping/blocking on this allows us to detect when the client has disconnected.
         let stream = connection.accept_bi().await;
         let (send, mut recv) = match stream {
             Err(e) => {
