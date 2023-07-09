@@ -20,7 +20,20 @@ pub fn load_known_certs() -> Result<Vec<rustls::Certificate>> {
     Ok(certs)
 }
 
-pub fn load_keypair() -> Result<(rustls::Certificate, rustls::PrivateKey)> {
+fn splash(label: &str, fingerprint: &str) {
+    println!(
+        r"
+ \\ //
+  \V/
+   U
+   | nikau {}
+   | {}
+",
+        label, fingerprint
+    );
+}
+
+pub fn load_keypair(splash_label: &str) -> Result<(rustls::Certificate, rustls::PrivateKey)> {
     let file_path = init_config_dir()?.join("private.pem");
     if file_path.is_file() {
         let mut reader =
@@ -46,11 +59,8 @@ pub fn load_keypair() -> Result<(rustls::Certificate, rustls::PrivateKey)> {
             }
         }
         if let (Some(cert), Some(key)) = (cert, key) {
-            info!(
-                "Read our cert from {}: {}",
-                file_path.display(),
-                fingerprint(&cert)
-            );
+            splash(splash_label, &fingerprint(&cert));
+            info!("Using keypair from {}", file_path.display());
             return Ok((cert, key));
         } else {
             bail!("Incomplete cert/key content in {}", file_path.display());

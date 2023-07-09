@@ -1,53 +1,48 @@
 use std::net::SocketAddr;
 
-use tracing::{info, warn};
+use anyhow::{anyhow, Context, Result};
+use quinn::SendStream;
+use tracing::{info, trace, warn};
 
 use crate::{devicewatch, messages};
 
 #[derive(Debug)]
 struct ClientInfo {
     endpoint: SocketAddr,
-    netmsg_tx: async_channel::Sender<messages::NetworkMessageV1>,
+    send: SendStream,
 }
 
 pub struct Rotation {
     grab_tx: async_channel::Sender<devicewatch::GrabEvent>,
     clients: Vec<ClientInfo>,
     current_client: Option<SocketAddr>,
+    buf: Vec<u8>,
 }
 
 impl Rotation {
     pub fn new(grab_tx: async_channel::Sender<devicewatch::GrabEvent>) -> Rotation {
+        let mut buf = Vec::with_capacity(1024);
+        // Init required for space to be usable
+        buf.resize(buf.capacity(), 0);
         Rotation {
             grab_tx,
             clients: Vec::new(),
             current_client: None,
+            buf,
         }
     }
 
-    pub async fn add_client(
-        &mut self,
-        endpoint: SocketAddr,
-        netmsg_tx: async_channel::Sender<messages::NetworkMessageV1>,
-    ) {
-        // Check for any dead clients before we add new ones (e.g. client reconnecting)
-        self.check_dead_clients().await;
-
+    pub async fn add_client(&mut self, endpoint: SocketAddr, send: SendStream) {
         // Sort clients by their endpoints as an arbitrary consistent order across sessions
         let idx = match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
             Ok(idx) => idx,
             Err(idx) => idx,
         };
-        self.clients.insert(
-            idx,
-            ClientInfo {
-                endpoint,
-                netmsg_tx,
-            },
-        );
+        self.clients.insert(idx, ClientInfo { endpoint, send });
 
         info!(
-            "Client added to rotation: {:?}",
+            "Added client {} to rotation: {:?}",
+            endpoint,
             self.clients
                 .iter()
                 .map(|c| c.endpoint)
@@ -55,10 +50,24 @@ impl Rotation {
         );
     }
 
-    pub async fn prev_client(&mut self) {
-        // Check for any dead clients before rotating
-        self.check_dead_clients().await;
+    pub fn remove_client(&mut self, endpoint: SocketAddr) {
+        if let Ok(idx) = self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
+            self.clients.remove(idx);
+            info!(
+                "Removed client {} from rotation: {:?}",
+                endpoint,
+                self.clients
+                    .iter()
+                    .map(|c| c.endpoint)
+                    .collect::<Vec<SocketAddr>>()
+            );
+        } else {
+            // Shouldn't happen
+            warn!("Client {} not found in rotation", endpoint);
+        }
+    }
 
+    pub async fn prev_client(&mut self) {
         if let Some(current_client) = &self.current_client {
             // Currently on remote machine, find its entry in the list and go to the prev one
             let idx = match self
@@ -84,9 +93,6 @@ impl Rotation {
     }
 
     pub async fn next_client(&mut self) {
-        // Check for any dead clients before rotating
-        self.check_dead_clients().await;
-
         if let Some(current_client) = &self.current_client {
             // Currently on remote machine, find its entry in the list and go to the next one
             let idx = match self
@@ -106,36 +112,15 @@ impl Rotation {
         }
     }
 
-    async fn check_dead_clients(&mut self) {
-        // Closed channels: Nobody's listening
-        let mut to_remove = vec![];
-        for client in &self.clients {
-            if client.netmsg_tx.is_closed() {
-                to_remove.push(client.endpoint);
-            }
-        }
-        // Clean up current_client if it's to_remove
-        if let Some(current_client) = &self.current_client {
-            if to_remove.contains(current_client) {
-                self.set_current_client(None).await;
-            }
-        }
-        // Clean up vec entries that are to_remove
-        for endpoint in to_remove {
-            if let Ok(idx) = self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
-                self.clients.remove(idx);
-            }
-        }
-    }
-
     async fn update_current_client(&mut self, new_client: Option<SocketAddr>) {
         if let Some(_old_client) = self.current_client {
             // Try to send switch{false} to last current_client.
             // If it fails then current_client is cleaned up.
-            self.send(messages::NetworkMessageV1::Switch(
-                messages::SwitchEventV1 { enabled: false },
-            ))
-            .await;
+            let _ = self
+                .send(messages::NetworkMessageV1::Switch(
+                    messages::SwitchEventV1 { enabled: false },
+                ))
+                .await;
         }
 
         self.set_current_client(new_client).await;
@@ -143,19 +128,21 @@ impl Rotation {
         if let Some(new_client) = new_client {
             // Try to send switch{true} to the newly assigned current_client.
             // If it fails then current_client is cleaned up.
-            self.send(messages::NetworkMessageV1::Switch(
-                messages::SwitchEventV1 { enabled: true },
-            ))
-            .await;
-
-            info!(
-                "Switched to client: {} (clients: {:?})",
-                new_client,
-                self.clients
-                    .iter()
-                    .map(|c| c.endpoint)
-                    .collect::<Vec<SocketAddr>>()
-            );
+            if let Ok(()) = self
+                .send(messages::NetworkMessageV1::Switch(
+                    messages::SwitchEventV1 { enabled: true },
+                ))
+                .await
+            {
+                info!(
+                    "Switched to client: {} (clients: {:?})",
+                    new_client,
+                    self.clients
+                        .iter()
+                        .map(|c| c.endpoint)
+                        .collect::<Vec<SocketAddr>>()
+                );
+            }
         } else {
             info!(
                 "Switched to local machine (clients: {:?})",
@@ -167,26 +154,27 @@ impl Rotation {
         }
     }
 
-    pub async fn send(&mut self, netmsg: messages::NetworkMessageV1) {
+    pub async fn send(&mut self, netmsg: messages::NetworkMessageV1) -> Result<()> {
         if let Some(current_client) = &self.current_client {
             match self
                 .clients
                 .binary_search_by(|c| c.endpoint.cmp(&current_client))
             {
                 Ok(idx) => {
-                    let netmsg_tx = &self
+                    let send = &mut self
                         .clients
-                        .get(idx)
+                        .get_mut(idx)
                         .expect("missing current_client")
-                        .netmsg_tx;
-                    if let Err(_) = netmsg_tx.send(netmsg).await {
+                        .send;
+                    if let Err(e) = send_client(send, netmsg, &mut self.buf).await {
                         info!(
-                            "Client has {} disconnected, switching to local machine",
-                            current_client
+                            "Client {} has disconnected, switching to local machine: {:?}",
+                            current_client, e
                         );
                         // Client is dead, remove it and switch to local machine
                         self.clients.remove(idx);
                         self.set_current_client(None).await;
+                        return Err(e);
                     }
                 }
                 Err(_idx) => {
@@ -196,6 +184,7 @@ impl Rotation {
                 }
             };
         }
+        Ok(())
     }
 
     async fn set_current_client(&mut self, client: Option<SocketAddr>) {
@@ -213,4 +202,22 @@ impl Rotation {
             );
         }
     }
+}
+
+async fn send_client(
+    send: &mut quinn::SendStream,
+    netmsg: messages::NetworkMessageV1,
+    buf: &mut Vec<u8>,
+) -> Result<()> {
+    // Serialize message data: postcard with cobs encoding for event framing
+    let serializedmsg = postcard::to_slice_cobs(&netmsg, buf)
+        .map_err(|e| anyhow!("Failed to serialize message: {:?}", e))?;
+    trace!(
+        "Sending {} byte event: {:X?}",
+        serializedmsg.len(),
+        &serializedmsg
+    );
+    send.write_all(&serializedmsg)
+        .await
+        .context("Failed to send network message")
 }

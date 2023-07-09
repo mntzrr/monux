@@ -2,14 +2,22 @@ use serde::{Deserialize, Serialize};
 
 /// The protocol version sent from the client to the server.
 /// If the message definitions below change, then this must change.
-pub const PROTOCOL_VERSION: &[u8] = b"v1";
+pub const PROTOCOL_VERSION: u64 = 1;
+
+/// An initial handshake message sent from the client to the server, and from the server to the client.
+/// If either side doesn't support the provided version value, it can cut off the connection early.
+/// The structure of this message shouldn't ever change as it breaks the bootstrap handshake.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct VersionBootstrapMessage {
+    pub version: u64,
+}
 
 /// A serialized message sent from the server to a client.
 /// Changes to this signature likely require changing PROTOCOL_VERSION.
 #[derive(Debug, Deserialize, Serialize)]
 pub enum NetworkMessageV1 {
     /// Notification to client that stream has started or ended.
-    /// This allows the client to clear any key states on its virtual devices
+    /// This allows the client to init or clear any local state, or to indicate selection to the user.
     Switch(SwitchEventV1),
 
     /// An input event to be sent to a virtual device as indicated by the target.

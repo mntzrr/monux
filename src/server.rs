@@ -1,11 +1,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::Result;
 use async_lock::Mutex;
 use async_std::task;
 use futures::StreamExt;
-use tracing::{debug, error, info, trace};
+use tracing::{error, warn};
 
 use crate::{approval, deviceinput, devicewatch, messages, rotation, transport};
 
@@ -23,7 +23,8 @@ pub async fn run_server(
         while let Some(event) = input_rx.next().await {
             match event {
                 deviceinput::Event::Input(evt) => {
-                    rotation2
+                    // rotation handles and logs failed sends internally
+                    let _result = rotation2
                         .lock()
                         .await
                         .send(messages::NetworkMessageV1::Input(evt))
@@ -57,63 +58,33 @@ async fn handle_connection(
     rotation: Arc<Mutex<rotation::Rotation>>,
 ) -> Result<()> {
     let connection = conn.await?;
-
-    // A single message is around 6-9 bytes, so 64 is plenty for a scratch pad
-    let mut buf = Vec::with_capacity(64);
-    buf.resize(64, 0);
-
     loop {
-        debug!("Waiting for bidirectional stream to start");
         let stream = connection.accept_bi().await;
-        let (mut send, mut recv) = match stream {
-            Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
-                info!("Client connection closed");
-                break;
-            }
+        let (send, mut recv) = match stream {
             Err(e) => {
-                bail!("Connection error: {:?}", e);
+                warn!("Connection error to {}: {}", connection.remote_address(), e);
+                rotation
+                    .lock()
+                    .await
+                    .remove_client(connection.remote_address());
+                break;
             }
             Ok(stream) => stream,
         };
 
-        // Expect client to start with providing a plain string of its current version
-        // We currently only support 'v1'.
-        debug!("Reading protocol version from client");
-        let client_protocol_version = recv
-            .read_chunk(1024, true)
-            .await
-            .context("failed reading protocol version from client")?
-            .context("client closed connection before sending initial protocol version")?;
-        if client_protocol_version.bytes == messages::PROTOCOL_VERSION {
-            debug!("Client protocol version is supported");
-        } else {
-            bail!("Client version isn't supported, dropping client");
+        // Receive version from client and close the connection if it's not supported.
+        // Future versions could follow the version message with more data. We ignore/discard it here.
+        {
+            let mut version_buf = vec![];
+            transport::recv_version(&mut recv, &mut version_buf).await?;
         }
 
         // Add client to the rotation after a successful handshake
-        let (netmsg_tx, mut netmsg_rx): (
-            async_channel::Sender<messages::NetworkMessageV1>,
-            async_channel::Receiver<messages::NetworkMessageV1>,
-        ) = async_channel::bounded(32);
         rotation
             .lock()
             .await
-            .add_client(connection.remote_address(), netmsg_tx)
+            .add_client(connection.remote_address(), send)
             .await;
-
-        while let Some(netmsg) = netmsg_rx.next().await {
-            // Serialize message data: postcard with cobs encoding for event framing
-            let serializedmsg = postcard::to_slice_cobs(&netmsg, &mut buf)
-                .map_err(|e| anyhow!("Failed to serialize message: {:?}", e))?;
-            trace!(
-                "Sending {} byte event: {:X?}",
-                serializedmsg.len(),
-                &serializedmsg
-            );
-            send.write_all(&serializedmsg)
-                .await
-                .context("Failed to send network message")?;
-        }
     }
     Ok(())
 }

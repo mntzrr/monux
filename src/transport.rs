@@ -2,10 +2,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use quinn::{ClientConfig, Endpoint, IdleTimeout, ServerConfig, TransportConfig, VarInt};
+use anyhow::{anyhow, bail, Context, Result};
+use quinn::{
+    ClientConfig, Endpoint, IdleTimeout, RecvStream, SendStream, ServerConfig, TransportConfig,
+    VarInt,
+};
+use tracing::debug;
 
-use crate::approval;
+use crate::{approval, messages};
 
 /// Wireguard recommends 25000 for spanning NATs/firewalls.
 /// Must be shorter than TIMEOUT_MILLIS to avoid spurious timeouts.
@@ -37,7 +41,7 @@ pub fn build_server(
         .use_retry(true)
         .transport_config(transport_config());
     Ok(Endpoint::server(server_config, listen_addr.clone())
-       .with_context(|| format!("Failed to listen on {}", listen_addr))?)
+        .with_context(|| format!("Failed to listen on {}", listen_addr))?)
 }
 
 fn transport_config() -> Arc<TransportConfig> {
@@ -47,4 +51,54 @@ fn transport_config() -> Arc<TransportConfig> {
         .keep_alive_interval(Some(Duration::from_millis(KEEPALIVE_MILLIS)))
         .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(TIMEOUT_MILLIS))));
     Arc::new(transport_config)
+}
+
+pub async fn send_version(send: &mut SendStream, buf: &mut Vec<u8>) -> Result<()> {
+    let msg = messages::VersionBootstrapMessage {
+        version: messages::PROTOCOL_VERSION,
+    };
+    buf.resize(buf.capacity(), 0);
+    let serializedmsg = postcard::to_slice_cobs(&msg, buf)
+        .map_err(|e| anyhow!("Failed to serialize message: {:?}", e))?;
+    debug!(
+        "Sending {} byte version: {:X?}",
+        serializedmsg.len(),
+        &serializedmsg
+    );
+    send.write_all(&serializedmsg)
+        .await
+        .context("Failed to send protocol version")?;
+    buf.clear();
+    Ok(())
+}
+
+pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<usize> {
+    debug!("Waiting to receive version");
+    let resp = recv
+        .read_chunk(1024, true)
+        .await
+        .context("Failed reading protocol version from server")?
+        .context("Server closed connection")?;
+    debug!(
+        "Received {} byte version: {:X?}",
+        resp.bytes.len(),
+        &*resp.bytes
+    );
+    // Copy the immutable response data into a mutable buffer
+    buf.extend_from_slice(&*resp.bytes);
+    let (versionmsg, resp_remainder) =
+        postcard::take_from_bytes_cobs::<messages::VersionBootstrapMessage>(buf)
+            .map_err(|e| anyhow!("Failed to deserialize message: {:?}", e))?;
+    if versionmsg.version != messages::PROTOCOL_VERSION {
+        bail!(
+            "Their version {} doesn't match our expected version {}",
+            versionmsg.version,
+            messages::PROTOCOL_VERSION
+        );
+    }
+
+    // Return location of leftover bytes following the version.
+    // They could be NetworkMessage events to be processed by the client following the handshake.
+    let consumed = resp.bytes.len() - resp_remainder.len();
+    Ok(consumed)
 }

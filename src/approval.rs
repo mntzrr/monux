@@ -44,8 +44,6 @@ pub fn rustls_server_config(
 pub struct NikauCertVerification {
     /// Used for building rustls configs
     our_cert: rustls::Certificate,
-    /// Used for logging, calculated once up-front
-    our_cert_fingerprint: String,
     /// Used for building rustls configs
     our_privkey: rustls::PrivateKey,
     /// Pre-approved cert fingerprints provided via commandline argument
@@ -55,10 +53,9 @@ pub struct NikauCertVerification {
 }
 
 impl NikauCertVerification {
-    pub fn new(approved_cert_fingerprints: Vec<String>) -> Result<Arc<Self>> {
-        let (our_cert, our_privkey) =
-            certs::load_keypair().context("Failed to load our keypair")?;
-        let our_cert_fingerprint = certs::fingerprint(&our_cert);
+    pub fn new(splash_label: &str, approved_cert_fingerprints: Vec<String>) -> Result<Arc<Self>> {
+        let (our_cert, our_privkey) = certs::load_keypair(splash_label)
+            .with_context(|| format!("Failed to load {} keypair", splash_label))?;
         // Convert e.g. "18:AE:75:F2..." (openssl style) => "18ae75f2..." (our style)
         // Can get the openssl style from: openssl x509 -noout -sha256 -fingerprint -in /path/to/private.pem
         let approved_cert_fingerprints = approved_cert_fingerprints
@@ -67,7 +64,6 @@ impl NikauCertVerification {
             .collect();
         Ok(Arc::new(NikauCertVerification {
             our_cert,
-            our_cert_fingerprint,
             our_privkey,
             approved_cert_fingerprints,
             known_certs: RwLock::new(certs::load_known_certs()?),
@@ -85,7 +81,7 @@ impl NikauCertVerification {
         if let Ok(mut known_certs) = self.known_certs.write() {
             if known_certs.contains(their_cert) {
                 info!(
-                    "{} has a known certificate: {}",
+                    "{} cert has been approved before: {}",
                     their_name, their_cert_fingerprint
                 );
                 Ok(approve_response)
@@ -94,7 +90,7 @@ impl NikauCertVerification {
                 .contains(&their_cert_fingerprint)
             {
                 info!(
-                    "{} approved via --fingerprints: {}",
+                    "{} cert approved via --fingerprints: {}",
                     their_name, their_cert_fingerprint
                 );
                 // Don't save the cert to disk for --fingerprints.
@@ -102,10 +98,10 @@ impl NikauCertVerification {
                 // Maybe they don't WANT old certs to still be approved if the arg changes? Play it safe.
                 known_certs.push(their_cert.clone());
                 Ok(approve_response)
-            } else if prompt_unknown_cert(their_cert, &self.our_cert_fingerprint, we_are_server) {
+            } else if prompt_unknown_cert(their_cert, we_are_server) {
                 if let Err(e) = certs::write_approved_cert(their_cert) {
                     warn!(
-                        "{} approved, but couldn't save cert to disk: {}",
+                        "{} was approved, but couldn't save cert to disk: {}",
                         their_name, e
                     );
                 }
@@ -113,9 +109,12 @@ impl NikauCertVerification {
                 known_certs.push(their_cert.clone());
                 Ok(approve_response)
             } else {
-                info!("Server denied: {}", their_cert_fingerprint);
+                info!(
+                    "{} cert not approved: {}",
+                    their_name, their_cert_fingerprint
+                );
                 Err(rustls::Error::General(format!(
-                    "{} cert was denied: {}",
+                    "{} cert wasn't approved by user: {}",
                     their_name, their_cert_fingerprint
                 )))
             }
@@ -167,29 +166,24 @@ impl rustls::server::ClientCertVerifier for NikauCertVerification {
     }
 }
 
-fn prompt_unknown_cert(
-    their_cert: &rustls::Certificate,
-    our_cert_fingerprint: &String,
-    we_are_server: bool,
-) -> bool {
+fn prompt_unknown_cert(their_cert: &rustls::Certificate, we_are_server: bool) -> bool {
     let their_cert_fingerprint = certs::fingerprint(&their_cert);
     let message = if we_are_server {
         format!(
             "NEW UNKNOWN CLIENT CONNECTION: Approval needed
 
-The server has received a new connection from an unknown client.
+The server has received a connection from a new unknown client.
 Only approve this if you are expecting a new client.
 You will also likely need to confirm this connection on the client as well.
 
-Check that the following hashes look the same on the server and on the client:
-- Server fingerprint: {}
-- Client fingerprint: {}
+Comfirm that the client startup image has this fingerprint:
+    {}
 
-Answering yes will allow the client to join and will save the client certificate as pre-approved for future connections.
-Answering no will deny the new client and close the client connection.
+Answering yes allows the connection and saves the certificate as pre-approved for future connections.
+Answering no rejects the new client and closes the connection.
 
-Confirm new connection and save certificate as approved? ({}s timeout) [y/N]",
-            our_cert_fingerprint, their_cert_fingerprint, PROMPT_TIMEOUT_SECS)
+Accept new client connection and save certificate as approved? ({}s timeout) [y/N]",
+            their_cert_fingerprint, PROMPT_TIMEOUT_SECS)
     } else {
         format!(
             "NEW UNKNOWN SERVER CONNECTION: Approval needed
@@ -198,15 +192,14 @@ The client has connected to a new unknown server.
 Only approve this if you are expecting to be connecting to a new server.
 You will also likely need to confirm this connection on the server as well.
 
-Check that these fingerprints look the same on the server and on the client:
-- Server fingerprint: {}
-- Client fingerprint: {}
+Confirm that the server startup image has this fingerprint:
+    {}
 
-Answering yes will allow the server connection to proceed, saving the server certificate as pre-approved for future connections.
-Answering no will deny the new server and close the connection.
+Answering yes allows the connection and saves the certificate as pre-approved for future connections.
+Answering no rejects the new server and closes the connection.
 
-Confirm new connection and save certificate as approved? ({}s timeout) [y/N]",
-            their_cert_fingerprint, our_cert_fingerprint, PROMPT_TIMEOUT_SECS)
+Accept new server connection and save certificate as approved? ({}s timeout) [y/N]",
+            their_cert_fingerprint, PROMPT_TIMEOUT_SECS)
     };
     prompt_yn(&message, false)
 }

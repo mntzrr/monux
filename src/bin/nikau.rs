@@ -98,10 +98,11 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Server(args) => {
-            splash("server");
             let listen_addr = SocketAddr::new(args.listen, args.port);
-            let verifier =
-                approval::NikauCertVerification::new(args.fingerprints.unwrap_or(vec![]))?;
+            let verifier = approval::NikauCertVerification::new(
+                "server",
+                args.fingerprints.unwrap_or(vec![]),
+            )?;
             server(
                 listen_addr,
                 &args.shortcut,
@@ -111,7 +112,6 @@ fn main() -> Result<()> {
             )
         }
         Commands::Client(args) => {
-            splash("client");
             let connect_addr: SocketAddr = if let Ok(host_ip) = args.host.parse::<IpAddr>() {
                 // It's an IP.
                 SocketAddr::new(host_ip, args.port)
@@ -126,24 +126,13 @@ fn main() -> Result<()> {
                     bail!("Provided --host={} didn't resolve to an IP", args.host);
                 }
             };
-            let verifier =
-                approval::NikauCertVerification::new(args.fingerprints.unwrap_or(vec![]))?;
+            let verifier = approval::NikauCertVerification::new(
+                "client",
+                args.fingerprints.unwrap_or(vec![]),
+            )?;
             client(connect_addr, verifier)
         }
     }
-}
-
-fn splash(label: &str) {
-    println!(
-        r"
-\\ //
- \V/
-  U
-  |
-  | nikau {}
-",
-        label
-    );
 }
 
 fn server(
@@ -179,9 +168,7 @@ fn server(
 
     let server_task = async move {
         info!("Listening for clients: {}", listen_addr);
-        if let Err(e) = server::run_server(&listen_addr, verifier, event_rx, grab_tx).await {
-            error!("Server failure: {:?}", e);
-        }
+        server::run_server(&listen_addr, verifier, event_rx, grab_tx).await
     };
 
     if let Some(exit_secs) = exit_secs {
@@ -193,8 +180,7 @@ fn server(
         info!("Exiting following --exit-secs={}", exit_secs);
         Ok(())
     } else {
-        task::block_on(server_task);
-        bail!("Exiting due to server failure")
+        task::block_on(server_task)
     }
 }
 
@@ -214,6 +200,6 @@ fn client(connect_addr: SocketAddr, verifier: Arc<approval::NikauCertVerificatio
             }
         }
     });
-
+    // Unreachable code
     bail!("Exiting due to client failure")
 }
