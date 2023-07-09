@@ -8,6 +8,8 @@ use crate::messages;
 pub const VIRTUAL_DEVICE_NAME_PREFIX: &str = "nikau virtual";
 pub const SCALED_DIM_MIN: i32 = 0;
 pub const SCALED_DIM_MAX: i32 = 65535;
+pub const SCALED_DIM_RES_X: i32 = 640; // 65536 / 640 = 102.4mm
+pub const SCALED_DIM_RES_Y: i32 = 960; // for a 3/2 ratio vs X: 65536 / 960 = 68.3mm
 
 pub struct VirtualDevices {
     key_events: Vec<InputEvent>,
@@ -103,8 +105,7 @@ impl VirtualDevices {
 pub fn keyboard(pid: u32) -> Result<uinput::VirtualDevice> {
     let mut keys = AttributeSet::<Key>::new();
     // Report as many keys as possible to emit by the virtual device.
-    for code in 1..195 {
-        //(libc::KEY_MAX as u16) {
+    for code in 1..(libc::KEY_MAX as u16) {
         let key = Key::new(code);
         // HACK: Include only known KEY_* keys, or else the keyboard will be ignored.
         let key_name = format!("{:?}", key);
@@ -145,7 +146,6 @@ pub fn mouse(pid: u32) -> Result<uinput::VirtualDevice> {
     Ok(device)
 }
 
-// TODO touchpad still needs work: removing and reapplying finger causes cursor to hop to new absolute coords, and two finger scrolling doesnt work
 pub fn touchpad(pid: u32) -> Result<uinput::VirtualDevice> {
     let mut props = AttributeSet::<evdev::PropType>::new();
     // Doesn't seem to be required, but real touchpads have it:
@@ -156,9 +156,14 @@ pub fn touchpad(pid: u32) -> Result<uinput::VirtualDevice> {
     let mut keys = AttributeSet::<Key>::new();
     for code in 1..(libc::KEY_MAX as u16) {
         let key = Key::new(code);
-        // HACK: Limit to only BTN_* keys or else the device won't work.
+        // HACK: Limit to only (most) BTN_* keys or else the device won't work,
         let key_name = format!("{:?}", key);
-        if key_name.starts_with("BTN_") {
+        if key_name.starts_with("BTN_")
+        // If one of these keys is present, libinput will classify the device as an ID_INPUT_TABLET,
+        // rather than as an ID_INPUT_TOUCHPAD. See also: "sudo libinput record /dev/input/eventNN"
+            && key_name != "BTN_TOOL_PEN"
+            && key_name != "BTN_STYLUS"
+            && key_name != "BTN_STYLUS2" {
             keys.insert(key);
         }
     }
@@ -174,70 +179,86 @@ pub fn touchpad(pid: u32) -> Result<uinput::VirtualDevice> {
         .name(name.as_str())
         .with_properties(&props)?
         .with_keys(&keys)?
-        // These are the axes that deviceutil::is_scaled_axis returns false
-        .with_absolute_axis(&evdev::UinputAbsSetup::new(
+        // These are the valid axes that deviceutil::axis_scale_type returns DISCRETE
+        .with_absolute_axis(&abs_axis(
+            AbsoluteAxisType::ABS_MISC,
+            -1,      // min
+            1048576, // max (arbitrarily big in case some real device uses big values?)
+            0,       // res
+        ))?
+        .with_absolute_axis(&abs_axis(
             AbsoluteAxisType::ABS_MT_SLOT,
-            AbsInfo::new(
-                0,  // value
-                0,  // min
-                32, // max (if this is too big then something panics)
-                0,  // fuzz
-                0,  // flat
-                0,  // res
-            ),
+            0,  // min
+            32, // max (if this is too big then something panics)
+            0,  // res
         ))?
-        .with_absolute_axis(&evdev::UinputAbsSetup::new(
+        .with_absolute_axis(&abs_axis(
             AbsoluteAxisType::ABS_MT_TOOL_TYPE,
-            AbsInfo::new(
-                0,    // value
-                0,    // min
-                4095, // max
-                0,    // fuzz
-                0,    // flat
-                0,    // res
-            ),
+            0,    // min
+            4095, // max
+            0,    // res
         ))?
-        .with_absolute_axis(&evdev::UinputAbsSetup::new(
+        .with_absolute_axis(&abs_axis(
             AbsoluteAxisType::ABS_MT_BLOB_ID,
-            AbsInfo::new(
-                0,       // value
-                -1,      // min
-                1048576, // max (arbitrarily big in case some real device uses big IDs)
-                0,       // fuzz
-                0,       // flat
-                0,       // res
-            ),
+            -1,      // min
+            1048576, // max (arbitrarily big in case some real device uses big IDs)
+            0,       // res
         ))?
-        .with_absolute_axis(&evdev::UinputAbsSetup::new(
+        .with_absolute_axis(&abs_axis(
             AbsoluteAxisType::ABS_MT_TRACKING_ID,
-            AbsInfo::new(
-                0,       // value
-                -1,      // min
-                1048576, // max (arbitrarily big in case some real device uses big IDs)
-                0,       // fuzz
-                0,       // flat
-                0,       // res
-            ),
+            -1,      // min
+            1048576, // max (arbitrarily big in case some real device uses big IDs)
+            0,       // res
         ))?
         .with_msc(&misc)?;
 
     for i in 0..libc::ABS_MAX + 1 {
         let axis = AbsoluteAxisType::from_index(i as usize);
-        if deviceutil::is_scaled_axis(&axis) {
-            device_builder = device_builder.with_absolute_axis(&evdev::UinputAbsSetup::new(
-                axis,
-                AbsInfo::new(
-                    0,              // value
-                    SCALED_DIM_MIN, // min
-                    SCALED_DIM_MAX, // max
-                    0,              // fuzz
-                    0,              // flat
-                    1,              // res
-                ),
-            ))?;
+        match deviceutil::axis_scale_type(axis) {
+            deviceutil::AxisScale::X => {
+                // X axis values: use MAX_X
+                device_builder = device_builder.with_absolute_axis(&abs_axis(
+                    axis,
+                    SCALED_DIM_MIN,
+                    SCALED_DIM_MAX,
+                    SCALED_DIM_RES_X,
+                ))?;
+            },
+            deviceutil::AxisScale::Y => {
+                // Y axis values: use MAX_Y
+                device_builder = device_builder.with_absolute_axis(&abs_axis(
+                    axis,
+                    SCALED_DIM_MIN,
+                    SCALED_DIM_MAX,
+                    SCALED_DIM_RES_Y,
+                ))?;
+            },
+            deviceutil::AxisScale::OTHER => {
+                device_builder = device_builder.with_absolute_axis(&abs_axis(
+                    axis,
+                    SCALED_DIM_MIN,
+                    SCALED_DIM_MAX,
+                    1,
+                ))?;
+            },
+            _ => {},
         }
     }
 
     let device = device_builder.build()?;
     Ok(device)
+}
+
+fn abs_axis(axis: AbsoluteAxisType, min: i32, max: i32, res: i32) -> evdev::UinputAbsSetup {
+    evdev::UinputAbsSetup::new(
+        axis,
+        AbsInfo::new(
+            0,   // value
+            min, // min
+            max, // max
+            0,   // fuzz
+            0,   // flat
+            res, // res
+        ),
+    )
 }

@@ -50,7 +50,6 @@ I'm using this on a regular basis. As such it should "just work". Email me if yo
 The wire protocol is still unstable and may change between releases. For now, you should ensure that all servers and clients are running the same version.
 
 Known shortcomings:
-- Touchpads have partial support, the behavior is wrong when you lift your finger and put it back on the touchpad. There's probably an issue with drivers. Mice and keyboards meanwhile seem to work fine across a variety of models and types.
 - Clipboards are not synced across devices. I would like support for this. Currently, Nikau doesn't have access to clipboard contents as it only interfaces with uinput, but if e.g. Wayland offers an interface for this then I don't think there's a problem supporting it.
 - Nikau does not work on OSX or Windows, and I don't have any plans to add support for them.
 

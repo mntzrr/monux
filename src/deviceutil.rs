@@ -5,21 +5,64 @@ use tracing::{debug, trace};
 
 use crate::messages;
 
-pub fn is_scaled_axis(axis: &AbsoluteAxisType) -> bool {
-    // HACK: Check for valid enum by looking at the name
-    // Unknown values look like "unknown key: N"
-    if !format!("{:?}", axis).starts_with("ABS_") {
-        return false;
-    }
+#[derive(Debug, PartialEq)]
+pub enum AxisScale {
+    /// Values against the X axis
+    X,
+    /// Values against the Y axis
+    Y,
+    /// Continous values against other axes/scales
+    OTHER,
+    /// Values that aren't continuous
+    DISCRETE,
+    /// Not known axis values
+    INVALID
+}
 
-    // In practice it looks like MOST of the AbsoluteAxisTypes are supposed to be big continuous values.
-    // So lets just return the ones that we know AREN'T continuous.
+pub fn axis_scale_type(axis: AbsoluteAxisType) -> AxisScale {
     match axis {
-        &AbsoluteAxisType::ABS_MT_SLOT => false,
-        &AbsoluteAxisType::ABS_MT_TOOL_TYPE => false,
-        &AbsoluteAxisType::ABS_MT_BLOB_ID => false,
-        &AbsoluteAxisType::ABS_MT_TRACKING_ID => false,
-        _ => true,
+        AbsoluteAxisType::ABS_X => AxisScale::X,
+        AbsoluteAxisType::ABS_Y => AxisScale::Y,
+        AbsoluteAxisType::ABS_Z => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_RX => AxisScale::X,
+        AbsoluteAxisType::ABS_RY => AxisScale::Y,
+        AbsoluteAxisType::ABS_RZ => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_THROTTLE => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_RUDDER => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_WHEEL => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_GAS => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_BRAKE => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_HAT0X => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_HAT0Y => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_HAT1X => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_HAT1Y => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_HAT2X => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_HAT2Y => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_HAT3X => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_HAT3Y => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_PRESSURE => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_DISTANCE => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_TILT_X => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_TILT_Y => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_TOOL_WIDTH => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_VOLUME => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_MISC => AxisScale::DISCRETE,
+        AbsoluteAxisType::ABS_MT_SLOT => AxisScale::DISCRETE,
+        AbsoluteAxisType::ABS_MT_TOUCH_MAJOR => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_MT_TOUCH_MINOR => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_MT_WIDTH_MAJOR => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_MT_WIDTH_MINOR => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_MT_ORIENTATION => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_MT_POSITION_X => AxisScale::X,
+        AbsoluteAxisType::ABS_MT_POSITION_Y => AxisScale::Y,
+        AbsoluteAxisType::ABS_MT_TOOL_TYPE => AxisScale::DISCRETE,
+        AbsoluteAxisType::ABS_MT_BLOB_ID => AxisScale::DISCRETE,
+        AbsoluteAxisType::ABS_MT_TRACKING_ID => AxisScale::DISCRETE,
+        AbsoluteAxisType::ABS_MT_PRESSURE => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_MT_DISTANCE => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_MT_TOOL_X => AxisScale::X,
+        AbsoluteAxisType::ABS_MT_TOOL_Y => AxisScale::Y,
+        _ => AxisScale::INVALID,
     }
 }
 
@@ -39,7 +82,7 @@ pub fn device_info(device: &Device) -> DeviceInfo {
                 let mut i: u16 = 0;
                 for s in state {
                     let type_ = AbsoluteAxisType::from_index(i as usize);
-                    if abs_axes.contains(type_) && is_scaled_axis(&type_) {
+                    if abs_axes.contains(type_) && axis_scale_type(type_) != AxisScale::INVALID {
                         dims.insert(i, (s.minimum, s.maximum));
                     }
                     i += 1;
