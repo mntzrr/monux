@@ -83,20 +83,26 @@ impl std::fmt::Display for InputEventV1 {
 /// This maps to the virtual devices created by the client.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum EventTargetV1 {
-    /// The virtual keys device (keyboard)
-    Key,
-    /// The virtual relative movement device (mouse)
-    Rel,
-    /// The virtual absolute movement device (touchpad, joystick)
-    Abs,
+    /// A keyboard device: events from uinput key devices (that aren't rel or abs) go here
+    Keyboard,
+    /// A mouse device: events from uinput rel devices go here
+    Mouse,
+    /// A touchpad device: events from uinput abs devices go here
+    Touchpad,
+
+    // Other devices (tablet, joystick?) may be added here someday, but I don't have any to test.
+    // From uinput's perspective, they will be other rel/abs devices, but libinput detects them
+    // based on the controls they advertise support for, and treats them differently.
+    // For example, a 'tablet' is an abs device where touching the device immediately moves the
+    // cursor to that coordinate location on screen.
 }
 
 impl std::fmt::Display for EventTargetV1 {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match &self {
-            EventTargetV1::Key => f.write_str("Key"),
-            EventTargetV1::Rel => f.write_str("Rel"),
-            EventTargetV1::Abs => f.write_str("Abs"),
+            EventTargetV1::Keyboard => f.write_str("Keyboard"),
+            EventTargetV1::Mouse => f.write_str("Mouse"),
+            EventTargetV1::Touchpad => f.write_str("Touchpad"),
         }
     }
 }

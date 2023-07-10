@@ -89,11 +89,11 @@ pub fn device_info(device: &Device) -> DeviceInfo {
                 }
             }
         }
-        messages::EventTargetV1::Abs
+        messages::EventTargetV1::Touchpad
     } else if supported_events.contains(EventType::RELATIVE) {
-        messages::EventTargetV1::Rel
+        messages::EventTargetV1::Mouse
     } else {
-        messages::EventTargetV1::Key
+        messages::EventTargetV1::Keyboard
     };
     log_device(device, &target, &dims);
     DeviceInfo { target, dims }

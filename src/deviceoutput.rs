@@ -12,13 +12,13 @@ pub const SCALED_DIM_RES_X: i32 = 640; // 65536 / 640 = 102.4mm
 pub const SCALED_DIM_RES_Y: i32 = 960; // for a 3/2 ratio vs X: 65536 / 960 = 68.3mm
 
 pub struct VirtualDevices {
-    key_events: Vec<InputEvent>,
-    rel_events: Vec<InputEvent>,
-    abs_events: Vec<InputEvent>,
+    keyboard_events: Vec<InputEvent>,
+    mouse_events: Vec<InputEvent>,
+    touchpad_events: Vec<InputEvent>,
 
-    key_device: uinput::VirtualDevice,
-    rel_device: uinput::VirtualDevice,
-    abs_device: uinput::VirtualDevice,
+    keyboard_device: uinput::VirtualDevice,
+    mouse_device: uinput::VirtualDevice,
+    touchpad_device: uinput::VirtualDevice,
 }
 
 impl VirtualDevices {
@@ -26,20 +26,20 @@ impl VirtualDevices {
         info!("Creating virtual devices: keyboard, mouse, touchpad");
         let pid = std::process::id();
         Ok(VirtualDevices {
-            key_events: vec![],
-            rel_events: vec![],
-            abs_events: vec![],
-            key_device: keyboard(pid)?,
-            rel_device: mouse(pid)?,
-            abs_device: touchpad(pid)?,
+            keyboard_events: vec![],
+            mouse_events: vec![],
+            touchpad_events: vec![],
+            keyboard_device: keyboard(pid)?,
+            mouse_device: mouse(pid)?,
+            touchpad_device: touchpad(pid)?,
         })
     }
 
     pub fn add_event(&mut self, net_event: messages::InputEventV1) -> Result<()> {
         let (events, device) = match net_event.target {
-            messages::EventTargetV1::Key => (&mut self.key_events, &mut self.key_device),
-            messages::EventTargetV1::Rel => (&mut self.rel_events, &mut self.rel_device),
-            messages::EventTargetV1::Abs => (&mut self.abs_events, &mut self.abs_device),
+            messages::EventTargetV1::Keyboard => (&mut self.keyboard_events, &mut self.keyboard_device),
+            messages::EventTargetV1::Mouse => (&mut self.mouse_events, &mut self.mouse_device),
+            messages::EventTargetV1::Touchpad => (&mut self.touchpad_events, &mut self.touchpad_device),
         };
 
         if let Some(e) = net_event.f64event {
@@ -86,17 +86,17 @@ impl VirtualDevices {
         );
         // TODO(feature): clear device state for client switches, to avoid e.g. leaving a device with a repeating key. but this requires subscribing and keeping track of device state.
         // TODO(feature): flash LEDs on the OTHER, NON-virtual edvices when this client becomes enabled
-        if !self.key_events.is_empty() {
-            self.key_device.emit(&self.key_events)?;
-            self.key_events.clear();
+        if !self.keyboard_events.is_empty() {
+            self.keyboard_device.emit(&self.keyboard_events)?;
+            self.keyboard_events.clear();
         }
-        if !self.rel_events.is_empty() {
-            self.rel_device.emit(&self.rel_events)?;
-            self.rel_events.clear();
+        if !self.mouse_events.is_empty() {
+            self.mouse_device.emit(&self.mouse_events)?;
+            self.mouse_events.clear();
         }
-        if !self.abs_events.is_empty() {
-            self.abs_device.emit(&self.abs_events)?;
-            self.abs_events.clear();
+        if !self.touchpad_events.is_empty() {
+            self.touchpad_device.emit(&self.touchpad_events)?;
+            self.touchpad_events.clear();
         }
         Ok(())
     }
