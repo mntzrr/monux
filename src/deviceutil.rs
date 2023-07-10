@@ -16,7 +16,7 @@ pub enum AxisScale {
     /// Values that aren't continuous
     DISCRETE,
     /// Not known axis values
-    INVALID
+    INVALID,
 }
 
 pub fn axis_scale_type(axis: AbsoluteAxisType) -> AxisScale {

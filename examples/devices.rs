@@ -1,4 +1,5 @@
-use nikau::{deviceoutput, deviceutil, devicewatch, logging};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_std::task;
@@ -6,8 +7,7 @@ use evdev::{AbsoluteAxisType, EventType, InputEvent, Key};
 use futures::StreamExt;
 use tracing::{error, info, warn};
 
-use std::thread;
-use std::time::Duration;
+use nikau::{deviceoutput, deviceutil, devicewatch, logging};
 
 struct StubHandler {
     grab_tx: async_channel::Sender<devicewatch::GrabEvent>,

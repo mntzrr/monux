@@ -89,7 +89,6 @@ pub enum EventTargetV1 {
     Mouse,
     /// A touchpad device: events from uinput abs devices go here
     Touchpad,
-
     // Other devices (tablet, joystick?) may be added here someday, but I don't have any to test.
     // From uinput's perspective, they will be other rel/abs devices, but libinput detects them
     // based on the controls they advertise support for, and treats them differently.

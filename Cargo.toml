@@ -35,3 +35,4 @@ signal-hook = "0.3"
 signal-hook-async-std = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+x11-clipboard = "0.7"

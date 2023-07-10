@@ -37,9 +37,13 @@ impl VirtualDevices {
 
     pub fn add_event(&mut self, net_event: messages::InputEventV1) -> Result<()> {
         let (events, device) = match net_event.target {
-            messages::EventTargetV1::Keyboard => (&mut self.keyboard_events, &mut self.keyboard_device),
+            messages::EventTargetV1::Keyboard => {
+                (&mut self.keyboard_events, &mut self.keyboard_device)
+            }
             messages::EventTargetV1::Mouse => (&mut self.mouse_events, &mut self.mouse_device),
-            messages::EventTargetV1::Touchpad => (&mut self.touchpad_events, &mut self.touchpad_device),
+            messages::EventTargetV1::Touchpad => {
+                (&mut self.touchpad_events, &mut self.touchpad_device)
+            }
         };
 
         if let Some(e) = net_event.f64event {
@@ -163,7 +167,8 @@ pub fn touchpad(pid: u32) -> Result<uinput::VirtualDevice> {
         // rather than as an ID_INPUT_TOUCHPAD. See also: "sudo libinput record /dev/input/eventNN"
             && key_name != "BTN_TOOL_PEN"
             && key_name != "BTN_STYLUS"
-            && key_name != "BTN_STYLUS2" {
+            && key_name != "BTN_STYLUS2"
+        {
             keys.insert(key);
         }
     }
@@ -223,7 +228,7 @@ pub fn touchpad(pid: u32) -> Result<uinput::VirtualDevice> {
                     SCALED_DIM_MAX,
                     SCALED_DIM_RES_X,
                 ))?;
-            },
+            }
             deviceutil::AxisScale::Y => {
                 // Y axis values: use MAX_Y
                 device_builder = device_builder.with_absolute_axis(&abs_axis(
@@ -232,7 +237,7 @@ pub fn touchpad(pid: u32) -> Result<uinput::VirtualDevice> {
                     SCALED_DIM_MAX,
                     SCALED_DIM_RES_Y,
                 ))?;
-            },
+            }
             deviceutil::AxisScale::OTHER => {
                 device_builder = device_builder.with_absolute_axis(&abs_axis(
                     axis,
@@ -240,8 +245,8 @@ pub fn touchpad(pid: u32) -> Result<uinput::VirtualDevice> {
                     SCALED_DIM_MAX,
                     1,
                 ))?;
-            },
-            _ => {},
+            }
+            _ => {}
         }
     }
 
