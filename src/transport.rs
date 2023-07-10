@@ -98,7 +98,7 @@ pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<us
     }
 
     // Return location of leftover bytes following the version.
-    // They could be NetworkMessage events to be processed by the client following the handshake.
+    // They could be ServerMessage events to be processed by the client following the handshake.
     let consumed = resp.bytes.len() - resp_remainder.len();
     Ok(consumed)
 }

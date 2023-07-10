@@ -15,7 +15,7 @@ pub struct VersionBootstrapMessage {
 /// A serialized message sent from the server to a client.
 /// Changes to this signature likely require changing PROTOCOL_VERSION.
 #[derive(Debug, Deserialize, Serialize)]
-pub enum NetworkMessageV1 {
+pub enum ServerMessageV1 {
     /// Notification to client that stream has started or ended.
     /// This allows the client to init or clear any local state, or to indicate selection to the user.
     Switch(SwitchEventV1),
@@ -24,11 +24,11 @@ pub enum NetworkMessageV1 {
     Input(InputEventV1),
 }
 
-impl std::fmt::Display for NetworkMessageV1 {
+impl std::fmt::Display for ServerMessageV1 {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            NetworkMessageV1::Switch(e) => e.fmt(f),
-            NetworkMessageV1::Input(e) => e.fmt(f),
+            ServerMessageV1::Switch(e) => e.fmt(f),
+            ServerMessageV1::Input(e) => e.fmt(f),
         }
     }
 }
