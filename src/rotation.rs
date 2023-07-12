@@ -222,7 +222,7 @@ impl Rotation {
         }
     }
 
-    pub async fn send(&mut self, netmsg: messages::ServerMessage) -> Result<()> {
+    pub async fn send(&mut self, netmsg: messages::ServerMessage<'_>) -> Result<()> {
         if let Some(current_client) = &self.current_client {
             match self
                 .clients
@@ -274,7 +274,7 @@ impl Rotation {
 
 async fn send_client(
     send: &mut quinn::SendStream,
-    netmsg: messages::ServerMessage,
+    netmsg: messages::ServerMessage<'_>,
     buf: &mut Vec<u8>,
 ) -> Result<()> {
     // Serialize message data: postcard with cobs encoding for event framing

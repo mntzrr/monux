@@ -65,6 +65,12 @@ fn handle_messages(
             messages::ServerMessage::Input(input) => {
                 virtual_devices.add_event(input)?;
             }
+            messages::ServerMessage::ClipboardFetch(_fetch) => {
+                // TODO handle ClipboardFetch
+            }
+            messages::ServerMessage::ClipboardStore(_store) => {
+                // TODO handle ClipboardStore
+            }
         }
         offset += consumed;
     }
