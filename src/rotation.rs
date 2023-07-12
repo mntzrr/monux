@@ -59,6 +59,7 @@ impl Rotation {
                     self.set_current_client(None).await;
                 }
             }
+            // TODO if the client comes back in N seconds (quick disconnect/reconnect), maybe reactivate it automatically
             info!(
                 "Removed client {} from rotation: {:?}",
                 endpoint,
