@@ -27,7 +27,7 @@ pub async fn run_server(
                     let _result = rotation2
                         .lock()
                         .await
-                        .send(messages::ServerMessageV1::Input(evt))
+                        .send(messages::ServerMessage::Input(evt))
                         .await;
                 }
                 deviceinput::Event::SwitchNext => {

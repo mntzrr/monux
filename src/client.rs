@@ -49,7 +49,7 @@ fn handle_messages(
 ) -> Result<()> {
     while offset < bytes.len() {
         let (networkmsg, resp_remainder) =
-            postcard::take_from_bytes_cobs::<messages::ServerMessageV1>(&mut bytes[offset..])
+            postcard::take_from_bytes_cobs::<messages::ServerMessage>(&mut bytes[offset..])
                 .map_err(|e| anyhow!("Failed to deserialize message: {:?}", e))?;
         let consumed = resp_len - resp_remainder.len() - offset;
         trace!(
@@ -59,10 +59,10 @@ fn handle_messages(
             consumed
         );
         match networkmsg {
-            messages::ServerMessageV1::Switch(e) => {
+            messages::ServerMessage::Switch(e) => {
                 virtual_devices.switch(e.enabled)?;
             }
-            messages::ServerMessageV1::Input(input) => {
+            messages::ServerMessage::Input(input) => {
                 virtual_devices.add_event(input)?;
             }
         }

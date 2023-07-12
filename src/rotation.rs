@@ -123,7 +123,7 @@ impl Rotation {
             // Try to send switch{false} to last current_client.
             // If it fails then current_client is cleaned up.
             let _ = self
-                .send(messages::ServerMessageV1::Switch(messages::SwitchEventV1 {
+                .send(messages::ServerMessage::Switch(messages::SwitchEvent {
                     enabled: false,
                 }))
                 .await;
@@ -135,7 +135,7 @@ impl Rotation {
             // Try to send switch{true} to the newly assigned current_client.
             // If it fails then current_client is cleaned up.
             if let Ok(()) = self
-                .send(messages::ServerMessageV1::Switch(messages::SwitchEventV1 {
+                .send(messages::ServerMessage::Switch(messages::SwitchEvent {
                     enabled: true,
                 }))
                 .await
@@ -160,7 +160,7 @@ impl Rotation {
         }
     }
 
-    pub async fn send(&mut self, netmsg: messages::ServerMessageV1) -> Result<()> {
+    pub async fn send(&mut self, netmsg: messages::ServerMessage) -> Result<()> {
         if let Some(current_client) = &self.current_client {
             match self
                 .clients
@@ -212,7 +212,7 @@ impl Rotation {
 
 async fn send_client(
     send: &mut quinn::SendStream,
-    netmsg: messages::ServerMessageV1,
+    netmsg: messages::ServerMessage,
     buf: &mut Vec<u8>,
 ) -> Result<()> {
     // Serialize message data: postcard with cobs encoding for event framing

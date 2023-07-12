@@ -11,7 +11,7 @@ use crate::{deviceutil, messages};
 
 #[derive(Debug)]
 pub enum Event {
-    Input(messages::InputEventV1),
+    Input(messages::InputEvent),
     SwitchNext,
     SwitchPrev,
 }
@@ -193,10 +193,10 @@ async fn read_device_event(
     let event = if combo_next || combo_prev {
         // Combo has completed: User has pressed and released all of the combo keys (in any order)
         // Pass through the released event so that the key doesn't appear held down indefinitely for the switch
-        let orig_event = Event::Input(messages::InputEventV1 {
+        let orig_event = Event::Input(messages::InputEvent {
             target: device_info.target.clone(),
-            i32event: Some(messages::I32EventV1::from_evdev(event)),
-            f64event: None,
+            inputi32: Some(messages::InputI32::from_evdev(event)),
+            inputf64: None,
         });
         if let Err(e) = event_tx.send(orig_event).await {
             warn!("Error trying to send event to server for routing: {:?}", e);
@@ -218,10 +218,10 @@ async fn read_device_event(
             evdev::InputEventKind::AbsAxis(axis) => {
                 if let Some(axis_dims) = device_info.dims.get(&axis.0) {
                     // Apply scaling to [0.0, 1.0]
-                    Event::Input(messages::InputEventV1 {
+                    Event::Input(messages::InputEvent {
                         target: device_info.target.clone(),
-                        i32event: None,
-                        f64event: Some(messages::F64EventV1::from_evdev(
+                        inputi32: None,
+                        inputf64: Some(messages::InputF64::from_evdev(
                             event,
                             axis_dims.0,
                             axis_dims.1,
@@ -229,17 +229,17 @@ async fn read_device_event(
                     })
                 } else {
                     // No scaling for this axis
-                    Event::Input(messages::InputEventV1 {
+                    Event::Input(messages::InputEvent {
                         target: device_info.target.clone(),
-                        i32event: Some(messages::I32EventV1::from_evdev(event)),
-                        f64event: None,
+                        inputi32: Some(messages::InputI32::from_evdev(event)),
+                        inputf64: None,
                     })
                 }
             }
-            _ => Event::Input(messages::InputEventV1 {
+            _ => Event::Input(messages::InputEvent {
                 target: device_info.target.clone(),
-                i32event: Some(messages::I32EventV1::from_evdev(event)),
-                f64event: None,
+                inputi32: Some(messages::InputI32::from_evdev(event)),
+                inputf64: None,
             }),
         }
     };

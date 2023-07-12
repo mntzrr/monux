@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 /// The protocol version sent from the client to the server.
-/// If the message definitions below change, then this must change.
+/// This is compared on initial connection between client and server.
+/// If the message definitions below change, then this should change.
 pub const PROTOCOL_VERSION: u64 = 1;
 
 /// An initial handshake message sent from the client to the server, and from the server to the client.
@@ -15,64 +16,66 @@ pub struct VersionBootstrapMessage {
 /// A serialized message sent from the server to a client.
 /// Changes to this signature likely require changing PROTOCOL_VERSION.
 #[derive(Debug, Deserialize, Serialize)]
-pub enum ServerMessageV1 {
-    /// Notification to client that stream has started or ended.
-    /// This allows the client to init or clear any local state, or to indicate selection to the user.
-    Switch(SwitchEventV1),
+pub enum ServerMessage {
+    /// Notification to client that the input stream has started or ended.
+    /// This allows the client to init or clear any local state, or to indicate being selected to the user.
+    Switch(SwitchEvent),
 
-    /// An input event to be sent to a virtual device as indicated by the target.
-    Input(InputEventV1),
+    /// An input event to be written to a virtual device on the client as indicated by the target.
+    Input(InputEvent),
 }
 
-impl std::fmt::Display for ServerMessageV1 {
+impl std::fmt::Display for ServerMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            ServerMessageV1::Switch(e) => e.fmt(f),
-            ServerMessageV1::Input(e) => e.fmt(f),
+            ServerMessage::Switch(e) => e.fmt(f),
+            ServerMessage::Input(e) => e.fmt(f),
         }
     }
 }
 
-// SwitchEventV1
+// SwitchEvent
 
 /// Notifies the client that it should enable or disable its virtual devices for input.
 #[derive(Debug, Deserialize, Serialize)]
-pub struct SwitchEventV1 {
+pub struct SwitchEvent {
     pub enabled: bool,
 }
 
-impl std::fmt::Display for SwitchEventV1 {
+impl std::fmt::Display for SwitchEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(format!("SwitchEventV1(enabled={})", self.enabled).as_str())
+        f.write_str(format!("SwitchEvent(enabled={})", self.enabled).as_str())
     }
 }
 
-// InputEventV1
+// InputEvent
 
 /// An input event to be written to a virtual device indicated by the target.
 #[derive(Debug, Deserialize, Serialize)]
-pub struct InputEventV1 {
-    pub target: EventTargetV1,
-    pub i32event: Option<I32EventV1>,
-    pub f64event: Option<F64EventV1>,
+pub struct InputEvent {
+    pub target: EventTarget,
+    /// For discrete unscaled values.
+    pub inputi32: Option<InputI32>,
+    /// For continuous values. This is scaled from 0.0 to 1.0.
+    pub inputf64: Option<InputF64>,
 }
 
-impl std::fmt::Display for InputEventV1 {
+impl std::fmt::Display for InputEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let i32event = if let Some(evt) = &self.i32event {
-            format!(", i32event={}", evt)
+        let inputi32 = if let Some(evt) = &self.inputi32 {
+            format!(", inputi32={}", evt)
         } else {
             "".to_string()
         };
-        let f64event = if let Some(evt) = &self.f64event {
-            format!(", f64event={}", evt)
+        let inputf64 = if let Some(evt) = &self.inputf64 {
+            format!(", inputf64={}", evt)
         } else {
             "".to_string()
         };
         f.write_str(
             format!(
-                "InputEventV1(target={}{}{})",
-                self.target, i32event, f64event
+                "InputEvent(target={}{}{})",
+                self.target, inputi32, inputf64
             )
             .as_str(),
         )
@@ -82,7 +85,7 @@ impl std::fmt::Display for InputEventV1 {
 /// The device type where the event should be sent on the client.
 /// This maps to the virtual devices created by the client.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum EventTargetV1 {
+pub enum EventTarget {
     /// A keyboard device: events from uinput key devices (that aren't rel or abs) go here
     Keyboard,
     /// A mouse device: events from uinput rel devices go here
@@ -96,32 +99,32 @@ pub enum EventTargetV1 {
     // cursor to that coordinate location on screen.
 }
 
-impl std::fmt::Display for EventTargetV1 {
+impl std::fmt::Display for EventTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match &self {
-            EventTargetV1::Keyboard => f.write_str("Keyboard"),
-            EventTargetV1::Mouse => f.write_str("Mouse"),
-            EventTargetV1::Touchpad => f.write_str("Touchpad"),
+            EventTarget::Keyboard => f.write_str("Keyboard"),
+            EventTarget::Mouse => f.write_str("Mouse"),
+            EventTarget::Touchpad => f.write_str("Touchpad"),
         }
     }
 }
 
-// I32EventV1
+// InputI32
 
 /// Equivalent to a uinput event for the client to emit locally.
 /// Omits the timestamp since it isn't required.
 #[derive(Debug, Deserialize, Serialize)]
-pub struct I32EventV1 {
+pub struct InputI32 {
     pub type_: u16,
     pub code: u16,
     pub value: i32,
 }
 
-impl std::fmt::Display for I32EventV1 {
+impl std::fmt::Display for InputI32 {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(
             format!(
-                "I32EventV1(type={}, code={}, value={})",
+                "InputI32(type={}, code={}, value={})",
                 self.type_, self.code, self.value
             )
             .as_str(),
@@ -129,9 +132,9 @@ impl std::fmt::Display for I32EventV1 {
     }
 }
 
-impl I32EventV1 {
-    pub fn from_evdev(e: evdev::InputEvent) -> I32EventV1 {
-        I32EventV1 {
+impl InputI32 {
+    pub fn from_evdev(e: evdev::InputEvent) -> InputI32 {
+        InputI32 {
             type_: e.event_type().0,
             code: e.code(),
             value: e.value(),
@@ -143,23 +146,23 @@ impl I32EventV1 {
     }
 }
 
-// F64EventV1
+// InputF64
 
 /// Equivalent to a uinput event for the client to emit locally.
 /// Omits the timestamp since it isn't required.
 /// Used for absolute coordinates, with a scale of [0.0, 1.0] to be resized by the client.
 #[derive(Debug, Deserialize, Serialize)]
-pub struct F64EventV1 {
+pub struct InputF64 {
     pub type_: u16,
     pub code: u16,
     pub value: f64,
 }
 
-impl std::fmt::Display for F64EventV1 {
+impl std::fmt::Display for InputF64 {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(
             format!(
-                "F64EventV1(type={}, code={}, value={})",
+                "InputF64(type={}, code={}, value={})",
                 self.type_, self.code, self.value
             )
             .as_str(),
@@ -167,9 +170,9 @@ impl std::fmt::Display for F64EventV1 {
     }
 }
 
-impl F64EventV1 {
-    pub fn from_evdev(e: evdev::InputEvent, min: i32, max: i32) -> F64EventV1 {
-        F64EventV1 {
+impl InputF64 {
+    pub fn from_evdev(e: evdev::InputEvent, min: i32, max: i32) -> InputF64 {
+        InputF64 {
             type_: e.event_type().0,
             code: e.code(),
             // For example: min=-10, max=10, vali=5 -> valf=0.75

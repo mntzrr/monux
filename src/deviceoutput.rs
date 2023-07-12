@@ -35,20 +35,20 @@ impl VirtualDevices {
         })
     }
 
-    pub fn add_event(&mut self, net_event: messages::InputEventV1) -> Result<()> {
+    pub fn add_event(&mut self, net_event: messages::InputEvent) -> Result<()> {
         let (events, device) = match net_event.target {
-            messages::EventTargetV1::Keyboard => {
+            messages::EventTarget::Keyboard => {
                 (&mut self.keyboard_events, &mut self.keyboard_device)
             }
-            messages::EventTargetV1::Mouse => (&mut self.mouse_events, &mut self.mouse_device),
-            messages::EventTargetV1::Touchpad => {
+            messages::EventTarget::Mouse => (&mut self.mouse_events, &mut self.mouse_device),
+            messages::EventTarget::Touchpad => {
                 (&mut self.touchpad_events, &mut self.touchpad_device)
             }
         };
 
-        if let Some(e) = net_event.f64event {
+        if let Some(e) = net_event.inputf64 {
             events.push(e.to_evdev(SCALED_DIM_MIN, SCALED_DIM_MAX));
-        } else if let Some(e) = net_event.i32event {
+        } else if let Some(e) = net_event.inputi32 {
             if e.type_ == evdev::EventType::SYNCHRONIZATION.0 {
                 // If it's a sync event, then flush the queued events if any.
                 // We only do this queueing because VirtualDevice::emit() internally
