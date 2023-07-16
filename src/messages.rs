@@ -14,17 +14,28 @@ pub struct VersionBootstrapMessage {
 }
 
 /*
-OPTIONS:
-- active client immediately sends clipboard to server when an update occurs: less privacy and more bandwidth
-- active client sends clipboard when deactivated, either on request or automatically: DO THIS
-- active client sits on clipboard until asked by server on a future paste operation: probably can't intervene at time of paste
+message types:
+- ClipboardTypes: type announcement, bidirectional
+  - server tells newly activated client that clipboard is available, or no longer available
+  - client tells server that a copy has occurred (promiscuous, but small payload)
+- ClipboardContentRequest: data request from new client to server, and  server to old client
+- ClipboardContent: data response from old client to server, and server to new client
 
 TODO clipboard flow:
-- client watches clipboard via load_wait in a separate thread (just continuously regardless of active/inactive?)
-- when user copies something, client gets notified. client should only pay attention when active, saving it locally
-- when client is deactivated, client sends a clipboard update to server
-- server gets clipboard update from old active client and sends clipboard update to new active client
-- new active client store()s received clipboard content from server
+- client being activated: maybe recv ClipboardTypes from server, in which case clear any local data and advertise the types to x11
+- client being deactivated: in x11, clear ClipboardTypes previously received from server (stop advertising)
+- active client when copy occurs: save types/content into client (up to some limit), send ClipboardTypes to server immediately
+- active client when paste occurs: ClipboardContentRequest to server, read ClipboardContent from server
+- client receiving ClipboardContentRequest: send ClipboardContent
+
+- server receiving ClipboardTypes: keep track of the client that owns the data
+- server activating new client: send most recent ClipboardTypes to new client if available (or skip if not)
+- server receiving ClipboardContentRequest: send ClipboardContentRequest to clipboard client that last sent ClipboardTypes
+- server receiving ClipboardContent from clipboard client: send ClipboardContent to requesting client
+- server when clipboard client disconnects: send empty ClipboardTypes to active client
+
+NOTE: client shouldnt do anything to locally buffered data if local copy/paste occurs when deactivated
+NOTE: server may be a 'client' in local mode here
 */
 
 /// A serialized message sent from the server to a client.
@@ -46,7 +57,7 @@ pub enum ServerMessage<'a> {
     ClipboardStore(ClipboardContent<'a>),
 }
 
-impl <'a> std::fmt::Display for ServerMessage<'a> {
+impl<'a> std::fmt::Display for ServerMessage<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             ServerMessage::Switch(e) => e.fmt(f),
@@ -103,13 +114,7 @@ impl std::fmt::Display for InputEvent {
         } else {
             "".to_string()
         };
-        f.write_str(
-            format!(
-                "InputEvent(target={}{}{})",
-                self.target, inputi32, inputf64
-            )
-            .as_str(),
-        )
+        f.write_str(format!("InputEvent(target={}{}{})", self.target, inputi32, inputf64).as_str())
     }
 }
 
@@ -225,20 +230,23 @@ impl InputF64 {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ClipboardContent<'a> {
-    /// A mime type like image/png or text/plain;charset=utf-8
+    /// A mime type like one of the following:
+    /// - images: image/png, image/jpeg, image/webp
+    /// - text: text/plain, text/plain;charset=utf-8 (in X11, maps to STRING, TEXT, COMPOUND_TEXT, UTF8_STRING)
     pub mimetype: &'a str,
     /// The raw byte content for the given mimetype
     pub content: &'a [u8],
 }
 
-impl <'a> std::fmt::Display for ClipboardContent<'a> {
+impl<'a> std::fmt::Display for ClipboardContent<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(
             format!(
                 "ClipboardContentRequest(mimetype={}, content=({} bytes))",
                 self.mimetype,
                 self.content.len(),
-            ).as_str(),
+            )
+            .as_str(),
         )
     }
 }
@@ -247,15 +255,18 @@ impl <'a> std::fmt::Display for ClipboardContent<'a> {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ClipboardFetchRequest {
-    // No options for now, might specify supported mime types later
+    /// Request that the client not return clipboards which are larger than this size
+    pub max_size_bytes: u64,
 }
 
 impl std::fmt::Display for ClipboardFetchRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(
             format!(
-                "ClipboardFetchRequest()"
-            ).as_str(),
+                "ClipboardFetchRequest(max_size_bytes={})",
+                self.max_size_bytes,
+            )
+            .as_str(),
         )
     }
 }
@@ -269,13 +280,8 @@ pub struct ClipboardFetchResponse<'a> {
     pub content: Option<ClipboardContent<'a>>,
 }
 
-impl <'a> std::fmt::Display for ClipboardFetchResponse<'a> {
+impl<'a> std::fmt::Display for ClipboardFetchResponse<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(
-            format!(
-                "ClipboardFetchResponse(content={:?})",
-                self.content,
-            ).as_str(),
-        )
+        f.write_str(format!("ClipboardFetchResponse(content={:?})", self.content,).as_str())
     }
 }

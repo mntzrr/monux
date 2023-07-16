@@ -109,9 +109,9 @@ impl Rotation {
             if let Some(current_client) = self.current_client {
                 if current_client == endpoint {
                     // Current client is being removed. If it comes back soon, we can mark it current again.
-                    self.removed_current_client = Some(DefunctClientInfo{
+                    self.removed_current_client = Some(DefunctClientInfo {
                         endpoint: current_client,
-                        removed_at: Instant::now()
+                        removed_at: Instant::now(),
                     });
                     // Ensure ungrab is done!
                     self.set_current_client(None).await;

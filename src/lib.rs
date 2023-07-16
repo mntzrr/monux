@@ -6,6 +6,7 @@ pub mod deviceutil;
 pub mod devicewatch;
 pub mod logging;
 pub mod server;
+pub mod x11clipboard;
 
 mod certs;
 mod messages;

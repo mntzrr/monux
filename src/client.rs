@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use quinn::SendStream;
 use tracing::{info, trace};
 
 use crate::{approval, deviceoutput, messages, transport};
@@ -30,18 +31,17 @@ pub async fn run_client(
         let resp = recv
             .read_chunk(1024, true)
             .await
-            .context(
-                "Failed reading events from server, does server need to approve this connection?",
-            )?
+            .context("Lost connection, does server need to approve this connection?")?
             .context("Server closed connection")?;
         trace!("Received {} bytes: {:X?}", resp.bytes.len(), &*resp.bytes);
         // Copy the immutable response data into a mutable buffer
         bytes.extend_from_slice(&*resp.bytes);
-        handle_messages(0, &mut bytes, resp.bytes.len(), virtual_devices)?;
+        handle_messages(&mut send, 0, &mut bytes, resp.bytes.len(), virtual_devices)?;
     }
 }
 
 fn handle_messages(
+    _todo_send_clipboard_on_fetch: &mut SendStream,
     mut offset: usize,
     bytes: &mut Vec<u8>,
     resp_len: usize,

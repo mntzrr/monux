@@ -1,59 +1,62 @@
-use std::time::Duration;
-
 use anyhow::Result;
-use tracing::{info, warn};
-use x11_clipboard::Clipboard;
+use async_std::task;
+use tracing::{error, info};
 
-use nikau::logging;
+use nikau::{logging, x11clipboard};
 
 fn main() -> Result<()> {
     logging::init_logging();
 
-    let mut clipboard = Clipboard::new()?;
-    if let Err(e) = x11_fetch(&mut clipboard) {
-        warn!("x11 fetch failed: {:?}", e);
-    }
-    if let Err(e) = x11_store(&mut clipboard) {
-        warn!("x11 store failed, skipping x11 fetch: {:?}", e);
-    }
-    if let Err(e) = x11_fetch(&mut clipboard) {
-        warn!("x11 fetch failed: {:?}", e);
-    }
+    task::block_on(async {
+        if let Err(e) = do_thing().await {
+            error!("failed: {}", e);
+        }
+    });
 
     Ok(())
 }
 
-fn x11_store(clipboard: &mut Clipboard) -> Result<()> {
-    let val = "Hello xorg";
-    clipboard.store(
-        clipboard.setter.atoms.primary,
-        clipboard.setter.atoms.utf8_string,
-        val.clone(),
-    )?;
-    clipboard.store(
-        clipboard.setter.atoms.clipboard,
-        clipboard.setter.atoms.utf8_string,
-        val,
-    )?;
-    info!("stored");
+async fn do_thing() -> Result<()> {
+    let mut reader = x11clipboard::reader::ClipboardReader::new().await?;
+    let kind = "UTF8_STRING";
+    let mut writer = x11clipboard::writer::ClipboardWriter::new().await?;
+    let store_val = "hello xorg";
+
+    x11_fetch(&mut reader, kind).await?;
+    x11_store(&mut writer, "UTF8_STRING", store_val).await?;
+    x11_fetch(&mut reader, kind).await?;
     Ok(())
 }
 
-fn x11_fetch(clipboard: &mut Clipboard) -> Result<()> {
-    let val = clipboard.load(
-        clipboard.setter.atoms.primary,
-        clipboard.setter.atoms.utf8_string,
-        clipboard.setter.atoms.property,
-        Duration::from_secs(3),
-    )?;
-    info!("x11 fetch primary: {}", String::from_utf8_lossy(&val));
+async fn x11_store(
+    clipboard: &mut x11clipboard::writer::ClipboardWriter,
+    kind: &str,
+    val: &str,
+) -> Result<()> {
+    clipboard.store([kind.to_string()], val).await?;
+    info!("stored sample into clipboard");
+    Ok(())
+}
 
-    let val = clipboard.load(
-        clipboard.setter.atoms.clipboard,
-        clipboard.setter.atoms.utf8_string,
-        clipboard.setter.atoms.property,
-        Duration::from_secs(3),
-    )?;
-    info!("x11 fetch clipboard: {}", String::from_utf8_lossy(&val));
+async fn x11_fetch(
+    clipboard: &mut x11clipboard::reader::ClipboardReader,
+    kind: &str,
+) -> Result<()> {
+    info!("waiting for new clipboard content...");
+    let types = clipboard.types_wait().await?;
+    if types.contains(&"image/png".to_string()) {
+        info!("sweet");
+    }
+    info!("x11 clipboard types: {:?}", types);
+    let val = clipboard.read(kind, false).await?;
+    if val.len() > 256 {
+        info!("x11 fetch clipboard: {} bytes", val.len());
+    } else {
+        info!(
+            "x11 fetch clipboard: {} bytes: [{}]",
+            val.len(),
+            String::from_utf8_lossy(&val)
+        );
+    }
     Ok(())
 }
