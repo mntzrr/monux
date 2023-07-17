@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Result};
-use tracing::warn;
+use tracing::debug;
 use x11rb_async::connection::Connection;
 use x11rb_async::protocol::xproto::{Atom, AtomEnum, ConnectionExt, Property, Time};
 use x11rb_async::protocol::{xfixes, Event};
@@ -23,7 +23,7 @@ impl ClipboardReader {
         let mut is_incr = false;
         loop {
             let event = self.context.conn.wait_for_event().await?;
-            warn!("X11 reader event: {:?}", event);
+            debug!("X11 reader event: {:?}", event);
 
             match event {
                 Event::XfixesSelectionNotify(event) => {
@@ -130,7 +130,7 @@ impl ClipboardReader {
     }
 
     pub async fn types_wait(&mut self) -> Result<Vec<String>> {
-        let buf = self.read_wait(self.atoms.targets, false).await?;
+        let buf = self.read_wait(self.atoms.targets).await?;
         let mut atom_names = Vec::new();
         for atom in to_atoms(&buf)? {
             atom_names.push(self.atoms.to_name(&self.context.conn, atom).await?);
@@ -138,15 +138,15 @@ impl ClipboardReader {
         Ok(atom_names)
     }
 
-    pub async fn read(&mut self, kind: &str, delete: bool) -> Result<Vec<u8>> {
-        let kind_atom = self.atoms.to_atom(&self.context.conn, kind).await?;
+    pub async fn read(&mut self, type_: &str) -> Result<Vec<u8>> {
+        let type_atom = self.atoms.to_atom(&self.context.conn, type_).await?;
 
         self.context
             .conn
             .convert_selection(
                 self.context.window,
                 self.atoms.clipboard,
-                kind_atom,
+                type_atom,
                 self.atoms.recv_clipboard,
                 Time::CURRENT_TIME,
             )
@@ -155,20 +155,20 @@ impl ClipboardReader {
             .await?;
 
         let mut buf = Vec::new();
-        self.process_event(&mut buf, kind_atom, self.atoms.recv_clipboard)
+        self.process_event(&mut buf, type_atom, self.atoms.recv_clipboard)
             .await?;
-        if delete {
-            self.context
-                .conn
-                .delete_property(self.context.window, self.atoms.recv_clipboard)
-                .await?
-                .check()
-                .await?;
-        }
+
+        self.context
+            .conn
+            .delete_property(self.context.window, self.atoms.recv_clipboard)
+            .await?
+            .check()
+            .await?;
+
         Ok(buf)
     }
 
-    async fn read_wait(&self, target: Atom, delete: bool) -> Result<Vec<u8>> {
+    async fn read_wait(&self, target: Atom) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
 
         let screen = &self
@@ -202,14 +202,12 @@ impl ClipboardReader {
         self.process_event(&mut buf, target, self.atoms.recv_clipboard)
             .await?;
 
-        if delete {
-            self.context
-                .conn
-                .delete_property(self.context.window, self.atoms.recv_clipboard)
-                .await?
-                .check()
-                .await?;
-        }
+        self.context
+            .conn
+            .delete_property(self.context.window, self.atoms.recv_clipboard)
+            .await?
+            .check()
+            .await?;
 
         Ok(buf)
     }

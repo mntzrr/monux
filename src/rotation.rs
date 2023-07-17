@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use quinn::SendStream;
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{devicewatch, messages};
 
@@ -14,7 +14,7 @@ const REMOVED_CLIENT_RECOVERY_LIMIT: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 struct ClientInfo {
     endpoint: SocketAddr,
-    send: SendStream,
+    events_send: SendStream,
 }
 
 #[derive(Debug)]
@@ -59,13 +59,13 @@ impl Rotation {
         }
     }
 
-    pub async fn add_client(&mut self, endpoint: SocketAddr, send: SendStream) {
+    pub async fn add_client(&mut self, endpoint: SocketAddr, events_send: SendStream, bulk_send: SendStream) {
         // Sort clients by their endpoints as an arbitrary consistent order across sessions
         let idx = match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
             Ok(idx) => idx,
             Err(idx) => idx,
         };
-        self.clients.insert(idx, ClientInfo { endpoint, send });
+        self.clients.insert(idx, ClientInfo { endpoint, events_send });
 
         info!(
             "Added client {} to rotation: {:?}",
@@ -104,31 +104,35 @@ impl Rotation {
     }
 
     pub async fn remove_client(&mut self, endpoint: SocketAddr) {
-        if let Ok(idx) = self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
-            self.clients.remove(idx);
-            if let Some(current_client) = self.current_client {
-                if current_client == endpoint {
-                    // Current client is being removed. If it comes back soon, we can mark it current again.
-                    self.removed_current_client = Some(DefunctClientInfo {
-                        endpoint: current_client,
-                        removed_at: Instant::now(),
-                    });
-                    // Ensure ungrab is done!
-                    self.set_current_client(None).await;
-                }
+        let idx = match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
+            Ok(idx) => idx,
+            Err(_e) => {
+                // Noop. Can happen if we're cleaning up for a client that wasn't added yet.
+                debug!("Client {} not found in rotation", endpoint);
+                return;
             }
-            info!(
-                "Removed client {} from rotation: {:?}",
-                endpoint,
-                self.clients
-                    .iter()
-                    .map(|c| c.endpoint)
-                    .collect::<Vec<SocketAddr>>()
-            );
-        } else {
-            // Shouldn't happen
-            warn!("Client {} not found in rotation", endpoint);
+        };
+
+        self.clients.remove(idx);
+        if let Some(current_client) = self.current_client {
+            if current_client == endpoint {
+                // Current client is being removed. If it comes back soon, we can mark it current again.
+                self.removed_current_client = Some(DefunctClientInfo {
+                    endpoint: current_client,
+                    removed_at: Instant::now(),
+                });
+                // Ensure ungrab is done!
+                self.set_current_client(None).await;
+            }
         }
+        info!(
+            "Removed client {} from rotation: {:?}",
+            endpoint,
+            self.clients
+                .iter()
+                .map(|c| c.endpoint)
+                .collect::<Vec<SocketAddr>>()
+        );
     }
 
     pub async fn prev_client(&mut self) {
@@ -176,6 +180,24 @@ impl Rotation {
         }
     }
 
+    pub async fn clipboard_update_source(&mut self, source: Option<SocketAddr>, types: Vec<String>) {
+        // TODO:
+        // - send types to active client now (or to local x11 if local)
+        // - automatically send types to future active clients (or to local x11 if using local)
+        // - keep track of source for serving clipboard requests
+    }
+
+    pub async fn clipboard_request_content(&mut self, source: Option<SocketAddr>, type_: &str, max_size_bytes: u64) {
+        // TODO:
+        // - send query to the last clipboard_update_source(source) (or read from local x11 if it was local)
+        // - keep track of the outstanding request for sending the data back to that client via their bulk_send
+    }
+
+    pub async fn clipboard_send_content(&mut self, type_: &str, content: &[u8]) {
+        // TODO:
+        // - provide to local X11 if request was local, or send to the last requesting client via their bulk_send
+    }
+
     async fn update_current_client(&mut self, new_client: Option<SocketAddr>) {
         // Either we automatically reenabled a client, or the user manually did.
         // In either case, clear up any history of previously enabled clients.
@@ -185,7 +207,7 @@ impl Rotation {
             // Try to send switch{false} to last current_client.
             // If it fails then current_client is cleaned up.
             let _ = self
-                .send(messages::ServerMessage::Switch(messages::SwitchEvent {
+                .send_event(messages::ServerMessage::Switch(messages::SwitchEvent {
                     enabled: false,
                 }))
                 .await;
@@ -197,7 +219,7 @@ impl Rotation {
             // Try to send switch{true} to the newly assigned current_client.
             // If it fails then current_client is cleaned up.
             if let Ok(()) = self
-                .send(messages::ServerMessage::Switch(messages::SwitchEvent {
+                .send_event(messages::ServerMessage::Switch(messages::SwitchEvent {
                     enabled: true,
                 }))
                 .await
@@ -222,35 +244,38 @@ impl Rotation {
         }
     }
 
-    pub async fn send(&mut self, netmsg: messages::ServerMessage<'_>) -> Result<()> {
-        if let Some(current_client) = &self.current_client {
-            match self
-                .clients
-                .binary_search_by(|c| c.endpoint.cmp(&current_client))
-            {
-                Ok(idx) => {
-                    let send = &mut self
-                        .clients
-                        .get_mut(idx)
-                        .expect("missing current_client")
-                        .send;
-                    if let Err(e) = send_client(send, netmsg, &mut self.buf).await {
-                        info!(
-                            "Client {} has disconnected, switching to local machine: {:?}",
-                            current_client, e
-                        );
-                        // Client is dead, remove it and switch to local machine
-                        self.clients.remove(idx);
-                        self.set_current_client(None).await;
-                        return Err(e);
-                    }
-                }
-                Err(_idx) => {
-                    // Shouldn't happen
-                    warn!("Current client is not found in clients map");
+    pub async fn send_event(&mut self, msg: messages::ServerMessage<'_>) -> Result<()> {
+        let current_client = match &self.current_client {
+            Some(client) => client,
+            None => return Ok(()),
+        };
+
+        match self
+            .clients
+            .binary_search_by(|c| c.endpoint.cmp(&current_client))
+        {
+            Ok(idx) => {
+                let events_send = &mut self
+                    .clients
+                    .get_mut(idx)
+                    .expect("missing current_client")
+                    .events_send;
+                if let Err(e) = send_event_to_client(events_send, msg, &mut self.buf).await {
+                    info!(
+                        "Client {} has disconnected, switching to local machine: {:?}",
+                        current_client, e
+                    );
+                    // Client is dead, remove it and switch to local machine
+                    self.clients.remove(idx);
                     self.set_current_client(None).await;
+                    return Err(e);
                 }
-            };
+            }
+            Err(_idx) => {
+                // Shouldn't happen
+                warn!("Current client is not found in clients map");
+                self.set_current_client(None).await;
+            }
         }
         Ok(())
     }
@@ -272,20 +297,20 @@ impl Rotation {
     }
 }
 
-async fn send_client(
-    send: &mut quinn::SendStream,
-    netmsg: messages::ServerMessage<'_>,
+async fn send_event_to_client(
+    events_send: &mut quinn::SendStream,
+    msg: messages::ServerMessage<'_>,
     buf: &mut Vec<u8>,
 ) -> Result<()> {
     // Serialize message data: postcard with cobs encoding for event framing
-    let serializedmsg = postcard::to_slice_cobs(&netmsg, buf)
-        .map_err(|e| anyhow!("Failed to serialize message: {:?}", e))?;
+    let serializedmsg = postcard::to_slice_cobs(&msg, buf)
+        .map_err(|e| anyhow!("Failed to serialize event message: {:?}", e))?;
     trace!(
         "Sending {} byte event: {:X?}",
         serializedmsg.len(),
         &serializedmsg
     );
-    send.write_all(&serializedmsg)
+    events_send.write_all(&serializedmsg)
         .await
-        .context("Failed to send network message")
+        .context("Failed to send event message")
 }
