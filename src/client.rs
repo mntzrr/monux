@@ -3,7 +3,7 @@ use std::pin::pin;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use futures::{select, FutureExt};
+use futures::{select, FutureExt, StreamExt};
 use quinn::SendStream;
 use tracing::{info, trace};
 
@@ -21,22 +21,49 @@ pub async fn run_client(
         .connect(server_addr.clone(), "__ignored__")?
         .await?;
     info!("Connected to server: {}", conn.remote_address());
-    let (mut events_send, mut events_recv) = conn.open_bi().await.context("Failed to initialize events stream")?;
-    let mut bulk_bytes = Vec::with_capacity(1024); // TODO 64k here and in read_chunk below
-    let mut event_bytes = Vec::with_capacity(1024);
+    let (mut events_send, mut events_recv) = conn
+        .open_bi()
+        .await
+        .context("Failed to initialize events stream")?;
 
     // Send version to server, who will close the connection if they can't support it.
+    let mut event_bytes = Vec::with_capacity(1024);
     transport::send_version(&mut events_send, &mut event_bytes).await?;
 
-    let (mut bulk_send, mut bulk_recv) = conn.open_bi().await.context("Failed to initialize bulk stream")?;
+    let (mut bulk_send, mut bulk_recv) = conn
+        .open_bi()
+        .await
+        .context("Failed to initialize bulk stream")?;
 
-    let clipboard_writer = x11clipboard::writer::ClipboardWriter::new().await;
+    let (fetch_tx, mut fetch_rx) = async_channel::bounded(32);
+    let clipboard_writer = x11clipboard::writer::ClipboardWriter::new(fetch_tx).await?;
 
+    let mut bulk_recv_bytes = Vec::with_capacity(1024); // TODO 65536 here and below once chunking is known-good
+    let mut clipboard: Option<x11clipboard::ClipboardData> = None;
     info!("Waiting to be activated by server...");
     loop {
-        let mut bulk_fut = pin!(bulk_recv.read_chunk(1024, true).fuse());
+        // TODO is there a race condition where both of these read a chunk but we only get one of them?
         let mut event_fut = pin!(events_recv.read_chunk(1024, true).fuse());
+        let mut bulk_fut = pin!(bulk_recv.read_chunk(1024, true).fuse());
         select! {
+            fetch_request = fetch_rx.next() => {
+                if let Some(fetch_request) = fetch_request {
+                    let msg = messages::BulkMessage::ClipboardContentRequest(messages::ClipboardContentRequest{
+                        type_: &fetch_request.desired_type,
+                        max_size_bytes: 1048576, // TODO configurable
+                    });
+                    let serializedmsg = postcard::to_slice_cobs(&msg, &mut event_bytes)
+                        .map_err(|e| anyhow!("Failed to serialize clipboard request message: {:?}", e))?;
+                    trace!(
+                        "Sending {} byte event: {:X?}",
+                        serializedmsg.len(),
+                        &serializedmsg
+                    );
+                    bulk_send.write_all(&serializedmsg)
+                        .await
+                        .context("Failed to send clipboard request message")?;
+                }
+            },
             event_result = event_fut => {
                 // Incoming data may contain one or more messages, but I've never seen fragments of messages.
                 let resp = event_result
@@ -53,11 +80,35 @@ pub async fn run_client(
                     .context("Lost server bulk connection, does server need to approve our fingerprint?")?
                     .context("Server closed bulk connection")?;
                 trace!("Received {} bytes from bulk stream: {:X?}", resp.bytes.len(), &*resp.bytes);
-                // Copy the immutable response data into a mutable buffer
-                // TODO data will likely be coming in fragmented, need to accumulate before passing to handle (and then maybe reuse the logic elsewhere)
-                bulk_bytes.extend_from_slice(&*resp.bytes);
-                handle_bulk_messages(&mut bulk_send, &mut bulk_bytes)?;
-                event_bytes.clear();
+                if let Some(c) = &mut clipboard {
+                    if c.remaining_bytes >= resp.bytes.len() {
+                        // Chunk is all clipboard data.
+                        c.data.extend_from_slice(&*resp.bytes);
+                        c.remaining_bytes -= resp.bytes.len();
+                    } else {
+                        // Chunk contains additional data past the clipboard entry.
+                        c.data.extend_from_slice(&(*resp.bytes)[..c.remaining_bytes]);
+                        bulk_recv_bytes.extend_from_slice(&(*resp.bytes)[c.remaining_bytes..]);
+                        c.remaining_bytes = 0;
+                    }
+
+                    if c.remaining_bytes == 0 {
+                        // Clipboard data is all accumulated, flush and clear
+                        clipboard_writer.store_data(clipboard.take().expect("missing clipboard")).await?;
+                    }
+
+                    if bulk_recv_bytes.len() > 0 {
+                        // Handle any data following the clipboard entry.
+                        // Hopefully it's not fragmented too since we don't really support that
+                        clipboard = handle_bulk_messages(&mut bulk_send, &mut bulk_recv_bytes, &clipboard_writer).await?;
+                        bulk_recv_bytes.clear();
+                    }
+                } else {
+                    // Copy the immutable response data into a mutable buffer
+                    bulk_recv_bytes.extend_from_slice(&*resp.bytes);
+                    clipboard = handle_bulk_messages(&mut bulk_send, &mut bulk_recv_bytes, &clipboard_writer).await?;
+                    bulk_recv_bytes.clear();
+                }
             },
         }
     }
@@ -73,7 +124,7 @@ fn handle_event_messages(
     while offset < bytes.len() {
         let (msg, resp_remainder) =
             postcard::take_from_bytes_cobs::<messages::ServerMessage>(&mut bytes[offset..])
-                .map_err(|e| anyhow!("Failed to deserialize message: {:?}", e))?;
+                .map_err(|e| anyhow!("Failed to deserialize server message: {:?}", e))?;
         let consumed = bytes_len - resp_remainder.len() - offset;
         trace!(
             "Consumed event at offset={}: {} ({} bytes)",
@@ -100,16 +151,17 @@ fn handle_event_messages(
     Ok(())
 }
 
-fn handle_bulk_messages(
+async fn handle_bulk_messages(
     _todo_bulk_send: &mut SendStream,
     bytes: &mut Vec<u8>,
-) -> Result<()> {
+    clipboard_writer: &x11clipboard::writer::ClipboardWriter,
+) -> Result<Option<x11clipboard::ClipboardData>> {
     let mut offset = 0;
     let bytes_len = bytes.len();
-    while offset < bytes.len() {
+    while offset < bytes_len {
         let (msg, resp_remainder) =
             postcard::take_from_bytes_cobs::<messages::BulkMessage>(&mut bytes[offset..])
-                .map_err(|e| anyhow!("Failed to deserialize message: {:?}", e))?;
+                .map_err(|e| anyhow!("Failed to deserialize bulk message: {:?}", e))?;
         let consumed = bytes_len - resp_remainder.len() - offset;
         trace!(
             "Consumed event at offset={}: {} ({} bytes)",
@@ -117,15 +169,38 @@ fn handle_bulk_messages(
             msg,
             consumed
         );
+        offset += consumed;
+
         match msg {
             messages::BulkMessage::ClipboardContentRequest(c) => {
                 // TODO get from X11, send back via bulk_send
             }
             messages::BulkMessage::ClipboardContentHeader(c) => {
-                // TODO provide to X11
+                if c.content_bytes as usize <= resp_remainder.len() {
+                    // The clipboard content fits fully within resp_remainder
+                    // Mark content as consumed and continue looping in case another message follows?
+                    let mut data = Vec::with_capacity(c.content_bytes as usize);
+                    data.extend_from_slice(&resp_remainder[..c.content_bytes as usize]);
+                    let d = x11clipboard::ClipboardData {
+                        type_: c.type_.to_string(),
+                        data,
+                        remaining_bytes: 0,
+                    };
+                    clipboard_writer.store_data(d).await?;
+                    offset += c.content_bytes as usize;
+                } else {
+                    // Need to collect more data.
+                    // TODO enforce a limit on content_bytes
+                    let mut data = Vec::with_capacity(c.content_bytes as usize);
+                    data.extend_from_slice(resp_remainder);
+                    return Ok(Some(x11clipboard::ClipboardData {
+                        type_: c.type_.to_string(),
+                        data,
+                        remaining_bytes: c.content_bytes as usize - resp_remainder.len(),
+                    }));
+                }
             }
         }
-        offset += consumed;
     }
-    Ok(())
+    Ok(None)
 }

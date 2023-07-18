@@ -257,13 +257,7 @@ pub struct ClipboardTypes<'a> {
 
 impl<'a> std::fmt::Display for ClipboardTypes<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(
-            format!(
-                "ClipboardTypes(types=[{}])",
-                self.types,
-            )
-            .as_str(),
-        )
+        f.write_str(format!("ClipboardTypes(types=[{}])", self.types,).as_str())
     }
 }
 
@@ -306,8 +300,7 @@ impl<'a> std::fmt::Display for ClipboardContentHeader<'a> {
         f.write_str(
             format!(
                 "ClipboardContentHeader(type={}, content_bytes={})",
-                self.type_,
-                self.content_bytes,
+                self.type_, self.content_bytes,
             )
             .as_str(),
         )

@@ -59,13 +59,24 @@ impl Rotation {
         }
     }
 
-    pub async fn add_client(&mut self, endpoint: SocketAddr, events_send: SendStream, bulk_send: SendStream) {
+    pub async fn add_client(
+        &mut self,
+        endpoint: SocketAddr,
+        events_send: SendStream,
+        bulk_send: SendStream,
+    ) {
         // Sort clients by their endpoints as an arbitrary consistent order across sessions
         let idx = match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
             Ok(idx) => idx,
             Err(idx) => idx,
         };
-        self.clients.insert(idx, ClientInfo { endpoint, events_send });
+        self.clients.insert(
+            idx,
+            ClientInfo {
+                endpoint,
+                events_send,
+            },
+        );
 
         info!(
             "Added client {} to rotation: {:?}",
@@ -180,14 +191,23 @@ impl Rotation {
         }
     }
 
-    pub async fn clipboard_update_source(&mut self, source: Option<SocketAddr>, types: Vec<String>) {
+    pub async fn clipboard_update_source(
+        &mut self,
+        source: Option<SocketAddr>,
+        types: Vec<String>,
+    ) {
         // TODO:
         // - send types to active client now (or to local x11 if local)
         // - automatically send types to future active clients (or to local x11 if using local)
         // - keep track of source for serving clipboard requests
     }
 
-    pub async fn clipboard_request_content(&mut self, source: Option<SocketAddr>, type_: &str, max_size_bytes: u64) {
+    pub async fn clipboard_request_content(
+        &mut self,
+        source: Option<SocketAddr>,
+        type_: &str,
+        max_size_bytes: u64,
+    ) {
         // TODO:
         // - send query to the last clipboard_update_source(source) (or read from local x11 if it was local)
         // - keep track of the outstanding request for sending the data back to that client via their bulk_send
@@ -310,7 +330,8 @@ async fn send_event_to_client(
         serializedmsg.len(),
         &serializedmsg
     );
-    events_send.write_all(&serializedmsg)
+    events_send
+        .write_all(&serializedmsg)
         .await
         .context("Failed to send event message")
 }

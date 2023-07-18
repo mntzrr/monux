@@ -1,8 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use async_lock::{Barrier, Mutex};
 use async_std::task;
 use futures::{select, FutureExt, StreamExt};
 use tracing::{debug, info, warn};
@@ -14,101 +12,93 @@ use x11rb_async::protocol::xproto::{
 use x11rb_async::protocol::Event;
 use x11rb_async::rust_connection::RustConnection;
 
-use crate::x11clipboard::shared;
+use crate::x11clipboard::{shared, ClipboardData};
 
 /// A fetch request, and a path for sending the response.
 pub struct ClipboardFetch {
+    /// The type that we want
     pub desired_type: String,
-    /// Barrier to wait for the result to appear. The requestor should wait on this before accessing result.
-    pub result_barrier: Arc<Barrier>,
-    /// Where the result should go.
-    pub result: Arc<Mutex<Option<Result<Option<ResolvedClipboardData>>>>>,
-}
-
-pub struct ResolvedClipboardData {
-    /// The type that this data is associated with
-    pub type_: String,
-
-    /// The retrieved data
-    pub data: Vec<u8>,
 }
 
 pub struct ClipboardWriter {
-    /// Push: available clipboard types, advertised by server
+    /// Send available clipboard types, advertised by server
     types_tx: async_channel::Sender<Vec<String>>,
+    /// Send clipboard content for one of the previously advertised types
+    data_tx: async_channel::Sender<ClipboardData>,
 }
 
 impl ClipboardWriter {
-    pub async fn new() -> Result<(Self, async_channel::Receiver<ClipboardFetch>)> {
+    pub async fn new(fetch_tx: async_channel::Sender<ClipboardFetch>) -> Result<Self> {
         let context = shared::XContext::new().await?;
         let (types_tx, types_rx) = async_channel::bounded(32);
-        let (fetch_tx, fetch_rx) = async_channel::bounded(32);
+        let (data_tx, data_rx) = async_channel::bounded(32);
         task::spawn(async move {
-            let mut clipboard_server = ClipboardServer{ context, types_rx, fetch_tx };
-            if let Err(e) = clipboard_server.serve().await {
+            if let Err(e) = serve(context, types_rx, fetch_tx, data_rx).await {
                 warn!("clipboard server died: {}", e);
             }
         });
-        Ok((ClipboardWriter { types_tx }, fetch_rx))
+        Ok(ClipboardWriter { types_tx, data_tx })
     }
 
     /// Advertises with X11 that we have a new clipboard entry available
     pub async fn store_types<K: Into<Vec<String>>>(&self, types: K) -> Result<()> {
-        self.types_tx
-            .send(types.into())
-            .await?;
+        self.types_tx.send(types.into()).await?;
+        Ok(())
+    }
+
+    pub async fn store_data(&self, data: ClipboardData) -> Result<()> {
+        // TODO check if we're expecting a fetch. discard the data if not
+        self.data_tx.send(data).await?;
         Ok(())
     }
 }
 
-struct ClipboardServer {
+async fn serve(
     context: shared::XContext,
-    /// Push: available clipboard types, advertised by server
-    types_rx: async_channel::Receiver<Vec<String>>,
-    /// Pull: get clipboard content for one of the previously advertised types
+    // Receive available clipboard types, advertised by server
+    mut types_rx: async_channel::Receiver<Vec<String>>,
+    // Request clipboard content for one of the types received to types_rx
     fetch_tx: async_channel::Sender<ClipboardFetch>,
-}
-
-impl ClipboardServer {
-    async fn serve(&mut self) -> Result<()> {
-        let mut state = ClipboardServerState::new(&self.context.conn).await?;
-        loop {
-            let mut event_wait_fused = self.context.conn.wait_for_event().fuse();
-            select! {
-                clipboard_types = self.types_rx.next() => {
-                    info!("Got new clipboard types: {:?}", clipboard_types);
-                    // New (or cleared) clipboard: Update types, and clear any prior clipboard data
-                    if let Some(clipboard_types) = clipboard_types {
-                        if clipboard_types.is_empty() {
-                            // Treat empty types as a clipboard clear
-                            state.clipboard_types = None;
-                        } else {
-                            let mut type_atoms = Vec::with_capacity(clipboard_types.len());
-                            for type_ in clipboard_types {
-                                type_atoms.push((state.atoms.to_atom(&self.context.conn, &type_).await?, type_));
-                            }
-                            state.clipboard_types = Some(type_atoms);
-                        }
-                    } else {
+    // Receive clipboard content in response to a fetch_tx query
+    mut data_rx: async_channel::Receiver<ClipboardData>,
+) -> Result<()> {
+    let mut state = ClipboardServerState::new(&context.conn).await?;
+    loop {
+        let mut event_wait_fused = context.conn.wait_for_event().fuse();
+        select! {
+            clipboard_types = types_rx.next() => {
+                info!("Got new clipboard types: {:?}", clipboard_types);
+                // New (or cleared) clipboard: Update types, and clear any prior clipboard data
+                if let Some(clipboard_types) = clipboard_types {
+                    if clipboard_types.is_empty() {
+                        // Treat empty types as a clipboard clear
                         state.clipboard_types = None;
-                    }
-                    state.clipboard_data = None;
-
-                    if state.clipboard_types.is_some() {
-                        // Advertise the new clipboard to X11
-                        self.context.conn.set_selection_owner(
-                            self.context.window,
-                            state.atoms.clipboard,
-                            Time::CURRENT_TIME
-                        ).await?.check().await?;
-                    }
-                },
-                event = event_wait_fused => {
-                    if let Ok(event) = event {
-                        if let Err(e) = state.handle_event(event, &self.context, &self.fetch_tx).await {
-                            warn!("X11 event handling failed: {:?}", e);
-                            // keep going...
+                    } else {
+                        let mut type_atoms = Vec::with_capacity(clipboard_types.len());
+                        for type_ in clipboard_types {
+                            type_atoms.push((state.atoms.to_atom(&context.conn, &type_).await?, type_));
                         }
+                        state.clipboard_types = Some(type_atoms);
+                    }
+                } else {
+                    state.clipboard_types = None;
+                }
+                state.clipboard_data = None;
+
+                if state.clipboard_types.is_some() {
+                    // Advertise the new clipboard to X11
+                    context.conn.set_selection_owner(
+                        context.window,
+                        state.atoms.clipboard,
+                        Time::CURRENT_TIME
+                    ).await?.check().await?;
+                }
+            },
+            event = event_wait_fused => {
+                if let Ok(event) = event {
+                    if let Err(e) = state.handle_event(event, &context, &fetch_tx, &mut data_rx).await {
+                        warn!("X11 event handling failed: {:?}", e);
+                        // keep going...
                     }
                 }
             }
@@ -130,8 +120,8 @@ struct ClipboardServerState {
     max_length: usize,
     /// Received via server advertisement
     clipboard_types: Option<Vec<(Atom, String)>>,
-    /// Received via pull/lookup from server
-    clipboard_data: Option<ResolvedClipboardData>,
+    /// Received in response to lookup from server
+    clipboard_data: Option<ClipboardData>,
 }
 
 impl ClipboardServerState {
@@ -147,7 +137,13 @@ impl ClipboardServerState {
         Ok(ret)
     }
 
-    async fn handle_event(&mut self, event: Event, context: &shared::XContext, fetch_tx: &async_channel::Sender<ClipboardFetch>) -> Result<()> {
+    async fn handle_event(
+        &mut self,
+        event: Event,
+        context: &shared::XContext,
+        fetch_tx: &async_channel::Sender<ClipboardFetch>,
+        data_rx: &mut async_channel::Receiver<ClipboardData>,
+    ) -> Result<()> {
         debug!("X11 writer/server event: {:?}", event);
         match event {
             Event::SelectionRequest(event) => {
@@ -156,7 +152,7 @@ impl ClipboardServerState {
                     None => {
                         warn!("Got selection request when we don't have a clipboard to serve");
                         return Ok(());
-                    },
+                    }
                 };
 
                 if event.target == self.atoms.targets {
@@ -185,46 +181,44 @@ impl ClipboardServerState {
                     // If we don't have the correct type data already, fetch it.
                     let target = match clipboard_types.iter().find(|t| t.0 == event.target) {
                         Some(t) => t,
-                        None => bail!("Client requested clipboard type {} when we support {:?}", event.target, clipboard_types),
+                        None => bail!(
+                            "Client requested clipboard type {} when we support {:?}",
+                            event.target,
+                            clipboard_types
+                        ),
                     };
-                    let needs_fetch = self.clipboard_data.as_ref().map(|d| d.type_ != target.1).unwrap_or(true);
+                    let needs_fetch = self
+                        .clipboard_data
+                        .as_ref()
+                        .map(|d| d.type_ != target.1)
+                        .unwrap_or(true);
                     if needs_fetch {
                         info!("Fetching clipboard for type {}={}", target.0, target.1);
-                        // Fetch clipboard data from upstream: Send request and wait for response via barrier
-                        let result_barrier = Arc::new(Barrier::new(2));
-                        let result = Arc::new(Mutex::new(None));
                         fetch_tx
                             .send(ClipboardFetch {
                                 desired_type: target.1.clone(),
-                                result_barrier: result_barrier.clone(),
-                                result: result.clone(),
                             })
+                            .await?;
+                        // TODO timeout on retrieving data, where we mark the retrieval as closed
+                        let clipboard_data = data_rx
+                            .next()
                             .await
-                            .context("Failed to send cache fetch query")?;
-
-                        // Wait on the barrier to complete
-                        result_barrier.wait().await;
-                        // Barrier has completed, get the stored result.
-                        // Do a swap to get the result out without yet another copy.
-                        match result
-                            .lock()
-                            .await
-                            .replace(Ok(None))
-                            .expect("Missing fetch result following barrier")
-                        {
-                            Ok(Some(clipboard_data)) => {
-                                info!("Fetched clipboard data with type {}: {} bytes", target.1, clipboard_data.data.len());
-                                self.clipboard_data = Some(clipboard_data);
-                            },
-                            Ok(None) => {
-                                bail!("Clipboard data not available for type {}", target.1);
-                            },
-                            Err(e) => {
-                                bail!("Clipboard retrieval failed for type {}: {:?}", target.1, e);
-                            }
-                        };
+                            .context("failed to get clipboard data")?;
+                        info!(
+                            "Fetched clipboard data with type {}: {} bytes",
+                            clipboard_data.type_,
+                            clipboard_data.data.len()
+                        );
+                        self.clipboard_data = Some(clipboard_data);
                     } else {
-                        info!("Reusing existing clipboard content ({} bytes) for type {}", self.clipboard_data.as_ref().map(|d| d.data.len()).unwrap_or(0), target.1);
+                        info!(
+                            "Reusing existing clipboard content ({} bytes) for type {}",
+                            self.clipboard_data
+                                .as_ref()
+                                .map(|d| d.data.len())
+                                .unwrap_or(0),
+                            target.1
+                        );
                     }
 
                     let clipboard_data = match &self.clipboard_data {
