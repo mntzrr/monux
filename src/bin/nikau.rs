@@ -7,7 +7,7 @@ use async_std::task;
 use clap::{Args, Parser, Subcommand};
 use futures::StreamExt;
 use signal_hook::consts::signal;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use nikau::{approval, client, deviceinput, deviceoutput, devicewatch, logging, server};
 
@@ -214,7 +214,7 @@ fn client(
     let bind_addr: SocketAddr = "0.0.0.0:0".parse()?;
 
     task::block_on(async move {
-        let mut clipboard = match client::ClientClipboard::new().await {
+        let mut local_clipboard = match client::LocalClipboard::new().await {
             Ok(c) => c,
             Err(e) => panic!("Failed to initialize client clipboard: {:?}", e),
         };
@@ -228,11 +228,15 @@ fn client(
                 &mut virtual_devices,
                 verifier2,
                 max_clipboard_size_bytes,
-                &mut clipboard,
+                &mut local_clipboard,
             )
             .await
             {
                 error!("Client error: {:?}", e);
+                // Clear any clipboard status that may have been accumulated while active
+                if let Err(e) = local_clipboard.clear_remote_clipboard().await {
+                    warn!("Failed to clear remote clipboard: {}", e);
+                }
                 // Wait a bit before retrying. Often happens when waiting for server to approve the cert.
                 task::sleep(Duration::from_secs(5)).await
             }

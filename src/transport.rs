@@ -7,9 +7,9 @@ use quinn::{
     ClientConfig, Endpoint, IdleTimeout, RecvStream, SendStream, ServerConfig, TransportConfig,
     VarInt,
 };
-use tracing::debug;
+use tracing::{debug, trace};
 
-use crate::{approval, messages};
+use crate::{approval, sharedmsgs};
 
 /// Wireguard recommends 25000 for spanning NATs/firewalls.
 /// Must be shorter than TIMEOUT_MILLIS to avoid spurious timeouts.
@@ -55,12 +55,12 @@ fn transport_config() -> Arc<TransportConfig> {
 }
 
 pub async fn send_version(send: &mut SendStream) -> Result<()> {
-    let msg = messages::VersionBootstrapMessage {
-        version: messages::PROTOCOL_VERSION,
+    let msg = sharedmsgs::VersionBootstrapMessage {
+        version: sharedmsgs::PROTOCOL_VERSION,
     };
     let serializedmsg = postcard::to_stdvec_cobs(&msg)
         .map_err(|e| anyhow!("Failed to serialize version message: {:?}", e))?;
-    debug!(
+    trace!(
         "Sending {} byte version: {:X?}",
         serializedmsg.len(),
         &serializedmsg
@@ -78,7 +78,7 @@ pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<()
         .await
         .context("Failed reading protocol version from server")?
         .context("Server closed connection")?;
-    debug!(
+    trace!(
         "Received {} byte version: {:X?}",
         resp.bytes.len(),
         &*resp.bytes
@@ -87,23 +87,21 @@ pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<()
     buf.extend_from_slice(&*resp.bytes);
     let version: u64;
     {
-        debug!("bytes before: {:X?}", buf);
         let (versionmsg, resp_remainder) =
-            postcard::take_from_bytes_cobs::<messages::VersionBootstrapMessage>(buf)
-            .map_err(|e| anyhow!("Failed to deserialize message: {:?}", e))?;
+            postcard::take_from_bytes_cobs::<sharedmsgs::VersionBootstrapMessage>(buf)
+                .map_err(|e| anyhow!("Failed to deserialize message: {:?}", e))?;
         version = versionmsg.version;
         // Remove this message from the front of buf
         let consumed = resp.bytes.len() - resp_remainder.len();
         let buf_len = buf.len();
         buf.copy_within(consumed..buf_len, 0);
-        buf.truncate(buf_len-consumed);
-        debug!("bytes after: {:X?}", buf);
+        buf.truncate(buf_len - consumed);
     }
-    if version != messages::PROTOCOL_VERSION {
+    if version != sharedmsgs::PROTOCOL_VERSION {
         bail!(
             "Their version {} doesn't match our expected version {}",
             version,
-            messages::PROTOCOL_VERSION
+            sharedmsgs::PROTOCOL_VERSION
         );
     }
     Ok(())

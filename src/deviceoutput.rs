@@ -2,8 +2,7 @@ use anyhow::Result;
 use evdev::{uinput, AbsInfo, AbsoluteAxisType, AttributeSet, EvdevEnum, InputEvent, Key};
 use tracing::{info, trace, warn};
 
-use crate::deviceutil;
-use crate::messages;
+use crate::{deviceutil, eventmsgs};
 
 pub const VIRTUAL_DEVICE_NAME_PREFIX: &str = "nikau virtual";
 pub const SCALED_DIM_MIN: i32 = 0;
@@ -35,13 +34,13 @@ impl VirtualDevices {
         })
     }
 
-    pub fn add_event(&mut self, net_event: messages::InputEvent) -> Result<()> {
+    pub fn add_event(&mut self, net_event: eventmsgs::InputEvent) -> Result<()> {
         let (events, device) = match net_event.target {
-            messages::EventTarget::Keyboard => {
+            eventmsgs::EventTarget::Keyboard => {
                 (&mut self.keyboard_events, &mut self.keyboard_device)
             }
-            messages::EventTarget::Mouse => (&mut self.mouse_events, &mut self.mouse_device),
-            messages::EventTarget::Touchpad => {
+            eventmsgs::EventTarget::Mouse => (&mut self.mouse_events, &mut self.mouse_device),
+            eventmsgs::EventTarget::Touchpad => {
                 (&mut self.touchpad_events, &mut self.touchpad_device)
             }
         };

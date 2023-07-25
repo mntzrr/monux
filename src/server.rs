@@ -8,7 +8,9 @@ use async_std::task;
 use futures::{select, FutureExt, StreamExt};
 use tracing::{error, trace, warn};
 
-use crate::{approval, deviceinput, devicewatch, messages, rotation, transport, x11clipboard};
+use crate::{
+    approval, bulkmsgs, deviceinput, devicewatch, eventmsgs, rotation, transport, x11clipboard,
+};
 
 pub async fn run_server(
     listen_addr: &SocketAddr,
@@ -19,8 +21,9 @@ pub async fn run_server(
 ) -> Result<()> {
     // TODO(later) rotation just accepts inputs without responses? if so then maybe put it in a separate task behind a channel, with an enum for the different request types
     let (local_clipboard_fetch_tx, mut local_clipboard_fetch_rx) = async_channel::bounded(32);
-    let rotation: Arc<Mutex<rotation::Rotation>> =
-        Arc::new(Mutex::new(rotation::Rotation::new(grab_tx, local_clipboard_fetch_tx).await?));
+    let rotation: Arc<Mutex<rotation::Rotation>> = Arc::new(Mutex::new(
+        rotation::Rotation::new(grab_tx, local_clipboard_fetch_tx).await?,
+    ));
 
     let rotation_cpy = rotation.clone();
     // Task: listen to server device input events
@@ -32,7 +35,7 @@ pub async fn run_server(
                     let _result = rotation_cpy
                         .lock()
                         .await
-                        .send_event(messages::ServerMessage::Input(evt))
+                        .send_event_active(eventmsgs::ServerEvent::Input(evt))
                         .await;
                 }
                 deviceinput::Event::SwitchNext => {
@@ -46,15 +49,16 @@ pub async fn run_server(
     });
 
     let rotation_cpy = rotation.clone();
-    // Task: listen to server machine requests to get the clipboard
+    // Task: listen to local host requests to get the clipboard
     task::spawn(async move {
         while let Some(fetch_request) = local_clipboard_fetch_rx.next().await {
-            // Got clipboard paste request from the server machine.
+            // Got clipboard paste request from the local machine.
             if let Err(e) = rotation_cpy
                 .lock()
                 .await
                 .clipboard_request_content(None, &fetch_request.type_, max_clipboard_size_bytes)
-                .await {
+                .await
+            {
                 warn!("Failed to retrieve clipboard content for server: {:?}", e);
             }
         }
@@ -66,12 +70,13 @@ pub async fn run_server(
     // Task: listen to server machine updates to the clipboard types
     task::spawn(async move {
         while let Some(clipboard_types) = local_clipboard_types_rx.next().await {
-            // Got updated clipboard types from the server machine.
+            // Another application on the server machine has a clipboard entry.
             if let Err(e) = rotation_cpy
                 .lock()
                 .await
                 .clipboard_update_source(None, clipboard_types, max_clipboard_size_bytes)
-                .await {
+                .await
+            {
                 warn!("Failed to update clipboard source to server: {:?}", e);
             }
         }
@@ -86,7 +91,8 @@ pub async fn run_server(
                 Ok(conn) => {
                     let remote_addr = conn.remote_address();
                     if let Err(e) =
-                        handle_connection(conn, rotation_cpy.clone(), max_clipboard_size_bytes).await
+                        handle_connection(conn, rotation_cpy.clone(), max_clipboard_size_bytes)
+                            .await
                     {
                         // Always try to remove the client from rotation, even if it wasn't added yet.
                         rotation_cpy.lock().await.remove_client(remote_addr).await;
@@ -137,7 +143,8 @@ async fn handle_connection(
         .await;
 
     let mut bulk_bytes = Vec::with_capacity(1024); // TODO(later) 65536 here and below once chunking is known-good
-    let mut clipboard: Option<x11clipboard::ClipboardData> = None;
+    let mut incoming_clipboard_data: Option<(x11clipboard::ClipboardData, Option<SocketAddr>)> =
+        None;
     loop {
         let mut event_fut = pin!(events_recv.read_chunk(1024, true).fuse());
         let mut bulk_fut = pin!(bulk_recv.read_chunk(1024, true).fuse());
@@ -157,7 +164,7 @@ async fn handle_connection(
                     .context("Lost client bulk connection")?
                     .context("Client closed bulk connection")?;
                 trace!("Received {} bytes from bulk stream: {:X?}", resp.bytes.len(), &*resp.bytes);
-                if let Some(c) = &mut clipboard {
+                if let Some((c, request_source)) = &mut incoming_clipboard_data {
                     if c.remaining_bytes >= resp.bytes.len() {
                         // Chunk is all clipboard data.
                         c.data.extend_from_slice(&*resp.bytes);
@@ -170,24 +177,27 @@ async fn handle_connection(
                     }
 
                     if c.remaining_bytes == 0 {
-                        // Clipboard data is all accumulated, flush and clear
+                        // Streamed clipboard data is all accumulated, flush and clear
                         rotation
                             .lock()
                             .await
-                            .clipboard_send_content(conn.remote_address(), clipboard.take().unwrap())
+                            .clipboard_send_content(
+                                conn.remote_address(),
+                                *request_source,
+                                incoming_clipboard_data.take().unwrap().0
+                            )
                             .await?;
                     }
 
                     if bulk_bytes.len() > 0 {
                         // Handle any data following the clipboard entry.
-                        // Hopefully it's not fragmented too since we don't really support that
-                        clipboard = handle_bulk_messages(conn.remote_address(), &rotation, &mut bulk_bytes, max_clipboard_size_bytes).await?;
+                        incoming_clipboard_data = handle_bulk_messages(conn.remote_address(), &rotation, &mut bulk_bytes, max_clipboard_size_bytes).await?;
                         bulk_bytes.clear();
                     }
                 } else {
                     // Copy the immutable response data into a mutable buffer
                     bulk_bytes.extend_from_slice(&*resp.bytes);
-                    clipboard = handle_bulk_messages(conn.remote_address(), &rotation, &mut bulk_bytes, max_clipboard_size_bytes).await?;
+                    incoming_clipboard_data = handle_bulk_messages(conn.remote_address(), &rotation, &mut bulk_bytes, max_clipboard_size_bytes).await?;
                     bulk_bytes.clear();
                 }
             },
@@ -206,8 +216,15 @@ async fn handle_event_messages(
     while offset < bytes_len {
         let bytes2 = bytes.clone();
         let (msg, resp_remainder) =
-            postcard::take_from_bytes_cobs::<messages::ClientMessage>(&mut bytes[offset..])
-            .map_err(|e| anyhow!("Failed to deserialize client message: {:?} bytes(off={})={:X?}", e, offset, bytes2))?;
+            postcard::take_from_bytes_cobs::<eventmsgs::ClientEvent>(&mut bytes[offset..])
+                .map_err(|e| {
+                    anyhow!(
+                        "Failed to deserialize client message: {:?} bytes(off={})={:X?}",
+                        e,
+                        offset,
+                        bytes2
+                    )
+                })?;
         let consumed = bytes_len - resp_remainder.len() - offset;
         trace!(
             "Consumed event at offset={}: {} ({} bytes)",
@@ -216,7 +233,8 @@ async fn handle_event_messages(
             consumed
         );
         match msg {
-            messages::ClientMessage::ClipboardTypes(t) => {
+            eventmsgs::ClientEvent::ClipboardTypes(t) => {
+                // Client broadcasted new clipboard types for server (and other clients) to advertise
                 let types: Vec<String> = t.types.split(" ").map(|t| t.to_string()).collect();
                 rotation
                     .lock()
@@ -240,12 +258,12 @@ async fn handle_bulk_messages(
     rotation: &Arc<Mutex<rotation::Rotation>>,
     bytes: &mut Vec<u8>,
     max_clipboard_size_bytes: u64,
-) -> Result<Option<x11clipboard::ClipboardData>> {
+) -> Result<Option<(x11clipboard::ClipboardData, Option<SocketAddr>)>> {
     let mut offset = 0;
     let bytes_len = bytes.len();
     while offset < bytes_len {
         let (msg, resp_remainder) =
-            postcard::take_from_bytes_cobs::<messages::BulkMessage>(&mut bytes[offset..])
+            postcard::take_from_bytes_cobs::<bulkmsgs::ClientBulk>(&mut bytes[offset..])
                 .map_err(|e| anyhow!("Failed to deserialize bulk message: {:?}", e))?;
         let consumed = bytes_len - resp_remainder.len() - offset;
         trace!(
@@ -257,7 +275,8 @@ async fn handle_bulk_messages(
         offset += consumed;
 
         match msg {
-            messages::BulkMessage::ClipboardContentRequest(c) => {
+            bulkmsgs::ClientBulk::ClipboardRequest(c) => {
+                // Forward the request to rotation, which tracks where to get it from.
                 rotation
                     .lock()
                     .await
@@ -269,7 +288,7 @@ async fn handle_bulk_messages(
                     )
                     .await?;
             }
-            messages::BulkMessage::ClipboardContentHeader(c) => {
+            bulkmsgs::ClientBulk::ClipboardHeader(c) => {
                 if c.content_len_bytes > max_clipboard_size_bytes {
                     // The content length from the client is bigger than what we advertised.
                     // Reset the client connection since this shouldn't happen to begin with.
@@ -279,8 +298,8 @@ async fn handle_bulk_messages(
                         max_clipboard_size_bytes
                     );
                 } else if c.content_len_bytes as usize <= resp_remainder.len() {
-                    // The clipboard content fits fully within resp_remainder
-                    // Mark content as consumed and continue looping in case another message follows?
+                    // The clipboard content fits fully within resp_remainder.
+                    // Mark content as consumed and continue looping in case another message follows.
                     let mut data = Vec::new();
                     data.extend_from_slice(&resp_remainder[..c.content_len_bytes as usize]);
                     rotation
@@ -288,6 +307,7 @@ async fn handle_bulk_messages(
                         .await
                         .clipboard_send_content(
                             source,
+                            c.request_source,
                             x11clipboard::ClipboardData {
                                 type_: c.type_.to_string(),
                                 data,
@@ -297,14 +317,18 @@ async fn handle_bulk_messages(
                         .await?;
                     offset += c.content_len_bytes as usize;
                 } else {
-                    // Need to collect more data. Save what we've got so far, and assign remaining_bytes to what's left
+                    // Need to collect more data.
+                    // Save what we've got so far, and assign remaining_bytes to what's left.
                     let mut data = Vec::with_capacity(c.content_len_bytes as usize);
                     data.extend_from_slice(resp_remainder);
-                    return Ok(Some(x11clipboard::ClipboardData {
-                        type_: c.type_.to_string(),
-                        data,
-                        remaining_bytes: c.content_len_bytes as usize - resp_remainder.len(),
-                    }));
+                    return Ok(Some((
+                        x11clipboard::ClipboardData {
+                            type_: c.type_.to_string(),
+                            data,
+                            remaining_bytes: c.content_len_bytes as usize - resp_remainder.len(),
+                        },
+                        c.request_source,
+                    )));
                 }
             }
         }

@@ -42,7 +42,7 @@ async fn do_thing() -> Result<()> {
     task::spawn(async move {
         loop {
             if let Some(fetch) = fetch_rx.next().await {
-                info!("got fetch from writer");
+                info!("got clipboard lookup from writer, try pasting");
                 // pretend that we're a server fetching a result here...
                 let mut data = Vec::new();
                 data.extend_from_slice(b"hello xorg");
@@ -58,26 +58,40 @@ async fn do_thing() -> Result<()> {
         }
     });
 
-
     info!("waiting for new clipboard types...");
     if let Some(clipboard_types) = clipboard_types_rx.next().await {
-        info!("got clipboard types: {:?}", clipboard_types);
+        info!("got clipboard types A: {:?}", clipboard_types);
     }
 
     x11_fetch_data(&mut reader, type_).await?;
 
     {
         let mut writer = writer2.lock().await;
+        // This should get flagged as FROM nikau, and so ignored
         x11_store_types(&mut writer, &types).await?;
     }
 
-    info!("checking for appearance of new clipboard types...");
+    info!("waiting for new clipboard types again...");
     if let Some(clipboard_types) = clipboard_types_rx.next().await {
-        info!("got clipboard types: {:?}", clipboard_types);
+        info!("got clipboard types B: {:?}", clipboard_types);
     }
 
     x11_fetch_data(&mut reader, type_).await?;
+
+    info!("clearing clipboard types");
+    {
+        let mut writer = writer2.lock().await;
+        x11_store_types(&mut writer, &vec![]).await?;
+    }
+
+    // Sleep a bit to avoid a race between the fetch and the store
+    task::sleep(std::time::Duration::from_millis(500)).await;
+
+    info!("trying fetch after clear");
     x11_fetch_data(&mut reader, type_).await?;
+
+    info!("try pasting again in the next 5s, it should do nothing");
+    task::sleep(std::time::Duration::from_millis(5000)).await;
 
     Ok(())
 }
@@ -87,8 +101,9 @@ async fn x11_store_types(
     types: &Vec<&str>,
 ) -> Result<()> {
     let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+    let types_len = types.len();
     clipboard.store_types(types).await?;
-    info!("stored types into clipboard");
+    info!("stored {} types into clipboard", types_len);
     Ok(())
 }
 
@@ -98,10 +113,10 @@ async fn x11_fetch_data(
 ) -> Result<()> {
     let val = clipboard.read(type_, 0).await?;
     if val.len() > 256 {
-        info!("x11 fetch clipboard: {} bytes", val.len());
+        info!("got clipboard from x11: {} bytes", val.len());
     } else {
         info!(
-            "x11 fetch clipboard: {} bytes: [{}]",
+            "got clipboard from x11: {} bytes: [{}]",
             val.len(),
             String::from_utf8_lossy(&val)
         );

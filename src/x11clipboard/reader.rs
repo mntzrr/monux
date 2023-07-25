@@ -1,5 +1,7 @@
+use std::time::Duration;
+
 use anyhow::{anyhow, bail, Result};
-use async_std::task;
+use async_std::{future, task};
 use tracing::{info, trace, warn};
 use x11rb_async::connection::Connection;
 use x11rb_async::protocol::xproto::{Atom, AtomEnum, ConnectionExt, Property, Time};
@@ -7,6 +9,8 @@ use x11rb_async::protocol::{xfixes, Event};
 use x11rb_async::x11_utils::TryParse;
 
 use crate::x11clipboard::shared;
+
+const CLIPBOARD_TIMEOUT_SECS: u64 = 3;
 
 /// Task that listens for updates to the clipboard types (local cut or copy).
 /// Sends out an event when an update occurs, indicating a new clipboard is available.
@@ -30,8 +34,8 @@ impl ClipboardTypeWatcher {
                         // - we get advertised types pushed from server/client
                         // - we store the advertised types to X11 for future pastes into other applications
                         // - we see the update and think that another application took over the clipboard
-                        if types.contains(&shared::NIKAU_CANARY_TARGET.to_string()) {
-                            info!("Ignoring clipboard update from nikau itself: {:?}", types);
+                        if types.is_empty() || types.contains(&shared::NIKAU_REMOTE_TARGET.to_string()) {
+                            info!("Ignoring clipboard update that's empty or from nikau itself: {:?}", types);
                             continue;
                         }
                         info!("Detected updated clipboard types: {:?}", types);
@@ -122,7 +126,10 @@ impl ClipboardReader {
 
     /// Reads the clipboard data for the specified type.
     pub async fn read(&mut self, type_: &str, max_size_bytes: u64) -> Result<Vec<u8>> {
-        info!("Reading local clipboard content: type={} max_size_bytes={}", type_, max_size_bytes);
+        info!(
+            "Reading local clipboard content: type={} max_size_bytes={}",
+            type_, max_size_bytes
+        );
         let type_atom = self.atoms.to_atom(&self.context.conn, type_).await?;
 
         self.context
@@ -139,16 +146,32 @@ impl ClipboardReader {
             .await?;
 
         let mut buf = Vec::new();
-        // TODO freezes here. should have a timeout:
-        process_event(
-            &self.context,
-            &self.atoms,
-            &mut buf,
-            max_size_bytes,
-            type_atom,
-            self.atoms.recv_clipboard,
+        // If there's a bug in clipboard state management, retrieval can get stuck forever.
+        // So just in case let's avoid waiting forever here.
+        match future::timeout(
+            Duration::from_secs(CLIPBOARD_TIMEOUT_SECS),
+            process_event(
+                &self.context,
+                &self.atoms,
+                &mut buf,
+                max_size_bytes,
+                type_atom,
+                self.atoms.recv_clipboard,
+            ),
         )
-        .await?;
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                bail!("Clipboard retrieval failed: {:?}", e);
+            }
+            Err(_e) => {
+                bail!(
+                    "Clipboard retrieval timed out after {}s",
+                    CLIPBOARD_TIMEOUT_SECS
+                )
+            }
+        }
 
         self.context
             .conn
@@ -231,7 +254,11 @@ async fn process_event(
                 buf.extend_from_slice(&reply.value);
 
                 if max_size_bytes > 0 && buf.len() > max_size_bytes as usize {
-                    bail!("Aborting clipboard read: length={} exceeds max={}", buf.len(), max_size_bytes);
+                    bail!(
+                        "Aborting clipboard read: length={} exceeds max={}",
+                        buf.len(),
+                        max_size_bytes
+                    );
                 }
                 break;
             }

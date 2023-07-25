@@ -8,7 +8,9 @@ pub mod logging;
 pub mod server;
 pub mod x11clipboard;
 
+mod bulkmsgs;
 mod certs;
-mod messages;
+mod eventmsgs;
 mod rotation;
+mod sharedmsgs;
 mod transport;

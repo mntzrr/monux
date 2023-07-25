@@ -1,22 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-/// The protocol version sent from the client to the server on the events stream.
-/// This is compared on initial connection between client and server.
-/// If the message definitions below change, then this should change.
-pub const PROTOCOL_VERSION: u64 = 2;
-
-/// An initial handshake message sent from the client to the server on the events stream.
-/// If the server doesn't support the provided version value, it can cut off the connection early.
-/// The intent is for the structure of this message to never change.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct VersionBootstrapMessage {
-    pub version: u64,
-}
-
-/// A serialized message sent from the server to a client.
+/// A serialized event message sent from the server to a client.
 /// Changes to this signature likely require changing PROTOCOL_VERSION.
 #[derive(Debug, Deserialize, Serialize)]
-pub enum ServerMessage<'a> {
+pub enum ServerEvent<'a> {
     /// Notification to client that the input stream has started or ended.
     /// This allows the client to init or clear any local state, or to indicate being selected to the user.
     Switch(SwitchEvent),
@@ -29,50 +16,28 @@ pub enum ServerMessage<'a> {
     ClipboardTypes(ClipboardTypes<'a>),
 }
 
-impl<'a> std::fmt::Display for ServerMessage<'a> {
+impl<'a> std::fmt::Display for ServerEvent<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            ServerMessage::Switch(e) => e.fmt(f),
-            ServerMessage::Input(e) => e.fmt(f),
-            ServerMessage::ClipboardTypes(e) => e.fmt(f),
+            ServerEvent::Switch(e) => e.fmt(f),
+            ServerEvent::Input(e) => e.fmt(f),
+            ServerEvent::ClipboardTypes(e) => e.fmt(f),
         }
     }
 }
 
-/// A serialized message sent from a client to the server.
+/// A serialized event message sent from a client to the server.
 #[derive(Debug, Deserialize, Serialize)]
-pub enum ClientMessage<'a> {
+pub enum ClientEvent<'a> {
     /// Broadcasts the types of a clipboard that can be retrieved from the client.
     #[serde(borrow)]
     ClipboardTypes(ClipboardTypes<'a>),
 }
 
-impl<'a> std::fmt::Display for ClientMessage<'a> {
+impl<'a> std::fmt::Display for ClientEvent<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            ClientMessage::ClipboardTypes(e) => e.fmt(f),
-        }
-    }
-}
-
-/// A serialized message sent either from the server to the client or from the client to the server.
-/// This is sent on a separate 'bulk' stream from the main 'events' stream, to avoid blocking events.
-#[derive(Debug, Deserialize, Serialize)]
-pub enum BulkMessage<'a> {
-    /// Requests clipboard contents for the specified type from the server or client.
-    #[serde(borrow)]
-    ClipboardContentRequest(ClipboardContentRequest<'a>),
-
-    /// Sends requested clipboard contents back to the client or server.
-    #[serde(borrow)]
-    ClipboardContentHeader(ClipboardContentHeader<'a>),
-}
-
-impl<'a> std::fmt::Display for BulkMessage<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            BulkMessage::ClipboardContentRequest(e) => e.fmt(f),
-            BulkMessage::ClipboardContentHeader(e) => e.fmt(f),
+            ClientEvent::ClipboardTypes(e) => e.fmt(f),
         }
     }
 }
@@ -245,52 +210,6 @@ impl<'a> std::fmt::Display for ClipboardTypes<'a> {
             format!(
                 "ClipboardTypes(types=[{}], max_size_bytes={})",
                 self.types, self.max_size_bytes
-            )
-            .as_str(),
-        )
-    }
-}
-
-// ClipboardContentRequest
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ClipboardContentRequest<'a> {
-    /// The desired type to be retrieved from the client, from a prior ClipboardTypes
-    pub type_: &'a str,
-
-    /// Request that any sent clipboards not exceed this size
-    pub max_size_bytes: u64,
-}
-
-impl<'a> std::fmt::Display for ClipboardContentRequest<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(
-            format!(
-                "ClipboardContentRequest(type={}, max_size_bytes={})",
-                self.type_, self.max_size_bytes,
-            )
-            .as_str(),
-        )
-    }
-}
-
-// ClipboardContentHeader
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ClipboardContentHeader<'a> {
-    /// A mime type requested by an X11 (or Wayland) client
-    pub type_: &'a str,
-
-    /// The length of the clipboard content that follows this header
-    pub content_len_bytes: u64,
-}
-
-impl<'a> std::fmt::Display for ClipboardContentHeader<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(
-            format!(
-                "ClipboardContentHeader(type={}, content_len_bytes={})",
-                self.type_, self.content_len_bytes,
             )
             .as_str(),
         )

@@ -57,10 +57,12 @@ impl ClipboardWriter {
 async fn serve(
     context: shared::XContext,
     // Receive available clipboard types, advertised by server
+    // Events are from calls to store_types()
     mut types_rx: async_channel::Receiver<Vec<String>>,
     // Request clipboard content for one of the types received to types_rx
     fetch_tx: async_channel::Sender<ClipboardFetch>,
     // Receive clipboard content in response to a fetch_tx query
+    // Events are from calls to store_data()
     mut data_rx: async_channel::Receiver<ClipboardData>,
 ) -> Result<()> {
     let mut state = ClipboardServerState::new(&context.conn).await?;
@@ -68,9 +70,9 @@ async fn serve(
         let mut event_wait_fused = context.conn.wait_for_event().fuse();
         select! {
             clipboard_types = types_rx.next() => {
-                info!("Got new clipboard types: {:?}", clipboard_types);
                 // New (or cleared) clipboard: Update types, and clear any prior clipboard data
                 if let Some(clipboard_types) = clipboard_types {
+                    info!("Received new clipboard types to be served locally: {:?}", clipboard_types);
                     if clipboard_types.is_empty() {
                         // Treat empty types as a clipboard clear
                         state.clipboard_types = None;
@@ -86,14 +88,12 @@ async fn serve(
                 }
                 state.clipboard_data = None;
 
-                if state.clipboard_types.is_some() {
-                    // Advertise the new clipboard to X11
-                    context.conn.set_selection_owner(
-                        context.window,
-                        state.atoms.clipboard,
-                        Time::CURRENT_TIME
-                    ).await?.check().await?;
-                }
+                // Advertise the new clipboard (or lack thereof) to X11
+                context.conn.set_selection_owner(
+                    context.window,
+                    state.atoms.clipboard,
+                    Time::CURRENT_TIME
+                ).await?.check().await?;
             },
             event = event_wait_fused => {
                 if let Ok(event) = event {
@@ -148,135 +148,131 @@ impl ClipboardServerState {
         trace!("X11 writer/server event: {:?}", event);
         match event {
             Event::SelectionRequest(event) => {
-                let clipboard_types = match &self.clipboard_types {
-                    Some(t) => t,
-                    None => {
-                        warn!("Got selection request when we don't have a clipboard to serve");
-                        return Ok(());
-                    }
-                };
-
-                if event.target == self.atoms.targets {
-                    // request to get the available clipboard targets
-                    debug!("Returning available clipboard types: {:?}", clipboard_types);
-                    // TARGETS, NIKAU_CANARY, and the data types themselves:
-                    let target_count = 2 + clipboard_types.len();
-                    let mut data_u8 = Vec::with_capacity(4 * target_count);
-                    data_u8.extend(self.atoms.targets.to_ne_bytes());
-                    data_u8.extend(self.atoms.nikau_canary.to_ne_bytes());
-                    for type_ in clipboard_types {
-                        data_u8.extend(type_.0.to_ne_bytes());
-                    }
-                    context
-                        .conn
-                        .change_property(
-                            PropMode::REPLACE,
-                            event.requestor,
-                            event.property,
-                            Atom::from(AtomEnum::ATOM),
-                            32,
-                            target_count as u32,
-                            &data_u8,
-                        )
-                        .await?;
-                } else {
-                    // This is a clipboard retrieval.
-                    // If we don't have the correct type data already, fetch it.
-                    let target = match clipboard_types.iter().find(|t| t.0 == event.target) {
-                        Some(t) => t,
-                        None => bail!(
-                            "X11 requested clipboard type {} when we support {:?}",
-                            event.target,
-                            clipboard_types
-                        ),
-                    };
-                    let needs_fetch = self
-                        .clipboard_data
-                        .as_ref()
-                        .map(|d| d.type_ != target.1)
-                        .unwrap_or(true);
-                    if needs_fetch {
-                        info!("Fetching clipboard for type {}={}", target.0, target.1);
-                        fetch_tx
-                            .send(ClipboardFetch {
-                                type_: target.1.clone(),
-                            })
-                            .await?;
-                        // TODO(later) timeout on retrieving data, where we give up and return empty data?
-                        let clipboard_data = data_rx
-                            .next()
-                            .await
-                            .context("failed to get clipboard data")?;
-                        info!(
-                            "Fetched clipboard data with type {}: {} bytes",
-                            clipboard_data.type_,
-                            clipboard_data.data.len()
-                        );
-                        self.clipboard_data = Some(clipboard_data);
-                    } else {
-                        info!(
-                            "Reusing existing clipboard content ({} bytes) for type {}",
-                            self.clipboard_data
-                                .as_ref()
-                                .map(|d| d.data.len())
-                                .unwrap_or(0),
-                            target.1
-                        );
-                    }
-
-                    let clipboard_data = match &self.clipboard_data {
-                        Some(data) => data,
-                        None => return Ok(()),
-                    };
-                    if clipboard_data.data.len() < self.max_length - 24 {
-                        // request to get clipboard content, and data fits within max_length
+                if let Some(clipboard_types) = &self.clipboard_types {
+                    // We have a clipboard to advertise
+                    if event.target == self.atoms.targets {
+                        // request to get the available clipboard targets
+                        debug!("Returning available clipboard types: {:?}", clipboard_types);
+                        // TARGETS, NIKAU_REMOTE, and the data types themselves:
+                        let target_count = 2 + clipboard_types.len();
+                        let mut data_u8 = Vec::with_capacity(4 * target_count);
+                        data_u8.extend(self.atoms.targets.to_ne_bytes());
+                        data_u8.extend(self.atoms.nikau_remote.to_ne_bytes());
+                        for type_ in clipboard_types {
+                            data_u8.extend(type_.0.to_ne_bytes());
+                        }
                         context
                             .conn
                             .change_property(
                                 PropMode::REPLACE,
                                 event.requestor,
                                 event.property,
-                                event.target,
-                                8,
-                                clipboard_data.data.len() as u32,
-                                &clipboard_data.data,
-                            )
-                            .await?;
-                    } else {
-                        // request to get clipboard content, but data doesn't fit within max_length
-                        context
-                            .conn
-                            .change_window_attributes(
-                                event.requestor,
-                                &ChangeWindowAttributesAux::new()
-                                    .event_mask(EventMask::PROPERTY_CHANGE),
-                            )
-                            .await?;
-                        context
-                            .conn
-                            .change_property(
-                                PropMode::REPLACE,
-                                event.requestor,
-                                event.property,
-                                self.atoms.incr,
+                                Atom::from(AtomEnum::ATOM),
                                 32,
-                                0,
-                                &[],
+                                target_count as u32,
+                                &data_u8,
                             )
                             .await?;
-                        self.selection_to_property
-                            .insert(event.selection, event.property);
-                        self.property_to_state.insert(
-                            event.property,
-                            IncrState {
-                                requestor: event.requestor,
-                                property: event.property,
-                                target: event.target,
-                                pos: 0,
-                            },
-                        );
+                    } else {
+                        // This is a clipboard retrieval.
+                        // If we don't have the correct type data already, fetch it.
+                        let target = match clipboard_types.iter().find(|t| t.0 == event.target) {
+                            Some(t) => t,
+                            None => bail!(
+                                "X11 requested clipboard type {} when we support {:?}",
+                                event.target,
+                                clipboard_types
+                            ),
+                        };
+                        let needs_fetch = self
+                            .clipboard_data
+                            .as_ref()
+                            .map(|d| d.type_ != target.1)
+                            .unwrap_or(true);
+                        if needs_fetch {
+                            info!("Fetching clipboard for type {}={}", target.0, target.1);
+                            fetch_tx
+                                .send(ClipboardFetch {
+                                    type_: target.1.clone(),
+                                })
+                                .await?;
+                            // TODO(later) timeout on retrieving data, where we give up and return empty data?
+                            let clipboard_data = data_rx
+                                .next()
+                                .await
+                                .context("failed to get clipboard data")?;
+                            info!(
+                                "Fetched clipboard data with type {}: {} bytes",
+                                clipboard_data.type_,
+                                clipboard_data.data.len()
+                            );
+                            self.clipboard_data = Some(clipboard_data);
+                        } else {
+                            info!(
+                                "Reusing existing clipboard content ({} bytes) for type {}",
+                                self.clipboard_data
+                                    .as_ref()
+                                    .map(|d| d.data.len())
+                                    .unwrap_or(0),
+                                target.1
+                            );
+                        }
+
+                        let clipboard_data = match &self.clipboard_data {
+                            Some(data) => data,
+                            None => return Ok(()),
+                        };
+                        if clipboard_data.data.len() < self.max_length - 24 {
+                            // request to get clipboard content, and data fits within max_length
+                            context
+                                .conn
+                                .change_property(
+                                    PropMode::REPLACE,
+                                    event.requestor,
+                                    event.property,
+                                    event.target,
+                                    8,
+                                    clipboard_data.data.len() as u32,
+                                    &clipboard_data.data,
+                                )
+                                .await?;
+                        } else {
+                            // request to get clipboard content, but data doesn't fit within max_length
+                            context
+                                .conn
+                                .change_window_attributes(
+                                    event.requestor,
+                                    &ChangeWindowAttributesAux::new()
+                                        .event_mask(EventMask::PROPERTY_CHANGE),
+                                )
+                                .await?;
+                            context
+                                .conn
+                                .change_property(
+                                    PropMode::REPLACE,
+                                    event.requestor,
+                                    event.property,
+                                    self.atoms.incr,
+                                    32,
+                                    0,
+                                    &[],
+                                )
+                                .await?;
+                            self.selection_to_property
+                                .insert(event.selection, event.property);
+                            self.property_to_state.insert(
+                                event.property,
+                                IncrState {
+                                    requestor: event.requestor,
+                                    property: event.property,
+                                    target: event.target,
+                                    pos: 0,
+                                },
+                            );
+                        }
                     }
                 }
+
                 context
                     .conn
                     .send_event(

@@ -7,11 +7,11 @@ use futures::{select, FutureExt, StreamExt};
 use tracing::{debug, trace, warn};
 
 use crate::devicewatch::{DeviceHandle, DeviceHandler, GrabEvent};
-use crate::{deviceutil, messages};
+use crate::{deviceutil, eventmsgs};
 
 #[derive(Debug)]
 pub enum Event {
-    Input(messages::InputEvent),
+    Input(eventmsgs::InputEvent),
     SwitchNext,
     SwitchPrev,
 }
@@ -194,9 +194,9 @@ async fn read_device_event(
     let event = if combo_next || combo_prev {
         // Combo has completed: User has pressed and released all of the combo keys (in any order)
         // Pass through the released event so that the key doesn't appear held down indefinitely for the switch
-        let orig_event = Event::Input(messages::InputEvent {
+        let orig_event = Event::Input(eventmsgs::InputEvent {
             target: device_info.target.clone(),
-            inputi32: Some(messages::InputI32::from_evdev(event)),
+            inputi32: Some(eventmsgs::InputI32::from_evdev(event)),
             inputf64: None,
         });
         if let Err(e) = event_tx.send(orig_event).await {
@@ -219,10 +219,10 @@ async fn read_device_event(
             evdev::InputEventKind::AbsAxis(axis) => {
                 if let Some(axis_dims) = device_info.dims.get(&axis.0) {
                     // Apply scaling to [0.0, 1.0]
-                    Event::Input(messages::InputEvent {
+                    Event::Input(eventmsgs::InputEvent {
                         target: device_info.target.clone(),
                         inputi32: None,
-                        inputf64: Some(messages::InputF64::from_evdev(
+                        inputf64: Some(eventmsgs::InputF64::from_evdev(
                             event,
                             axis_dims.0,
                             axis_dims.1,
@@ -230,16 +230,16 @@ async fn read_device_event(
                     })
                 } else {
                     // No scaling for this axis
-                    Event::Input(messages::InputEvent {
+                    Event::Input(eventmsgs::InputEvent {
                         target: device_info.target.clone(),
-                        inputi32: Some(messages::InputI32::from_evdev(event)),
+                        inputi32: Some(eventmsgs::InputI32::from_evdev(event)),
                         inputf64: None,
                     })
                 }
             }
-            _ => Event::Input(messages::InputEvent {
+            _ => Event::Input(eventmsgs::InputEvent {
                 target: device_info.target.clone(),
-                inputi32: Some(messages::InputI32::from_evdev(event)),
+                inputi32: Some(eventmsgs::InputI32::from_evdev(event)),
                 inputf64: None,
             }),
         }
