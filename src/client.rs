@@ -219,8 +219,8 @@ async fn handle_event_messages(
                         // We're being disabled and we have a clipboard from a local app.
                         // It may be from when we were disabled, or from a prior enabled session. That's fine.
                         // Keep announcing the local clipboard until/unless it gets overridden by a new one from the server.
-                        info!("Sending clipboard types to server");
                         let types = types.join(" ");
+                        info!("Sending clipboard types to server: {}", types);
                         let msg =
                             eventmsgs::ClientEvent::ClipboardTypes(eventmsgs::ClipboardTypes {
                                 types: &types,
@@ -243,6 +243,7 @@ async fn handle_event_messages(
             eventmsgs::ServerEvent::ClipboardTypes(types) => {
                 // Receiving types announcement from server (following recent activation)
                 // Announce the types to X11 for local apps to see, and clear any prior types from local apps.
+                info!("Got clipboard types from server: {}", types.types);
                 local_clipboard.local_types = None;
                 local_clipboard.serving_remote_clipboard = true;
                 let types: Vec<String> = types.types.split(" ").map(|s| s.to_string()).collect();

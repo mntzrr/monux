@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use async_std::{future, task};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 use x11rb_async::connection::Connection;
 use x11rb_async::protocol::xproto::{Atom, AtomEnum, ConnectionExt, Property, Time};
 use x11rb_async::protocol::{xfixes, Event};
@@ -140,7 +140,7 @@ impl ClipboardReader {
         max_size_bytes: u64,
         request_client: &Option<SocketAddr>,
     ) -> Result<Vec<u8>> {
-        info!(
+        debug!(
             "Reading local clipboard content as requested by {}: type={} max_size_bytes={}",
             if let Some(c) = request_client {
                 format!("client {}", c)

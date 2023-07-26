@@ -74,7 +74,7 @@ async fn serve(
             clipboard_types = types_rx.next() => {
                 // New (or cleared) clipboard: Update types, and clear any prior clipboard data
                 if let Some(clipboard_types) = clipboard_types {
-                    info!("Received new clipboard types for serving locally: {}", clipboard_types.join(" "));
+                    debug!("Received new clipboard types for serving locally: {}", clipboard_types.join(" "));
                     if clipboard_types.is_empty() {
                         // Treat empty types as a clipboard clear
                         state.clipboard_types = None;
@@ -213,7 +213,7 @@ impl ClipboardServerState {
                             if clipboard_data.type_ != target.1 {
                                 bail!("Requested clipboard type {} for requestor={}, but fetched clipboard had type {}", target.1, event.requestor, clipboard_data.type_);
                             }
-                            info!(
+                            debug!(
                                 "Providing clipboard data to requestor={} with type {}: {} bytes",
                                 event.requestor,
                                 clipboard_data.type_,

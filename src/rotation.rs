@@ -436,16 +436,16 @@ impl Rotation {
                             max_size_bytes: c.max_size_bytes,
                         });
                     info!(
-                        "Sending clipboard types: src={}, dest={}",
-                        clipboard_source, current_client
+                        "Sending clipboard types for {} to {}: {}",
+                        clipboard_source, current_client, types_str
                     );
                     self.send_event_current(types_msg).await?;
                 }
             } else {
                 // The server is active. Tell it about the client clipbard.
                 info!(
-                    "Storing clipboard types: src={}, dest=server",
-                    clipboard_source
+                    "Storing clipboard types for {} on server: {}",
+                    clipboard_source, c.types.join(" ")
                 );
                 self.clipboard_writer.store_types(c.types.clone()).await?;
             }
@@ -459,8 +459,8 @@ impl Rotation {
                     max_size_bytes: c.max_size_bytes,
                 });
                 info!(
-                    "Sending clipboard types: src=server, dest={}",
-                    current_client
+                    "Sending clipboard types for server to {}: {}",
+                    current_client, types_str
                 );
                 self.send_event_current(types_msg).await?;
             }
