@@ -100,12 +100,13 @@ impl Rotation {
         );
 
         info!(
-            "Added client {} to rotation: {:?}",
+            "Added client {} to rotation: {}",
             endpoint,
             self.clients
                 .iter()
-                .map(|c| c.endpoint)
-                .collect::<Vec<SocketAddr>>()
+                .map(|c| c.endpoint.to_string())
+                .collect::<Vec<String>>()
+                .join(", ")
         );
 
         // If the new client has the same IP as the currently enabled client, it's probably a fast retry
@@ -362,19 +363,6 @@ impl Rotation {
                 }))
                 .await
             {
-                if let Some(clipboard_info) = &self.clipboard_target {
-                    // Update new client with the clipboard types to be advertised
-                    let types_str = clipboard_info.types.join(" ");
-                    let types_msg =
-                        eventmsgs::ServerEvent::ClipboardTypes(eventmsgs::ClipboardTypes {
-                            types: &types_str,
-                            max_size_bytes: clipboard_info.max_size_bytes,
-                        });
-                    // If the send fails then current_client is cleaned up.
-                    if let Err(_e) = self.send_event_current(types_msg).await {
-                        return;
-                    }
-                }
                 info!(
                     "Switched to client: {} (clients: {})",
                     new_client,
