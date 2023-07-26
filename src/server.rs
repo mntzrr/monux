@@ -19,7 +19,7 @@ pub async fn run_server(
     grab_tx: async_channel::Sender<devicewatch::GrabEvent>,
     max_clipboard_size_bytes: u64,
 ) -> Result<()> {
-    // TODO(later) rotation just accepts inputs without responses? if so then maybe put it in a separate task behind a channel, with an enum for the different request types
+    // TODO(later) rotation just accepts inputs without responses? if so then maybe put it in a separate task behind a channel, with an enum for the different request types. basically let's see if we can avoid mutex locking on input events.
     let (local_clipboard_fetch_tx, mut local_clipboard_fetch_rx) = async_channel::bounded(32);
     let rotation: Arc<Mutex<rotation::Rotation>> = Arc::new(Mutex::new(
         rotation::Rotation::new(grab_tx, local_clipboard_fetch_tx).await?,
@@ -35,7 +35,7 @@ pub async fn run_server(
                     let _result = rotation_cpy
                         .lock()
                         .await
-                        .send_event_active(eventmsgs::ServerEvent::Input(evt))
+                        .send_event_current(eventmsgs::ServerEvent::Input(evt))
                         .await;
                 }
                 deviceinput::Event::SwitchNext => {
@@ -164,7 +164,7 @@ async fn handle_connection(
                     .context("Lost client bulk connection")?
                     .context("Client closed bulk connection")?;
                 trace!("Received {} bytes from bulk stream: {:X?}", resp.bytes.len(), &*resp.bytes);
-                if let Some((c, request_source)) = &mut incoming_clipboard_data {
+                if let Some((c, request_client)) = &mut incoming_clipboard_data {
                     if c.remaining_bytes >= resp.bytes.len() {
                         // Chunk is all clipboard data.
                         c.data.extend_from_slice(&*resp.bytes);
@@ -183,7 +183,7 @@ async fn handle_connection(
                             .await
                             .clipboard_send_content(
                                 conn.remote_address(),
-                                *request_source,
+                                *request_client,
                                 incoming_clipboard_data.take().unwrap().0
                             )
                             .await?;
@@ -307,7 +307,7 @@ async fn handle_bulk_messages(
                         .await
                         .clipboard_send_content(
                             source,
-                            c.request_source,
+                            c.request_client,
                             x11clipboard::ClipboardData {
                                 type_: c.type_.to_string(),
                                 data,
@@ -327,7 +327,7 @@ async fn handle_bulk_messages(
                             data,
                             remaining_bytes: c.content_len_bytes as usize - resp_remainder.len(),
                         },
-                        c.request_source,
+                        c.request_client,
                     )));
                 }
             }

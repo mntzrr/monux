@@ -56,17 +56,17 @@ pub struct ServerClipboardRequest<'a> {
     /// Request that any sent clipboards not exceed this size
     pub max_size_bytes: u64,
 
-    /// The source of the request, to be passed back in the ServerClipboardHeader by clients.
-    /// Used by the server to route the clipboard back to its destination.
-    pub request_source: Option<SocketAddr>,
+    /// The client that requested the clipboard, or None if it was the server.
+    /// Used by the server to route the clipboard back to the requestor.
+    pub request_client: Option<SocketAddr>,
 }
 
 impl<'a> std::fmt::Display for ServerClipboardRequest<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(
             format!(
-                "ServerClipboardRequest(type={}, max_size_bytes={}, request_source={:?})",
-                self.type_, self.max_size_bytes, self.request_source,
+                "ServerClipboardRequest(type={}, max_size_bytes={}, request_client={:?})",
+                self.type_, self.max_size_bytes, self.request_client,
             )
             .as_str(),
         )
@@ -131,16 +131,17 @@ pub struct ClientClipboardHeader<'a> {
     /// The length of the clipboard content that follows this header
     pub content_len_bytes: u64,
 
-    /// The original source of the request, copied from the preceding ServerClipboardRequest
-    pub request_source: Option<SocketAddr>,
+    /// The client that requested the clipboard, or None if it was the server.
+    /// Copied from the preceding ServerClipboardRequest
+    pub request_client: Option<SocketAddr>,
 }
 
 impl<'a> std::fmt::Display for ClientClipboardHeader<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(
             format!(
-                "ClientClipboardHeader(type={}, content_len_bytes={}, request_source={:?})",
-                self.type_, self.content_len_bytes, self.request_source,
+                "ClientClipboardHeader(type={}, content_len_bytes={}, request_client={:?})",
+                self.type_, self.content_len_bytes, self.request_client,
             )
             .as_str(),
         )

@@ -225,7 +225,7 @@ impl Rotation {
         // min of source_client_max (if any), and server_max:
         max_size_bytes: u64,
     ) -> Result<()> {
-        debug!("Updating clipboard source: source={:?} current={:?} with max_size_bytes={} has types={:?}", source, self.current_client, max_size_bytes, types);
+        debug!("Announcing new clipboard source: source={:?} current={:?} with max_size_bytes={} has types={:?}", source, self.current_client, max_size_bytes, types);
         // Save the clipboard types/source for future retrievals and client switches
         self.clipboard_target = Some(ClipboardTarget {
             source,
@@ -233,37 +233,9 @@ impl Rotation {
             max_size_bytes,
         });
 
-        // Advertise clipboard to ALL clients, but avoid advertising back to the clipboard source.
-        // Sending to all clients has these tradeoffs:
-        // - Good: Consistent and predictable behavior!
-        // - Bad: Local clipboards on clients are overridden. Up-front broadcast could take longer.
-        let types_str = types.join(" ");
-        let types_msg = eventmsgs::ServerEvent::ClipboardTypes(eventmsgs::ClipboardTypes {
-            types: &types_str,
-            max_size_bytes,
-        });
-        if let Some(clipboard_source) = source.clone() {
-            // Clipboard is held by a remote client. Avoid telling same client about itself.
-            if self.send_event_all(types_msg, move |client: &ClientInfo| client.endpoint != clipboard_source).await? {
-                // We shouldn't need to do this because the client with the clipboard isn't being queried.
-                // But just in case...
-                self.clipboard_clear().await;
-                return Ok(());
-            }
-        } else {
-            // Clipboard is held by the server. Tell all clients.
-            if self.send_event_all(types_msg, |_client: &ClientInfo| true).await? {
-                // We shouldn't need to do this because the server has the clipboard, not the clients.
-                // But just in case...
-                self.clipboard_clear().await;
-                return Ok(());
-            }
-        };
-
-        // Advertise clipboard to server too, but only if it's from a client
-        if source.is_some() {
-            self.clipboard_writer.store_types(types).await?;
-        }
+        // Notify the active client (or server) about the clipboard info we just received.
+        // In practice we should be getting this shortly after a client switch.
+        self.update_current_client_clipboard().await?;
 
         Ok(())
     }
@@ -271,17 +243,17 @@ impl Rotation {
     /// Routes a request for clipboard content to a remote client or a local application
     pub async fn clipboard_request_content(
         &mut self,
-        request_source: Option<SocketAddr>,
+        request_client: Option<SocketAddr>,
         type_: &str,
         max_size_bytes: u64,
     ) -> Result<()> {
-        debug!("Handling clipboard content request from source={:?} with max_size_bytes={} for type={}: have {:?}", request_source, max_size_bytes, type_, self.clipboard_target);
+        debug!("Handling clipboard content request from source={:?} with max_size_bytes={} for type={}: have {:?}", request_client, max_size_bytes, type_, self.clipboard_target);
         let target = match &self.clipboard_target {
             Some(c) => c,
             None => {
                 bail!(
                     "No clipboard types available: request from {:?} for type {}",
-                    request_source,
+                    request_client,
                     type_
                 );
             }
@@ -300,19 +272,36 @@ impl Rotation {
             let msg = bulkmsgs::ServerBulk::ClipboardRequest(bulkmsgs::ServerClipboardRequest {
                 type_,
                 max_size_bytes,
-                request_source,
+                request_client,
             });
+            info!(
+                "Requesting clipboard data with type={} from {}{}",
+                type_,
+                clipboard_source,
+                if let Some(c) = request_client {
+                    format!(" on behalf of {}", c)
+                } else {
+                    "".to_string()
+                }
+            );
             self.send_bulk(clipboard_source, msg, None).await
         } else {
             // The server has the clipboard: serve via X11 from local app
-            if let Some(request_source) = &request_source {
+            if let Some(request_client) = &request_client {
                 // Read and send the clipboard content
-                let content = self.clipboard_reader.read(type_, max_size_bytes).await?;
+                let content = self
+                    .clipboard_reader
+                    .read(type_, max_size_bytes, &Some(*request_client))
+                    .await?;
                 let msg = bulkmsgs::ServerBulk::ClipboardHeader(bulkmsgs::ServerClipboardHeader {
                     type_,
                     content_len_bytes: content.len() as u64,
                 });
-                self.send_bulk(request_source, msg, Some(content)).await
+                info!(
+                    "Sending clipboard data with type={} from server to {}",
+                    type_, request_client
+                );
+                self.send_bulk(request_client, msg, Some(content)).await
             } else {
                 // We're getting a request for the clipboard from the server host.
                 // We should only be serving clipboards for remote clients, but there isn't one.
@@ -331,7 +320,7 @@ impl Rotation {
         // The client sending the clipboard data
         data_source: SocketAddr,
         // Copied from the ServerClipboardRequest, indicates where the clipboard data should be sent
-        request_source: Option<SocketAddr>,
+        request_client: Option<SocketAddr>,
         data: x11clipboard::ClipboardData,
     ) -> Result<()> {
         debug!(
@@ -339,15 +328,15 @@ impl Rotation {
             data.type_,
             data.data.len(),
             data_source,
-            request_source
+            request_client
         );
-        if let Some(request_source) = request_source {
+        if let Some(request_client) = request_client {
             // Send to specified remote client (assuming it's still available etc...)
             let msg = bulkmsgs::ServerBulk::ClipboardHeader(bulkmsgs::ServerClipboardHeader {
                 type_: &data.type_,
                 content_len_bytes: data.data.len() as u64,
             });
-            self.send_bulk(&request_source, msg, Some(data.data)).await
+            self.send_bulk(&request_client, msg, Some(data.data)).await
         } else {
             // Send to local X11
             self.clipboard_writer.store_data(data).await
@@ -359,15 +348,8 @@ impl Rotation {
         // In either case, clear up any history of previously enabled disconnected clients.
         self.removed_current_client = None;
 
-        if let Some(_old_client) = self.current_client {
-            // Try to send switch{false} to last current_client.
-            // If it fails then current_client is cleaned up.
-            let _ = self
-                .send_event_active(eventmsgs::ServerEvent::Switch(eventmsgs::SwitchEvent {
-                    enabled: false,
-                }))
-                .await;
-        }
+        // Save the old client for sending enabled=false below
+        let old_client = self.current_client;
 
         self.set_and_grab_current_client(new_client).await;
 
@@ -375,7 +357,7 @@ impl Rotation {
             // Try to send switch{true} to the newly assigned current_client.
             // If it fails then current_client is cleaned up.
             if let Ok(()) = self
-                .send_event_active(eventmsgs::ServerEvent::Switch(eventmsgs::SwitchEvent {
+                .send_event_current(eventmsgs::ServerEvent::Switch(eventmsgs::SwitchEvent {
                     enabled: true,
                 }))
                 .await
@@ -389,7 +371,7 @@ impl Rotation {
                             max_size_bytes: clipboard_info.max_size_bytes,
                         });
                     // If the send fails then current_client is cleaned up.
-                    if let Err(_e) = self.send_event_active(types_msg).await {
+                    if let Err(_e) = self.send_event_current(types_msg).await {
                         return;
                     }
                 }
@@ -411,6 +393,79 @@ impl Rotation {
                     .collect::<Vec<SocketAddr>>()
             );
         }
+
+        // Notify the new client (or server) about any current clipboard info, or a noop if it fails.
+        // This may be overridden if the old client sends a clipboard update following the switch.
+        if let Err(e) = self.update_current_client_clipboard().await {
+            warn!(
+                "Failed to send clipboard update to active client/server: {:?}",
+                e
+            );
+        }
+
+        // AFTER setting up the new client, lets send enabled=false to the old client.
+        // This avoids a potential race between the above clipboard update for current data
+        // vs the old client sending a new clipboard update when it's marked inactive.
+        if let Some(old_client) = old_client {
+            // Try to send switch{false} to last current_client.
+            // If it fails then the client is cleaned up.
+            let _ = self
+                .send_event(
+                    &old_client,
+                    eventmsgs::ServerEvent::Switch(eventmsgs::SwitchEvent { enabled: false }),
+                )
+                .await;
+        }
+    }
+
+    async fn update_current_client_clipboard(&mut self) -> Result<()> {
+        let c = match &self.clipboard_target {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        if let Some(clipboard_source) = &c.source {
+            // The clipboard is from a client.
+            if let Some(current_client) = self.current_client {
+                // A remote client is active. Tell it about the clipboard, if it isn't the source of the clipboard.
+                if current_client != *clipboard_source {
+                    let types_str = c.types.join(" ");
+                    let types_msg =
+                        eventmsgs::ServerEvent::ClipboardTypes(eventmsgs::ClipboardTypes {
+                            types: &types_str,
+                            max_size_bytes: c.max_size_bytes,
+                        });
+                    info!(
+                        "Sending clipboard types: src={}, dest={}",
+                        clipboard_source, current_client
+                    );
+                    self.send_event_current(types_msg).await?;
+                }
+            } else {
+                // The server is active. Tell it about the client clipbard.
+                info!(
+                    "Storing clipboard types: src={}, dest=server",
+                    clipboard_source
+                );
+                self.clipboard_writer.store_types(c.types.clone()).await?;
+            }
+        } else {
+            // The clipboard is from the server.
+            if let Some(current_client) = self.current_client {
+                // A remote client is active. Tell it about the clipboard.
+                let types_str = c.types.join(" ");
+                let types_msg = eventmsgs::ServerEvent::ClipboardTypes(eventmsgs::ClipboardTypes {
+                    types: &types_str,
+                    max_size_bytes: c.max_size_bytes,
+                });
+                info!(
+                    "Sending clipboard types: src=server, dest={}",
+                    current_client
+                );
+                self.send_event_current(types_msg).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Sends an event to all connected clients, removing any where sending fails.
@@ -420,11 +475,15 @@ impl Rotation {
         msg: eventmsgs::ServerEvent<'_>,
         test_fn: F,
     ) -> Result<bool>
-    where F: Fn(&ClientInfo) -> bool {
+    where
+        F: Fn(&ClientInfo) -> bool,
+    {
         let mut clients_to_remove = vec![];
         for (idx, client) in self.clients.iter_mut().enumerate() {
             if test_fn(&client) {
-                if let Err(e) = send_message_to_client(&mut client.events_send, &msg, &mut self.buf).await {
+                if let Err(e) =
+                    send_message_to_client(&mut client.events_send, &msg, &mut self.buf).await
+                {
                     clients_to_remove.push((idx, client.endpoint.clone()));
                     return Err(e);
                 }
@@ -443,7 +502,7 @@ impl Rotation {
 
     /// Sends an event to the currently active client, removing it if sending fails.
     /// If no client is active, this does nothing.
-    pub async fn send_event_active(&mut self, msg: eventmsgs::ServerEvent<'_>) -> Result<()> {
+    pub async fn send_event_current(&mut self, msg: eventmsgs::ServerEvent<'_>) -> Result<()> {
         let current_client = match self.current_client.clone() {
             Some(client) => client,
             None => {
@@ -464,11 +523,12 @@ impl Rotation {
     /// Sends an event to the specified client, removing it if sending fails.
     /// If the client isn't found, returns Ok(false)
     /// If sending the message fails, removes the client and returns Err
-    async fn send_event(&mut self, client: &SocketAddr, msg: eventmsgs::ServerEvent<'_>) -> Result<bool> {
-        match self
-            .clients
-            .binary_search_by(|c| c.endpoint.cmp(&client))
-        {
+    async fn send_event(
+        &mut self,
+        client: &SocketAddr,
+        msg: eventmsgs::ServerEvent<'_>,
+    ) -> Result<bool> {
+        match self.clients.binary_search_by(|c| c.endpoint.cmp(&client)) {
             Ok(idx) => {
                 let events_send = &mut self
                     .clients
@@ -599,7 +659,8 @@ impl Rotation {
         }
     }
 
-    /// To be called when handle_client_removal() returns true.
+    /// Ensures that all clients and the server have their clipboard state cleared.
+    /// To be called when handle_client_removal() returns true, when a client holding the clipboard has disconnected.
     /// Broken into a separate function to avoid recursive async calls.
     async fn clipboard_clear(&mut self) {
         debug!("Clearing clipboard on server and all clients");
@@ -618,7 +679,10 @@ impl Rotation {
             max_size_bytes: 0,
         });
         // Treat this as best-effort to tidy up the clients, they should reset locally when disconnected.
-        if let Err(e) = self.send_event_all(types_msg, |_client: &ClientInfo| true).await {
+        if let Err(e) = self
+            .send_event_all(types_msg, |_client: &ClientInfo| true)
+            .await
+        {
             warn!("Failed to clear clipboard on all clients: {}", e);
         }
     }

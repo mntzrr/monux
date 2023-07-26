@@ -111,7 +111,7 @@ async fn x11_fetch_data(
     clipboard: &mut x11clipboard::reader::ClipboardReader,
     type_: &str,
 ) -> Result<()> {
-    let val = clipboard.read(type_, 0).await?;
+    let val = clipboard.read(type_, 0, &None).await?;
     if val.len() > 256 {
         info!("got clipboard from x11: {} bytes", val.len());
     } else {

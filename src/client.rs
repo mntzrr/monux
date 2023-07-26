@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::pin::pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures::{select, FutureExt, StreamExt};
@@ -58,6 +59,9 @@ pub async fn run_client(
         .connect(server_addr.clone(), "__ignored__")?
         .await?;
     info!("Connected to server: {}", conn.remote_address());
+    let connect_time = Instant::now();
+    let is_new_connection =
+        move || Instant::now().duration_since(connect_time) < Duration::from_secs(5);
     let (mut events_send, mut events_recv) = conn
         .open_bi()
         .await
@@ -84,6 +88,7 @@ pub async fn run_client(
     // Accumulator of raw clipboard data streamed from the server.
     // Cleared when the clipboard data has all been received.
     let mut incoming_clipboard_data: Option<x11clipboard::ClipboardData> = None;
+    let mut active = false;
     info!("Waiting to be activated by server...");
     loop {
         let mut event_fut = pin!(events_recv.read_chunk(1024, true).fuse());
@@ -109,26 +114,36 @@ pub async fn run_client(
                 }
             },
             types = local_clipboard.types_rx.next() => {
-                // Save recently received types
-                info!("Received updated clipboard types from X11: {:?}", types);
-                // TODO(later): Should we just immediately announce it here if we're active? Feels easier to explain the behavior: "copy on active client can then be pasted anywhere right away". If added here then remove from the Switch{active:false} event case
-                local_clipboard.local_types = types;
-                local_clipboard.serving_remote_clipboard = false;
+                if active {
+                    // New clipboard entry on local machine, and we're active.
+                    // We'll advertise it to the server when there's a switch.
+                    // Avoid polluting the rotation with "external" clipboards: only collect info if we're active.
+                    local_clipboard.local_types = types;
+                    local_clipboard.serving_remote_clipboard = false;
+                }
             },
             event_result = event_fut => {
                 // Incoming data may contain one or more messages, but I've never seen fragments of messages.
                 let resp = event_result
-                    .context("Lost events connection, does server need to approve our fingerprint?")?
+                    .with_context(|| if is_new_connection() {
+                        "Lost events connection, does server need to approve our fingerprint?"
+                    } else {
+                        "Lost events connection"
+                    })?
                     .context("Server closed events connection")?;
                 trace!("Received {} bytes from events stream: {:X?}", resp.bytes.len(), &*resp.bytes);
                 // Copy the immutable response data into a mutable buffer
                 event_bytes.extend_from_slice(&*resp.bytes);
-                handle_event_messages(&mut events_send, &mut event_bytes, virtual_devices, local_clipboard, max_clipboard_size_bytes).await?;
+                handle_event_messages(&mut events_send, &mut event_bytes, virtual_devices, local_clipboard, max_clipboard_size_bytes, &mut active).await?;
                 event_bytes.clear();
             },
             bulk_result = bulk_fut => {
                 let resp = bulk_result
-                    .context("Lost server bulk connection, does server need to approve our fingerprint?")?
+                    .with_context(|| if is_new_connection() {
+                        "Lost bulk connection, does server need to approve our fingerprint?"
+                    } else {
+                        "Lost bulk connection"
+                    })?
                     .context("Server closed bulk connection")?;
                 trace!("Received {} bytes from bulk stream: {:X?}", resp.bytes.len(), &*resp.bytes);
                 if let Some(c) = &mut incoming_clipboard_data {
@@ -175,6 +190,7 @@ async fn handle_event_messages(
     virtual_devices: &mut deviceoutput::VirtualDevices,
     local_clipboard: &mut LocalClipboard,
     max_clipboard_size_bytes: u64,
+    active: &mut bool,
 ) -> Result<()> {
     let mut offset = 0;
     let bytes_len = bytes.len();
@@ -192,12 +208,18 @@ async fn handle_event_messages(
         );
         match msg {
             eventmsgs::ServerEvent::Switch(e) => {
+                info!(
+                    "This client is {}",
+                    if e.enabled { "active" } else { "inactive" }
+                );
+                *active = e.enabled;
                 virtual_devices.switch(e.enabled)?;
                 if let Some(types) = &local_clipboard.local_types {
                     if !e.enabled && !types.is_empty() {
                         // We're being disabled and we have a clipboard from a local app.
                         // It may be from when we were disabled, or from a prior enabled session. That's fine.
                         // Keep announcing the local clipboard until/unless it gets overridden by a new one from the server.
+                        info!("Sending clipboard types to server");
                         let types = types.join(" ");
                         let msg =
                             eventmsgs::ClientEvent::ClipboardTypes(eventmsgs::ClipboardTypes {
@@ -257,14 +279,23 @@ async fn handle_bulk_messages(
 
         match msg {
             bulkmsgs::ServerBulk::ClipboardRequest(c) => {
+                info!(
+                    "Sending clipboard data with type={} to {}",
+                    c.type_,
+                    if let Some(c) = c.request_client {
+                        format!("server for {}", c)
+                    } else {
+                        "server".to_string()
+                    }
+                );
                 // Read the clipboard data from the local application.
                 let local_clipboard_data = local_clipboard_reader
-                    .read(c.type_, c.max_size_bytes)
+                    .read(c.type_, c.max_size_bytes, &c.request_client)
                     .await?;
                 let msg = bulkmsgs::ClientBulk::ClipboardHeader(bulkmsgs::ClientClipboardHeader {
                     type_: c.type_,
                     content_len_bytes: local_clipboard_data.len() as u64,
-                    request_source: c.request_source,
+                    request_client: c.request_client,
                 });
                 let serializedmsg = postcard::to_stdvec_cobs(&msg)
                     .map_err(|e| anyhow!("Failed to serialize clipboard types message: {:?}", e))?;

@@ -1,8 +1,9 @@
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use async_std::{future, task};
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 use x11rb_async::connection::Connection;
 use x11rb_async::protocol::xproto::{Atom, AtomEnum, ConnectionExt, Property, Time};
 use x11rb_async::protocol::{xfixes, Event};
@@ -34,11 +35,19 @@ impl ClipboardTypeWatcher {
                         // - we get advertised types pushed from server/client
                         // - we store the advertised types to X11 for future pastes into other applications
                         // - we see the update and think that another application took over the clipboard
-                        if types.is_empty() || types.contains(&shared::NIKAU_REMOTE_TARGET.to_string()) {
-                            info!("Ignoring clipboard update that's empty or from nikau itself: {:?}", types);
+                        if types.is_empty()
+                            || types.contains(&shared::NIKAU_REMOTE_TARGET.to_string())
+                        {
+                            debug!(
+                                "Ignoring clipboard update that's empty or from nikau itself: {:?}",
+                                types
+                            );
                             continue;
                         }
-                        info!("Detected updated clipboard types: {:?}", types);
+                        debug!(
+                            "Received updated clipboard from local system with types: {:?}",
+                            types
+                        );
                         if let Err(e) = types_tx.send(types).await {
                             warn!("Failed to send updated clipboard types: {}", e);
                         }
@@ -125,10 +134,21 @@ impl ClipboardReader {
     }
 
     /// Reads the clipboard data for the specified type.
-    pub async fn read(&mut self, type_: &str, max_size_bytes: u64) -> Result<Vec<u8>> {
+    pub async fn read(
+        &mut self,
+        type_: &str,
+        max_size_bytes: u64,
+        request_client: &Option<SocketAddr>,
+    ) -> Result<Vec<u8>> {
         info!(
-            "Reading local clipboard content: type={} max_size_bytes={}",
-            type_, max_size_bytes
+            "Reading local clipboard content as requested by {}: type={} max_size_bytes={}",
+            if let Some(c) = request_client {
+                format!("client {}", c)
+            } else {
+                format!("server")
+            },
+            type_,
+            max_size_bytes
         );
         let type_atom = self.atoms.to_atom(&self.context.conn, type_).await?;
 
@@ -163,13 +183,15 @@ impl ClipboardReader {
         {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                bail!("Clipboard retrieval failed: {:?}", e);
+                bail!("X11 clipboard read failed: {:?}", e);
             }
             Err(_e) => {
-                bail!(
-                    "Clipboard retrieval timed out after {}s",
+                warn!(
+                    "X11 clipboard read timed out after {}s",
                     CLIPBOARD_TIMEOUT_SECS
-                )
+                );
+                buf.clear();
+                // Continue below, try to clear the status
             }
         }
 

@@ -30,7 +30,9 @@ pub struct ClipboardWriter {
 impl ClipboardWriter {
     pub async fn new(fetch_tx: async_channel::Sender<ClipboardFetch>) -> Result<Self> {
         let context = shared::XContext::new().await?;
+        // TODO(later) replace this DIY watching with tokio::sync::watch (fetch latest recved value)
         let (types_tx, types_rx) = async_channel::bounded(32);
+        // TODO(later) replace this DIY watching with tokio::sync::watch (fetch latest recved value)
         let (data_tx, data_rx) = async_channel::bounded(32);
         task::spawn(async move {
             if let Err(e) = serve(context, types_rx, fetch_tx, data_rx).await {
@@ -48,7 +50,7 @@ impl ClipboardWriter {
 
     /// Makes the provided clipboard data available to X11 for a paste operation
     pub async fn store_data(&self, data: ClipboardData) -> Result<()> {
-        // TODO(later) check if we're expecting a fetch. discard the data if not
+        // TODO(later) check if we're expecting a fetch and discard the data if not?
         self.data_tx.send(data).await?;
         Ok(())
     }
@@ -72,7 +74,7 @@ async fn serve(
             clipboard_types = types_rx.next() => {
                 // New (or cleared) clipboard: Update types, and clear any prior clipboard data
                 if let Some(clipboard_types) = clipboard_types {
-                    info!("Received new clipboard types to be served locally: {:?}", clipboard_types);
+                    info!("Received new clipboard types for serving locally: {}", clipboard_types.join(" "));
                     if clipboard_types.is_empty() {
                         // Treat empty types as a clipboard clear
                         state.clipboard_types = None;
@@ -152,7 +154,10 @@ impl ClipboardServerState {
                     // We have a clipboard to advertise
                     if event.target == self.atoms.targets {
                         // request to get the available clipboard targets
-                        debug!("Returning available clipboard types: {:?}", clipboard_types);
+                        debug!(
+                            "Returning available clipboard types to requestor={}: {:?}",
+                            event.requestor, clipboard_types
+                        );
                         // TARGETS, NIKAU_REMOTE, and the data types themselves:
                         let target_count = 2 + clipboard_types.len();
                         let mut data_u8 = Vec::with_capacity(4 * target_count);
@@ -179,8 +184,9 @@ impl ClipboardServerState {
                         let target = match clipboard_types.iter().find(|t| t.0 == event.target) {
                             Some(t) => t,
                             None => bail!(
-                                "X11 requested clipboard type {} when we support {:?}",
+                                "Got request for clipboard type {} from requestor={} when we have {:?}",
                                 event.target,
+                                event.requestor,
                                 clipboard_types
                             ),
                         };
@@ -190,7 +196,10 @@ impl ClipboardServerState {
                             .map(|d| d.type_ != target.1)
                             .unwrap_or(true);
                         if needs_fetch {
-                            info!("Fetching clipboard for type {}={}", target.0, target.1);
+                            debug!(
+                                "Fetching clipboard with type {}={} for requestor={}",
+                                target.0, target.1, event.requestor
+                            );
                             fetch_tx
                                 .send(ClipboardFetch {
                                     type_: target.1.clone(),
@@ -201,20 +210,25 @@ impl ClipboardServerState {
                                 .next()
                                 .await
                                 .context("failed to get clipboard data")?;
+                            if clipboard_data.type_ != target.1 {
+                                bail!("Requested clipboard type {} for requestor={}, but fetched clipboard had type {}", target.1, event.requestor, clipboard_data.type_);
+                            }
                             info!(
-                                "Fetched clipboard data with type {}: {} bytes",
+                                "Providing clipboard data to requestor={} with type {}: {} bytes",
+                                event.requestor,
                                 clipboard_data.type_,
                                 clipboard_data.data.len()
                             );
                             self.clipboard_data = Some(clipboard_data);
                         } else {
                             info!(
-                                "Reusing existing clipboard content ({} bytes) for type {}",
+                                "Reusing existing clipboard content to requestor={} with type {}: {} bytes",
+                                event.requestor,
+                                target.1,
                                 self.clipboard_data
                                     .as_ref()
                                     .map(|d| d.data.len())
                                     .unwrap_or(0),
-                                target.1
                             );
                         }
 
