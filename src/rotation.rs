@@ -385,7 +385,8 @@ impl Rotation {
         }
 
         // Notify the new client (or server) about any current clipboard info, or a noop if it fails.
-        // This may be overridden if the old client sends a clipboard update following the switch.
+        // This may be overridden if the old client sends a clipboard update following the switch,
+        // or it won't, if the old client doesn't have a clipboard update to send.
         if let Err(e) = self.update_current_client_clipboard().await {
             warn!(
                 "Failed to send clipboard update to active client/server: {:?}",
@@ -408,9 +409,11 @@ impl Rotation {
         }
     }
 
+    // TODO(later): this can get called/logged twice in a switch, between us proactively updating and the client sending a clipboard types announce after being marked inactive. doesn't hurt anything though.
     async fn update_current_client_clipboard(&mut self) -> Result<()> {
         let c = match &self.clipboard_target {
             Some(c) => c,
+            // No clipboard to announce
             None => return Ok(()),
         };
 
