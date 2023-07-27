@@ -9,4 +9,4 @@ if [ -z "$1" ]; then
 fi
 
 # allow passthrough of LOG_LEVEL env to client:
-cargo build && sudo -E ./target/debug/nikau client $1
+cargo build && sudo -E ./target/debug/nikau client $@
