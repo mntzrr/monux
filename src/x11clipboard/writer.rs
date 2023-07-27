@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
-use async_std::task;
-use futures::{select, FutureExt, StreamExt};
+use tokio::{sync::mpsc, task};
 use tracing::{debug, info, trace, warn};
 use x11rb_async::connection::{Connection, RequestConnection};
 use x11rb_async::protocol::xproto::{
@@ -22,18 +21,18 @@ pub struct ClipboardFetch {
 
 pub struct ClipboardWriter {
     /// Send available clipboard types, advertised by server
-    types_tx: async_channel::Sender<Vec<String>>,
+    types_tx: mpsc::Sender<Vec<String>>,
     /// Send clipboard content for one of the previously advertised types
-    data_tx: async_channel::Sender<ClipboardData>,
+    data_tx: mpsc::Sender<ClipboardData>,
 }
 
 impl ClipboardWriter {
-    pub async fn new(fetch_tx: async_channel::Sender<ClipboardFetch>) -> Result<Self> {
+    pub async fn new(fetch_tx: mpsc::Sender<ClipboardFetch>) -> Result<Self> {
         let context = shared::XContext::new().await?;
         // TODO(later) replace this DIY watching with tokio::sync::watch (fetch latest recved value)
-        let (types_tx, types_rx) = async_channel::bounded(32);
+        let (types_tx, types_rx) = mpsc::channel(32);
         // TODO(later) replace this DIY watching with tokio::sync::watch (fetch latest recved value)
-        let (data_tx, data_rx) = async_channel::bounded(32);
+        let (data_tx, data_rx) = mpsc::channel(32);
         task::spawn(async move {
             if let Err(e) = serve(context, types_rx, fetch_tx, data_rx).await {
                 warn!("clipboard server died: {}", e);
@@ -60,18 +59,17 @@ async fn serve(
     context: shared::XContext,
     // Receive available clipboard types, advertised by server
     // Events are from calls to store_types()
-    mut types_rx: async_channel::Receiver<Vec<String>>,
+    mut types_rx: mpsc::Receiver<Vec<String>>,
     // Request clipboard content for one of the types received to types_rx
-    fetch_tx: async_channel::Sender<ClipboardFetch>,
+    fetch_tx: mpsc::Sender<ClipboardFetch>,
     // Receive clipboard content in response to a fetch_tx query
     // Events are from calls to store_data()
-    mut data_rx: async_channel::Receiver<ClipboardData>,
+    mut data_rx: mpsc::Receiver<ClipboardData>,
 ) -> Result<()> {
     let mut state = ClipboardServerState::new(&context.conn).await?;
     loop {
-        let mut event_wait_fused = context.conn.wait_for_event().fuse();
-        select! {
-            clipboard_types = types_rx.next() => {
+        tokio::select! {
+            clipboard_types = types_rx.recv() => {
                 // New (or cleared) clipboard: Update types, and clear any prior clipboard data
                 if let Some(clipboard_types) = clipboard_types {
                     debug!("Received new clipboard types for serving locally: {}", clipboard_types.join(" "));
@@ -97,7 +95,7 @@ async fn serve(
                     Time::CURRENT_TIME
                 ).await?.check().await?;
             },
-            event = event_wait_fused => {
+            event = context.conn.wait_for_event() => {
                 if let Ok(event) = event {
                     if let Err(e) = state.handle_event(event, &context, &fetch_tx, &mut data_rx).await {
                         warn!("X11 event handling failed: {:?}", e);
@@ -144,8 +142,8 @@ impl ClipboardServerState {
         &mut self,
         event: Event,
         context: &shared::XContext,
-        fetch_tx: &async_channel::Sender<ClipboardFetch>,
-        data_rx: &mut async_channel::Receiver<ClipboardData>,
+        fetch_tx: &mpsc::Sender<ClipboardFetch>,
+        data_rx: &mut mpsc::Receiver<ClipboardData>,
     ) -> Result<()> {
         trace!("X11 writer/server event: {:?}", event);
         match event {
@@ -207,7 +205,7 @@ impl ClipboardServerState {
                                 .await?;
                             // TODO(later) timeout on retrieving data, where we give up and return empty data?
                             let clipboard_data = data_rx
-                                .next()
+                                .recv()
                                 .await
                                 .context("failed to get clipboard data")?;
                             if clipboard_data.type_ != target.1 {

@@ -2,7 +2,8 @@ use anyhow::Result;
 use evdev::{uinput, AbsInfo, AbsoluteAxisType, AttributeSet, EvdevEnum, InputEvent, Key};
 use tracing::{info, trace, warn};
 
-use crate::{deviceutil, eventmsgs};
+use crate::device::util;
+use crate::msgs::event;
 
 pub const VIRTUAL_DEVICE_NAME_PREFIX: &str = "nikau virtual";
 pub const SCALED_DIM_MIN: i32 = 0;
@@ -34,15 +35,11 @@ impl VirtualDevices {
         })
     }
 
-    pub fn add_event(&mut self, net_event: eventmsgs::InputEvent) -> Result<()> {
+    pub fn add_event(&mut self, net_event: event::InputEvent) -> Result<()> {
         let (events, device) = match net_event.target {
-            eventmsgs::EventTarget::Keyboard => {
-                (&mut self.keyboard_events, &mut self.keyboard_device)
-            }
-            eventmsgs::EventTarget::Mouse => (&mut self.mouse_events, &mut self.mouse_device),
-            eventmsgs::EventTarget::Touchpad => {
-                (&mut self.touchpad_events, &mut self.touchpad_device)
-            }
+            event::EventTarget::Keyboard => (&mut self.keyboard_events, &mut self.keyboard_device),
+            event::EventTarget::Mouse => (&mut self.mouse_events, &mut self.mouse_device),
+            event::EventTarget::Touchpad => (&mut self.touchpad_events, &mut self.touchpad_device),
         };
 
         if let Some(e) = net_event.inputf64 {
@@ -59,7 +56,7 @@ impl VirtualDevices {
                         net_event.target,
                         events
                             .iter()
-                            .map(|e| deviceutil::log_event(e))
+                            .map(|e| util::log_event(e))
                             .collect::<Vec<String>>(),
                     );
                     device.emit(&events)?;
@@ -214,8 +211,8 @@ pub fn touchpad(pid: u32) -> Result<uinput::VirtualDevice> {
 
     for i in 0..libc::ABS_MAX + 1 {
         let axis = AbsoluteAxisType::from_index(i as usize);
-        match deviceutil::axis_scale_type(axis) {
-            deviceutil::AxisScale::X => {
+        match util::axis_scale_type(axis) {
+            util::AxisScale::X => {
                 // X axis values: use MAX_X
                 device_builder = device_builder.with_absolute_axis(&abs_axis(
                     axis,
@@ -224,7 +221,7 @@ pub fn touchpad(pid: u32) -> Result<uinput::VirtualDevice> {
                     SCALED_DIM_RES_X,
                 ))?;
             }
-            deviceutil::AxisScale::Y => {
+            util::AxisScale::Y => {
                 // Y axis values: use MAX_Y
                 device_builder = device_builder.with_absolute_axis(&abs_axis(
                     axis,
@@ -233,7 +230,7 @@ pub fn touchpad(pid: u32) -> Result<uinput::VirtualDevice> {
                     SCALED_DIM_RES_Y,
                 ))?;
             }
-            deviceutil::AxisScale::OTHER => {
+            util::AxisScale::OTHER => {
                 device_builder = device_builder.with_absolute_axis(&abs_axis(
                     axis,
                     SCALED_DIM_MIN,

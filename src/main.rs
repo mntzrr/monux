@@ -3,13 +3,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use async_std::task;
 use clap::{Args, Parser, Subcommand};
-use futures::StreamExt;
-use signal_hook::consts::signal;
+use signal_hook::{consts::signal, iterator::Signals};
+use tokio::sync::mpsc;
+use tokio::{task, time};
 use tracing::{error, info, warn};
 
-use nikau::{approval, client, deviceinput, deviceoutput, devicewatch, logging, server};
+use nikau::device::{input, output, watch};
+use nikau::network::approval;
+use nikau::{client, logging, server};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -80,28 +82,29 @@ struct ClientArgs {
 }
 
 /// Listens for SIGUSR1 and SIGUSR2, treating them as "switch to next client" and "switch to prev client" respectively.
-async fn handle_signals(
-    mut signals: signal_hook_async_std::Signals,
-    out: async_channel::Sender<deviceinput::Event>,
-) {
-    while let Some(signal) = signals.next().await {
-        match signal {
-            signal::SIGUSR1 => {
-                if let Err(e) = out.send(deviceinput::Event::SwitchNext).await {
+fn handle_signals(mut signals: Signals, out: mpsc::Sender<input::Event>) {
+    let mut iter = signals.into_iter();
+    loop {
+        match iter.next() {
+            Some(signal::SIGUSR1) => {
+                if let Err(e) = out.blocking_send(input::Event::SwitchNext) {
                     error!("Failed to submit SwitchNext event for SIGUSR1: {:?}", e);
                 }
             }
-            signal::SIGUSR2 => {
-                if let Err(e) = out.send(deviceinput::Event::SwitchPrev).await {
+            Some(signal::SIGUSR2) => {
+                if let Err(e) = out.blocking_send(input::Event::SwitchPrev) {
                     error!("Failed to submit SwitchPrev event for SIGUSR2: {:?}", e);
                 }
             }
-            _ => continue,
+            other => {
+                info!("no signals here? {:?}", other);
+            }
         }
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     logging::init_logging();
 
     let cli = Cli::parse();
@@ -121,6 +124,7 @@ fn main() -> Result<()> {
                 verifier,
                 args.max_clipboard_size_bytes,
             )
+            .await
         }
         Commands::Client(args) => {
             let connect_addr: SocketAddr = if let Ok(host_ip) = args.host.parse::<IpAddr>() {
@@ -141,12 +145,12 @@ fn main() -> Result<()> {
                 "client",
                 args.fingerprints.unwrap_or(vec![]),
             )?;
-            client(connect_addr, verifier, args.max_clipboard_size_bytes)
+            client(connect_addr, verifier, args.max_clipboard_size_bytes).await
         }
     }
 }
 
-fn server(
+async fn server(
     listen_addr: SocketAddr,
     next_keys: &str,
     prev_keys: Option<&str>,
@@ -154,32 +158,44 @@ fn server(
     verifier: Arc<approval::NikauCertVerification>,
     max_clipboard_size_bytes: u64,
 ) -> Result<()> {
-    let (event_tx, event_rx): (
-        async_channel::Sender<deviceinput::Event>,
-        async_channel::Receiver<deviceinput::Event>,
-    ) = async_channel::bounded(32);
+    let (event_tx, event_rx): (mpsc::Sender<input::Event>, mpsc::Receiver<input::Event>) =
+        mpsc::channel(32);
 
     let event_tx2 = event_tx.clone();
-    let signals = signal_hook_async_std::Signals::new(&[signal::SIGUSR1, signal::SIGUSR2])?;
-    task::spawn(async move {
-        handle_signals(signals, event_tx2).await;
-    });
+    let signals = Signals::new(&[signal::SIGUSR1, signal::SIGUSR2])?;
+    std::thread::spawn(|| handle_signals(signals, event_tx2));
 
     let (grab_tx, grab_rx): (
-        async_channel::Sender<devicewatch::GrabEvent>,
-        async_channel::Receiver<devicewatch::GrabEvent>,
-    ) = async_channel::bounded(32);
+        mpsc::Sender<watch::GrabEvent>,
+        mpsc::Receiver<watch::GrabEvent>,
+    ) = mpsc::channel(32);
 
-    let input_handler = deviceinput::InputHandler::new(&next_keys, prev_keys, event_tx)?;
+    let input_handler = input::InputHandler::new(&next_keys, prev_keys, event_tx)?;
 
     task::spawn(async move {
-        if let Err(e) = devicewatch::watch_loop(input_handler, grab_rx).await {
+        if let Err(e) = watch::watch_loop(input_handler, grab_rx).await {
             error!("Input device watch failure: {:?}", e);
         }
     });
 
-    let server_task = async move {
-        info!("Listening for clients: {}", listen_addr);
+    info!("Listening for clients: {}", listen_addr);
+    if let Some(exit_secs) = exit_secs {
+        info!("Exiting in {} seconds...", exit_secs);
+        tokio::select! {
+            server_exit = server::run_server(
+                &listen_addr,
+                verifier,
+                event_rx,
+                grab_tx,
+                max_clipboard_size_bytes,
+            ) => {
+                bail!("Server unexpectedly exited early: {:?}", server_exit);
+            },
+            _timeout = time::sleep(Duration::from_secs(exit_secs as u64)) => {
+                info!("Exiting automatically as requested (--exit-secs={})", exit_secs);
+            }
+        };
+    } else {
         server::run_server(
             &listen_addr,
             verifier,
@@ -187,61 +203,47 @@ fn server(
             grab_tx,
             max_clipboard_size_bytes,
         )
-        .await
-    };
-
-    if let Some(exit_secs) = exit_secs {
-        info!("Exiting in {} seconds...", exit_secs);
-        task::spawn(server_task);
-        task::block_on(async {
-            task::sleep(Duration::from_secs(exit_secs as u64)).await;
-        });
-        info!("Exiting following --exit-secs={}", exit_secs);
-        Ok(())
-    } else {
-        task::block_on(server_task)
+        .await?;
     }
+    Ok(())
 }
 
-fn client(
+async fn client(
     connect_addr: SocketAddr,
     verifier: Arc<approval::NikauCertVerification>,
     max_clipboard_size_bytes: u64,
 ) -> Result<()> {
     // Try to set up virtual devices up-front - exit early if we aren't root
-    let mut virtual_devices = deviceoutput::VirtualDevices::new()
-        .context("Failed to create virtual devices, are you root?")?;
+    let mut virtual_devices =
+        output::VirtualDevices::new().context("Failed to create virtual devices, are you root?")?;
     let bind_addr: SocketAddr = "0.0.0.0:0".parse()?;
 
-    task::block_on(async move {
-        let mut local_clipboard = match client::LocalClipboard::new().await {
-            Ok(c) => c,
-            Err(e) => panic!("Failed to initialize client clipboard: {:?}", e),
-        };
+    // TODO(later) allow missing clipboard support
+    let mut local_clipboard = match client::LocalClipboard::new().await {
+        Ok(c) => c,
+        Err(e) => panic!("Failed to initialize client clipboard: {:?}", e),
+    };
 
-        loop {
-            let verifier2 = verifier.clone();
-            info!("Connecting to server: {}", connect_addr);
-            if let Err(e) = client::run_client(
-                &bind_addr,
-                &connect_addr,
-                &mut virtual_devices,
-                verifier2,
-                max_clipboard_size_bytes,
-                &mut local_clipboard,
-            )
-            .await
-            {
-                error!("Client error: {:?}", e);
-                // Clear any clipboard status that may have been accumulated while active
-                if let Err(e) = local_clipboard.clear_remote_clipboard().await {
-                    warn!("Failed to clear remote clipboard: {}", e);
-                }
-                // Wait a bit before retrying. Often happens when waiting for server to approve the cert.
-                task::sleep(Duration::from_secs(5)).await
+    loop {
+        let verifier2 = verifier.clone();
+        info!("Connecting to server: {}", connect_addr);
+        if let Err(e) = client::run_client(
+            &bind_addr,
+            &connect_addr,
+            &mut virtual_devices,
+            verifier2,
+            max_clipboard_size_bytes,
+            &mut local_clipboard,
+        )
+        .await
+        {
+            error!("Client error: {:?}", e);
+            // Clear any clipboard status that may have been accumulated while active
+            if let Err(e) = local_clipboard.clear_remote_clipboard().await {
+                warn!("Failed to clear remote clipboard: {}", e);
             }
+            // Wait a bit before retrying. Often happens when waiting for server to approve the cert.
+            time::sleep(Duration::from_secs(5)).await
         }
-    });
-    // Unreachable code
-    bail!("Exiting due to client failure")
+    }
 }

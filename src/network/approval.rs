@@ -1,12 +1,11 @@
 use std::io::{self, prelude::*};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
-use async_std::{io as aio, task};
 use tracing::{error, info, warn};
 
-use crate::certs;
+use crate::network::certs;
 
 const ALPN_QUIC_HTTP: &[&[u8]] = &[b"hq-29"];
 const PROMPT_TIMEOUT_SECS: u64 = 60;
@@ -17,7 +16,7 @@ pub fn rustls_client_config(
     let mut rustls_config = rustls::ClientConfig::builder()
         .with_safe_defaults()
         .with_custom_certificate_verifier(verifier.clone())
-        .with_single_cert(
+        .with_client_auth_cert(
             vec![verifier.our_cert.clone()],
             verifier.our_privkey.clone(),
         )?;
@@ -207,9 +206,14 @@ impl rustls::server::ClientCertVerifier for NikauCertVerification {
 
 fn prompt_unknown_cert(their_cert: &rustls::Certificate, we_are_server: bool) -> bool {
     let their_cert_fingerprint = certs::fingerprint(&their_cert);
+    if atty::isnt(atty::Stream::Stdin) {
+        warn!("Stdin is not a TTY, skipping user certificate approval prompt. Approve this cert by running the {} with '--fingerprints {}'", if we_are_server { "server" } else { "client" }, their_cert_fingerprint);
+        return false;
+    }
+
     let message = if we_are_server {
         format!(
-            "NEW UNKNOWN CLIENT CONNECTION: Approval needed
+            "APPROVAL NEEDED: New unknown client connection
 
 The server has received a connection from a new unknown client.
 Only approve this if you are expecting a new client.
@@ -219,12 +223,12 @@ Comfirm that the client startup image has this fingerprint:
     {}
 
 Allow this new client and save its certificate for future connections? ({}s timeout) [y/N]
-",
+> ",
             their_cert_fingerprint, PROMPT_TIMEOUT_SECS
         )
     } else {
         format!(
-            "NEW UNKNOWN SERVER CONNECTION: Approval needed
+            "APPROVAL NEEDED: New unknown server connection
 
 The client has connected to a new unknown server.
 Only approve this if you are expecting to be connecting to a new server.
@@ -234,7 +238,7 @@ Confirm that the server startup image has this fingerprint:
     {}
 
 Allow this new server and save its certificate for future connections? ({}s timeout) [y/N]
-",
+> ",
             their_cert_fingerprint, PROMPT_TIMEOUT_SECS
         )
     };
@@ -243,12 +247,10 @@ Allow this new server and save its certificate for future connections? ({}s time
 
 fn prompt_yn(msg: &str, default: bool) -> bool {
     match prompt_internal(msg) {
-        Ok(input) => {
-            if input.is_empty() {
-                return default;
-            }
-            match input.chars().nth(0).expect("Failed to get first char") {
-                'y' | 'Y' | 't' | 'T' => true,
+        Ok(char_) => {
+            match char_ {
+                // Check for [yY]es or [tT]rue
+                b'y' | b'Y' | b't' | b'T' => true,
                 _ => false,
             }
         }
@@ -263,30 +265,48 @@ fn prompt_yn(msg: &str, default: bool) -> bool {
     }
 }
 
-fn prompt_internal(msg: &str) -> Result<String> {
+fn prompt_internal(msg: &str) -> Result<u8> {
+    // Use nonblock to allow timeout on stdin.
+    // Could try to use async, but Tokio docs don't recommend it in this context.
+    let mut stdin = nonblock::NonBlockingReader::from_fd(io::stdin())
+        .context("Failed to set up nonblocking reader for stdin")?;
+
+    // Flush any preceding input before prompt
+    {
+        let mut discard = vec![];
+        stdin
+            .read_available(&mut discard)
+            .context("Failed to flush initial input")?;
+    }
+
+    // Send the prompt
     let msg_formatted = format!("{}", msg);
     let mut stdout = io::stdout();
     stdout
         .write_all(msg_formatted.as_bytes())
         .context("Failed to write prompt to stdout")?;
     stdout.flush().expect("Failed to flush stdout");
-    let mut response = String::new();
-    task::block_on(async {
-        match aio::timeout(
-            Duration::from_secs(PROMPT_TIMEOUT_SECS),
-            aio::stdin().read_line(&mut response),
-        )
-        .await
-        {
-            Ok(_) => {
-                return Ok(());
-            }
-            Err(_e) => {
-                // Skip output to next line so that logs don't print on top of the prompt
-                println!("");
-                bail!("Prompt timed out after {}s", PROMPT_TIMEOUT_SECS)
-            }
+
+    // Wait for first char, or time out. Use blocking APIs.
+    let end_at = Instant::now()
+        .checked_add(Duration::from_secs(PROMPT_TIMEOUT_SECS))
+        .expect("Failed to configure timeout");
+    let mut content = vec![];
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        stdin
+            .read_available(&mut content)
+            .context("Failed to check for user input")?;
+
+        // Check and return first character
+        if let Some(c) = content.first() {
+            return Ok(*c);
         }
-    })?;
-    Ok(response.trim().to_string())
+
+        // Still nothing, check for timeout
+        if Instant::now() >= end_at {
+            println!("");
+            bail!("Prompt timed out after {}s", PROMPT_TIMEOUT_SECS)
+        }
+    }
 }

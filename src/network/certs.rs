@@ -118,9 +118,7 @@ pub fn write_approved_cert(cert: &rustls::Certificate) -> Result<()> {
         .join(format!("{}.pem", fingerprint(cert)));
     let content = pem::encode_config(
         &pem::Pem::new("CERTIFICATE", cert.0.clone()),
-        pem::EncodeConfig {
-            line_ending: pem::LineEnding::LF,
-        },
+        pem::EncodeConfig::new().set_line_ending(pem::LineEnding::LF),
     );
     let mut outfile = fs::File::create(&file_path).with_context(|| {
         format!(

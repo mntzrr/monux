@@ -9,7 +9,8 @@ use quinn::{
 };
 use tracing::{debug, trace};
 
-use crate::{approval, sharedmsgs};
+use crate::msgs::shared;
+use crate::network::approval;
 
 /// Wireguard recommends 25000 for spanning NATs/firewalls.
 /// Must be shorter than TIMEOUT_MILLIS to avoid spurious timeouts.
@@ -55,8 +56,8 @@ fn transport_config() -> Arc<TransportConfig> {
 }
 
 pub async fn send_version(send: &mut SendStream) -> Result<()> {
-    let msg = sharedmsgs::VersionBootstrapMessage {
-        version: sharedmsgs::PROTOCOL_VERSION,
+    let msg = shared::VersionBootstrapMessage {
+        version: shared::PROTOCOL_VERSION,
     };
     let serializedmsg = postcard::to_stdvec_cobs(&msg)
         .map_err(|e| anyhow!("Failed to serialize version message: {:?}", e))?;
@@ -88,7 +89,7 @@ pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<()
     let version: u64;
     {
         let (versionmsg, resp_remainder) =
-            postcard::take_from_bytes_cobs::<sharedmsgs::VersionBootstrapMessage>(buf)
+            postcard::take_from_bytes_cobs::<shared::VersionBootstrapMessage>(buf)
                 .map_err(|e| anyhow!("Failed to deserialize message: {:?}", e))?;
         version = versionmsg.version;
         // Remove this message from the front of buf
@@ -97,11 +98,11 @@ pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<()
         buf.copy_within(consumed..buf_len, 0);
         buf.truncate(buf_len - consumed);
     }
-    if version != sharedmsgs::PROTOCOL_VERSION {
+    if version != shared::PROTOCOL_VERSION {
         bail!(
             "Their version {} doesn't match our expected version {}",
             version,
-            sharedmsgs::PROTOCOL_VERSION
+            shared::PROTOCOL_VERSION
         );
     }
     Ok(())

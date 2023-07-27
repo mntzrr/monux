@@ -4,9 +4,12 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use quinn::SendStream;
 use serde::Serialize;
+use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
-use crate::{bulkmsgs, devicewatch, eventmsgs, x11clipboard};
+use crate::device::watch;
+use crate::msgs::{bulk, event};
+use crate::x11clipboard;
 
 /// If the selected client reconnects within 5 seconds of being removed, then reselect it automatically.
 /// This is intended to help with fast recovery following networking flakes.
@@ -48,7 +51,7 @@ struct ClipboardTarget {
 }
 
 pub struct Rotation {
-    grab_tx: async_channel::Sender<devicewatch::GrabEvent>,
+    grab_tx: mpsc::Sender<watch::GrabEvent>,
     clients: Vec<ClientInfo>,
     current_client: Option<SocketAddr>,
     removed_current_client: Option<DefunctClientInfo>,
@@ -60,8 +63,8 @@ pub struct Rotation {
 
 impl Rotation {
     pub async fn new(
-        grab_tx: async_channel::Sender<devicewatch::GrabEvent>,
-        clipboard_fetch_tx: async_channel::Sender<x11clipboard::writer::ClipboardFetch>,
+        grab_tx: mpsc::Sender<watch::GrabEvent>,
+        clipboard_fetch_tx: mpsc::Sender<x11clipboard::writer::ClipboardFetch>,
     ) -> Result<Self> {
         let mut buf = Vec::with_capacity(1024);
         // Init required for space to be usable
@@ -146,7 +149,7 @@ impl Rotation {
             } {
                 // Tell the new client about the current clipboard status.
                 let types_str = clipboard_target.types.join(" ");
-                let types_msg = eventmsgs::ServerEvent::ClipboardTypes(eventmsgs::ClipboardTypes {
+                let types_msg = event::ServerEvent::ClipboardTypes(event::ClipboardTypes {
                     types: &types_str,
                     max_size_bytes: clipboard_target.max_size_bytes,
                 });
@@ -270,7 +273,7 @@ impl Rotation {
 
         if let Some(clipboard_source) = &target.source.clone() {
             // A client has the clipboard: route request to them
-            let msg = bulkmsgs::ServerBulk::ClipboardRequest(bulkmsgs::ServerClipboardRequest {
+            let msg = bulk::ServerBulk::ClipboardRequest(bulk::ServerClipboardRequest {
                 type_,
                 max_size_bytes,
                 request_client,
@@ -294,7 +297,7 @@ impl Rotation {
                     .clipboard_reader
                     .read(type_, max_size_bytes, &Some(*request_client))
                     .await?;
-                let msg = bulkmsgs::ServerBulk::ClipboardHeader(bulkmsgs::ServerClipboardHeader {
+                let msg = bulk::ServerBulk::ClipboardHeader(bulk::ServerClipboardHeader {
                     type_,
                     content_len_bytes: content.len() as u64,
                 });
@@ -333,7 +336,7 @@ impl Rotation {
         );
         if let Some(request_client) = request_client {
             // Send to specified remote client (assuming it's still available etc...)
-            let msg = bulkmsgs::ServerBulk::ClipboardHeader(bulkmsgs::ServerClipboardHeader {
+            let msg = bulk::ServerBulk::ClipboardHeader(bulk::ServerClipboardHeader {
                 type_: &data.type_,
                 content_len_bytes: data.data.len() as u64,
             });
@@ -358,7 +361,7 @@ impl Rotation {
             // Try to send switch{true} to the newly assigned current_client.
             // If it fails then current_client is cleaned up.
             if let Ok(()) = self
-                .send_event_current(eventmsgs::ServerEvent::Switch(eventmsgs::SwitchEvent {
+                .send_event_current(event::ServerEvent::Switch(event::SwitchEvent {
                     enabled: true,
                 }))
                 .await
@@ -403,7 +406,7 @@ impl Rotation {
             let _ = self
                 .send_event(
                     &old_client,
-                    eventmsgs::ServerEvent::Switch(eventmsgs::SwitchEvent { enabled: false }),
+                    event::ServerEvent::Switch(event::SwitchEvent { enabled: false }),
                 )
                 .await;
         }
@@ -423,11 +426,10 @@ impl Rotation {
                 // A remote client is active. Tell it about the clipboard, if it isn't the source of the clipboard.
                 if current_client != *clipboard_source {
                     let types_str = c.types.join(" ");
-                    let types_msg =
-                        eventmsgs::ServerEvent::ClipboardTypes(eventmsgs::ClipboardTypes {
-                            types: &types_str,
-                            max_size_bytes: c.max_size_bytes,
-                        });
+                    let types_msg = event::ServerEvent::ClipboardTypes(event::ClipboardTypes {
+                        types: &types_str,
+                        max_size_bytes: c.max_size_bytes,
+                    });
                     info!(
                         "Sending clipboard types for {} to {}: {}",
                         clipboard_source, current_client, types_str
@@ -438,7 +440,8 @@ impl Rotation {
                 // The server is active. Tell it about the client clipbard.
                 info!(
                     "Storing clipboard types for {} on server: {}",
-                    clipboard_source, c.types.join(" ")
+                    clipboard_source,
+                    c.types.join(" ")
                 );
                 self.clipboard_writer.store_types(c.types.clone()).await?;
             }
@@ -447,7 +450,7 @@ impl Rotation {
             if let Some(current_client) = self.current_client {
                 // A remote client is active. Tell it about the clipboard.
                 let types_str = c.types.join(" ");
-                let types_msg = eventmsgs::ServerEvent::ClipboardTypes(eventmsgs::ClipboardTypes {
+                let types_msg = event::ServerEvent::ClipboardTypes(event::ClipboardTypes {
                     types: &types_str,
                     max_size_bytes: c.max_size_bytes,
                 });
@@ -463,11 +466,7 @@ impl Rotation {
 
     /// Sends an event to all connected clients, removing any where sending fails.
     /// If this returns true, then clipboard_clear() should also be called.
-    async fn send_event_all<F>(
-        &mut self,
-        msg: eventmsgs::ServerEvent<'_>,
-        test_fn: F,
-    ) -> Result<bool>
+    async fn send_event_all<F>(&mut self, msg: event::ServerEvent<'_>, test_fn: F) -> Result<bool>
     where
         F: Fn(&ClientInfo) -> bool,
     {
@@ -495,7 +494,7 @@ impl Rotation {
 
     /// Sends an event to the currently active client, removing it if sending fails.
     /// If no client is active, this does nothing.
-    pub async fn send_event_current(&mut self, msg: eventmsgs::ServerEvent<'_>) -> Result<()> {
+    pub async fn send_event_current(&mut self, msg: event::ServerEvent<'_>) -> Result<()> {
         let current_client = match self.current_client.clone() {
             Some(client) => client,
             None => {
@@ -519,7 +518,7 @@ impl Rotation {
     async fn send_event(
         &mut self,
         client: &SocketAddr,
-        msg: eventmsgs::ServerEvent<'_>,
+        msg: event::ServerEvent<'_>,
     ) -> Result<bool> {
         match self.clients.binary_search_by(|c| c.endpoint.cmp(&client)) {
             Ok(idx) => {
@@ -550,7 +549,7 @@ impl Rotation {
     async fn send_bulk(
         &mut self,
         endpoint: &SocketAddr,
-        msg: bulkmsgs::ServerBulk<'_>,
+        msg: bulk::ServerBulk<'_>,
         payload: Option<Vec<u8>>,
     ) -> Result<()> {
         match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
@@ -639,9 +638,9 @@ impl Rotation {
     async fn set_and_grab_current_client(&mut self, client: Option<SocketAddr>) {
         self.current_client = client;
         let grab = if client.is_some() {
-            devicewatch::GrabEvent::Grab
+            watch::GrabEvent::Grab
         } else {
-            devicewatch::GrabEvent::Ungrab
+            watch::GrabEvent::Ungrab
         };
         if let Err(e) = self.grab_tx.send(grab).await {
             // Avoid leaving devices in a bad grabbed state
@@ -666,7 +665,7 @@ impl Rotation {
         }
 
         // Clear all clients' host clipboard statuses (the client was already removed)
-        let types_msg = eventmsgs::ServerEvent::ClipboardTypes(eventmsgs::ClipboardTypes {
+        let types_msg = event::ServerEvent::ClipboardTypes(event::ClipboardTypes {
             types: "",
             // Size shouldn't matter for clearing clipboard...
             max_size_bytes: 0,

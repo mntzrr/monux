@@ -1,27 +1,17 @@
-use async_lock::Mutex;
 use std::sync::Arc;
 
 use anyhow::Result;
-use async_std::task;
-use futures::StreamExt;
+use tokio::sync::{mpsc, Mutex};
+use tokio::{task, time};
 use tracing::{error, info};
 
 use nikau::{logging, x11clipboard};
 
+#[tokio::main]
 fn main() -> Result<()> {
     logging::init_logging();
 
-    task::block_on(async {
-        if let Err(e) = do_thing().await {
-            error!("failed: {:?}", e);
-        }
-    });
-
-    Ok(())
-}
-
-async fn do_thing() -> Result<()> {
-    let (clipboard_types_tx, mut clipboard_types_rx) = async_channel::bounded(32);
+    let (clipboard_types_tx, mut clipboard_types_rx) = mpsc::channel(32);
     x11clipboard::reader::ClipboardTypeWatcher::start(clipboard_types_tx).await?;
     let mut reader = x11clipboard::reader::ClipboardReader::new().await?;
     let type_ = "UTF8_STRING";
@@ -33,7 +23,7 @@ async fn do_thing() -> Result<()> {
         "COMPOUND_TEXT",
         type_,
     ];
-    let (fetch_tx, mut fetch_rx) = async_channel::bounded(32);
+    let (fetch_tx, mut fetch_rx) = mpsc::channel(32);
     let writer = Arc::new(Mutex::new(
         x11clipboard::writer::ClipboardWriter::new(fetch_tx).await?,
     ));
@@ -41,7 +31,7 @@ async fn do_thing() -> Result<()> {
     let writer2 = writer.clone();
     task::spawn(async move {
         loop {
-            if let Some(fetch) = fetch_rx.next().await {
+            if let Some(fetch) = fetch_rx.recv().await {
                 info!("got clipboard lookup from writer, try pasting");
                 // pretend that we're a server fetching a result here...
                 let mut data = Vec::new();
@@ -59,7 +49,7 @@ async fn do_thing() -> Result<()> {
     });
 
     info!("waiting for new clipboard types...");
-    if let Some(clipboard_types) = clipboard_types_rx.next().await {
+    if let Some(clipboard_types) = clipboard_types_rx.recv().await {
         info!("got clipboard types A: {:?}", clipboard_types);
     }
 
@@ -72,7 +62,7 @@ async fn do_thing() -> Result<()> {
     }
 
     info!("waiting for new clipboard types again...");
-    if let Some(clipboard_types) = clipboard_types_rx.next().await {
+    if let Some(clipboard_types) = clipboard_types_rx.recv().await {
         info!("got clipboard types B: {:?}", clipboard_types);
     }
 
@@ -85,13 +75,13 @@ async fn do_thing() -> Result<()> {
     }
 
     // Sleep a bit to avoid a race between the fetch and the store
-    task::sleep(std::time::Duration::from_millis(500)).await;
+    time::sleep(std::time::Duration::from_millis(500)).await;
 
     info!("trying fetch after clear");
     x11_fetch_data(&mut reader, type_).await?;
 
     info!("try pasting again in the next 5s, it should do nothing");
-    task::sleep(std::time::Duration::from_millis(5000)).await;
+    time::sleep(std::time::Duration::from_millis(5000)).await;
 
     Ok(())
 }

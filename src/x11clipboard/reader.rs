@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
-use async_std::{future, task};
+use tokio::{sync::mpsc, task, time};
 use tracing::{debug, trace, warn};
 use x11rb_async::connection::Connection;
 use x11rb_async::protocol::xproto::{Atom, AtomEnum, ConnectionExt, Property, Time};
@@ -22,7 +22,7 @@ pub struct ClipboardTypeWatcher {
 
 impl ClipboardTypeWatcher {
     // TODO(later) replace this DIY watching with tokio::sync::watch (fetch latest recved value)
-    pub async fn start(types_tx: async_channel::Sender<Vec<String>>) -> Result<()> {
+    pub async fn start(types_tx: mpsc::Sender<Vec<String>>) -> Result<()> {
         let context = shared::XContext::new().await?;
         let atoms = shared::Atoms::new(&context.conn).await?;
         task::spawn(async move {
@@ -168,7 +168,7 @@ impl ClipboardReader {
         let mut buf = Vec::new();
         // If there's a bug in clipboard state management, retrieval can get stuck forever.
         // So just in case let's avoid waiting forever here.
-        match future::timeout(
+        match time::timeout(
             Duration::from_secs(CLIPBOARD_TIMEOUT_SECS),
             process_event(
                 &self.context,

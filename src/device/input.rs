@@ -1,17 +1,17 @@
 use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Result};
-use async_std::task;
 use evdev::{EventStream, EventType, InputEvent, Key};
-use futures::{select, FutureExt, StreamExt};
+use tokio::{sync::mpsc, task};
 use tracing::{debug, trace, warn};
 
-use crate::devicewatch::{DeviceHandle, DeviceHandler, GrabEvent};
-use crate::{deviceutil, eventmsgs};
+use crate::device::util;
+use crate::device::watch::{DeviceHandle, DeviceHandler, GrabEvent};
+use crate::msgs::event;
 
 #[derive(Debug)]
 pub enum Event {
-    Input(eventmsgs::InputEvent),
+    Input(event::InputEvent),
     SwitchNext,
     SwitchPrev,
 }
@@ -24,14 +24,14 @@ pub struct InputHandler {
 struct HandlerConfig {
     combo_keys_next: Vec<Key>,
     combo_keys_prev: Vec<Key>,
-    event_tx: async_channel::Sender<Event>,
+    event_tx: mpsc::Sender<Event>,
 }
 
 impl InputHandler {
     pub fn new(
         keys_next: &str,
         keys_prev: Option<&str>,
-        event_tx: async_channel::Sender<Event>,
+        event_tx: mpsc::Sender<Event>,
     ) -> Result<InputHandler> {
         let mut combo_keys_next = vec![];
         let mut combo_keys_prev = vec![];
@@ -65,15 +65,11 @@ impl InputHandler {
 impl DeviceHandler for InputHandler {
     /// Spawns a task for listening to a device's events and for controlling its grab state.
     fn handle_device_stream(&mut self, mut stream: EventStream) -> Result<DeviceHandle> {
-        let (grab_tx, grab_rx): (
-            async_channel::Sender<GrabEvent>,
-            async_channel::Receiver<GrabEvent>,
-        ) = async_channel::bounded(32);
+        let (grab_tx, grab_rx): (mpsc::Sender<GrabEvent>, mpsc::Receiver<GrabEvent>) =
+            mpsc::channel(32);
         let config = self.config.clone();
-        let handle = task::Builder::new()
-            .name(format!("device: {:?}", stream.device().name()))
-            .spawn(async move { read_device_events(&mut stream, config, grab_rx).await })
-            .map_err(|e| anyhow!(e))?;
+        let handle =
+            task::spawn(async move { read_device_events(&mut stream, config, grab_rx).await });
         Ok(DeviceHandle { handle, grab_tx })
     }
 }
@@ -133,14 +129,14 @@ impl ComboState {
 async fn read_device_events(
     stream: &mut EventStream,
     mut c: HandlerConfig,
-    mut grab_rx: async_channel::Receiver<GrabEvent>,
+    mut grab_rx: mpsc::Receiver<GrabEvent>,
 ) {
     let mut combo_state_next = ComboState::new(c.combo_keys_next.clone());
     let mut combo_state_prev = ComboState::new(c.combo_keys_prev.clone());
-    let device_info = deviceutil::device_info(&stream.device());
+    let device_info = util::device_info(&stream.device());
     loop {
-        select! {
-            event = stream.next_event().fuse() => {
+        tokio::select! {
+            event = stream.next_event() => {
                 match event {
                     Ok(event) => {
                         read_device_event(event, &mut c.event_tx, &stream.device(), &device_info, &mut combo_state_next, &mut combo_state_prev).await;
@@ -158,7 +154,7 @@ async fn read_device_events(
                     }
                 }
             },
-            grab = grab_rx.next() => {
+            grab = grab_rx.recv() => {
                 if let Some(grab) = grab {
                     match grab {
                         GrabEvent::Grab => {
@@ -182,9 +178,9 @@ async fn read_device_events(
 
 async fn read_device_event(
     event: evdev::InputEvent,
-    event_tx: &mut async_channel::Sender<Event>,
+    event_tx: &mut mpsc::Sender<Event>,
     device: &evdev::Device,
-    device_info: &deviceutil::DeviceInfo,
+    device_info: &util::DeviceInfo,
     combo_state_next: &mut ComboState,
     combo_state_prev: &mut ComboState,
 ) {
@@ -194,9 +190,9 @@ async fn read_device_event(
     let event = if combo_next || combo_prev {
         // Combo has completed: User has pressed and released all of the combo keys (in any order)
         // Pass through the released event so that the key doesn't appear held down indefinitely for the switch
-        let orig_event = Event::Input(eventmsgs::InputEvent {
+        let orig_event = Event::Input(event::InputEvent {
             target: device_info.target.clone(),
-            inputi32: Some(eventmsgs::InputI32::from_evdev(event)),
+            inputi32: Some(event::InputI32::from_evdev(event)),
             inputf64: None,
         });
         if let Err(e) = event_tx.send(orig_event).await {
@@ -213,16 +209,16 @@ async fn read_device_event(
             "{} event {:?}: {}",
             device_info.target,
             device.name().unwrap_or("(Unnamed device)"),
-            deviceutil::log_event(&event),
+            util::log_event(&event),
         );
         match event.kind() {
             evdev::InputEventKind::AbsAxis(axis) => {
                 if let Some(axis_dims) = device_info.dims.get(&axis.0) {
                     // Apply scaling to [0.0, 1.0]
-                    Event::Input(eventmsgs::InputEvent {
+                    Event::Input(event::InputEvent {
                         target: device_info.target.clone(),
                         inputi32: None,
-                        inputf64: Some(eventmsgs::InputF64::from_evdev(
+                        inputf64: Some(event::InputF64::from_evdev(
                             event,
                             axis_dims.0,
                             axis_dims.1,
@@ -230,16 +226,16 @@ async fn read_device_event(
                     })
                 } else {
                     // No scaling for this axis
-                    Event::Input(eventmsgs::InputEvent {
+                    Event::Input(event::InputEvent {
                         target: device_info.target.clone(),
-                        inputi32: Some(eventmsgs::InputI32::from_evdev(event)),
+                        inputi32: Some(event::InputI32::from_evdev(event)),
                         inputf64: None,
                     })
                 }
             }
-            _ => Event::Input(eventmsgs::InputEvent {
+            _ => Event::Input(event::InputEvent {
                 target: device_info.target.clone(),
-                inputi32: Some(eventmsgs::InputI32::from_evdev(event)),
+                inputi32: Some(event::InputI32::from_evdev(event)),
                 inputf64: None,
             }),
         }

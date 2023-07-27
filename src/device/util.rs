@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use evdev::{AbsoluteAxisType, Device, EvdevEnum, EventType, InputEvent, InputEventKind, Key};
 use tracing::{debug, trace};
 
-use crate::eventmsgs;
+use crate::msgs::event;
 
 #[derive(Debug, PartialEq)]
 pub enum AxisScale {
@@ -67,7 +67,7 @@ pub fn axis_scale_type(axis: AbsoluteAxisType) -> AxisScale {
 }
 
 pub struct DeviceInfo {
-    pub target: eventmsgs::EventTarget,
+    pub target: event::EventTarget,
     pub dims: BTreeMap<u16, (i32, i32)>,
 }
 
@@ -89,11 +89,11 @@ pub fn device_info(device: &Device) -> DeviceInfo {
                 }
             }
         }
-        eventmsgs::EventTarget::Touchpad
+        event::EventTarget::Touchpad
     } else if supported_events.contains(EventType::RELATIVE) {
-        eventmsgs::EventTarget::Mouse
+        event::EventTarget::Mouse
     } else {
-        eventmsgs::EventTarget::Keyboard
+        event::EventTarget::Keyboard
     };
     log_device(device, &target, &dims);
     DeviceInfo { target, dims }
@@ -110,7 +110,7 @@ pub fn log_event(event: &InputEvent) -> String {
     format!("{:?}={}", kind, event.value())
 }
 
-fn log_device(device: &Device, target: &eventmsgs::EventTarget, dims: &BTreeMap<u16, (i32, i32)>) {
+fn log_device(device: &Device, target: &event::EventTarget, dims: &BTreeMap<u16, (i32, i32)>) {
     let device_name = device.name().unwrap_or("(Unnamed device)").to_string();
     let mut abs_entries = vec![];
     if let Some(abs_axes) = device.supported_absolute_axes() {

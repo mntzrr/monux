@@ -2,13 +2,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use async_std::task;
 use evdev::{Device, EventStream, EventType, Key};
-use futures::{select, StreamExt};
 use notify::Watcher;
+use tokio::{sync::mpsc, task};
 use tracing::{debug, info, trace, warn};
 
-use crate::deviceoutput;
+use crate::device::output;
 
 #[derive(Debug)]
 enum DeviceEventKind {
@@ -30,7 +29,7 @@ pub enum GrabEvent {
 
 pub struct DeviceHandle {
     pub handle: task::JoinHandle<()>,
-    pub grab_tx: async_channel::Sender<GrabEvent>,
+    pub grab_tx: mpsc::Sender<GrabEvent>,
 }
 
 /// Trait for watching the addition and removal of devices from the machine
@@ -40,16 +39,20 @@ pub trait DeviceHandler: Send + 'static {
 
 pub async fn watch_loop<F: DeviceHandler>(
     mut handler: F,
-    mut grab_rx: async_channel::Receiver<GrabEvent>,
+    mut grab_rx: mpsc::Receiver<GrabEvent>,
 ) -> Result<()> {
     // Start watch for new and removed devices BEFORE scanning current devices.
     let (device_event_tx, mut device_event_rx): (
-        async_channel::Sender<DeviceEvent>,
-        async_channel::Receiver<DeviceEvent>,
-    ) = async_channel::bounded(32);
+        mpsc::Sender<DeviceEvent>,
+        mpsc::Receiver<DeviceEvent>,
+    ) = mpsc::channel(32);
     let mut watcher = notify::RecommendedWatcher::new(
         move |res: Result<notify::Event, notify::Error>| match res {
-            Ok(event) => send_device_events(event, &device_event_tx),
+            Ok(event) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(send_device_events(event, &device_event_tx)),
             Err(e) => warn!("filesystem watch error: {:?}", e),
         },
         notify::Config::default(),
@@ -82,9 +85,9 @@ pub async fn watch_loop<F: DeviceHandler>(
 
     // Start handler to consume new/removed device events
     loop {
-        select! {
+        tokio::select! {
             // TODO(later) replace this DIY broadcast with tokio::sync::broadcast
-            grab = grab_rx.next() => {
+            grab = grab_rx.recv() => {
                 if let Some(grab) = grab {
                     trace!("Updating {} devices with grab state: {:?}", devices.len(), grab);
                     for device in devices.values() {
@@ -94,7 +97,7 @@ pub async fn watch_loop<F: DeviceHandler>(
                     }
                 }
             },
-            device_event = device_event_rx.next() => {
+            device_event = device_event_rx.recv() => {
                 if let Some(event) = device_event {
                     handle_device_event(&mut handler, &mut devices, event).await;
                 }
@@ -165,7 +168,7 @@ async fn handle_device_event<F: DeviceHandler>(
         DeviceEventKind::Deleted => {
             if let Some(device_handle) = devices.remove(&event.path) {
                 info!("Removing device: {}", event.path.to_string_lossy());
-                device_handle.handle.cancel().await;
+                device_handle.handle.abort();
             }
         }
     }
@@ -182,7 +185,7 @@ fn compatible_device(d: &Device) -> bool {
     // Avoid a situation where we're consuming our own virtual output device, risking an infinite loop.
     // This could happen if client and server are running on the same machine (e.g. for testing)
     if let Some(name) = d.name() {
-        if name.contains(deviceoutput::VIRTUAL_DEVICE_NAME_PREFIX) {
+        if name.contains(output::VIRTUAL_DEVICE_NAME_PREFIX) {
             return false;
         }
     }
@@ -225,39 +228,35 @@ fn start_device_stream(device: Device, path: &PathBuf) -> Result<EventStream> {
     })
 }
 
-fn send_device_events(event: notify::Event, device_event_tx: &async_channel::Sender<DeviceEvent>) {
+async fn send_device_events(event: notify::Event, device_event_tx: &mpsc::Sender<DeviceEvent>) {
     match event.kind {
         notify::EventKind::Create(notify::event::CreateKind::File) => {
             debug!("File created: {:?}", event);
-            task::block_on(async {
-                for path in event.paths {
-                    if let Err(e) = device_event_tx
-                        .send(DeviceEvent {
-                            kind: DeviceEventKind::Created,
-                            path,
-                        })
-                        .await
-                    {
-                        warn!("Failed to queue device create event: {:?}", e);
-                    }
+            for path in event.paths {
+                if let Err(e) = device_event_tx
+                    .send(DeviceEvent {
+                        kind: DeviceEventKind::Created,
+                        path,
+                    })
+                    .await
+                {
+                    warn!("Failed to queue device create event: {:?}", e);
                 }
-            });
+            }
         }
         notify::EventKind::Remove(notify::event::RemoveKind::File) => {
             debug!("File deleted: {:?}", event);
-            task::block_on(async {
-                for path in event.paths {
-                    if let Err(e) = device_event_tx
-                        .send(DeviceEvent {
-                            kind: DeviceEventKind::Deleted,
-                            path,
-                        })
-                        .await
-                    {
-                        warn!("Failed to queue device delete event: {:?}", e);
-                    }
+            for path in event.paths {
+                if let Err(e) = device_event_tx
+                    .send(DeviceEvent {
+                        kind: DeviceEventKind::Deleted,
+                        path,
+                    })
+                    .await
+                {
+                    warn!("Failed to queue device delete event: {:?}", e);
                 }
-            })
+            }
         }
         _ => trace!("Other filesystem event: {:?}", event),
     }

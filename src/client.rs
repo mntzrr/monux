@@ -4,26 +4,29 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use futures::{select, FutureExt, StreamExt};
 use quinn::SendStream;
+use tokio::sync::mpsc;
 use tracing::{info, trace};
 
-use crate::{approval, bulkmsgs, deviceoutput, eventmsgs, transport, x11clipboard};
+use crate::device::output;
+use crate::msgs::{bulk, event};
+use crate::network::{approval, transport};
+use crate::x11clipboard;
 
 pub struct LocalClipboard {
     reader: x11clipboard::reader::ClipboardReader,
     pub writer: x11clipboard::writer::ClipboardWriter,
-    fetch_rx: async_channel::Receiver<x11clipboard::writer::ClipboardFetch>,
-    types_rx: async_channel::Receiver<Vec<String>>,
+    fetch_rx: mpsc::Receiver<x11clipboard::writer::ClipboardFetch>,
+    types_rx: mpsc::Receiver<Vec<String>>,
     local_types: Option<Vec<String>>,
     pub serving_remote_clipboard: bool,
 }
 
 impl LocalClipboard {
     pub async fn new() -> Result<Self> {
-        let (fetch_tx, fetch_rx) = async_channel::bounded(32);
+        let (fetch_tx, fetch_rx) = mpsc::channel(32);
         let reader = x11clipboard::reader::ClipboardReader::new().await?;
-        let (types_tx, types_rx) = async_channel::bounded(32);
+        let (types_tx, types_rx) = mpsc::channel(32);
         x11clipboard::reader::ClipboardTypeWatcher::start(types_tx).await?;
         let writer = x11clipboard::writer::ClipboardWriter::new(fetch_tx).await?;
         Ok(Self {
@@ -49,7 +52,7 @@ impl LocalClipboard {
 pub async fn run_client(
     bind_addr: &SocketAddr,
     server_addr: &SocketAddr,
-    virtual_devices: &mut deviceoutput::VirtualDevices,
+    virtual_devices: &mut output::VirtualDevices,
     cert_verifier: Arc<approval::NikauCertVerification>,
     max_clipboard_size_bytes: u64,
     local_clipboard: &mut LocalClipboard,
@@ -92,13 +95,13 @@ pub async fn run_client(
     let mut active = false;
     info!("Waiting to be activated by server...");
     loop {
-        let mut event_fut = pin!(events_recv.read_chunk(1024, true).fuse());
-        let mut bulk_fut = pin!(bulk_recv.read_chunk(1024, true).fuse());
-        select! {
-            local_fetch_request = local_clipboard.fetch_rx.next() => {
+        let event_fut = pin!(events_recv.read_chunk(1024, true));
+        let bulk_fut = pin!(bulk_recv.read_chunk(1024, true));
+        tokio::select! {
+            local_fetch_request = local_clipboard.fetch_rx.recv() => {
                 // Send fetch request to server
                 if let Some(local_fetch_request) = local_fetch_request {
-                    let msg = bulkmsgs::ClientBulk::ClipboardRequest(bulkmsgs::ClientClipboardRequest{
+                    let msg = bulk::ClientBulk::ClipboardRequest(bulk::ClientClipboardRequest{
                         type_: &local_fetch_request.type_,
                         max_size_bytes: max_clipboard_size_bytes as u64,
                     });
@@ -114,7 +117,7 @@ pub async fn run_client(
                         .context("Failed to send clipboard request message")?;
                 }
             },
-            types = local_clipboard.types_rx.next() => {
+            types = local_clipboard.types_rx.recv() => {
                 if active {
                     // New clipboard entry on local machine, and we're active.
                     // We'll advertise it to the server when there's a switch.
@@ -188,7 +191,7 @@ pub async fn run_client(
 async fn handle_event_messages(
     event_send: &mut SendStream,
     bytes: &mut Vec<u8>,
-    virtual_devices: &mut deviceoutput::VirtualDevices,
+    virtual_devices: &mut output::VirtualDevices,
     local_clipboard: &mut LocalClipboard,
     max_clipboard_size_bytes: u64,
     active: &mut bool,
@@ -198,7 +201,7 @@ async fn handle_event_messages(
     while offset < bytes.len() {
         // Assumption: We shouldn't be getting a ServerMessage that's broken up into separate fragments
         let (msg, resp_remainder) =
-            postcard::take_from_bytes_cobs::<eventmsgs::ServerEvent>(&mut bytes[offset..])
+            postcard::take_from_bytes_cobs::<event::ServerEvent>(&mut bytes[offset..])
                 .map_err(|e| anyhow!("Failed to deserialize server message: {:?}", e))?;
         let consumed = bytes_len - resp_remainder.len() - offset;
         trace!(
@@ -208,7 +211,7 @@ async fn handle_event_messages(
             consumed
         );
         match msg {
-            eventmsgs::ServerEvent::Switch(e) => {
+            event::ServerEvent::Switch(e) => {
                 info!(
                     "This client is {}",
                     if e.enabled { "active" } else { "inactive" }
@@ -222,11 +225,10 @@ async fn handle_event_messages(
                         // Keep announcing the local clipboard until/unless it gets overridden by a new one from the server.
                         let types = types.join(" ");
                         info!("Sending clipboard types to server: {}", types);
-                        let msg =
-                            eventmsgs::ClientEvent::ClipboardTypes(eventmsgs::ClipboardTypes {
-                                types: &types,
-                                max_size_bytes: max_clipboard_size_bytes,
-                            });
+                        let msg = event::ClientEvent::ClipboardTypes(event::ClipboardTypes {
+                            types: &types,
+                            max_size_bytes: max_clipboard_size_bytes,
+                        });
                         let serializedmsg = postcard::to_stdvec_cobs(&msg).map_err(|e| {
                             anyhow!("Failed to serialize clipboard types message: {:?}", e)
                         })?;
@@ -237,11 +239,11 @@ async fn handle_event_messages(
                     }
                 }
             }
-            eventmsgs::ServerEvent::Input(input) => {
+            event::ServerEvent::Input(input) => {
                 // User input event
                 virtual_devices.add_event(input)?;
             }
-            eventmsgs::ServerEvent::ClipboardTypes(types) => {
+            event::ServerEvent::ClipboardTypes(types) => {
                 // Receiving types announcement from server (following recent activation)
                 // Announce the types to X11 for local apps to see, and clear any prior types from local apps.
                 info!("Got clipboard types from server: {}", types.types);
@@ -268,7 +270,7 @@ async fn handle_bulk_messages(
     while offset < bytes_len {
         // Assumption: We shouldn't be getting a BulkMessage that's broken up into separate fragments
         let (msg, resp_remainder) =
-            postcard::take_from_bytes_cobs::<bulkmsgs::ServerBulk>(&mut bytes[offset..])
+            postcard::take_from_bytes_cobs::<bulk::ServerBulk>(&mut bytes[offset..])
                 .map_err(|e| anyhow!("Failed to deserialize bulk message: {:?}", e))?;
         let consumed = bytes_len - resp_remainder.len() - offset;
         trace!(
@@ -280,7 +282,7 @@ async fn handle_bulk_messages(
         offset += consumed;
 
         match msg {
-            bulkmsgs::ServerBulk::ClipboardRequest(c) => {
+            bulk::ServerBulk::ClipboardRequest(c) => {
                 info!(
                     "Sending clipboard data with type={} to {}",
                     c.type_,
@@ -294,7 +296,7 @@ async fn handle_bulk_messages(
                 let local_clipboard_data = local_clipboard_reader
                     .read(c.type_, c.max_size_bytes, &c.request_client)
                     .await?;
-                let msg = bulkmsgs::ClientBulk::ClipboardHeader(bulkmsgs::ClientClipboardHeader {
+                let msg = bulk::ClientBulk::ClipboardHeader(bulk::ClientClipboardHeader {
                     type_: c.type_,
                     content_len_bytes: local_clipboard_data.len() as u64,
                     request_client: c.request_client,
@@ -315,7 +317,7 @@ async fn handle_bulk_messages(
                         )
                     })?;
             }
-            bulkmsgs::ServerBulk::ClipboardHeader(c) => {
+            bulk::ServerBulk::ClipboardHeader(c) => {
                 if c.content_len_bytes > max_clipboard_size_bytes {
                     // The content length from the server is bigger than what we advertised.
                     // Reset the connection since this shouldn't happen to begin with.

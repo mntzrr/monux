@@ -13,26 +13,24 @@ exclude = ["README.md", "Dockerfile", ".build.yml", "*.sh"]
 
 [dependencies]
 anyhow = "1.0"
-async-channel = "1.5"
-async-lock = "2.5"
-async-std = { version = "1.8", features = ["tokio1"] }
+atty = "0.2"
 bit-vec = "0.6"
 clap = { version = "4.3", features = ["derive"] }
 evdev = { version = "0.12", features = ["tokio"] }
-futures = "0.3"
 home = "0.5"
 libc = "0.2"
+nonblock = "0.2"
 notify = "6.0"
-pem = "2.0"
+pem = "3.0"
 postcard = { version = "1.0", features = ["use-std"] }
-quinn = { version = "0.10", default-features = false, features = ["tls-rustls", "runtime-async-std", "log"]}
+quinn = { version = "0.10", default-features = false, features = ["tls-rustls", "runtime-tokio", "log"]}
 rcgen = "0.11"
 rustls = { version = "0.21", features = ["dangerous_configuration"] } # dangerous_configuration: Required for custom ServerCertVerifier
 rustls-pemfile = "1.0"
 serde = { version = "1.0", default-features = false }
 sha2 = "0.10"
 signal-hook = "0.3"
-signal-hook-async-std = "0.2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 x11rb-async = { version = "0.12", features = ["xfixes"] }

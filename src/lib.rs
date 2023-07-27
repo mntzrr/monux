@@ -1,16 +1,9 @@
-pub mod approval;
 pub mod client;
-pub mod deviceinput;
-pub mod deviceoutput;
-pub mod deviceutil;
-pub mod devicewatch;
+pub mod device;
 pub mod logging;
+pub mod msgs;
+pub mod network;
 pub mod server;
-pub mod x11clipboard;
 
-mod bulkmsgs;
-mod certs;
-mod eventmsgs;
 mod rotation;
-mod sharedmsgs;
-mod transport;
+mod x11clipboard;

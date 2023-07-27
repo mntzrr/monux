@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Context, Result};
-use async_std::task;
+use tokio::task;
 use x11rb_async::connection::Connection;
 use x11rb_async::protocol::xproto::{
     Atom, ConnectionExt, CreateWindowAux, EventMask, Window, WindowClass,

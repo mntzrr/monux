@@ -1,16 +1,15 @@
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
-use async_std::task;
+use anyhow::{bail, Context, Result};
 use evdev::{AbsoluteAxisType, EventType, InputEvent, Key};
-use futures::StreamExt;
+use tokio::{sync::mpsc, task};
 use tracing::{error, info, warn};
 
 use nikau::{deviceoutput, deviceutil, devicewatch, logging};
 
 struct StubHandler {
-    grab_tx: async_channel::Sender<devicewatch::GrabEvent>,
+    grab_tx: mpsc::Sender<devicewatch::GrabEvent>,
 }
 
 impl devicewatch::DeviceHandler for StubHandler {
@@ -18,27 +17,24 @@ impl devicewatch::DeviceHandler for StubHandler {
         &mut self,
         mut stream: evdev::EventStream,
     ) -> Result<devicewatch::DeviceHandle> {
-        let handle = task::Builder::new()
-            .name(format!("device: {:?}", stream.device().name()))
-            .spawn(async move {
-                let _device_info = deviceutil::device_info(&stream.device());
-                let device_name = stream
-                    .device()
-                    .name()
-                    .unwrap_or("(Unnamed device)")
-                    .to_string();
-                while let Some(event) = stream.next().await {
-                    match event {
-                        Ok(event) => {
-                            info!("Event for {}: {:?}", device_name, event);
-                        }
-                        Err(e) => {
-                            warn!("Error event for {}, removing device: {:?}", device_name, e);
-                        }
+        let handle = tokio::spawn(async move {
+            let _device_info = deviceutil::device_info(&stream.device());
+            let device_name = stream
+                .device()
+                .name()
+                .unwrap_or("(Unnamed device)")
+                .to_string();
+            loop {
+                match stream.next_event().await {
+                    Ok(event) => {
+                        info!("Event for {}: {:?}", device_name, event);
+                    }
+                    Err(e) => {
+                        warn!("Error event for {}, removing device: {:?}", device_name, e);
                     }
                 }
-            })
-            .map_err(|e| anyhow!(e))?;
+            }
+        });
         Ok(devicewatch::DeviceHandle {
             handle,
             grab_tx: self.grab_tx.clone(),
@@ -46,10 +42,11 @@ impl devicewatch::DeviceHandler for StubHandler {
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     logging::init_logging();
 
-    let (grab_tx, grab_rx) = async_channel::bounded(32);
+    let (grab_tx, grab_rx) = mpsc::channel(32);
     let handler = task::spawn(async move {
         if let Err(e) = devicewatch::watch_loop(StubHandler { grab_tx }, grab_rx).await {
             error!("Input device watch failure: {:?}", e);
@@ -93,8 +90,6 @@ fn main() -> Result<()> {
         thread::sleep(Duration::from_micros(5_000));
     }
 
-    task::block_on(async move {
-        handler.await;
-    });
+    handler.await?;
     bail!("Exited prematurely");
 }
