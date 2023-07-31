@@ -4,8 +4,9 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use quinn::SendStream;
 use serde::Serialize;
-use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, info, trace, warn};
+use tokio::sync::{broadcast, mpsc, watch as watchchan};
+use tokio::task;
+use tracing::{debug, error, info, trace, warn};
 
 use crate::device::watch;
 use crate::msgs::{bulk, event};
@@ -50,21 +51,119 @@ struct ClipboardTarget {
     max_size_bytes: u64,
 }
 
+pub struct LocalClipboard {
+    reader: x11clipboard::reader::ClipboardReader,
+    writer: x11clipboard::writer::ClipboardWriter,
+}
+
+impl LocalClipboard {
+    pub async fn start(
+        rotation_tx: mpsc::Sender<RotationEvent>,
+        max_clipboard_size_bytes: u64,
+    ) -> Result<Self> {
+        let (clipboard_fetch_tx, mut clipboard_fetch_rx) =
+            mpsc::channel::<x11clipboard::writer::ClipboardFetch>(32);
+        let (local_types_tx, mut local_types_rx) = watchchan::channel(vec![]);
+        x11clipboard::reader::ClipboardTypeWatcher::start(local_types_tx).await?;
+
+        task::spawn(async move {
+            loop {
+                tokio::select! {
+                    // Listen to local host requests to get the clipboard
+                    fetch_request = clipboard_fetch_rx.recv() => {
+                        if let Some(fetch_request) = fetch_request {
+                            // Got clipboard paste request from the local machine.
+                            let event = RotationEvent::ClipboardRequestContent(ClipboardRequestContentArgs {
+                                request_client: None,
+                                type_: fetch_request.type_,
+                                max_size_bytes: max_clipboard_size_bytes,
+                            });
+                            if let Err(e) = rotation_tx.send(event).await {
+                                error!("Failed to queue request content event: {:?}", e);
+                                break;
+                            }
+                        } else {
+                            error!("Clipboard fetch request queue has closed, exiting clipboard loop");
+                            break;
+                        }
+                    },
+                    // Listen to local host updates to the clipboard types
+                    types_notify = local_types_rx.changed() => {
+                        if let Err(e) = types_notify {
+                            error!("local_types_rx has closed: {}", e);
+                            break;
+                        }
+                        // Another application on the server machine has a clipboard entry.
+                        let event = RotationEvent::ClipboardUpdateSource(ClipboardUpdateSourceArgs {
+                            source: None,
+                            types: local_types_rx.borrow().clone(),
+                            max_size_bytes: max_clipboard_size_bytes,
+                        });
+                        if let Err(e) = rotation_tx.send(event).await {
+                            error!("Failed to queue update source event: {:?}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            reader: x11clipboard::reader::ClipboardReader::new().await?,
+            writer: x11clipboard::writer::ClipboardWriter::start(clipboard_fetch_tx).await?,
+        })
+    }
+}
+
+pub enum RotationEvent {
+    AddClient(AddClientArgs),
+    RemoveClient(SocketAddr),
+    ClipboardUpdateSource(ClipboardUpdateSourceArgs),
+    ClipboardRequestContent(ClipboardRequestContentArgs),
+    ClipboardSendContent(ClipboardSendContentArgs),
+}
+
+pub struct AddClientArgs {
+    pub endpoint: SocketAddr,
+    pub events_send: SendStream,
+    pub bulk_send: SendStream,
+}
+
+pub struct ClipboardUpdateSourceArgs {
+    pub source: Option<SocketAddr>,
+    pub types: Vec<String>,
+    // min of source_client_max (if any), and server_max:
+    pub max_size_bytes: u64,
+}
+
+pub struct ClipboardRequestContentArgs {
+    pub request_client: Option<SocketAddr>,
+    pub type_: String,
+    pub max_size_bytes: u64,
+}
+
+pub struct ClipboardSendContentArgs {
+    // The client sending the clipboard data
+    pub data_source: SocketAddr,
+    // Copied from the ServerClipboardRequest, indicates where the clipboard data should be sent
+    pub request_client: Option<SocketAddr>,
+    pub data: x11clipboard::ClipboardData,
+}
+
 pub struct Rotation {
     grab_tx: broadcast::Sender<watch::GrabEvent>,
     clients: Vec<ClientInfo>,
     current_client: Option<SocketAddr>,
     removed_current_client: Option<DefunctClientInfo>,
     buf: Vec<u8>,
-    clipboard_reader: x11clipboard::reader::ClipboardReader,
-    clipboard_writer: x11clipboard::writer::ClipboardWriter,
+    local_clipboard: Option<LocalClipboard>,
     clipboard_target: Option<ClipboardTarget>,
 }
 
 impl Rotation {
     pub async fn new(
         grab_tx: broadcast::Sender<watch::GrabEvent>,
-        clipboard_fetch_tx: mpsc::Sender<x11clipboard::writer::ClipboardFetch>,
+        local_clipboard: Option<LocalClipboard>,
     ) -> Result<Self> {
         let mut buf = Vec::with_capacity(1024);
         // Init required for space to be usable
@@ -75,14 +174,50 @@ impl Rotation {
             current_client: None,
             removed_current_client: None,
             buf,
-            clipboard_reader: x11clipboard::reader::ClipboardReader::new().await?,
-            clipboard_writer: x11clipboard::writer::ClipboardWriter::new(clipboard_fetch_tx)
-                .await?,
+            local_clipboard,
             clipboard_target: None,
         })
     }
 
-    pub async fn add_client(
+    pub async fn accept(&mut self, event: RotationEvent) {
+        match event {
+            RotationEvent::AddClient(args) => {
+                self.add_client(args.endpoint, args.events_send, args.bulk_send)
+                    .await
+            }
+            RotationEvent::RemoveClient(endpoint) => self.remove_client(endpoint).await,
+            RotationEvent::ClipboardUpdateSource(args) => {
+                if let Err(e) = self
+                    .clipboard_update_source(args.source, args.types, args.max_size_bytes)
+                    .await
+                {
+                    warn!("Failed to update clipboard source to server: {:?}", e);
+                }
+            }
+            RotationEvent::ClipboardRequestContent(args) => {
+                if let Err(e) = self
+                    .clipboard_request_content(
+                        args.request_client,
+                        &args.type_,
+                        args.max_size_bytes,
+                    )
+                    .await
+                {
+                    warn!("Failed to retrieve clipboard content for server: {:?}", e);
+                }
+            }
+            RotationEvent::ClipboardSendContent(args) => {
+                if let Err(e) = self
+                    .clipboard_send_content(args.data_source, args.request_client, args.data)
+                    .await
+                {
+                    warn!("Failed to send clipboard content to client: {:?}", e);
+                }
+            }
+        }
+    }
+
+    async fn add_client(
         &mut self,
         endpoint: SocketAddr,
         events_send: SendStream,
@@ -161,7 +296,7 @@ impl Rotation {
         }
     }
 
-    pub async fn remove_client(&mut self, endpoint: SocketAddr) {
+    async fn remove_client(&mut self, endpoint: SocketAddr) {
         let idx = match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
             Ok(idx) => idx,
             Err(_e) => {
@@ -222,7 +357,7 @@ impl Rotation {
 
     /// Updates the tracked location for the current clipboard,
     /// whether on the server host or on a remote client.
-    pub async fn clipboard_update_source(
+    async fn clipboard_update_source(
         &mut self,
         source: Option<SocketAddr>,
         types: Vec<String>,
@@ -239,13 +374,13 @@ impl Rotation {
 
         // Notify the active client (or server) about the clipboard info we just received.
         // In practice we should be getting this shortly after a client switch.
-        self.update_current_client_clipboard().await?;
+        self.update_current_client_clipboard(true).await?;
 
         Ok(())
     }
 
     /// Routes a request for clipboard content to a remote client or a local application
-    pub async fn clipboard_request_content(
+    async fn clipboard_request_content(
         &mut self,
         request_client: Option<SocketAddr>,
         type_: &str,
@@ -291,35 +426,39 @@ impl Rotation {
             self.send_bulk(clipboard_source, msg, None).await
         } else {
             // The server has the clipboard: serve via X11 from local app
-            if let Some(request_client) = &request_client {
-                // Read and send the clipboard content
-                let content = self
-                    .clipboard_reader
-                    .read(type_, max_size_bytes, &Some(*request_client))
-                    .await?;
-                let msg = bulk::ServerBulk::ClipboardHeader(bulk::ServerClipboardHeader {
-                    type_,
-                    content_len_bytes: content.len() as u64,
-                });
-                info!(
-                    "Sending clipboard data with type={} from server to {}",
-                    type_, request_client
-                );
-                self.send_bulk(request_client, msg, Some(content)).await
-            } else {
+            let request_client = match &request_client {
+                Some(c) => c,
                 // We're getting a request for the clipboard from the server host.
                 // We should only be serving clipboards for remote clients, but there isn't one.
                 // This may mean that the serving client disconnected, but we should have cleared the status.
-                bail!(
+                None => bail!(
                     "Server got local clipboard request against itself? current_clipboard={:?}",
                     target
-                );
-            }
+                ),
+            };
+            let local_clipboard = match &mut self.local_clipboard {
+                Some(c) => c,
+                None => bail!("Fetch for local server clipboard but server clipboard is disabled"),
+            };
+            // Read and send the clipboard content
+            let content = local_clipboard
+                .reader
+                .read(type_, max_size_bytes, &Some(*request_client))
+                .await?;
+            let msg = bulk::ServerBulk::ClipboardHeader(bulk::ServerClipboardHeader {
+                type_,
+                content_len_bytes: content.len() as u64,
+            });
+            info!(
+                "Sending clipboard data with type={} from server to {}",
+                type_, request_client
+            );
+            self.send_bulk(request_client, msg, Some(content)).await
         }
     }
 
     /// Sends clipboard content in response to a prior request via clipboard_request_content.
-    pub async fn clipboard_send_content(
+    async fn clipboard_send_content(
         &mut self,
         // The client sending the clipboard data
         data_source: SocketAddr,
@@ -342,8 +481,12 @@ impl Rotation {
             });
             self.send_bulk(&request_client, msg, Some(data.data)).await
         } else {
-            // Send to local X11
-            self.clipboard_writer.store_data(data).await
+            if let Some(local_clipboard) = &mut self.local_clipboard {
+                // Send to local X11
+                local_clipboard.writer.store_data(data).await
+            } else {
+                bail!("Got unexpected clipboard data: server system clipboard is disabled");
+            }
         }
     }
 
@@ -390,7 +533,9 @@ impl Rotation {
         // Notify the new client (or server) about any current clipboard info, or a noop if it fails.
         // This may be overridden if the old client sends a clipboard update following the switch,
         // or it won't, if the old client doesn't have a clipboard update to send.
-        if let Err(e) = self.update_current_client_clipboard().await {
+        // log_info=false: Avoid duplicate info-level logging of clipboard types, between the server
+        // switch and then (potentially) an update from the client that's being deactivated.
+        if let Err(e) = self.update_current_client_clipboard(false).await {
             warn!(
                 "Failed to send clipboard update to active client/server: {:?}",
                 e
@@ -412,8 +557,7 @@ impl Rotation {
         }
     }
 
-    // TODO(later): this can get called/logged twice in a switch, between us proactively updating and the client sending a clipboard types announce after being marked inactive. doesn't hurt anything though.
-    async fn update_current_client_clipboard(&mut self) -> Result<()> {
+    async fn update_current_client_clipboard(&mut self, log_info: bool) -> Result<()> {
         let c = match &self.clipboard_target {
             Some(c) => c,
             // No clipboard to announce
@@ -430,20 +574,40 @@ impl Rotation {
                         types: &types_str,
                         max_size_bytes: c.max_size_bytes,
                     });
-                    info!(
-                        "Sending clipboard types for {} to {}: {}",
-                        clipboard_source, current_client, types_str
-                    );
+                    if log_info {
+                        info!(
+                            "Sending clipboard types for {} to {}: {}",
+                            clipboard_source, current_client, types_str
+                        );
+                    } else {
+                        debug!(
+                            "Sending clipboard types for {} to {}: {}",
+                            clipboard_source, current_client, types_str
+                        );
+                    }
                     self.send_event_current(types_msg).await?;
                 }
             } else {
-                // The server is active. Tell it about the client clipbard.
-                info!(
-                    "Storing clipboard types for {} on server: {}",
-                    clipboard_source,
-                    c.types.join(" ")
-                );
-                self.clipboard_writer.store_types(c.types.clone())?;
+                if let Some(local_clipboard) = &mut self.local_clipboard {
+                    // The server is active and its clipboard support is enabled.
+                    // Tell it about the client clipbard.
+                    if log_info {
+                        info!(
+                            "Storing clipboard types for {} on server: {}",
+                            clipboard_source,
+                            c.types.join(" ")
+                        );
+                    } else {
+                        debug!(
+                            "Storing clipboard types for {} on server: {}",
+                            clipboard_source,
+                            c.types.join(" ")
+                        );
+                    }
+                    local_clipboard.writer.store_types(c.types.clone())?;
+                } else {
+                    debug!("Ignoring clipboard types sent by client: Server clipboard is disabled");
+                }
             }
         } else {
             // The clipboard is from the server.
@@ -659,9 +823,11 @@ impl Rotation {
         self.clipboard_target = None;
 
         // Clear the server's host clipboard status
-        if let Err(e) = self.clipboard_writer.store_types(vec![]) {
-            // Keep going with the clients...
-            warn!("Failed to clear server clipboard: {}", e);
+        if let Some(c) = &mut self.local_clipboard {
+            if let Err(e) = c.writer.store_types(vec![]) {
+                // Keep going with the clients...
+                warn!("Failed to clear server clipboard: {}", e);
+            }
         }
 
         // Clear all clients' host clipboard statuses (the client was already removed)

@@ -756,6 +756,7 @@ dependencies = [
  "anyhow",
  "atty",
  "bit-vec",
+ "bytes",
  "clap",
  "evdev",
  "home",

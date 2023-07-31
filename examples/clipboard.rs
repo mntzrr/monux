@@ -25,7 +25,7 @@ fn main() -> Result<()> {
     ];
     let (fetch_tx, mut fetch_rx) = mpsc::channel(32);
     let writer = Arc::new(Mutex::new(
-        x11clipboard::writer::ClipboardWriter::new(fetch_tx).await?,
+        x11clipboard::writer::ClipboardWriter::start(fetch_tx).await?,
     ));
 
     let writer2 = writer.clone();

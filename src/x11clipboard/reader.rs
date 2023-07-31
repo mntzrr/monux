@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use tokio::{sync::watch, task, time};
 use tracing::{debug, trace, warn};
 use x11rb_async::connection::Connection;
@@ -22,7 +22,9 @@ pub struct ClipboardTypeWatcher {
 
 impl ClipboardTypeWatcher {
     pub async fn start(types_tx: watch::Sender<Vec<String>>) -> Result<()> {
-        let context = shared::XContext::new().await?;
+        let context = shared::XContext::new()
+            .await
+            .context("Failed to set up X11 API context")?;
         let atoms = shared::Atoms::new(&context.conn).await?;
         task::spawn(async move {
             let mut watcher = Self { context, atoms };
@@ -127,8 +129,12 @@ pub struct ClipboardReader {
 
 impl ClipboardReader {
     pub async fn new() -> Result<Self> {
-        let context = shared::XContext::new().await?;
-        let atoms = shared::Atoms::new(&context.conn).await?;
+        let context = shared::XContext::new()
+            .await
+            .context("Failed to set up X11 API context")?;
+        let atoms = shared::Atoms::new(&context.conn)
+            .await
+            .context("Failed to set up X11 Atoms storage")?;
         Ok(Self { context, atoms })
     }
 

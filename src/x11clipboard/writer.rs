@@ -34,8 +34,10 @@ pub struct ClipboardWriter {
 }
 
 impl ClipboardWriter {
-    pub async fn new(fetch_data_tx: mpsc::Sender<ClipboardFetch>) -> Result<Self> {
-        let context = shared::XContext::new().await?;
+    pub async fn start(fetch_data_tx: mpsc::Sender<ClipboardFetch>) -> Result<Self> {
+        let context = shared::XContext::new()
+            .await
+            .context("Failed to set up X11 API context")?;
         let (store_types_tx, store_types_rx) = watch::channel(vec![]);
         let (store_data_tx, store_data_rx) = mpsc::channel(32);
         task::spawn(async move {

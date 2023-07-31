@@ -212,31 +212,32 @@ async fn client(
     // Try to set up virtual devices up-front - exit early if we aren't root
     let mut virtual_devices =
         output::VirtualDevices::new().context("Failed to create virtual devices, are you root?")?;
-    let bind_addr: SocketAddr = "0.0.0.0:0".parse()?;
 
-    // TODO(later) allow missing clipboard support
     let mut local_clipboard = match client::LocalClipboard::new().await {
-        Ok(c) => c,
-        Err(e) => panic!("Failed to initialize client clipboard: {:?}", e),
+        Ok(c) => Some(c),
+        Err(e) => {
+            info!("Disabled system clipboard support: {}", e);
+            None
+        }
     };
 
     loop {
-        let verifier2 = verifier.clone();
         info!("Connecting to server: {}", connect_addr);
-        if let Err(e) = client::run_client(
-            &bind_addr,
+        if let Err(e) = client::run(
             &connect_addr,
-            &mut virtual_devices,
-            verifier2,
+            verifier.clone(),
             max_clipboard_size_bytes,
             &mut local_clipboard,
+            &mut virtual_devices,
         )
         .await
         {
             error!("Client error: {:?}", e);
             // Clear any clipboard status that may have been accumulated while active
-            if let Err(e) = local_clipboard.clear_remote_clipboard().await {
-                warn!("Failed to clear remote clipboard: {}", e);
+            if let Some(lc) = &mut local_clipboard {
+                if let Err(e) = lc.clear_remote_clipboard().await {
+                    warn!("Failed to clear remote clipboard: {}", e);
+                }
             }
             // Wait a bit before retrying. Often happens when waiting for server to approve the cert.
             time::sleep(Duration::from_secs(5)).await
