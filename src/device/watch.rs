@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use evdev::{Device, EventStream, EventType, Key};
@@ -86,7 +86,7 @@ pub async fn watch_loop<F: DeviceHandler>(
         );
     }
     info!("Listening to {} input devices", devices.len());
-    if devices.len() <= 0 {
+    if devices.is_empty() {
         bail!("Didn't find any compatible devices, are you root?");
     }
 
@@ -172,7 +172,7 @@ async fn handle_device_event<F: DeviceHandler>(
     }
 }
 
-fn compatible_path(path: &PathBuf) -> bool {
+fn compatible_path(path: &Path) -> bool {
     // Filename should be 'event<N>', like 'event3' or 'event14'
     path.file_name()
         .filter(|f| f.to_string_lossy().starts_with("event"))
@@ -189,25 +189,19 @@ fn compatible_device(d: &Device) -> bool {
     }
     // We care about these kinds of devices: keyboard, mouse, and touchpad
     let evts = d.supported_events();
-    if evts.contains(EventType::ABSOLUTE) {
-        // Touchpad or joystick
-        true
-    } else if evts.contains(EventType::RELATIVE) {
-        // Mouse
+    if evts.contains(EventType::ABSOLUTE) || evts.contains(EventType::RELATIVE) {
+        // absolute: probably a touchpad or joystick
+        // relative: probably a mouse
         true
     } else if evts.contains(EventType::KEY) {
-        // Keyboard or utility keys
+        // probably a keyboard or utility keys
         if let Some(keys) = d.supported_keys() {
+            // Some machines have special devices for the power/suspend button, we can ignore those.
             // If the device only supports one or more of these keys, then ignore the device.
-            // If the user presses a power button on the server machine, then we shouldn't send the event to the client.
-            if keys
+            // If this button is pressed on the server, we shouldn't send the power event to clients.
+            !keys
                 .iter()
                 .all(|key| key == Key::KEY_POWER || key == Key::KEY_SLEEP || key == Key::KEY_WAKEUP)
-            {
-                false
-            } else {
-                true
-            }
         } else {
             // Key device without any keys? Skip it
             false
@@ -217,7 +211,7 @@ fn compatible_device(d: &Device) -> bool {
     }
 }
 
-fn start_device_stream(device: Device, path: &PathBuf) -> Result<EventStream> {
+fn start_device_stream(device: Device, path: &Path) -> Result<EventStream> {
     device.into_event_stream().with_context(|| {
         format!(
             "Failed to initialize async fd for device: {}",

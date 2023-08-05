@@ -66,7 +66,7 @@ impl ClipboardTypeWatcher {
         let buf = self.read_wait(self.atoms.targets).await?;
         let mut atom_names = Vec::new();
         for atom in to_atoms(&buf)? {
-            atom_names.push(self.atoms.to_name(&self.context.conn, atom).await?);
+            atom_names.push(self.atoms.get_name(&self.context.conn, atom).await?);
         }
         Ok(atom_names)
     }
@@ -150,12 +150,12 @@ impl ClipboardReader {
             if let Some(c) = request_client {
                 format!("client {}", c)
             } else {
-                format!("server")
+                "server".to_string()
             },
             type_,
             max_size_bytes
         );
-        let type_atom = self.atoms.to_atom(&self.context.conn, type_).await?;
+        let type_atom = self.atoms.get_atom(&self.context.conn, type_).await?;
 
         self.context
             .conn
@@ -337,10 +337,10 @@ fn to_atoms(buf: &Vec<u8>) -> Result<Vec<Atom>> {
     let mut atoms: Vec<Atom> = Vec::new();
     let mut next = buf.as_slice();
     loop {
-        if next.len() <= 0 {
+        if next.is_empty() {
             break;
         }
-        if let Ok((atom, remaining)) = Atom::try_parse(&next) {
+        if let Ok((atom, remaining)) = Atom::try_parse(next) {
             atoms.push(atom);
             next = remaining;
         } else {

@@ -36,14 +36,14 @@ impl InputHandler {
     ) -> Result<InputHandler> {
         let mut combo_keys_next = vec![];
         let mut combo_keys_prev = vec![];
-        for key in keys_next.split(",") {
+        for key in keys_next.split(',') {
             combo_keys_next.push(
                 Key::from_str(format!("KEY_{}", key.trim().to_uppercase()).as_str())
                     .map_err(|e| anyhow!("Unsupported key '{}': {:?}", key, e))?,
             );
         }
         if let Some(keys_prev) = keys_prev {
-            for key in keys_prev.split(",") {
+            for key in keys_prev.split(',') {
                 combo_keys_prev.push(
                     Key::from_str(format!("KEY_{}", key.trim().to_uppercase()).as_str())
                         .map_err(|e| anyhow!("Unsupported key '{}': {:?}", key, e))?,
@@ -136,13 +136,13 @@ async fn read_device_events(
 ) {
     let mut combo_state_next = ComboState::new(c.combo_keys_next.clone());
     let mut combo_state_prev = ComboState::new(c.combo_keys_prev.clone());
-    let device_info = util::device_info(&stream.device());
+    let device_info = util::device_info(stream.device());
     loop {
         tokio::select! {
             event = stream.next_event() => {
                 match event {
                     Ok(event) => {
-                        read_device_event(event, &mut c.event_tx, &stream.device(), &device_info, &mut combo_state_next, &mut combo_state_prev).await;
+                        read_device_event(event, &mut c.event_tx, stream.device(), &device_info, &mut combo_state_next, &mut combo_state_prev).await;
                     }
                     Err(e) => {
                         // Common when the device has been unplugged.

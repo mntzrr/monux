@@ -11,12 +11,16 @@ use tracing::{info, trace, warn};
 use crate::device::output;
 use crate::msgs::{bulk, event};
 use crate::network::{approval, transport};
-use crate::x11clipboard;
+use crate::x11clipboard::{
+    reader::{ClipboardReader, ClipboardTypeWatcher},
+    writer::{ClipboardFetch, ClipboardWriter},
+    ClipboardData,
+};
 
 pub struct LocalClipboard {
-    reader: x11clipboard::reader::ClipboardReader,
-    pub writer: x11clipboard::writer::ClipboardWriter,
-    fetch_rx: mpsc::Receiver<x11clipboard::writer::ClipboardFetch>,
+    reader: ClipboardReader,
+    pub writer: ClipboardWriter,
+    fetch_rx: mpsc::Receiver<ClipboardFetch>,
     local_types_rx: watch::Receiver<Vec<String>>,
     local_types: Option<Vec<String>>,
     pub serving_remote_clipboard: bool,
@@ -25,10 +29,10 @@ pub struct LocalClipboard {
 impl LocalClipboard {
     pub async fn new() -> Result<Self> {
         let (fetch_tx, fetch_rx) = mpsc::channel(32);
-        let reader = x11clipboard::reader::ClipboardReader::new().await?;
+        let reader = ClipboardReader::new().await?;
         let (local_types_tx, local_types_rx) = watch::channel(vec![]);
-        x11clipboard::reader::ClipboardTypeWatcher::start(local_types_tx).await?;
-        let writer = x11clipboard::writer::ClipboardWriter::start(fetch_tx).await?;
+        ClipboardTypeWatcher::start(local_types_tx).await?;
+        let writer = ClipboardWriter::start(fetch_tx).await?;
         Ok(Self {
             reader,
             writer,
@@ -61,12 +65,9 @@ pub async fn run(
     let (mut client, connect_time) =
         Connection::new(server_addr, cert_verifier, max_clipboard_size_bytes).await?;
     loop {
-        if let Err(e) = client
+        client
             .step(local_clipboard, virtual_devices, &connect_time)
-            .await
-        {
-            return Err(e);
-        }
+            .await?
     }
 }
 
@@ -86,7 +87,7 @@ struct Connection {
 
     // Accumulator of raw clipboard data streamed from the server.
     // Cleared when the clipboard data has all been received.
-    incoming_clipboard_data: Option<x11clipboard::ClipboardData>,
+    incoming_clipboard_data: Option<ClipboardData>,
 }
 
 impl Connection {
@@ -100,7 +101,7 @@ impl Connection {
         let client_endpoint = transport::build_client(&bind_addr, cert_verifier)?;
         // Connect to server, our custom cert verifiers result in server_name being ignored
         let conn = client_endpoint
-            .connect(server_addr.clone(), "__ignored__")?
+            .connect(*server_addr, "__ignored__")?
             .await?;
         info!(
             "Connected to server: {} (from local endpoint {})",
@@ -160,7 +161,7 @@ impl Connection {
                     if let Some(local_fetch_request) = local_fetch_request {
                         let msg = bulk::ClientBulk::ClipboardRequest(bulk::ClientClipboardRequest{
                             type_: &local_fetch_request.type_,
-                            max_size_bytes: self.max_clipboard_size_bytes as u64,
+                            max_size_bytes: self.max_clipboard_size_bytes,
                         });
                         let serializedmsg = postcard::to_stdvec_cobs(&msg)
                             .map_err(|e| anyhow!("Failed to serialize clipboard request message: {:?}", e))?;
@@ -200,7 +201,7 @@ impl Connection {
                         .context("Server closed events connection")?;
                     trace!("Received {} bytes from events stream: {:X?}", resp.bytes.len(), &*resp.bytes);
                     // Copy the immutable response data into a mutable buffer
-                    self.event_bytes.extend_from_slice(&*resp.bytes);
+                    self.event_bytes.extend_from_slice(&resp.bytes);
                     self.handle_event_messages(Some(local_clipboard), virtual_devices).await?;
                     self.event_bytes.clear();
                 },
@@ -230,7 +231,7 @@ impl Connection {
                         .context("Server closed events connection")?;
                     trace!("Received {} bytes from events stream: {:X?}", resp.bytes.len(), &*resp.bytes);
                     // Copy the immutable response data into a mutable buffer
-                    self.event_bytes.extend_from_slice(&*resp.bytes);
+                    self.event_bytes.extend_from_slice(&resp.bytes);
                     self.handle_event_messages(None, virtual_devices).await?;
                     self.event_bytes.clear();
                 },
@@ -318,7 +319,7 @@ impl Connection {
                         local_clipboard.local_types = None;
                         local_clipboard.serving_remote_clipboard = true;
                         let types: Vec<String> =
-                            types.types.split(" ").map(|s| s.to_string()).collect();
+                            types.types.split(' ').map(|s| s.to_string()).collect();
                         local_clipboard.writer.store_types(types)?;
                     } else {
                         info!("Ignoring clipboard types from server: {}", types.types);
@@ -339,7 +340,7 @@ impl Connection {
             // Clipboard data streaming is in progress. Interpret as raw clipboard data.
             if c.remaining_bytes >= resp_bytes.len() {
                 // This chunk should entirely be raw clipboard data.
-                c.data.extend_from_slice(&*resp_bytes);
+                c.data.extend_from_slice(&resp_bytes);
                 c.remaining_bytes -= resp_bytes.len();
             } else {
                 // Chunk contains more data than expected for the clipboard entry.
@@ -363,7 +364,7 @@ impl Connection {
                 }
             }
 
-            if self.bulk_recv_bytes.len() > 0 {
+            if !self.bulk_recv_bytes.is_empty() {
                 // Handle any data/messages following the raw clipboard dump.
                 if let Some(updated_clipboard_data) =
                     self.handle_bulk_messages(local_clipboard).await?
@@ -375,7 +376,7 @@ impl Connection {
         } else {
             // Not in the middle of a raw clipboard dump. Must be a postcard message.
             // Copy the immutable response data into a mutable buffer for parsing.
-            self.bulk_recv_bytes.extend_from_slice(&*resp_bytes);
+            self.bulk_recv_bytes.extend_from_slice(&resp_bytes);
             if let Some(updated_clipboard_data) = self.handle_bulk_messages(local_clipboard).await?
             {
                 self.incoming_clipboard_data.replace(updated_clipboard_data);
@@ -388,7 +389,7 @@ impl Connection {
     async fn handle_bulk_messages(
         &mut self,
         mut local_clipboard: Option<&mut LocalClipboard>,
-    ) -> Result<Option<x11clipboard::ClipboardData>> {
+    ) -> Result<Option<ClipboardData>> {
         let mut offset = 0;
         let bytes_len = self.bulk_recv_bytes.len();
         while offset < bytes_len {
@@ -470,7 +471,7 @@ impl Connection {
                         // Mark content as consumed and continue looping in case another message follows.
                         let mut data = Vec::with_capacity(c.content_len_bytes as usize);
                         data.extend_from_slice(&resp_remainder[..c.content_len_bytes as usize]);
-                        let d = x11clipboard::ClipboardData {
+                        let d = ClipboardData {
                             type_: c.type_.to_string(),
                             data,
                             remaining_bytes: 0,
@@ -482,7 +483,7 @@ impl Connection {
                         // Save what we've got so far, and assign remaining_bytes to what's left.
                         let mut data = Vec::with_capacity(c.content_len_bytes as usize);
                         data.extend_from_slice(resp_remainder);
-                        return Ok(Some(x11clipboard::ClipboardData {
+                        return Ok(Some(ClipboardData {
                             type_: c.type_.to_string(),
                             data,
                             remaining_bytes: c.content_len_bytes as usize - resp_remainder.len(),

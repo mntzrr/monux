@@ -54,12 +54,9 @@ impl VirtualDevices {
                         "Sending {} events to {} device: {:?}",
                         events.len(),
                         net_event.target,
-                        events
-                            .iter()
-                            .map(|e| util::log_event(e))
-                            .collect::<Vec<String>>(),
+                        events.iter().map(util::log_event).collect::<Vec<String>>(),
                     );
-                    device.emit(&events)?;
+                    device.emit(events)?;
                     events.clear();
                 }
             } else {
@@ -72,7 +69,7 @@ impl VirtualDevices {
         if events.len() >= 100 {
             // Just in case, avoid the risk of collecting queued events forever
             warn!("Forcing event flush due to lack of sync events");
-            device.emit(&events)?;
+            device.emit(events)?;
             events.clear();
         }
 
@@ -101,7 +98,7 @@ impl VirtualDevices {
 pub fn keyboard(pid: u32) -> Result<uinput::VirtualDevice> {
     let mut keys = AttributeSet::<Key>::new();
     // Report as many keys as possible to emit by the virtual device.
-    for code in 1..(libc::KEY_MAX as u16) {
+    for code in 1..libc::KEY_MAX {
         let key = Key::new(code);
         // HACK: Include only known KEY_* keys, or else the keyboard will be ignored.
         let key_name = format!("{:?}", key);
@@ -119,7 +116,7 @@ pub fn keyboard(pid: u32) -> Result<uinput::VirtualDevice> {
 
 pub fn mouse(pid: u32) -> Result<uinput::VirtualDevice> {
     let mut keys = AttributeSet::<Key>::new();
-    for code in 1..(libc::KEY_MAX as u16) {
+    for code in 1..libc::KEY_MAX {
         let key = Key::new(code);
         // HACK: Include only BTN_* keys, and exclude BTN_TOOL_* or else the mouse is ignored.
         let key_name = format!("{:?}", key);
@@ -150,7 +147,7 @@ pub fn touchpad(pid: u32) -> Result<uinput::VirtualDevice> {
     props.insert(evdev::PropType::POINTER);
 
     let mut keys = AttributeSet::<Key>::new();
-    for code in 1..(libc::KEY_MAX as u16) {
+    for code in 1..libc::KEY_MAX {
         let key = Key::new(code);
         // HACK: Limit to only (most) BTN_* keys or else the device won't work,
         let key_name = format!("{:?}", key);
@@ -230,7 +227,7 @@ pub fn touchpad(pid: u32) -> Result<uinput::VirtualDevice> {
                     SCALED_DIM_RES_Y,
                 ))?;
             }
-            util::AxisScale::OTHER => {
+            util::AxisScale::Other => {
                 device_builder = device_builder.with_absolute_axis(&abs_axis(
                     axis,
                     SCALED_DIM_MIN,

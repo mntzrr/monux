@@ -147,7 +147,7 @@ async fn handle_connection(
                     .context("Client closed events connection")?;
                 trace!("Received {} bytes from events stream: {:X?}", resp.bytes.len(), &*resp.bytes);
                 // Copy the immutable response data into a mutable buffer
-                event_bytes.extend_from_slice(&*resp.bytes);
+                event_bytes.extend_from_slice(&resp.bytes);
                 handle_event_messages(conn.remote_address(), &rotation_tx, &mut event_bytes, max_clipboard_size_bytes).await?;
                 event_bytes.clear();
             },
@@ -159,7 +159,7 @@ async fn handle_connection(
                 if let Some((c, request_client)) = &mut incoming_clipboard_data {
                     if c.remaining_bytes >= resp.bytes.len() {
                         // Chunk is all clipboard data.
-                        c.data.extend_from_slice(&*resp.bytes);
+                        c.data.extend_from_slice(&resp.bytes);
                         c.remaining_bytes -= resp.bytes.len();
                     } else {
                         // Chunk contains additional data past the clipboard entry.
@@ -177,14 +177,14 @@ async fn handle_connection(
                         })).await?;
                     }
 
-                    if bulk_bytes.len() > 0 {
+                    if !bulk_bytes.is_empty() {
                         // Handle any data following the clipboard entry.
                         incoming_clipboard_data = handle_bulk_messages(conn.remote_address(), &rotation_tx, &mut bulk_bytes, max_clipboard_size_bytes).await?;
                         bulk_bytes.clear();
                     }
                 } else {
                     // Copy the immutable response data into a mutable buffer
-                    bulk_bytes.extend_from_slice(&*resp.bytes);
+                    bulk_bytes.extend_from_slice(&resp.bytes);
                     incoming_clipboard_data = handle_bulk_messages(conn.remote_address(), &rotation_tx, &mut bulk_bytes, max_clipboard_size_bytes).await?;
                     bulk_bytes.clear();
                 }
@@ -224,7 +224,7 @@ async fn handle_event_messages(
         match msg {
             event::ClientEvent::ClipboardTypes(t) => {
                 // Client broadcasted new clipboard types for server (and other clients) to advertise
-                let types: Vec<String> = t.types.split(" ").map(|t| t.to_string()).collect();
+                let types: Vec<String> = t.types.split(' ').map(|t| t.to_string()).collect();
                 rotation_tx
                     .send(rotation::RotationEvent::ClipboardUpdateSource(
                         rotation::ClipboardUpdateSourceArgs {

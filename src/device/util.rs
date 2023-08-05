@@ -12,57 +12,57 @@ pub enum AxisScale {
     /// Values against the Y axis
     Y,
     /// Continous values against other axes/scales
-    OTHER,
-    /// Values that aren't continuous
-    DISCRETE,
+    Other,
+    /// Values that aren't continuous along an axis
+    Discrete,
     /// Not known axis values
-    INVALID,
+    Invalid,
 }
 
 pub fn axis_scale_type(axis: AbsoluteAxisType) -> AxisScale {
     match axis {
         AbsoluteAxisType::ABS_X => AxisScale::X,
         AbsoluteAxisType::ABS_Y => AxisScale::Y,
-        AbsoluteAxisType::ABS_Z => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_Z => AxisScale::Other,
         AbsoluteAxisType::ABS_RX => AxisScale::X,
         AbsoluteAxisType::ABS_RY => AxisScale::Y,
-        AbsoluteAxisType::ABS_RZ => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_THROTTLE => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_RUDDER => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_WHEEL => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_GAS => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_BRAKE => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_HAT0X => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_HAT0Y => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_HAT1X => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_HAT1Y => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_HAT2X => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_HAT2Y => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_HAT3X => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_HAT3Y => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_PRESSURE => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_DISTANCE => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_TILT_X => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_TILT_Y => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_TOOL_WIDTH => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_VOLUME => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_MISC => AxisScale::DISCRETE,
-        AbsoluteAxisType::ABS_MT_SLOT => AxisScale::DISCRETE,
-        AbsoluteAxisType::ABS_MT_TOUCH_MAJOR => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_MT_TOUCH_MINOR => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_MT_WIDTH_MAJOR => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_MT_WIDTH_MINOR => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_MT_ORIENTATION => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_RZ => AxisScale::Other,
+        AbsoluteAxisType::ABS_THROTTLE => AxisScale::Other,
+        AbsoluteAxisType::ABS_RUDDER => AxisScale::Other,
+        AbsoluteAxisType::ABS_WHEEL => AxisScale::Other,
+        AbsoluteAxisType::ABS_GAS => AxisScale::Other,
+        AbsoluteAxisType::ABS_BRAKE => AxisScale::Other,
+        AbsoluteAxisType::ABS_HAT0X => AxisScale::Other,
+        AbsoluteAxisType::ABS_HAT0Y => AxisScale::Other,
+        AbsoluteAxisType::ABS_HAT1X => AxisScale::Other,
+        AbsoluteAxisType::ABS_HAT1Y => AxisScale::Other,
+        AbsoluteAxisType::ABS_HAT2X => AxisScale::Other,
+        AbsoluteAxisType::ABS_HAT2Y => AxisScale::Other,
+        AbsoluteAxisType::ABS_HAT3X => AxisScale::Other,
+        AbsoluteAxisType::ABS_HAT3Y => AxisScale::Other,
+        AbsoluteAxisType::ABS_PRESSURE => AxisScale::Other,
+        AbsoluteAxisType::ABS_DISTANCE => AxisScale::Other,
+        AbsoluteAxisType::ABS_TILT_X => AxisScale::Other,
+        AbsoluteAxisType::ABS_TILT_Y => AxisScale::Other,
+        AbsoluteAxisType::ABS_TOOL_WIDTH => AxisScale::Other,
+        AbsoluteAxisType::ABS_VOLUME => AxisScale::Other,
+        AbsoluteAxisType::ABS_MISC => AxisScale::Discrete,
+        AbsoluteAxisType::ABS_MT_SLOT => AxisScale::Discrete,
+        AbsoluteAxisType::ABS_MT_TOUCH_MAJOR => AxisScale::Other,
+        AbsoluteAxisType::ABS_MT_TOUCH_MINOR => AxisScale::Other,
+        AbsoluteAxisType::ABS_MT_WIDTH_MAJOR => AxisScale::Other,
+        AbsoluteAxisType::ABS_MT_WIDTH_MINOR => AxisScale::Other,
+        AbsoluteAxisType::ABS_MT_ORIENTATION => AxisScale::Other,
         AbsoluteAxisType::ABS_MT_POSITION_X => AxisScale::X,
         AbsoluteAxisType::ABS_MT_POSITION_Y => AxisScale::Y,
-        AbsoluteAxisType::ABS_MT_TOOL_TYPE => AxisScale::DISCRETE,
-        AbsoluteAxisType::ABS_MT_BLOB_ID => AxisScale::DISCRETE,
-        AbsoluteAxisType::ABS_MT_TRACKING_ID => AxisScale::DISCRETE,
-        AbsoluteAxisType::ABS_MT_PRESSURE => AxisScale::OTHER,
-        AbsoluteAxisType::ABS_MT_DISTANCE => AxisScale::OTHER,
+        AbsoluteAxisType::ABS_MT_TOOL_TYPE => AxisScale::Discrete,
+        AbsoluteAxisType::ABS_MT_BLOB_ID => AxisScale::Discrete,
+        AbsoluteAxisType::ABS_MT_TRACKING_ID => AxisScale::Discrete,
+        AbsoluteAxisType::ABS_MT_PRESSURE => AxisScale::Other,
+        AbsoluteAxisType::ABS_MT_DISTANCE => AxisScale::Other,
         AbsoluteAxisType::ABS_MT_TOOL_X => AxisScale::X,
         AbsoluteAxisType::ABS_MT_TOOL_Y => AxisScale::Y,
-        _ => AxisScale::INVALID,
+        _ => AxisScale::Invalid,
     }
 }
 
@@ -79,13 +79,12 @@ pub fn device_info(device: &Device) -> DeviceInfo {
         // Result will be something like ABS_X(0,100), ABS_Y(0,70), ABS_MT_POSITION_X(0,100) ...
         if let Some(abs_axes) = device.supported_absolute_axes() {
             if let Ok(state) = device.get_abs_state() {
-                let mut i: u16 = 0;
-                for s in state {
+                // clippy recommends this ugly way to get a loop counter
+                for (i, s) in (0_u16..).zip(state.into_iter()) {
                     let type_ = AbsoluteAxisType::from_index(i as usize);
-                    if abs_axes.contains(type_) && axis_scale_type(type_) != AxisScale::INVALID {
+                    if abs_axes.contains(type_) && axis_scale_type(type_) != AxisScale::Invalid {
                         dims.insert(i, (s.minimum, s.maximum));
                     }
-                    i += 1;
                 }
             }
         }
@@ -115,13 +114,11 @@ fn log_device(device: &Device, target: &event::EventTarget, dims: &BTreeMap<u16,
     let mut abs_entries = vec![];
     if let Some(abs_axes) = device.supported_absolute_axes() {
         if let Ok(state) = device.get_abs_state() {
-            let mut i = 0;
-            for s in state {
+            for (i, s) in state.into_iter().enumerate() {
                 let type_ = AbsoluteAxisType::from_index(i);
                 if abs_axes.contains(type_) {
                     abs_entries.push(format!("{:?}:{:?}", type_, s));
                 }
-                i += 1;
             }
         }
     }

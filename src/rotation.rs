@@ -10,7 +10,11 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::device::watch;
 use crate::msgs::{bulk, event};
-use crate::x11clipboard;
+use crate::x11clipboard::{
+    reader::{ClipboardReader, ClipboardTypeWatcher},
+    writer::{ClipboardFetch, ClipboardWriter},
+    ClipboardData,
+};
 
 /// If the selected client reconnects within 5 seconds of being removed, then reselect it automatically.
 /// This is intended to help with fast recovery following networking flakes.
@@ -52,8 +56,8 @@ struct ClipboardTarget {
 }
 
 pub struct LocalClipboard {
-    reader: x11clipboard::reader::ClipboardReader,
-    writer: x11clipboard::writer::ClipboardWriter,
+    reader: ClipboardReader,
+    writer: ClipboardWriter,
 }
 
 impl LocalClipboard {
@@ -61,10 +65,9 @@ impl LocalClipboard {
         rotation_tx: mpsc::Sender<RotationEvent>,
         max_clipboard_size_bytes: u64,
     ) -> Result<Self> {
-        let (clipboard_fetch_tx, mut clipboard_fetch_rx) =
-            mpsc::channel::<x11clipboard::writer::ClipboardFetch>(32);
+        let (clipboard_fetch_tx, mut clipboard_fetch_rx) = mpsc::channel::<ClipboardFetch>(32);
         let (local_types_tx, mut local_types_rx) = watchchan::channel(vec![]);
-        x11clipboard::reader::ClipboardTypeWatcher::start(local_types_tx).await?;
+        ClipboardTypeWatcher::start(local_types_tx).await?;
 
         task::spawn(async move {
             loop {
@@ -109,8 +112,8 @@ impl LocalClipboard {
         });
 
         Ok(Self {
-            reader: x11clipboard::reader::ClipboardReader::new().await?,
-            writer: x11clipboard::writer::ClipboardWriter::start(clipboard_fetch_tx).await?,
+            reader: ClipboardReader::new().await?,
+            writer: ClipboardWriter::start(clipboard_fetch_tx).await?,
         })
     }
 }
@@ -147,7 +150,7 @@ pub struct ClipboardSendContentArgs {
     pub data_source: SocketAddr,
     // Copied from the ServerClipboardRequest, indicates where the clipboard data should be sent
     pub request_client: Option<SocketAddr>,
-    pub data: x11clipboard::ClipboardData,
+    pub data: ClipboardData,
 }
 
 pub struct Rotation {
@@ -165,9 +168,8 @@ impl Rotation {
         grab_tx: broadcast::Sender<watch::GrabEvent>,
         local_clipboard: Option<LocalClipboard>,
     ) -> Result<Self> {
-        let mut buf = Vec::with_capacity(1024);
         // Init required for space to be usable
-        buf.resize(buf.capacity(), 0);
+        let buf = vec![0; 1024];
         Ok(Rotation {
             grab_tx,
             clients: Vec::new(),
@@ -315,7 +317,7 @@ impl Rotation {
             // Currently on remote machine, find its entry in the list and go to the prev one
             let idx = match self
                 .clients
-                .binary_search_by(|c| c.endpoint.cmp(&current_client))
+                .binary_search_by(|c| c.endpoint.cmp(current_client))
             {
                 Ok(idx) => idx,
                 Err(idx) => idx,
@@ -340,7 +342,7 @@ impl Rotation {
             // Currently on remote machine, find its entry in the list and go to the next one
             let idx = match self
                 .clients
-                .binary_search_by(|c| c.endpoint.cmp(&current_client))
+                .binary_search_by(|c| c.endpoint.cmp(current_client))
             {
                 Ok(idx) => idx,
                 Err(idx) => idx,
@@ -464,7 +466,7 @@ impl Rotation {
         data_source: SocketAddr,
         // Copied from the ServerClipboardRequest, indicates where the clipboard data should be sent
         request_client: Option<SocketAddr>,
-        data: x11clipboard::ClipboardData,
+        data: ClipboardData,
     ) -> Result<()> {
         debug!(
             "Sending clipboard content of type={} with len={} from source={:?} to dest={:?}",
@@ -480,13 +482,11 @@ impl Rotation {
                 content_len_bytes: data.data.len() as u64,
             });
             self.send_bulk(&request_client, msg, Some(data.data)).await
+        } else if let Some(local_clipboard) = &mut self.local_clipboard {
+            // Send to local X11
+            local_clipboard.writer.store_data(data).await
         } else {
-            if let Some(local_clipboard) = &mut self.local_clipboard {
-                // Send to local X11
-                local_clipboard.writer.store_data(data).await
-            } else {
-                bail!("Got unexpected clipboard data: server system clipboard is disabled");
-            }
+            bail!("Got unexpected clipboard data: server system clipboard is disabled");
         }
     }
 
@@ -587,27 +587,25 @@ impl Rotation {
                     }
                     self.send_event_current(types_msg).await?;
                 }
-            } else {
-                if let Some(local_clipboard) = &mut self.local_clipboard {
-                    // The server is active and its clipboard support is enabled.
-                    // Tell it about the client clipbard.
-                    if log_info {
-                        info!(
-                            "Storing clipboard types for {} on server: {}",
-                            clipboard_source,
-                            c.types.join(" ")
-                        );
-                    } else {
-                        debug!(
-                            "Storing clipboard types for {} on server: {}",
-                            clipboard_source,
-                            c.types.join(" ")
-                        );
-                    }
-                    local_clipboard.writer.store_types(c.types.clone())?;
+            } else if let Some(local_clipboard) = &mut self.local_clipboard {
+                // The server is active and its clipboard support is enabled.
+                // Tell it about the client clipbard.
+                if log_info {
+                    info!(
+                        "Storing clipboard types for {} on server: {}",
+                        clipboard_source,
+                        c.types.join(" ")
+                    );
                 } else {
-                    debug!("Ignoring clipboard types sent by client: Server clipboard is disabled");
+                    debug!(
+                        "Storing clipboard types for {} on server: {}",
+                        clipboard_source,
+                        c.types.join(" ")
+                    );
                 }
+                local_clipboard.writer.store_types(c.types.clone())?;
+            } else {
+                debug!("Ignoring clipboard types sent by client: Server clipboard is disabled");
             }
         } else {
             // The clipboard is from the server.
@@ -636,11 +634,11 @@ impl Rotation {
     {
         let mut clients_to_remove = vec![];
         for (idx, client) in self.clients.iter_mut().enumerate() {
-            if test_fn(&client) {
+            if test_fn(client) {
                 if let Err(e) =
                     send_message_to_client(&mut client.events_send, &msg, &mut self.buf).await
                 {
-                    clients_to_remove.push((idx, client.endpoint.clone()));
+                    clients_to_remove.push((idx, client.endpoint));
                     return Err(e);
                 }
             }
@@ -659,7 +657,7 @@ impl Rotation {
     /// Sends an event to the currently active client, removing it if sending fails.
     /// If no client is active, this does nothing.
     pub async fn send_event_current(&mut self, msg: event::ServerEvent<'_>) -> Result<()> {
-        let current_client = match self.current_client.clone() {
+        let current_client = match self.current_client {
             Some(client) => client,
             None => {
                 // Ignore input when using the local machine.
@@ -684,7 +682,7 @@ impl Rotation {
         client: &SocketAddr,
         msg: event::ServerEvent<'_>,
     ) -> Result<bool> {
-        match self.clients.binary_search_by(|c| c.endpoint.cmp(&client)) {
+        match self.clients.binary_search_by(|c| c.endpoint.cmp(client)) {
             Ok(idx) => {
                 let events_send = &mut self
                     .clients
@@ -716,7 +714,7 @@ impl Rotation {
         msg: bulk::ServerBulk<'_>,
         payload: Option<Vec<u8>>,
     ) -> Result<()> {
-        match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
+        match self.clients.binary_search_by(|c| c.endpoint.cmp(endpoint)) {
             Ok(idx) => {
                 let bulk_send = &mut self
                     .clients
@@ -868,7 +866,7 @@ where
         serializedmsg.len(),
         &serializedmsg
     );
-    send.write_all(&serializedmsg)
+    send.write_all(serializedmsg)
         .await
         .context("Failed to send serialized message")
 }

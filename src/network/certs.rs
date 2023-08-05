@@ -61,7 +61,7 @@ pub fn load_keypair(splash_label: &str) -> Result<(rustls::Certificate, rustls::
         if let (Some(cert), Some(key)) = (cert, key) {
             splash(splash_label, &fingerprint(&cert));
             info!("Using keypair from {}", file_path.display());
-            return Ok((cert, key));
+            Ok((cert, key))
         } else {
             bail!("Incomplete cert/key content in {}", file_path.display());
         }
@@ -109,7 +109,7 @@ pub fn load_keypair(splash_label: &str) -> Result<(rustls::Certificate, rustls::
 /// We use this for cert filenames and for comparing certs in confirmation prompts.
 /// This should match the output of "openssl x509 -in <filename> -noout -sha256 -fingerprint"
 pub fn fingerprint(cert: &rustls::Certificate) -> String {
-    format!("{:x}", Sha256::digest(&cert))
+    format!("{:x}", Sha256::digest(cert))
 }
 
 pub fn write_approved_cert(cert: &rustls::Certificate) -> Result<()> {
@@ -144,14 +144,14 @@ pub fn write_approved_cert(cert: &rustls::Certificate) -> Result<()> {
 
 fn load_cert(file_path: &PathBuf) -> Result<rustls::Certificate> {
     let mut reader = io::BufReader::new(
-        fs::File::open(&file_path)
+        fs::File::open(file_path)
             .with_context(|| format!("Failed to open cert file: {}", file_path.display()))?,
     );
     if let Some(rustls_pemfile::Item::X509Certificate(filecert)) =
         rustls_pemfile::read_one(&mut reader)
             .with_context(|| format!("Failed to read cert file: {}", file_path.display()))?
     {
-        return Ok(rustls::Certificate(filecert));
+        Ok(rustls::Certificate(filecert))
     } else {
         bail!("Public certificate not found in {}", file_path.display());
     }

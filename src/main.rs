@@ -160,13 +160,13 @@ async fn server(
         mpsc::channel(32);
 
     let event_tx2 = event_tx.clone();
-    let signals = Signals::new(&[signal::SIGUSR1, signal::SIGUSR2])?;
+    let signals = Signals::new([signal::SIGUSR1, signal::SIGUSR2])?;
     std::thread::spawn(|| handle_signals(signals, event_tx2));
 
     let (grab_tx, _grab_rx) = broadcast::channel(1);
     let grab_tx2 = grab_tx.clone();
 
-    let input_handler = input::InputHandler::new(&next_keys, prev_keys, event_tx)?;
+    let input_handler = input::InputHandler::new(next_keys, prev_keys, event_tx)?;
 
     task::spawn(async move {
         if let Err(e) = watch::watch_loop(input_handler, grab_tx).await {

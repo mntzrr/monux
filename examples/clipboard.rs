@@ -1,19 +1,24 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::{task, time};
 use tracing::{error, info};
 
-use nikau::{logging, x11clipboard};
+use nikau::logging;
+use nikau::x11clipboard::{
+    reader::{ClipboardReader, ClipboardTypeWatcher},
+    writer::ClipboardWriter,
+    ClipboardData,
+};
 
 #[tokio::main]
-fn main() -> Result<()> {
+async fn main() -> Result<()> {
     logging::init_logging();
 
-    let (clipboard_types_tx, mut clipboard_types_rx) = mpsc::channel(32);
-    x11clipboard::reader::ClipboardTypeWatcher::start(clipboard_types_tx).await?;
-    let mut reader = x11clipboard::reader::ClipboardReader::new().await?;
+    let (clipboard_types_tx, mut clipboard_types_rx) = watch::channel(vec![]);
+    ClipboardTypeWatcher::start(clipboard_types_tx).await?;
+    let mut reader = ClipboardReader::new().await?;
     let type_ = "UTF8_STRING";
     let types = vec![
         "text/plain",
@@ -24,9 +29,7 @@ fn main() -> Result<()> {
         type_,
     ];
     let (fetch_tx, mut fetch_rx) = mpsc::channel(32);
-    let writer = Arc::new(Mutex::new(
-        x11clipboard::writer::ClipboardWriter::start(fetch_tx).await?,
-    ));
+    let writer = Arc::new(Mutex::new(ClipboardWriter::start(fetch_tx).await?));
 
     let writer2 = writer.clone();
     task::spawn(async move {
@@ -36,7 +39,7 @@ fn main() -> Result<()> {
                 // pretend that we're a server fetching a result here...
                 let mut data = Vec::new();
                 data.extend_from_slice(b"hello xorg");
-                let d = x11clipboard::ClipboardData {
+                let d = ClipboardData {
                     type_: fetch.type_,
                     data,
                     remaining_bytes: 0,
@@ -49,9 +52,8 @@ fn main() -> Result<()> {
     });
 
     info!("waiting for new clipboard types...");
-    if let Some(clipboard_types) = clipboard_types_rx.recv().await {
-        info!("got clipboard types A: {:?}", clipboard_types);
-    }
+    clipboard_types_rx.changed().await?;
+    info!("got clipboard types A: {:?}", clipboard_types_rx.borrow());
 
     x11_fetch_data(&mut reader, type_).await?;
 
@@ -62,9 +64,8 @@ fn main() -> Result<()> {
     }
 
     info!("waiting for new clipboard types again...");
-    if let Some(clipboard_types) = clipboard_types_rx.recv().await {
-        info!("got clipboard types B: {:?}", clipboard_types);
-    }
+    clipboard_types_rx.changed().await?;
+    info!("got clipboard types B: {:?}", clipboard_types_rx.borrow());
 
     x11_fetch_data(&mut reader, type_).await?;
 
@@ -86,21 +87,15 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-async fn x11_store_types(
-    clipboard: &mut x11clipboard::writer::ClipboardWriter,
-    types: &Vec<&str>,
-) -> Result<()> {
+async fn x11_store_types(clipboard: &mut ClipboardWriter, types: &Vec<&str>) -> Result<()> {
     let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
     let types_len = types.len();
-    clipboard.store_types(types).await?;
+    clipboard.store_types(types)?;
     info!("stored {} types into clipboard", types_len);
     Ok(())
 }
 
-async fn x11_fetch_data(
-    clipboard: &mut x11clipboard::reader::ClipboardReader,
-    type_: &str,
-) -> Result<()> {
+async fn x11_fetch_data(clipboard: &mut ClipboardReader, type_: &str) -> Result<()> {
     let val = clipboard.read(type_, 0, &None).await?;
     if val.len() > 256 {
         info!("got clipboard from x11: {} bytes", val.len());

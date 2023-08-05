@@ -66,7 +66,7 @@ impl NikauCertVerification {
         // Can get the openssl style from: openssl x509 -noout -sha256 -fingerprint -in /path/to/private.pem
         let approved_cert_fingerprints = approved_cert_fingerprints
             .into_iter()
-            .map(|fingerprint| fingerprint.to_lowercase().replace(":", ""))
+            .map(|fingerprint| fingerprint.to_lowercase().replace(':', ""))
             .collect();
         Ok(Arc::new(NikauCertVerification {
             our_cert,
@@ -86,7 +86,7 @@ impl NikauCertVerification {
         we_are_server: bool,
         approve_response: T,
     ) -> Result<T, rustls::Error> {
-        let their_cert_fingerprint = certs::fingerprint(&their_cert);
+        let their_cert_fingerprint = certs::fingerprint(their_cert);
         if let Ok(mut approval_state) = self.approval_state.write() {
             if approval_state.known_certs.contains(their_cert) {
                 info!(
@@ -206,7 +206,7 @@ impl rustls::server::ClientCertVerifier for NikauCertVerification {
 }
 
 fn prompt_unknown_cert(their_cert: &rustls::Certificate, we_are_server: bool) -> bool {
-    let their_cert_fingerprint = certs::fingerprint(&their_cert);
+    let their_cert_fingerprint = certs::fingerprint(their_cert);
     if atty::isnt(atty::Stream::Stdin) {
         warn!("Stdin is not a TTY, skipping user certificate approval prompt. Approve this cert by running the {} with '--fingerprints {}'", if we_are_server { "server" } else { "client" }, their_cert_fingerprint);
         return false;
@@ -261,7 +261,7 @@ fn prompt_yn(msg: &str, default: bool) -> bool {
                 if default { "yes" } else { "no" },
                 e
             );
-            return default;
+            default
         }
     }
 }
@@ -281,7 +281,7 @@ fn prompt_internal(msg: &str) -> Result<u8> {
     }
 
     // Send the prompt
-    let msg_formatted = format!("{}", msg);
+    let msg_formatted = msg.to_string();
     let mut stdout = io::stdout();
     stdout
         .write_all(msg_formatted.as_bytes())
@@ -306,7 +306,7 @@ fn prompt_internal(msg: &str) -> Result<u8> {
 
         // Still nothing, check for timeout
         if Instant::now() >= end_at {
-            println!("");
+            println!();
             bail!("Prompt timed out after {}s", PROMPT_TIMEOUT_SECS)
         }
     }

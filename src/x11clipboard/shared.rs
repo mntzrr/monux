@@ -36,15 +36,15 @@ impl Atoms {
             name_to_atom: HashMap::new(),
         };
         // populate values and fill in cache maps:
-        atoms.clipboard = atoms.to_atom(conn, "CLIPBOARD").await?;
-        atoms.targets = atoms.to_atom(conn, "TARGETS").await?;
-        atoms.nikau_remote = atoms.to_atom(conn, NIKAU_REMOTE_TARGET).await?;
-        atoms.incr = atoms.to_atom(conn, "INCR").await?;
-        atoms.recv_clipboard = atoms.to_atom(conn, "NIKAU_CLIPBOARD_OUT").await?;
+        atoms.clipboard = atoms.get_atom(conn, "CLIPBOARD").await?;
+        atoms.targets = atoms.get_atom(conn, "TARGETS").await?;
+        atoms.nikau_remote = atoms.get_atom(conn, NIKAU_REMOTE_TARGET).await?;
+        atoms.incr = atoms.get_atom(conn, "INCR").await?;
+        atoms.recv_clipboard = atoms.get_atom(conn, "NIKAU_CLIPBOARD_OUT").await?;
         Ok(atoms)
     }
 
-    pub(crate) async fn to_name(&mut self, conn: &RustConnection, atom: Atom) -> Result<String> {
+    pub(crate) async fn get_name(&mut self, conn: &RustConnection, atom: Atom) -> Result<String> {
         if let Some(name) = self.atom_to_name.get(&atom) {
             // cached
             Ok(name.clone())
@@ -60,7 +60,7 @@ impl Atoms {
         }
     }
 
-    pub(crate) async fn to_atom(&mut self, conn: &RustConnection, name: &str) -> Result<Atom> {
+    pub(crate) async fn get_atom(&mut self, conn: &RustConnection, name: &str) -> Result<Atom> {
         if let Some(atom) = self.name_to_atom.get(name) {
             // cached
             Ok(*atom)

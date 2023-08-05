@@ -144,7 +144,7 @@ impl InputI32 {
     }
 
     pub fn to_evdev(&self) -> evdev::InputEvent {
-        evdev::InputEvent::new(evdev::EventType { 0: self.type_ }, self.code, self.value)
+        evdev::InputEvent::new(evdev::EventType(self.type_), self.code, self.value)
     }
 }
 
@@ -184,7 +184,7 @@ impl InputF64 {
 
     pub fn to_evdev(&self, min: i32, max: i32) -> evdev::InputEvent {
         evdev::InputEvent::new(
-            evdev::EventType { 0: self.type_ },
+            evdev::EventType(self.type_),
             self.code,
             // Inverse of from_evdev math:
             (self.value * ((max - min) as f64)) as i32 + min,

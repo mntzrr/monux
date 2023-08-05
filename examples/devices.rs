@@ -3,22 +3,22 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use evdev::{AbsoluteAxisType, EventType, InputEvent, Key};
-use tokio::{sync::mpsc, task};
+use tokio::sync::broadcast;
+use tokio::task;
 use tracing::{error, info, warn};
 
-use nikau::{deviceoutput, deviceutil, devicewatch, logging};
+use nikau::device::{output, watch};
+use nikau::logging;
 
-struct StubHandler {
-    grab_tx: mpsc::Sender<devicewatch::GrabEvent>,
-}
+struct StubHandler {}
 
-impl devicewatch::DeviceHandler for StubHandler {
+impl watch::DeviceHandler for StubHandler {
     fn handle_device_stream(
         &mut self,
         mut stream: evdev::EventStream,
-    ) -> Result<devicewatch::DeviceHandle> {
+        _grab_rx: broadcast::Receiver<watch::GrabEvent>,
+    ) -> Result<watch::DeviceHandle> {
         let handle = tokio::spawn(async move {
-            let _device_info = deviceutil::device_info(&stream.device());
             let device_name = stream
                 .device()
                 .name()
@@ -35,10 +35,7 @@ impl devicewatch::DeviceHandler for StubHandler {
                 }
             }
         });
-        Ok(devicewatch::DeviceHandle {
-            handle,
-            grab_tx: self.grab_tx.clone(),
-        })
+        Ok(watch::DeviceHandle { handle })
     }
 }
 
@@ -46,18 +43,18 @@ impl devicewatch::DeviceHandler for StubHandler {
 async fn main() -> Result<()> {
     logging::init_logging();
 
-    let (grab_tx, grab_rx) = mpsc::channel(32);
+    let (grab_tx, _grab_rx) = broadcast::channel(32);
     let handler = task::spawn(async move {
-        if let Err(e) = devicewatch::watch_loop(StubHandler { grab_tx }, grab_rx).await {
+        if let Err(e) = watch::watch_loop(StubHandler {}, grab_tx).await {
             error!("Input device watch failure: {:?}", e);
         }
     });
 
     let pid = std::process::id();
     let mut keyboard =
-        deviceoutput::keyboard(pid).context("Failed to init virtual device, are you root?")?;
-    let mut mouse = deviceoutput::mouse(pid)?;
-    let mut touchpad = deviceoutput::touchpad(pid)?;
+        output::keyboard(pid).context("Failed to init virtual device, are you root?")?;
+    let mut mouse = output::mouse(pid)?;
+    let mut touchpad = output::touchpad(pid)?;
 
     // Sleep for a bit, otherwise events can be missed. Devices need a bit of time to come up.
     thread::sleep(Duration::from_secs(1));

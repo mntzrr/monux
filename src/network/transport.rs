@@ -27,7 +27,7 @@ pub fn build_client(
     let mut client_config = ClientConfig::new(approval::rustls_client_config(cert_verifier)?);
     client_config.transport_config(transport_config());
 
-    let mut client_endpoint = Endpoint::client(bind_addr.clone())?;
+    let mut client_endpoint = Endpoint::client(*bind_addr)?;
     client_endpoint.set_default_client_config(client_config);
     Ok(client_endpoint)
 }
@@ -41,8 +41,8 @@ pub fn build_server(
     server_config
         .use_retry(true)
         .transport_config(transport_config());
-    Ok(Endpoint::server(server_config, listen_addr.clone())
-        .with_context(|| format!("Failed to listen on {}", listen_addr))?)
+    Endpoint::server(server_config, *listen_addr)
+        .with_context(|| format!("Failed to listen on {}", listen_addr))
 }
 
 fn transport_config() -> Arc<TransportConfig> {
@@ -85,7 +85,7 @@ pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<()
         &*resp.bytes
     );
     // Copy the immutable response data into a mutable buffer
-    buf.extend_from_slice(&*resp.bytes);
+    buf.extend_from_slice(&resp.bytes);
     let version: u64;
     {
         let (versionmsg, resp_remainder) =

@@ -95,7 +95,7 @@ async fn serve(
                     } else {
                         let mut type_atoms = Vec::with_capacity(clipboard_types.len());
                         for type_ in clipboard_types {
-                            type_atoms.push((state.atoms.to_atom(&context.conn, &type_).await?, type_));
+                            type_atoms.push((state.atoms.get_atom(&context.conn, &type_).await?, type_));
                         }
                         state.clipboard_types = Some(type_atoms);
                     }
