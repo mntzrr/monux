@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::{sync::watch, task, time};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 use x11rb_async::connection::Connection;
 use x11rb_async::protocol::xproto::{Atom, AtomEnum, ConnectionExt, Property, Time};
 use x11rb_async::protocol::{xfixes, Event};
@@ -47,11 +47,6 @@ impl ClipboardTypeWatcher {
                             "Received updated clipboard from local system with types: {:?}",
                             types
                         );
-                        // TODO(clipboard): remove this filtering once tmpzip conversion is implemented
-                        let types = types
-                            .into_iter()
-                            .filter(|t| t != "x-special/gnome-copied-files" && t != "text/uri-list")
-                            .collect();
                         if let Err(e) = types_tx.send(types) {
                             warn!("Failed to send updated clipboard types: {}", e);
                         }
@@ -214,8 +209,20 @@ impl ClipboardReader {
             .check()
             .await?;
 
-        // TODO(clipboard) buf has the clipboard data. convert from requested_type to a preferred data_type as relevant
-        Ok((buf, None))
+        if shared::NIKAU_ZIPPED_PATHS_TYPES.contains(&requested_type) {
+            // TODO(clipboard) create zip file with the referenced paths
+            Ok((buf, None))
+        } else if buf.len() >= 100 {
+            // Compress clipboard using zstd
+            let orig_len = buf.len();
+            buf = zstd::stream::encode_all(buf.as_slice(), 0)?;
+            // TODO(later): don't bother compressing certain incompressible datatypes like image/png
+            info!("Compressed {}: {} => {} bytes", requested_type, orig_len, buf.len());
+            Ok((buf, Some(shared::NIKAU_ZSTD_TARGET_DATATYPE.to_string())))
+        } else {
+            // Don't bother compressing empty data
+            Ok((buf, None))
+        }
     }
 }
 

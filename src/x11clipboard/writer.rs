@@ -333,10 +333,16 @@ async fn fetch_clipboard_data(
     )
     .await
     {
-        Ok(Ok(clipboard_data)) => {
+        Ok(Ok(mut clipboard_data)) => {
             if let Some(data_type) = &clipboard_data.data_type {
-                // TODO(clipboard) convert from data_type to requested_type for writing
-                error!("Clipboard data conversion from data_type={} to requested_type={} isn't supported, writing empty clipboard", data_type, clipboard_data.requested_type);
+                if data_type == shared::NIKAU_ZSTD_TARGET_DATATYPE {
+                    // Decompress payload using zstd
+                    let compressed_len = clipboard_data.data.len();
+                    clipboard_data.data = zstd::stream::decode_all(clipboard_data.data.as_slice())?;
+                    info!("Decompressed {}: {} => {} bytes", requested_type, compressed_len, clipboard_data.data.len());
+                } else {
+                    error!("Clipboard data conversion from data_type={} to requested_type={} isn't supported, writing empty clipboard", data_type, clipboard_data.requested_type);
+                }
             } else if clipboard_data.requested_type != requested_type {
                 error!("Returned clipboard type {} doesn't match requested type {} for requestor={}, writing empty clipboard", clipboard_data.requested_type, requested_type, event.requestor);
             } else {

@@ -13,6 +13,18 @@ pub(crate) const CLIPBOARD_TIMEOUT_SECS: u64 = 5;
 /// A clipboard type that we advertise to tell if we're serving a clipboard already
 pub(crate) const NIKAU_REMOTE_TARGET: &str = "__NIKAU_REMOTE__";
 
+pub(crate) const NIKAU_ZIPPED_PATHS_TYPES: &[&str] = &["x-special/gnome-copied-files", "text/uri-list"];
+
+/// data_type value for one or more files that are referenced by path.
+/// Special handling to support cases where the clipboard is a set of local file paths:
+/// The reader combines the file(s) as a single .zip payload to preserve their filenames.
+/// The writer extracts the file(s) into a temp directory and advertises the paths in that directory.
+pub(crate) const NIKAU_ZIPPED_PATHS_DATATYPE: &str = "application/zip+clipboard-paths";
+
+/// data_type value for data that has been compressed using zstandard to improve clipboard transfer performance.
+/// In practice this should be used for all payloads that aren't ZIPPED_FILES.
+pub(crate) const NIKAU_ZSTD_TARGET_DATATYPE: &str = "application/zstd";
+
 pub(crate) struct Atoms {
     // atoms that are needed internally:
     pub(crate) clipboard: Atom,
