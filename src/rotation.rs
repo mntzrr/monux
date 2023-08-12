@@ -75,6 +75,7 @@ impl LocalClipboard {
         config_dir: PathBuf,
         rotation_tx: mpsc::Sender<RotationEvent>,
         max_clipboard_size_bytes: u64,
+        max_uncompressed_size_bytes: u64,
     ) -> Result<Self> {
         let (clipboard_fetch_tx, mut clipboard_fetch_rx) = mpsc::channel::<ClipboardFetch>(32);
         let (local_types_tx, mut local_types_rx) = watchchan::channel(vec![]);
@@ -125,7 +126,12 @@ impl LocalClipboard {
 
         Ok(Self {
             reader: ClipboardReader::new().await?,
-            writer: ClipboardWriter::start(config_dir, clipboard_fetch_tx).await?,
+            writer: ClipboardWriter::start(
+                config_dir,
+                max_uncompressed_size_bytes,
+                clipboard_fetch_tx,
+            )
+            .await?,
             waiting_clipboard_tx: None,
         })
     }

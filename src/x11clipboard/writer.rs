@@ -41,13 +41,25 @@ pub struct ClipboardWriter {
 impl ClipboardWriter {
     /// Launches the async background task and returns a call for sending clipboard type updates.
     /// fetch_data_tx is the call for requesting clipboard contents for a given type from Nikau.
-    pub async fn start(config_dir: PathBuf, fetch_data_tx: mpsc::Sender<ClipboardFetch>) -> Result<Self> {
+    pub async fn start(
+        config_dir: PathBuf,
+        max_uncompressed_size_bytes: u64,
+        fetch_data_tx: mpsc::Sender<ClipboardFetch>,
+    ) -> Result<Self> {
         let context = shared::XContext::new()
             .await
             .context("Failed to set up X11 API context")?;
         let (store_types_tx, store_types_rx) = watch::channel(vec![]);
         task::spawn(async move {
-            if let Err(e) = serve(config_dir, context, store_types_rx, fetch_data_tx).await {
+            if let Err(e) = serve(
+                config_dir,
+                max_uncompressed_size_bytes,
+                context,
+                store_types_rx,
+                fetch_data_tx,
+            )
+            .await
+            {
                 warn!("clipboard server died: {}", e);
             }
         });
@@ -63,6 +75,7 @@ impl ClipboardWriter {
 
 async fn serve(
     config_dir: PathBuf,
+    max_uncompressed_size_bytes: u64,
     context: shared::XContext,
     // Receive available clipboard types, advertised by Nikau server.
     // Uses watch rather than an mpsc since we only care about the current/latest clipboard.
@@ -71,7 +84,8 @@ async fn serve(
     // via store_types()/store_types_rx. The ClipboardFetch has a oneshot for sending the data.
     fetch_data_tx: mpsc::Sender<ClipboardFetch>,
 ) -> Result<()> {
-    let mut state = ClipboardServerState::new(&context.conn, config_dir).await?;
+    let mut state =
+        ClipboardServerState::new(&context.conn, config_dir, max_uncompressed_size_bytes).await?;
     loop {
         tokio::select! {
             types_notify = store_types_rx.changed() => {
@@ -128,7 +142,10 @@ struct ClipboardServerState {
     selection_to_property: HashMap<Atom, Atom>,
     property_to_state: HashMap<Atom, IncrState>,
     atoms: shared::Atoms,
-    max_length: usize,
+    /// Safety limit to the uncompressed size of a clipboard
+    max_uncompressed_size_bytes: u64,
+    /// Large X11 clipboards are passed in chunks. Max size per chunk.
+    max_chunk_size_bytes: usize,
     /// Received via server advertisement
     clipboard_types: Option<Vec<(Atom, String)>>,
     /// Received in response to lookup from server
@@ -136,13 +153,18 @@ struct ClipboardServerState {
 }
 
 impl ClipboardServerState {
-    async fn new(conn: &RustConnection, config_dir: PathBuf) -> Result<Self> {
+    async fn new(
+        conn: &RustConnection,
+        config_dir: PathBuf,
+        max_uncompressed_size_bytes: u64,
+    ) -> Result<Self> {
         let ret = ClipboardServerState {
             config_dir,
             selection_to_property: HashMap::<Atom, Atom>::new(),
             property_to_state: HashMap::<Atom, IncrState>::new(),
             atoms: shared::Atoms::new(conn).await?,
-            max_length: CLIPBOARD_MAX_CHUNK_BYTES,
+            max_uncompressed_size_bytes,
+            max_chunk_size_bytes: CLIPBOARD_MAX_CHUNK_BYTES,
             clipboard_types: None,
             clipboard_data: None,
         };
@@ -204,8 +226,16 @@ impl ClipboardServerState {
                             .map(|d| d.requested_type != target.1)
                             .unwrap_or(true);
                         if needs_fetch {
-                            self.clipboard_data =
-                                Some(fetch_clipboard_data(fetch_data_tx, &target.1, &event, &self.config_dir).await?);
+                            self.clipboard_data = Some(
+                                fetch_clipboard_data(
+                                    fetch_data_tx,
+                                    &target.1,
+                                    self.max_uncompressed_size_bytes,
+                                    &event,
+                                    &self.config_dir,
+                                )
+                                .await?,
+                            );
                         } else {
                             info!(
                                 "Reusing existing clipboard content to requestor={} with type {}: {} bytes",
@@ -223,7 +253,7 @@ impl ClipboardServerState {
                                 data,
                                 &context,
                                 &event,
-                                self.max_length,
+                                self.max_chunk_size_bytes,
                                 self.atoms.incr,
                             )
                             .await?;
@@ -280,8 +310,8 @@ impl ClipboardServerState {
 
                 let mut len = clipboard_data.data.len() - state.pos;
                 // Enforce a max size per chunk
-                if len > self.max_length {
-                    len = self.max_length;
+                if len > self.max_chunk_size_bytes {
+                    len = self.max_chunk_size_bytes;
                 }
                 let data = &clipboard_data.data[state.pos..][..len];
                 context
@@ -316,6 +346,7 @@ impl ClipboardServerState {
 async fn fetch_clipboard_data(
     fetch_data_tx: &mpsc::Sender<ClipboardFetch>,
     requested_type: &str,
+    max_uncompressed_size_bytes: u64,
     event: &SelectionRequestEvent,
     config_dir: &PathBuf,
 ) -> Result<ClipboardData> {
@@ -340,7 +371,13 @@ async fn fetch_clipboard_data(
     {
         Ok(Ok(mut clipboard_data)) => {
             if let Some(data_type) = &clipboard_data.data_type {
-                clipboard_data.data = convert::write(clipboard_data.data, requested_type, data_type, config_dir)?;
+                clipboard_data.data = convert::write(
+                    clipboard_data.data,
+                    max_uncompressed_size_bytes,
+                    requested_type,
+                    data_type,
+                    config_dir,
+                )?;
             } else if clipboard_data.requested_type != requested_type {
                 error!("Returned clipboard type {} doesn't match requested type {} for requestor={}, writing empty clipboard", clipboard_data.requested_type, requested_type, event.requestor);
             } else {
@@ -380,11 +417,11 @@ async fn send_clipboard_data(
     clipboard_data: &ClipboardData,
     context: &shared::XContext,
     event: &SelectionRequestEvent,
-    max_length: usize,
+    max_chunk_size_bytes: usize,
     incr_atom: Atom,
 ) -> Result<()> {
-    if clipboard_data.data.len() < max_length - 24 {
-        // Request to get clipboard content, and data fits within max_length
+    if clipboard_data.data.len() < max_chunk_size_bytes - 24 {
+        // Request to get clipboard content, and data fits within max_chunk_size_bytes
         // If the size is too big, then the underlying X11 thread will panic here.
         context
             .conn
@@ -401,7 +438,7 @@ async fn send_clipboard_data(
         return Ok(());
     }
 
-    // Request to get clipboard content, but data doesn't fit within max_length
+    // Request to get clipboard content, but data doesn't fit within max_chunk_size_bytes
     context
         .conn
         .change_window_attributes(

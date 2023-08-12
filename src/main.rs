@@ -148,7 +148,13 @@ async fn main() -> Result<()> {
                 args.fingerprints.unwrap_or(vec![]),
                 &config_dir,
             )?;
-            client(config_dir, connect_addr, verifier, args.max_clipboard_size_kb * 1024).await
+            client(
+                config_dir,
+                connect_addr,
+                verifier,
+                args.max_clipboard_size_kb * 1024,
+            )
+            .await
         }
     }
 }
@@ -189,6 +195,8 @@ async fn server(
         }
     });
 
+    let max_uncompressed_size_bytes = 10 * max_clipboard_size_bytes;
+
     info!("Listening for clients: {}", listen_addr);
     if let Some(exit_secs) = exit_secs {
         info!("Exiting in {} seconds...", exit_secs);
@@ -200,6 +208,7 @@ async fn server(
                 event_rx,
                 grab_tx2,
                 max_clipboard_size_bytes,
+                max_uncompressed_size_bytes,
             ) => {
                 bail!("Server unexpectedly exited early: {:?}", server_exit);
             },
@@ -215,6 +224,7 @@ async fn server(
             event_rx,
             grab_tx2,
             max_clipboard_size_bytes,
+            max_uncompressed_size_bytes,
         )
         .await?;
     }
@@ -230,14 +240,15 @@ async fn client(
     // Try to set up virtual devices up-front - exit early if we aren't root
     let mut virtual_devices =
         output::VirtualDevices::new().context("Failed to create virtual devices, are you root?")?;
-
-    let mut local_clipboard = match client::LocalClipboard::new(config_dir).await {
-        Ok(c) => Some(c),
-        Err(e) => {
-            info!("Disabled system clipboard support: {}", e);
-            None
-        }
-    };
+    let max_uncompressed_size_bytes = 10 * max_clipboard_size_bytes;
+    let mut local_clipboard =
+        match client::LocalClipboard::new(config_dir, max_uncompressed_size_bytes).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                info!("Disabled system clipboard support: {}", e);
+                None
+            }
+        };
 
     loop {
         info!("Connecting to server: {}", connect_addr);

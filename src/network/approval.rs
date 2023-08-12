@@ -62,7 +62,11 @@ pub struct NikauCertVerification {
 }
 
 impl NikauCertVerification {
-    pub fn new(splash_label: &str, approved_cert_fingerprints: Vec<String>, config_dir: &PathBuf) -> Result<Arc<Self>> {
+    pub fn new(
+        splash_label: &str,
+        approved_cert_fingerprints: Vec<String>,
+        config_dir: &PathBuf,
+    ) -> Result<Arc<Self>> {
         let (our_cert, our_privkey) = certs::load_keypair(splash_label, config_dir)
             .with_context(|| format!("Failed to load {} keypair", splash_label))?;
         // Convert e.g. "18:AE:75:F2..." (openssl style) => "18ae75f2..." (our style)

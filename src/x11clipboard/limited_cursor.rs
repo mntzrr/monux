@@ -11,7 +11,7 @@ impl LimitedCursor {
     pub fn new(limit: u64) -> Self {
         Self {
             inner: Cursor::new(vec![]),
-            limit
+            limit,
         }
     }
 
@@ -38,7 +38,12 @@ impl Write for LimitedCursor {
         if length > self.limit {
             return Err(Error::new(
                 ErrorKind::Other,
-                format!("Write of {} bytes at position {} would exceed size limit {}", buf.len(), self.inner.position(), self.limit)
+                format!(
+                    "Write of {} bytes at position {} would exceed size limit {}",
+                    buf.len(),
+                    self.inner.position(),
+                    self.limit
+                ),
             ));
         }
         self.inner.write(buf)

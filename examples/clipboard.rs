@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -29,7 +30,16 @@ async fn main() -> Result<()> {
         type_,
     ];
     let (fetch_tx, mut fetch_rx) = mpsc::channel(32);
-    let writer = Arc::new(Mutex::new(ClipboardWriter::start(fetch_tx).await?));
+    let max_uncompressed_bytes = 1024 * 1024;
+    let writer = Arc::new(Mutex::new(
+        ClipboardWriter::start(
+            // For zipping/unzipping files to serve their paths
+            PathBuf::from("/tmp/nikau"),
+            max_uncompressed_bytes,
+            fetch_tx,
+        )
+        .await?,
+    ));
 
     let writer2 = writer.clone();
     task::spawn(async move {

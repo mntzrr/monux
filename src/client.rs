@@ -28,12 +28,13 @@ pub struct LocalClipboard {
 }
 
 impl LocalClipboard {
-    pub async fn new(config_dir: PathBuf) -> Result<Self> {
+    pub async fn new(config_dir: PathBuf, max_uncompressed_size_bytes: u64) -> Result<Self> {
         let (fetch_tx, fetch_rx) = mpsc::channel(32);
         let reader = ClipboardReader::new().await?;
         let (local_types_tx, local_types_rx) = watch::channel(vec![]);
         ClipboardTypeWatcher::start(local_types_tx).await?;
-        let writer = ClipboardWriter::start(config_dir, fetch_tx).await?;
+        let writer =
+            ClipboardWriter::start(config_dir, max_uncompressed_size_bytes, fetch_tx).await?;
         Ok(Self {
             reader,
             writer,

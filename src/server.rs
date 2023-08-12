@@ -19,12 +19,14 @@ pub async fn run_server(
     mut input_rx: mpsc::Receiver<input::Event>,
     grab_tx: broadcast::Sender<watch::GrabEvent>,
     max_clipboard_size_bytes: u64,
+    max_uncompressed_size_bytes: u64,
 ) -> Result<()> {
     let (rotation_tx, mut rotation_rx) = mpsc::channel::<rotation::RotationEvent>(32);
     let local_clipboard = match rotation::LocalClipboard::start(
         config_dir,
         rotation_tx.clone(),
         max_clipboard_size_bytes,
+        max_uncompressed_size_bytes,
     )
     .await
     {

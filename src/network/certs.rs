@@ -33,7 +33,10 @@ fn splash(label: &str, fingerprint: &str) {
     );
 }
 
-pub fn load_keypair(splash_label: &str, config_dir: &PathBuf) -> Result<(rustls::Certificate, rustls::PrivateKey)> {
+pub fn load_keypair(
+    splash_label: &str,
+    config_dir: &PathBuf,
+) -> Result<(rustls::Certificate, rustls::PrivateKey)> {
     let file_path = config_dir.join("private.pem");
     if file_path.is_file() {
         let mut reader =
