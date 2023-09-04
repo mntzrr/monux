@@ -239,7 +239,8 @@ fn build_zip_payload(file_uri_strs: Vec<&str>, max_compressed_size_bytes: u64) -
     let mut files_to_zip = vec![];
     for uri_str in file_uri_strs {
         let uri = url::Url::parse(&uri_str)?;
-        let path = uri.to_file_path()
+        let path = uri
+            .to_file_path()
             .map_err(|_e| anyhow!("Invalid file entry: {}", uri))?;
         if path.is_dir() {
             // Recursively scan the directory, omitting the directory path itself
