@@ -1,11 +1,11 @@
 use std::io::{self, prelude::*};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
-use tracing::{error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::network::certs;
 
@@ -59,6 +59,8 @@ pub struct NikauCertVerification {
     approved_cert_fingerprints: Vec<String>,
     /// Mutable certificate approval state
     approval_state: RwLock<ApprovalState>,
+    /// Storage for reporting the latest received fingerprint
+    fingerprint: Arc<Mutex<Option<String>>>,
 }
 
 impl NikauCertVerification {
@@ -66,15 +68,23 @@ impl NikauCertVerification {
         splash_label: &str,
         approved_cert_fingerprints: Vec<String>,
         config_dir: &PathBuf,
+        fingerprint: Arc<Mutex<Option<String>>>,
     ) -> Result<Arc<Self>> {
         let (our_cert, our_privkey) = certs::load_keypair(splash_label, config_dir)
             .with_context(|| format!("Failed to load {} keypair", splash_label))?;
         // Convert e.g. "18:AE:75:F2..." (openssl style) => "18ae75f2..." (our style)
         // Can get the openssl style from: openssl x509 -noout -sha256 -fingerprint -in /path/to/private.pem
-        let approved_cert_fingerprints = approved_cert_fingerprints
+        let approved_cert_fingerprints: Vec<String> = approved_cert_fingerprints
             .into_iter()
             .map(|fingerprint| fingerprint.to_lowercase().replace(':', ""))
             .collect();
+        if !approved_cert_fingerprints.is_empty() {
+            info!(
+                "Configured {} preapproved fingerprints: {:?}",
+                approved_cert_fingerprints.len(),
+                approved_cert_fingerprints
+            )
+        }
         Ok(Arc::new(NikauCertVerification {
             config_dir: config_dir.clone(),
             our_cert,
@@ -84,16 +94,16 @@ impl NikauCertVerification {
                 known_certs: certs::load_known_certs(config_dir)?,
                 prompt_active: false,
             }),
+            fingerprint,
         }))
     }
 
-    fn verify_cert<T>(
+    fn verify_cert(
         &self,
         their_cert: &rustls::Certificate,
         their_name: &str,
         we_are_server: bool,
-        approve_response: T,
-    ) -> Result<T, rustls::Error> {
+    ) -> Result<String> {
         let their_cert_fingerprint = certs::fingerprint(their_cert);
         if let Ok(mut approval_state) = self.approval_state.write() {
             if approval_state.known_certs.contains(their_cert) {
@@ -101,7 +111,7 @@ impl NikauCertVerification {
                     "{} cert has been approved before: {}",
                     their_name, their_cert_fingerprint
                 );
-                return Ok(approve_response);
+                return Ok(their_cert_fingerprint);
             } else if self
                 .approved_cert_fingerprints
                 .contains(&their_cert_fingerprint)
@@ -114,31 +124,30 @@ impl NikauCertVerification {
                 // Saving to disk creates weird behavior if the user later changes the certs they approve.
                 // Maybe they don't WANT old certs to still be approved if the arg changes? Play it safe.
                 approval_state.known_certs.push(their_cert.clone());
-                return Ok(approve_response);
+                return Ok(their_cert_fingerprint);
             } else if approval_state.prompt_active {
                 // Only one prompt at a time, reject other prompts. They will retry connecting anyway.
-                return Err(rustls::Error::General(format!(
+                bail!(
                     "{} cert rejected: Approval prompt is already pending",
                     their_name
-                )));
+                );
             } else {
                 approval_state.prompt_active = true;
                 // Prompt continues below after releasing lock
             }
         } else {
-            error!("Failed to get lock on known_certs for check");
-            return Err(rustls::Error::General(
-                "Failed to lock known certs".to_string(),
-            ));
+            bail!("Failed to lock known certs for check");
         }
 
         // Must release lock on self.known_certs during prompt to avoid breaking connectivity,
         // especially on the server, where it can break all clients until the server is restarted.
         if prompt_unknown_cert(their_cert, we_are_server) {
             info!("{} cert approved: {}", their_name, their_cert_fingerprint);
-            if let Err(e) = certs::write_approved_cert(their_cert, &self.config_dir) {
+            if let Err(e) =
+                certs::write_approved_cert(their_cert, &their_cert_fingerprint, &self.config_dir)
+            {
                 warn!(
-                    "{} was approved, but couldn't save cert to disk: {}",
+                    "{} approved, but couldn't save cert to disk: {}",
                     their_name, e
                 );
             }
@@ -147,12 +156,9 @@ impl NikauCertVerification {
                 approval_state.known_certs.push(their_cert.clone());
                 approval_state.prompt_active = false;
             } else {
-                error!("Failed to get lock on known_certs for approval");
-                return Err(rustls::Error::General(
-                    "Failed to lock known certs".to_string(),
-                ));
+                bail!("Failed to lock known certs for approval");
             }
-            Ok(approve_response)
+            Ok(their_cert_fingerprint)
         } else {
             info!(
                 "{} cert not approved: {}",
@@ -161,19 +167,18 @@ impl NikauCertVerification {
             if let Ok(mut approval_state) = self.approval_state.write() {
                 approval_state.prompt_active = false;
             } else {
-                error!("Failed to get lock on known_certs for rejection");
-                return Err(rustls::Error::General(
-                    "Failed to lock mutable state".to_string(),
-                ));
+                bail!("Failed to lock known certs for disapproval");
             }
-            Err(rustls::Error::General(format!(
+            bail!(
                 "{} cert wasn't approved by user: {}",
-                their_name, their_cert_fingerprint
-            )))
+                their_name,
+                their_cert_fingerprint
+            );
         }
     }
 }
 
+/// Run by the client to verify servers
 impl rustls::client::ServerCertVerifier for NikauCertVerification {
     fn verify_server_cert(
         &self,
@@ -184,15 +189,15 @@ impl rustls::client::ServerCertVerifier for NikauCertVerification {
         _ocsp_response: &[u8],
         _now: SystemTime,
     ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        self.verify_cert(
-            server_cert,
-            "Server",
-            false,
-            rustls::client::ServerCertVerified::assertion(),
-        )
+        if let Err(e) = self.verify_cert(server_cert, "Server", false) {
+            Err(rustls::Error::General(e.to_string()))
+        } else {
+            Ok(rustls::client::ServerCertVerified::assertion())
+        }
     }
 }
 
+/// Run by the server to verify clients
 impl rustls::server::ClientCertVerifier for NikauCertVerification {
     fn client_auth_root_subjects(&self) -> &[rustls::DistinguishedName] {
         &[]
@@ -204,12 +209,66 @@ impl rustls::server::ClientCertVerifier for NikauCertVerification {
         _intermediates: &[rustls::Certificate],
         _now: SystemTime,
     ) -> Result<rustls::server::ClientCertVerified, rustls::Error> {
-        self.verify_cert(
-            client_cert,
-            "Client",
-            true,
-            rustls::server::ClientCertVerified::assertion(),
-        )
+        match self.verify_cert(client_cert, "Client", true) {
+            Err(e) => Err(rustls::Error::General(e.to_string())),
+            Ok(their_cert_fingerprint) => {
+                // HACK: This is storing the fingerprint for reading by server.rs
+                // This code is meant to allow pairing new connections with their cert fingerprints for use by "--shortcut-goto".
+                //
+                // In an ideal world, the solution for this could be one of the following:
+                // - Packing/embedding the fingerprint with the client here somehow
+                // - Extracting the cert/fingerprint within the server connection handling somehow
+                //
+                // But fundamentally we hit these issues:
+                // - This rustls API lets us see the cert/fingerprint, but not the client endpoint.
+                // - The quinn API lets us see the client endpoint, but not the cert/fingerprint.
+                //
+                // In order to bridge the gap, we go with this timing-based "message in a bottle" method,
+                // where we assume that a rustls cert check will be immediately followed by the quinn connection appearing.
+                // This assumption has problems, see below.
+                if let Ok(mut fingerprint) = self.fingerprint.lock() {
+                    debug!(
+                        "Saving fingerprint for connection: {}",
+                        their_cert_fingerprint
+                    );
+                    if let Some(old_fingerprint) =
+                        fingerprint.replace(their_cert_fingerprint.clone())
+                    {
+                        // The fingerprint->connection assumption could fall apart when multiple clients connect at the same time, resulting in fingerprint mismatch:
+                        // Scenario A:
+                        //   1. client A connects and its fingerprint is saved
+                        //   2. very soon after, client B connects and its fingerprint gets saved, overwriting client A's fingerprint <-- you are here
+                        //   3. then client A's connection completes and client B's fingerprint is pulled
+                        // Scenario B:
+                        //   1. client A connects and its fingerprint is saved
+                        //   2. very soon after, client B connects and its fingerprint gets saved, overwriting client A's fingerprint <-- you are here
+                        //   3. then client B's connection completes and client B's fingerprint is pulled
+                        //   3. then client A's connection completes and there is no fingerprint left
+                        //
+                        // Amelioration:
+                        // In both of these cases, if things look off, we reset the fingerprint state and reject client B, so that it can try again.
+                        // Meanwhile, server.rs will see the missing fingerprint state and reject client A.
+                        // However, another client C could swoop in at this time and store a new fingerprint to be seen by server.rs, this workaround isn't perfect either.
+                        // But at the same time, this client-fingerprint pairing is only used for "--shortcut-goto", so it's somewhat less critical that things be perfect.
+                        //
+                        // Another option would be to put the old fingerprint back and only reject client B, but then that creates a different problem, unrelated to multi-client races:
+                        // What if a client finishes cert validation here, but then disconnects before server.rs takes the fingerprint?
+                        // In that case, we'd want the unused fingerprint to be overwritten by the next connection attempt.
+                        // So it's better to leave things in a recoverable state so that the server isn't rejecting connections indefinitely.
+                        warn!("BUG: Obtained new client fingerprint {} but old fingerprint {} is still present, resetting state and rejecting new client (try again)", their_cert_fingerprint, old_fingerprint);
+                        // Reject the new client, and clear the fingerprint state. The old client (if any) should then be rejected by server.rs. Both clients can retry.
+                        let _ = fingerprint.take();
+                        Err(rustls::Error::General("Fingerprint is valid but an existing connection is still in progress, try again".to_string()))
+                    } else {
+                        Ok(rustls::server::ClientCertVerified::assertion())
+                    }
+                } else {
+                    Err(rustls::Error::General(
+                        "Failed to lock fingerprint".to_string(),
+                    ))
+                }
+            }
+        }
     }
 }
 

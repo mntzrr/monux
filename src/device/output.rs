@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use evdev::{uinput, AbsInfo, AbsoluteAxisType, AttributeSet, EvdevEnum, InputEvent, Key};
 use tracing::{info, trace, warn};
 
@@ -23,16 +23,20 @@ pub struct VirtualDevices {
 
 impl VirtualDevices {
     pub fn new() -> Result<VirtualDevices> {
-        info!("Creating virtual devices: keyboard, mouse, touchpad");
         let pid = std::process::id();
-        Ok(VirtualDevices {
+        let ret = VirtualDevices {
             keyboard_events: vec![],
             mouse_events: vec![],
             touchpad_events: vec![],
-            keyboard_device: keyboard(pid)?,
-            mouse_device: mouse(pid)?,
-            touchpad_device: touchpad(pid)?,
-        })
+            keyboard_device: keyboard(pid)
+                .context("Failed to create virtual keyboard for simulated output")?,
+            mouse_device: mouse(pid)
+                .context("Failed to create virtual mouse for simulated output")?,
+            touchpad_device: touchpad(pid)
+                .context("Failed to create virtual touchpad for simulated output")?,
+        };
+        info!("Created virtual devices: keyboard, mouse, touchpad");
+        Ok(ret)
     }
 
     pub fn add_event(&mut self, net_event: event::InputEvent) -> Result<()> {
@@ -77,8 +81,7 @@ impl VirtualDevices {
     }
 
     pub fn switch(&mut self) -> Result<()> {
-        // TODO(feature): clear device state for client switches, to avoid e.g. leaving a device with a repeating key. but this requires subscribing and keeping track of device state.
-        // TODO(feature): flash LEDs on the OTHER, NON-virtual edvices when this client becomes enabled
+        // TODO(feature): flash LEDs on the OTHER, NON-virtual devices when this client becomes enabled
         if !self.keyboard_events.is_empty() {
             self.keyboard_device.emit(&self.keyboard_events)?;
             self.keyboard_events.clear();

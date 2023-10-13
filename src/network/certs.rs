@@ -115,10 +115,14 @@ pub fn fingerprint(cert: &rustls::Certificate) -> String {
     format!("{:x}", Sha256::digest(cert))
 }
 
-pub fn write_approved_cert(cert: &rustls::Certificate, config_dir: &PathBuf) -> Result<()> {
+pub fn write_approved_cert(
+    cert: &rustls::Certificate,
+    fingerprint: &str,
+    config_dir: &PathBuf,
+) -> Result<()> {
     let file_path = init_known_certs_dir(config_dir)
         .context("Failed to init known_certs dir")?
-        .join(format!("{}.pem", fingerprint(cert)));
+        .join(format!("{}.pem", fingerprint));
     let content = pem::encode_config(
         &pem::Pem::new("CERTIFICATE", cert.0.clone()),
         pem::EncodeConfig::new().set_line_ending(pem::LineEnding::LF),

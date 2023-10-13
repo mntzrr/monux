@@ -217,7 +217,10 @@ impl ClipboardServerState {
                     } else if event.target == self.atoms.timestamp {
                         // Clients may ask for TIMESTAMP even if we don't advertise it.
                         // Let's keep it simple and just return the CURRENT_TIME, rather than tracking real time.
-                        debug!("Returning clipboard timestamp to requestor={}", event.requestor);
+                        debug!(
+                            "Returning clipboard timestamp to requestor={}",
+                            event.requestor
+                        );
                         context
                             .conn
                             .change_property(
@@ -244,7 +247,8 @@ impl ClipboardServerState {
                                 clipboard.types
                             ),
                         };
-                        let needs_fetch = clipboard.data
+                        let needs_fetch = clipboard
+                            .data
                             .as_ref()
                             .map(|d| d.requested_type != target.1)
                             .unwrap_or(true);

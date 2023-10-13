@@ -59,7 +59,7 @@ impl std::fmt::Display for SwitchEvent {
 // InputEvent
 
 /// An input event to be written to a virtual device indicated by the target.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InputEvent {
     pub target: EventTarget,
     /// For discrete unscaled values
@@ -115,7 +115,7 @@ impl std::fmt::Display for EventTarget {
 
 /// Equivalent to a uinput event for the client to emit locally.
 /// Omits the timestamp since it isn't required.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InputI32 {
     pub type_: u16,
     pub code: u16,
@@ -153,7 +153,7 @@ impl InputI32 {
 /// Equivalent to a uinput event for the client to emit locally.
 /// Omits the timestamp since it isn't required.
 /// Used for absolute coordinates, with a scale of [0.0, 1.0] to be resized by the client.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InputF64 {
     pub type_: u16,
     pub code: u16,

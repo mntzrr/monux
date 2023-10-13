@@ -24,7 +24,12 @@ const REMOVED_CLIENT_RECOVERY_DEADLINE: Duration = Duration::from_secs(5);
 /// Channels for communicating with a connected client.
 #[derive(Debug)]
 struct ClientInfo {
+    /// The primary identifier for a client. We can have multiple clients with the same fingerprint:
+    /// - When the user is sharing certificates between clients (they are free to do so)
+    /// - When a client has reconnected without the old connection timing out yet
     endpoint: SocketAddr,
+    /// Cert fingerprint used to select clients via --shortcut-goto keyboard shortcuts
+    fingerprint: String,
     events_send: SendStream,
     bulk_send: SendStream,
 }
@@ -33,6 +38,9 @@ struct ClientInfo {
 /// used for automatically reactivating clients if they reconnect quickly.
 #[derive(Debug)]
 struct DefunctClientInfo {
+    /// Use the endpoint, not the fingerprint, to identify recently disconnected clients.
+    /// This reduces the likelihood of weird behavior if e.g. clients are sharing certificates.
+    /// In practice we only address clients by certificate with certain keyboard shortcuts.
     endpoint: SocketAddr,
     removed_at: Instant,
 }
@@ -153,6 +161,7 @@ pub enum RotationEvent {
 
 pub struct AddClientArgs {
     pub endpoint: SocketAddr,
+    pub fingerprint: String,
     pub events_send: SendStream,
     pub bulk_send: SendStream,
 }
@@ -203,6 +212,8 @@ pub struct ClipboardSendContentArgs {
 pub struct Rotation {
     grab_tx: broadcast::Sender<watch::GrabEvent>,
     clients: Vec<ClientInfo>,
+    /// Use the endpoint, not the fingerprint, to uniquely identify clients.
+    /// This allows situations like a client reconnecting before the old socket has closed.
     current_client: Option<SocketAddr>,
     removed_current_client: Option<DefunctClientInfo>,
     buf: Vec<u8>,
@@ -233,8 +244,13 @@ impl Rotation {
     pub async fn accept(&mut self, event: RotationEvent) {
         match event {
             RotationEvent::AddClient(args) => {
-                self.add_client(args.endpoint, args.events_send, args.bulk_send)
-                    .await
+                self.add_client(
+                    args.endpoint,
+                    args.fingerprint,
+                    args.events_send,
+                    args.bulk_send,
+                )
+                .await
             }
             RotationEvent::RemoveClient(endpoint) => self.remove_client(endpoint).await,
             RotationEvent::ClipboardUpdateSource(args) => {
@@ -275,6 +291,7 @@ impl Rotation {
     async fn add_client(
         &mut self,
         endpoint: SocketAddr,
+        fingerprint: String,
         events_send: SendStream,
         bulk_send: SendStream,
     ) {
@@ -287,13 +304,15 @@ impl Rotation {
             idx,
             ClientInfo {
                 endpoint,
+                fingerprint: fingerprint.clone(),
                 events_send,
                 bulk_send,
             },
         );
 
         info!(
-            "Added client {} to rotation: {}",
+            "Added client {} @ {} to rotation: {}",
+            fingerprint,
             endpoint,
             self.clients
                 .iter()
@@ -365,6 +384,7 @@ impl Rotation {
         }
     }
 
+    /// Switches to the previous client (or to the server) in the arbitrary rotation.
     pub async fn prev_client(&mut self) {
         if let Some(current_client) = &self.current_client {
             // Currently on remote machine, find its entry in the list and go to the prev one
@@ -390,6 +410,7 @@ impl Rotation {
         }
     }
 
+    /// Switches to the next client (or to the server) in the arbitrary rotation.
     pub async fn next_client(&mut self) {
         if let Some(current_client) = &self.current_client {
             // Currently on remote machine, find its entry in the list and go to the next one
@@ -407,6 +428,43 @@ impl Rotation {
             // Currently on local machine, go to last entry on vec (if any)
             self.update_current_client(self.clients.first().map(|c| c.endpoint))
                 .await;
+        }
+    }
+
+    /// Switches to the specified client by fingerprint, or to the server if the fingerprint is empty.
+    /// If a matching client isn't connected, does nothing.
+    pub async fn set_client(&mut self, fingerprint: String) {
+        if fingerprint.is_empty() {
+            // Empty fingerprint means "go to server"
+            self.update_current_client(None).await;
+        } else {
+            // Find the matching client, if any. Allow "abcd123" to match client with "abcd12345[...]"
+            let matching_clients: Vec<&ClientInfo> = self
+                .clients
+                .iter()
+                .filter(|c| c.fingerprint.starts_with(&fingerprint))
+                .collect();
+            match matching_clients.len() {
+                0 => {
+                    warn!(
+                        "Missing client with fingerprint {}, doing nothing",
+                        fingerprint
+                    );
+                }
+                1 => {
+                    let endpoint = matching_clients
+                        .first()
+                        .expect("matching_clients has len=1")
+                        .endpoint;
+                    self.update_current_client(Some(endpoint)).await;
+                }
+                _ => {
+                    warn!(
+                        "Multiple clients match fingerprint {}, doing nothing: {:?}",
+                        fingerprint, matching_clients
+                    );
+                }
+            }
         }
     }
 
@@ -588,13 +646,28 @@ impl Rotation {
         }
     }
 
-    /// Updates internal state to route future events to the new client.
+    /// Updates internal state to route future events to the new client (or to the server).
     /// Goes through the steps of notifying the new client that it's active (if new_client is Some),
     /// then notifying any old client that it's inactive (if old_client is Some).
     async fn update_current_client(&mut self, new_client: Option<SocketAddr>) {
         // Either we automatically reenabled a client, or the user manually did.
         // In either case, clear up any history of previously enabled disconnected clients.
         self.removed_current_client = None;
+
+        // Check if the client is already assigned, treat as a no-op if so
+        match (&new_client, &self.current_client) {
+            (Some(new_client), Some(current_client)) => {
+                if new_client == current_client {
+                    debug!("Already switched to client: {}", current_client);
+                    return;
+                }
+            }
+            (None, None) => {
+                debug!("Already switched to local machine");
+                return;
+            }
+            (_, _) => {}
+        }
 
         // Save the old client for sending enabled=false below
         let old_client = self.current_client;

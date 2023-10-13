@@ -41,7 +41,6 @@ async fn main() -> Result<()> {
         .await?,
     ));
 
-    let writer2 = writer.clone();
     task::spawn(async move {
         loop {
             if let Some(fetch) = fetch_rx.recv().await {
@@ -69,7 +68,7 @@ async fn main() -> Result<()> {
     x11_fetch_data(&mut reader, type_).await?;
 
     {
-        let mut writer = writer2.lock().await;
+        let mut writer = writer.lock().await;
         // This should get flagged as FROM nikau, and so ignored
         x11_store_types(&mut writer, &types).await?;
     }
@@ -82,7 +81,7 @@ async fn main() -> Result<()> {
 
     info!("clearing clipboard types");
     {
-        let mut writer = writer2.lock().await;
+        let mut writer = writer.lock().await;
         x11_store_types(&mut writer, &vec![]).await?;
     }
 

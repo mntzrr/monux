@@ -85,10 +85,10 @@ pub async fn watch_loop<F: DeviceHandler>(
             handler.handle_device_stream(events, grab_tx.subscribe())?,
         );
     }
-    info!("Listening to {} input devices", devices.len());
     if devices.is_empty() {
-        bail!("Didn't find any compatible devices, are you root?");
+        bail!("Didn't find any compatible input devices to listen to.");
     }
+    info!("Listening to {} input devices", devices.len());
 
     // Start handler to consume new/removed device events
     loop {

@@ -1,14 +1,14 @@
 use std::fs;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use signal_hook::{consts::signal, iterator::Signals};
 use tokio::sync::{broadcast, mpsc};
-use tokio::{task, time};
+use tokio::{runtime, task, time};
 use tracing::{error, info, warn};
 
 use nikau::device::{input, output, watch};
@@ -34,50 +34,60 @@ enum Commands {
 
 #[derive(Args)]
 struct ServerArgs {
-    /// Keyboard shortcut for switching to the next client
-    #[arg(long, default_value = "leftalt,n")]
+    /// Keyboard shortcut for switching to the next client in the rotation
+    #[arg(
+        long,
+        alias = "shortcut-next",
+        default_value = "leftalt,n",
+        value_name = "key1,key2,key3"
+    )]
     shortcut: String,
 
-    /// Key shortcut for switching to the previous client
-    #[arg(long, default_value = "leftalt,p")]
+    /// Keyboard shortcut for switching to the previous client in the rotation
+    #[arg(long, default_value = "leftalt,p", value_name = "key1,key2,key3")]
     shortcut_prev: Option<String>,
 
+    /// Keyboard shortcut for switching directly to a client by its fingerprint prefix, or to the server for an empty fingerprint prefix
+    #[arg(long, value_name = "key1,key2,key3=[fingerprint-prefix]")]
+    shortcut_goto: Option<Vec<String>>,
+
     /// Server listen IP
-    #[arg(short = 'l', long, default_value = "0.0.0.0")]
+    #[arg(short = 'l', long, default_value = "0.0.0.0", value_name = "ip")]
     listen: IpAddr,
 
     /// Server port
-    #[arg(short = 'p', long, default_value_t = 1213)]
+    #[arg(short = 'p', long, default_value_t = 1213, value_name = "port")]
     port: u16,
 
-    /// Client certificate fingerprints to automatically accept without prompting
-    #[arg(long)]
-    fingerprints: Option<Vec<String>>,
+    /// Client certificate fingerprint to automatically accept without prompting (repeat for multiple fingerprints)
+    #[arg(long, alias = "fingerprints", value_name = "fingerprint")]
+    fingerprint: Option<Vec<String>>,
 
     /// Number of seconds to wait before automatically exiting the server, to safely test configuration
-    #[arg(long)]
+    #[arg(long, value_name = "seconds")]
     exit_secs: Option<u32>,
 
     /// Maximum size in KB for transferring clipboard data (default: 5MB)
-    #[arg(long, default_value_t = 5120)]
+    #[arg(long, default_value_t = 5120, value_name = "kb")]
     max_clipboard_size_kb: u64,
 }
 
 #[derive(Args)]
 struct ClientArgs {
     /// Server hostname or IP
+    #[arg(long, value_name = "host/ip")]
     host: String,
 
     /// Server port
-    #[arg(short = 'p', long, default_value_t = 1213)]
+    #[arg(short = 'p', long, default_value_t = 1213, value_name = "port")]
     port: u16,
 
-    /// Server certificate fingerprints to automatically accept without prompting
-    #[arg(long)]
-    fingerprints: Option<Vec<String>>,
+    /// Server certificate fingerprint to automatically accept without prompting (repeat for multiple fingerprints)
+    #[arg(long, alias = "fingerprints", value_name = "fingerprint")]
+    fingerprint: Option<Vec<String>>,
 
     /// Maximum size in KB for transferring clipboard data (default: 5MB)
-    #[arg(long, default_value_t = 5120)]
+    #[arg(long, default_value_t = 5120, value_name = "kb")]
     max_clipboard_size_kb: u64,
 }
 
@@ -103,30 +113,41 @@ fn handle_signals(mut signals: Signals, out: mpsc::Sender<input::Event>) {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     logging::init_logging();
     let cli = Cli::parse();
     let config_dir = init_config_dir()?;
 
+    let rt = Arc::new(
+        runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime"),
+    );
+
     match cli.command {
         Commands::Server(args) => {
-            let listen_addr = SocketAddr::new(args.listen, args.port);
+            let fingerprint = Arc::new(Mutex::new(None));
             let verifier = approval::NikauCertVerification::new(
                 "server",
-                args.fingerprints.unwrap_or(vec![]),
+                args.fingerprint.unwrap_or(vec![]),
                 &config_dir,
+                fingerprint.clone(),
             )?;
-            server(
-                config_dir,
-                listen_addr,
-                &args.shortcut,
-                args.shortcut_prev.as_deref(),
-                args.exit_secs,
-                verifier,
-                args.max_clipboard_size_kb * 1024,
-            )
-            .await
+            rt.block_on(async {
+                server(
+                    config_dir,
+                    SocketAddr::new(args.listen, args.port),
+                    &args.shortcut,
+                    args.shortcut_prev.as_deref(),
+                    args.shortcut_goto.unwrap_or(vec![]),
+                    args.exit_secs,
+                    verifier,
+                    fingerprint,
+                    args.max_clipboard_size_kb * 1024,
+                )
+                .await
+            })?;
         }
         Commands::Client(args) => {
             let connect_addr: SocketAddr = if let Ok(host_ip) = args.host.parse::<IpAddr>() {
@@ -145,18 +166,22 @@ async fn main() -> Result<()> {
             };
             let verifier = approval::NikauCertVerification::new(
                 "client",
-                args.fingerprints.unwrap_or(vec![]),
+                args.fingerprint.unwrap_or(vec![]),
                 &config_dir,
+                Arc::new(Mutex::new(None)),
             )?;
-            client(
-                config_dir,
-                connect_addr,
-                verifier,
-                args.max_clipboard_size_kb * 1024,
-            )
-            .await
+            rt.block_on(async {
+                client(
+                    config_dir,
+                    connect_addr,
+                    verifier,
+                    args.max_clipboard_size_kb * 1024,
+                )
+                .await
+            })?;
         }
     }
+    Ok(())
 }
 
 fn init_config_dir() -> Result<PathBuf> {
@@ -171,10 +196,12 @@ fn init_config_dir() -> Result<PathBuf> {
 async fn server(
     config_dir: PathBuf,
     listen_addr: SocketAddr,
-    next_keys: &str,
-    prev_keys: Option<&str>,
+    keys_next: &str,
+    keys_prev: Option<&str>,
+    keys_goto: Vec<String>,
     exit_secs: Option<u32>,
     verifier: Arc<approval::NikauCertVerification>,
+    fingerprint: Arc<Mutex<Option<String>>>,
     max_clipboard_size_bytes: u64,
 ) -> Result<()> {
     let (event_tx, event_rx): (mpsc::Sender<input::Event>, mpsc::Receiver<input::Event>) =
@@ -187,46 +214,56 @@ async fn server(
     let (grab_tx, _grab_rx) = broadcast::channel(1);
     let grab_tx2 = grab_tx.clone();
 
-    let input_handler = input::InputHandler::new(next_keys, prev_keys, event_tx)?;
+    let input_handler = input::InputHandler::new(keys_next, keys_prev, keys_goto, event_tx)?;
 
-    task::spawn(async move {
-        if let Err(e) = watch::watch_loop(input_handler, grab_tx).await {
-            error!("Input device watch failure: {:?}", e);
-        }
+    let watch_handle = task::spawn(async move {
+        watch::watch_loop(input_handler, grab_tx).await.context(
+            "Failed to listen to input devices, possible solutions:
+- Are any input devices (keyboard, mouse, etc) plugged into the machine?
+- The server may need to be run as root with 'sudo -E nikau server ...' to allow listening to input.
+- Enable uinput and/or evdev in the kernel, check for /dev/uinput and /dev/input/",
+        )
     });
 
-    let max_uncompressed_size_bytes = 10 * max_clipboard_size_bytes;
-
-    info!("Listening for clients: {}", listen_addr);
-    if let Some(exit_secs) = exit_secs {
-        info!("Exiting in {} seconds...", exit_secs);
-        tokio::select! {
-            server_exit = server::run_server(
-                &listen_addr,
-                verifier,
-                config_dir,
-                event_rx,
-                grab_tx2,
-                max_clipboard_size_bytes,
-                max_uncompressed_size_bytes,
-            ) => {
-                bail!("Server unexpectedly exited early: {:?}", server_exit);
-            },
-            _timeout = time::sleep(Duration::from_secs(exit_secs as u64)) => {
-                info!("Exiting automatically as requested (--exit-secs={})", exit_secs);
-            }
-        };
-    } else {
+    let server_handle = task::spawn(async move {
         server::run_server(
             &listen_addr,
             verifier,
             config_dir,
             event_rx,
+            fingerprint,
             grab_tx2,
+            // Max compressed clipboard size over the wire
             max_clipboard_size_bytes,
-            max_uncompressed_size_bytes,
+            // Max uncompressed clipboard size, just in case
+            10 * max_clipboard_size_bytes,
         )
-        .await?;
+        .await
+    });
+
+    info!("Listening for clients: {}", listen_addr);
+    if let Some(exit_secs) = exit_secs {
+        info!("Exiting in {} seconds...", exit_secs);
+        tokio::select! {
+            watch_exit = watch_handle => {
+                watch_exit?.context("Failed to watch input events, exiting early")?
+            },
+            server_exit = server_handle => {
+                server_exit?.context("Server failed, exiting early")?
+            },
+            _timeout = time::sleep(Duration::from_secs(exit_secs as u64)) => {
+                info!("Exiting automatically as requested (--exit-secs={})", exit_secs);
+            },
+        };
+    } else {
+        tokio::select! {
+            watch_exit = watch_handle => {
+                watch_exit?.context("Failed to watch input events, exiting")?
+            },
+            server_exit = server_handle => {
+                server_exit?.context("Server failed, exiting")?
+            },
+        }
     }
     Ok(())
 }
@@ -238,8 +275,10 @@ async fn client(
     max_clipboard_size_bytes: u64,
 ) -> Result<()> {
     // Try to set up virtual devices up-front - exit early if we aren't root
-    let mut virtual_devices =
-        output::VirtualDevices::new().context("Failed to create virtual devices, are you root?")?;
+    let mut virtual_devices = output::VirtualDevices::new()
+        .context("Failed to create virtual devices for output, possible solutions:
+- The client may need to be run as root with 'sudo -E nikau client ...' to allow creating virtual devices.
+- Enable uinput and/or evdev in the kernel, check for /dev/uinput and /dev/input/")?;
     let max_uncompressed_size_bytes = 10 * max_clipboard_size_bytes;
     let mut local_clipboard =
         match client::LocalClipboard::new(config_dir, max_uncompressed_size_bytes).await {

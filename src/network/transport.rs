@@ -12,11 +12,11 @@ use tracing::{debug, trace};
 use crate::msgs::shared;
 use crate::network::approval;
 
-/// Wireguard recommends 25000 for spanning NATs/firewalls.
-/// Must be shorter than TIMEOUT_MILLIS to avoid spurious timeouts.
+/// Wireguard for example recommends 25000 for spanning NATs/firewalls, so that'd be optimal.
+/// But we need to keep it shorter than TIMEOUT_MILLIS to avoid spurious timeouts.
 const KEEPALIVE_MILLIS: u64 = 2000;
 
-/// This is the delay between a client losing connection and a server ungrabbing the keys.
+/// This is the delay between a client losing connection and a server ungrabbing its input devices.
 /// Keep this very short so that connection problems get resolved relatively quickly.
 const TIMEOUT_MILLIS: u32 = 3000;
 
