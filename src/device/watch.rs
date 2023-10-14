@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use evdev::{Device, EventStream, EventType, Key};
 use notify::Watcher;
+use regex::Regex;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task;
 use tracing::{debug, info, trace, warn};
@@ -44,6 +45,7 @@ pub trait DeviceHandler: Send + 'static {
 pub async fn watch_loop<F: DeviceHandler>(
     mut handler: F,
     mut grab_tx: broadcast::Sender<GrabEvent>,
+    device_filters: Vec<Regex>,
 ) -> Result<()> {
     // Start watch for new and removed devices BEFORE scanning current devices.
     let (device_event_tx, mut device_event_rx): (
@@ -79,6 +81,9 @@ pub async fn watch_loop<F: DeviceHandler>(
             );
             continue;
         }
+        if !matches_filters(&device_filters, &device) {
+            continue;
+        }
         let events = start_device_stream(device, &path)?;
         devices.insert(
             path,
@@ -88,12 +93,19 @@ pub async fn watch_loop<F: DeviceHandler>(
     if devices.is_empty() {
         bail!("Didn't find any compatible input devices to listen to.");
     }
-    info!("Listening to {} input devices", devices.len());
+    info!("Listening to {} input device{}", devices.len(), if devices.len() > 1 { "s" } else { "" });
 
     // Start handler to consume new/removed device events
     loop {
         if let Some(event) = device_event_rx.recv().await {
-            handle_device_event(&mut handler, &mut devices, &mut grab_tx, event).await;
+            handle_device_event(
+                &mut handler,
+                &mut devices,
+                &mut grab_tx,
+                &device_filters,
+                event,
+            )
+            .await;
         } else {
             // Channel lost, exit
             return Ok(());
@@ -105,6 +117,7 @@ async fn handle_device_event<F: DeviceHandler>(
     handler: &mut F,
     devices: &mut HashMap<PathBuf, DeviceHandle>,
     grab_tx: &mut broadcast::Sender<GrabEvent>,
+    device_filters: &Vec<Regex>,
     event: DeviceEvent,
 ) {
     trace!("Device file event: {:?}", event);
@@ -115,6 +128,9 @@ async fn handle_device_event<F: DeviceHandler>(
             }
             match Device::open(&event.path) {
                 Ok(device) => {
+                    if !matches_filters(device_filters, &device) {
+                        return;
+                    }
                     if !compatible_device(&device) {
                         debug!(
                             "Ignoring new device: {} @ {}",
@@ -170,6 +186,36 @@ async fn handle_device_event<F: DeviceHandler>(
             }
         }
     }
+}
+
+fn matches_filters(name_filters: &Vec<Regex>, device: &evdev::Device) -> bool {
+    if name_filters.is_empty() {
+        return true;
+    }
+    let device_name = match device.name() {
+        Some(d) => d,
+        None => return false,
+    };
+    let matches: Vec<&Regex> = name_filters
+        .iter()
+        .filter(|p| p.is_match(device_name))
+        .collect();
+    let is_match = !matches.is_empty();
+    info!(
+        "Device name {}: '{}' vs --device patterns: {}",
+        if is_match {
+            "match, monitoring device"
+        } else {
+            "mismatch, ignoring device"
+        },
+        device_name,
+        name_filters
+            .iter()
+            .map(|p| format!("'{}'", p.as_str()))
+            .collect::<Vec<String>>()
+            .join(", ")
+    );
+    is_match
 }
 
 fn compatible_path(path: &Path) -> bool {

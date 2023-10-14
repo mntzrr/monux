@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use regex::Regex;
 use signal_hook::{consts::signal, iterator::Signals};
 use tokio::sync::{broadcast, mpsc};
 use tokio::{runtime, task, time};
@@ -47,9 +48,15 @@ struct ServerArgs {
     #[arg(long, default_value = "leftalt,p", value_name = "key1,key2,key3")]
     shortcut_prev: Option<String>,
 
-    /// Keyboard shortcut for switching directly to a client by its fingerprint prefix, or to the server for an empty fingerprint prefix
+    /// Keyboard shortcut for switching directly to a client by its fingerprint prefix,
+    /// or to the server for an empty fingerprint
     #[arg(long, value_name = "key1,key2,key3=[fingerprint-prefix]")]
     shortcut_goto: Option<Vec<String>>,
+
+    /// Substring or regular expression for selecting specific devices to monitor,
+    /// argument can be repeated for multiple filters
+    #[arg(long, value_name = "device-name-pattern")]
+    device: Option<Vec<Regex>>,
 
     /// Server listen IP
     #[arg(short = 'l', long, default_value = "0.0.0.0", value_name = "ip")]
@@ -140,6 +147,7 @@ fn main() -> Result<()> {
                     &args.shortcut,
                     args.shortcut_prev.as_deref(),
                     args.shortcut_goto.unwrap_or(vec![]),
+                    args.device.unwrap_or(vec![]),
                     args.exit_secs,
                     verifier,
                     fingerprint,
@@ -198,6 +206,7 @@ async fn server(
     keys_next: &str,
     keys_prev: Option<&str>,
     keys_goto: Vec<String>,
+    devices: Vec<Regex>,
     exit_secs: Option<u32>,
     verifier: Arc<approval::NikauCertVerification>,
     fingerprint: Arc<Mutex<Option<String>>>,
@@ -216,12 +225,15 @@ async fn server(
     let input_handler = input::InputHandler::new(keys_next, keys_prev, keys_goto, event_tx)?;
 
     let watch_handle = task::spawn(async move {
-        watch::watch_loop(input_handler, grab_tx).await.context(
-            "Failed to listen to input devices, possible solutions:
+        watch::watch_loop(input_handler, grab_tx, devices)
+            .await
+            .context(
+                "Failed to listen to any input devices, possible solutions:
 - Are any input devices (keyboard, mouse, etc) plugged into the machine?
 - The server may need to be run as root with 'sudo -E nikau server ...' to allow listening to input.
-- Enable uinput and/or evdev in the kernel, check for /dev/uinput and /dev/input/",
-        )
+- Enable uinput and/or evdev in the kernel, check for /dev/uinput and /dev/input/
+- If any '--device' filters are specified, they might be filtering out all current devices",
+            )
     });
 
     let server_handle = task::spawn(async move {

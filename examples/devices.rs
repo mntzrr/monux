@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use evdev::{AbsoluteAxisType, EventType, InputEvent, Key};
+use regex::Regex;
 use tokio::sync::broadcast;
 use tokio::task;
 use tracing::{error, info, warn};
@@ -43,9 +44,17 @@ impl watch::DeviceHandler for StubHandler {
 async fn main() -> Result<()> {
     logging::init_logging();
 
+    let devices = match std::env::var("DEVICES") {
+        Ok(val) => val
+            .split(",")
+            .map(|s| Regex::new(s).expect("Bad 'DEVICES' pattern"))
+            .collect::<Vec<Regex>>(),
+        Err(_e) => vec![],
+    };
+
     let (grab_tx, _grab_rx) = broadcast::channel(32);
     let handler = task::spawn(async move {
-        if let Err(e) = watch::watch_loop(StubHandler {}, grab_tx).await {
+        if let Err(e) = watch::watch_loop(StubHandler {}, grab_tx, devices).await {
             error!("Input device watch failure: {:?}", e);
         }
     });
