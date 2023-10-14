@@ -236,7 +236,7 @@ fn matches_filters(name_filters: &Vec<Regex>, d: &Device, path: &Path) -> bool {
         .collect();
     let is_match = !matches.is_empty();
     if !is_match {
-        util::log_device_info(d, path, "Ignoring device that doesn't match --device name filters", false);
+        util::log_device_info(d, path, "Ignoring device that doesn't match --device name filters", true);
     }
     is_match
 }
