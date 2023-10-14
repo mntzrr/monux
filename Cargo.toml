@@ -26,6 +26,7 @@ pem = "3.0"
 postcard = { version = "1.0", features = ["use-std"] }
 quinn = { version = "0.10", default-features = false, features = ["tls-rustls", "runtime-tokio", "log"]}
 rcgen = "0.11"
+regex = "1.10"
 rustls = { version = "0.21", features = ["dangerous_configuration"] } # dangerous_configuration: Required for custom ServerCertVerifier
 rustls-pemfile = "1.0"
 serde = { version = "1.0", default-features = false }
@@ -38,4 +39,4 @@ url = "2.4"
 walkdir = "2.3"
 x11rb-async = { version = "0.12", features = ["xfixes"] }
 zip = { version = "0.6", default-features = false, features = ["zstd"] }
-zstd = "0.12"
+zstd = "0.13"
