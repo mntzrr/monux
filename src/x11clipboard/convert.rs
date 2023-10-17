@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::task;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 use crate::x11clipboard::{limited, shared};
 
@@ -148,7 +148,7 @@ fn read_zstd(
     let mut limited = limited::LimitedCursor::new(max_compressed_size_bytes);
     zstd::stream::copy_encode(buf.as_slice(), &mut limited, 0)?;
     buf = limited.into_inner();
-    info!(
+    debug!(
         "Compressed {}: {} => {} bytes",
         requested_type,
         orig_len,
@@ -167,7 +167,7 @@ fn write_zstd(
     let mut limited = limited::LimitedCursor::new(max_uncompressed_size_bytes);
     zstd::stream::copy_decode(buf.as_slice(), &mut limited)?;
     buf = limited.into_inner();
-    info!(
+    debug!(
         "Decompressed {}: {} => {} bytes",
         requested_type,
         compressed_len,
@@ -258,7 +258,7 @@ fn build_zip_payload(file_uri_strs: Vec<&str>, max_compressed_size_bytes: u64) -
     }
     // Then write the files to the zip file, aborting internally if the compressed size gets too big
     let (uncompressed_len, zipdata) = zip_files(&files_to_zip, max_compressed_size_bytes)?;
-    info!(
+    debug!(
         "Zipped {} files ({} bytes) into {} bytes",
         files_to_zip.len(),
         uncompressed_len,

@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::{task, time};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 use x11rb_async::connection::Connection;
 use x11rb_async::protocol::xproto::{
     Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt, EventMask, PropMode, Property,
@@ -264,7 +264,7 @@ impl ClipboardServerState {
                                 .await?,
                             );
                         } else {
-                            info!(
+                            debug!(
                                 "Reusing existing clipboard content to requestor={} with type {}: {} bytes",
                                 event.requestor,
                                 target.1,
@@ -413,7 +413,7 @@ async fn fetch_clipboard_data(
                     )
                     .await?;
                 }
-                info!(
+                debug!(
                     "Writing clipboard data to requestor={} with type {}: {} bytes",
                     event.requestor,
                     clipboard_data.requested_type,

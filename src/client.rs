@@ -7,7 +7,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use quinn::{RecvStream, SendStream};
 use tokio::sync::{mpsc, watch};
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::device::output;
 use crate::msgs::{bulk, event};
@@ -298,7 +298,7 @@ impl Connection {
                                 // It may be from when we were disabled, or from a prior enabled session. That's fine.
                                 // Keep announcing the local clipboard until/unless it gets overridden by a new one from the server.
                                 let types = types.join(" ");
-                                info!("Sending clipboard types to server: {}", types);
+                                debug!("Sending clipboard types to server: {}", types);
                                 let msg =
                                     event::ClientEvent::ClipboardTypes(event::ClipboardTypes {
                                         types: &types,
@@ -327,14 +327,14 @@ impl Connection {
                     // Receiving types announcement from server (following recent activation)
                     // Announce the types to X11 for local apps to see, and clear any prior types from local apps.
                     if let Some(local_clipboard) = &mut local_clipboard {
-                        info!("Got clipboard types from server: {}", types.types);
+                        debug!("Got clipboard types from server: {}", types.types);
                         local_clipboard.local_types = None;
                         local_clipboard.serving_remote_clipboard = true;
                         let types: Vec<String> =
                             types.types.split(' ').map(|s| s.to_string()).collect();
                         local_clipboard.writer.store_types(types)?;
                     } else {
-                        info!("Ignoring clipboard types from server: {}", types.types);
+                        debug!("Ignoring clipboard types from server: {}", types.types);
                     }
                 }
             }
@@ -432,7 +432,7 @@ impl Connection {
                             bail!("Got ClipboardRequest event from server when we don't support clipboards, resetting connection");
                         }
                     };
-                    info!(
+                    debug!(
                         "Reading clipboard data for requested type {} to {}",
                         c.requested_type,
                         if let Some(c) = c.request_client {

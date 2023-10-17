@@ -8,7 +8,7 @@ use tokio::sync::broadcast;
 use tokio::task;
 use tracing::{error, info, warn};
 
-use nikau::device::{output, watch};
+use nikau::device::{output, util, watch};
 use nikau::logging;
 
 struct StubHandler {}
@@ -18,6 +18,7 @@ impl watch::DeviceHandler for StubHandler {
         &mut self,
         mut stream: evdev::EventStream,
         _grab_rx: broadcast::Receiver<watch::GrabEvent>,
+        _device_info: util::DeviceInfo,
     ) -> Result<watch::DeviceHandle> {
         let handle = tokio::spawn(async move {
             let device_name = stream

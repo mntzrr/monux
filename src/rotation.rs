@@ -487,7 +487,7 @@ impl Rotation {
 
         // Notify the active client (or server) about the clipboard info we just received.
         // In practice we should be getting this shortly after a client switch.
-        self.update_current_client_clipboard(true).await?;
+        self.update_current_client_clipboard().await?;
 
         Ok(())
     }
@@ -533,7 +533,7 @@ impl Rotation {
                     None
                 },
             });
-            info!(
+            debug!(
                 "Requesting clipboard data with type {} from {}{}",
                 requested_type,
                 clipboard_source,
@@ -586,12 +586,12 @@ impl Rotation {
                 content_len_bytes: content.len() as u64,
             });
             if let Some(data_type) = &data_type {
-                info!(
+                debug!(
                     "Sending clipboard data for requested type {} (data type {}) from server to {}",
                     requested_type, data_type, request_client
                 );
             } else {
-                info!(
+                debug!(
                     "Sending clipboard data for requested type {} from server to {}",
                     requested_type, request_client
                 );
@@ -709,7 +709,7 @@ impl Rotation {
         // or it won't, if the old client doesn't have a clipboard update to send.
         // log_info=false: Avoid duplicate info-level logging of clipboard types, between the server
         // switch and then (potentially) an update from the client that's being deactivated.
-        if let Err(e) = self.update_current_client_clipboard(false).await {
+        if let Err(e) = self.update_current_client_clipboard().await {
             warn!(
                 "Failed to send clipboard update to active client/server: {:?}",
                 e
@@ -733,7 +733,7 @@ impl Rotation {
 
     /// Updates and announces the current clipboard source for handling any future paste requests.
     /// In practice this occurs when a client broadcasts its clipboard shortly after being told its no longer active.
-    async fn update_current_client_clipboard(&mut self, log_info: bool) -> Result<()> {
+    async fn update_current_client_clipboard(&mut self) -> Result<()> {
         let c = match &self.clipboard_target {
             Some(c) => c,
             // No clipboard to announce
@@ -750,35 +750,20 @@ impl Rotation {
                         types: &types_str,
                         max_size_bytes: c.max_size_bytes,
                     });
-                    if log_info {
-                        info!(
-                            "Sending clipboard types for {} to {}: {}",
-                            clipboard_source, current_client, types_str
-                        );
-                    } else {
-                        debug!(
-                            "Sending clipboard types for {} to {}: {}",
-                            clipboard_source, current_client, types_str
-                        );
-                    }
+                    debug!(
+                        "Sending clipboard types for {} to {}: {}",
+                        clipboard_source, current_client, types_str
+                    );
                     self.send_event_current(types_msg).await?;
                 }
             } else if let Some(local_clipboard) = &mut self.local_clipboard {
                 // The server is active and its clipboard support is enabled.
                 // Tell it about the client clipbard.
-                if log_info {
-                    info!(
-                        "Storing clipboard types for {} on server: {}",
-                        clipboard_source,
-                        c.types.join(" ")
-                    );
-                } else {
-                    debug!(
-                        "Storing clipboard types for {} on server: {}",
-                        clipboard_source,
-                        c.types.join(" ")
-                    );
-                }
+                debug!(
+                    "Storing clipboard types for {} on server: {}",
+                    clipboard_source,
+                    c.types.join(" ")
+                );
                 local_clipboard.writer.store_types(c.types.clone())?;
             } else {
                 debug!("Ignoring clipboard types sent by client: Server clipboard is disabled");
@@ -792,7 +777,7 @@ impl Rotation {
                     types: &types_str,
                     max_size_bytes: c.max_size_bytes,
                 });
-                info!(
+                debug!(
                     "Sending clipboard types for server to {}: {}",
                     current_client, types_str
                 );
