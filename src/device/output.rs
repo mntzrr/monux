@@ -47,7 +47,9 @@ impl VirtualDevices {
         };
 
         if let Some(e) = net_event.inputf64 {
-            events.push(e.to_evdev(SCALED_DIM_MIN, SCALED_DIM_MAX));
+            let event = e.to_evdev(SCALED_DIM_MIN, SCALED_DIM_MAX);
+            trace!("Queued event {:?} -> {}", e, util::log_event(&event));
+            events.push(event);
         } else if let Some(e) = net_event.inputi32 {
             if e.type_ == evdev::EventType::SYNCHRONIZATION.0 {
                 // If it's a sync event, then flush the queued events if any.
@@ -55,7 +57,7 @@ impl VirtualDevices {
                 // writes its own sync event that we can't skip.
                 if !events.is_empty() {
                     trace!(
-                        "Sending {} events to {} device: {:?}",
+                        "Sending {} queued events to {} device: {:?}",
                         events.len(),
                         net_event.target,
                         events.iter().map(util::log_event).collect::<Vec<String>>(),
@@ -64,7 +66,9 @@ impl VirtualDevices {
                     events.clear();
                 }
             } else {
-                events.push(e.to_evdev());
+                let event = e.to_evdev();
+                trace!("Queued event {:?} -> {}", e, util::log_event(&event));
+                events.push(event);
             }
         } else {
             warn!("Event missing either an i32 or an f64 value: {}", net_event);

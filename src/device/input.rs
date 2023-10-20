@@ -246,13 +246,6 @@ async fn read_device_event(
     device_info: &util::DeviceInfo,
     combo_states: &mut Vec<ComboState>,
 ) {
-    trace!(
-        "{} event {:?}: {}",
-        device_info.target,
-        device.name().unwrap_or("(Unnamed device)"),
-        util::log_event(&event),
-    );
-
     // Check whether this event completes a key combo, which creates an additional event.
     // No short-circuit: Ensure that all combo_states have a chance to be updated
     let combo_events: Vec<Event> = combo_states
@@ -261,7 +254,7 @@ async fn read_device_event(
         .collect();
 
     // Convert and send the original event before any combo-generated events.
-    let event = if let evdev::InputEventKind::AbsAxis(axis) = event.kind() {
+    let net_event = if let evdev::InputEventKind::AbsAxis(axis) = event.kind() {
         // Special handling for evdev touchpad axis events
         if let Some((axis_min, axis_max)) = device_info.dims.get(&axis.0) {
             // Apply scaling from hardware width to [0.0, 1.0]
@@ -284,7 +277,16 @@ async fn read_device_event(
             inputf64: None,
         })
     };
-    if let Err(e) = event_tx.send(event).await {
+
+    trace!(
+        "{} event {:?}: {} -> {:?}",
+        device_info.target,
+        device.name().unwrap_or("(Unnamed device)"),
+        util::log_event(&event),
+        net_event
+    );
+
+    if let Err(e) = event_tx.send(net_event).await {
         warn!("Error trying to send event to server for routing: {:?}", e);
     }
 
