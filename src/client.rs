@@ -483,7 +483,8 @@ impl Connection {
                         // Mark content as consumed and continue looping in case another message follows.
                         if let Some(waiting_clipboard_fetch) = self.waiting_clipboard_fetch.take() {
                             let mut bytes = Vec::with_capacity(c.content_len_bytes as usize);
-                            bytes.extend_from_slice(&resp_remainder[..c.content_len_bytes as usize]);
+                            bytes
+                                .extend_from_slice(&resp_remainder[..c.content_len_bytes as usize]);
                             let d = ClipboardData {
                                 requested_type: c.requested_type.to_string(),
                                 data_type: c.data_type.map(|t| t.to_string()),

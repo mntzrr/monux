@@ -252,7 +252,9 @@ impl Rotation {
                 )
                 .await
             }
-            RotationEvent::RemoveClient(endpoint) => self.remove_client_and_clear_clipboard(endpoint).await,
+            RotationEvent::RemoveClient(endpoint) => {
+                self.remove_client_and_clear_clipboard(endpoint).await
+            }
             RotationEvent::ClipboardUpdateSource(args) => {
                 if let Err(e) = self
                     .clipboard_update_source(args.source, args.types, args.max_size_bytes)
@@ -908,7 +910,7 @@ impl Rotation {
         match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
             Ok(idx) => {
                 self.clients.remove(idx);
-            },
+            }
             Err(_e) => {
                 // Noop. Can happen if we're cleaning up for a client that wasn't added yet.
                 debug!("Client to remove not found in rotation: {}", endpoint);

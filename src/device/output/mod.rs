@@ -1,8 +1,8 @@
 pub mod uinput;
 
+use crate::msgs::event;
 use anyhow::Result;
 use async_trait::async_trait;
-use crate::msgs::event;
 
 /// Name prefix to use on nikau-created devices that should not be consumed by nikau
 pub const VIRTUAL_DEVICE_NAME_PREFIX: &str = "nikau virtual";
