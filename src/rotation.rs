@@ -539,19 +539,39 @@ impl Rotation {
             );
 
             // If the request is coming from the server itself, keep the oneshot for handling the reply.
-            if let ClipboardRequestSource::Local(waiting_clipboard_tx) = request_source {
-                // Clipboard request is from the server itself.
-                // Keep the oneshot for replying later.
-                if let Some(local_clipboard) = &mut self.local_clipboard {
-                    local_clipboard.waiting_clipboard_tx = Some(waiting_clipboard_tx);
-                } else {
-                    bail!(
-                        "Got request for clipboard from server, but server clipboard is disabled"
-                    );
-                }
+            match request_source {
+                ClipboardRequestSource::Local(waiting_clipboard_tx) => {
+                    // Clipboard request is from the server itself.
+                    // Keep the oneshot for replying later.
+                    if let Some(local_clipboard) = &mut self.local_clipboard {
+                        local_clipboard.waiting_clipboard_tx = Some(waiting_clipboard_tx);
+                    } else {
+                        bail!(
+                            "Got request for clipboard from server, but server clipboard is disabled"
+                        );
+                    }
+                    if !(self.send_bulk(clipboard_source, msg, None).await?) {
+                        warn!(
+                            "Unable to send request for clipboard to {}: not connected (clients: {:?})",
+                            clipboard_source,
+                            self.clients,
+                        );
+                    }
+                },
+                ClipboardRequestSource::Remote(client) => {
+                    // Clipboard request is from a client.
+                    // Route the request to the clipboard owner.
+                    if !(self.send_bulk(clipboard_source, msg, None).await?) {
+                        warn!(
+                            "Unable to send request for clipboard to {} on behalf of {}: not connected (clients: {:?})",
+                            clipboard_source,
+                            client,
+                            self.clients,
+                        );
+                    }
+                },
             }
-
-            self.send_bulk(clipboard_source, msg, None).await
+            Ok(())
         } else {
             // The server has the clipboard: serve via X11 from local app
             let request_client = if let ClipboardRequestSource::Remote(c) = &request_source {
@@ -590,7 +610,13 @@ impl Rotation {
                     requested_type, request_client
                 );
             }
-            self.send_bulk(request_client, msg, Some(content)).await
+            if !(self.send_bulk(request_client, msg, Some(content)).await?) {
+                warn!(
+                    "Unable to send server clipboard data to {}: not connected (clients: {:?})",
+                    request_client, self.clients
+                );
+            }
+            Ok(())
         }
     }
 
@@ -604,7 +630,7 @@ impl Rotation {
         data: ClipboardData,
     ) -> Result<()> {
         debug!(
-            "Sending clipboard content of requested_type={} data_type={:?} with len={} from source={:?} to dest={:?}",
+            "Sending clipboard content of requested_type={} data_type={:?} with len={} from source={} to dest={:?}",
             data.requested_type,
             data.data_type,
             data.bytes.len(),
@@ -618,7 +644,16 @@ impl Rotation {
                 data_type: data.data_type.as_ref().map(|t| t.as_str()),
                 content_len_bytes: data.bytes.len() as u64,
             });
-            self.send_bulk(&request_client, msg, Some(data.bytes)).await
+            // If send_bulk returns Ok(false), the client wasn't found. In that case just ignore the request,
+            // don't try to reset state since the client should already be removed.
+            if !(self
+                .send_bulk(&request_client, msg, Some(data.bytes))
+                .await?)
+            {
+                warn!("Unable to send clipboard data received from {} to {}: not connected (clients: {:?})",
+                      data_source, request_client, self.clients);
+            }
+            Ok(())
         } else if let Some(local_clipboard) = &mut self.local_clipboard {
             // Send to local X11 clipboard, using response oneshot that we'd gotten with the request.
             if let Some(waiting_clipboard_tx) = local_clipboard.waiting_clipboard_tx.take() {
@@ -854,7 +889,10 @@ impl Rotation {
                 }
             }
             Err(_idx) => {
-                warn!("Client {} not found in clients map", endpoint);
+                warn!(
+                    "Event client {} not found in clients map: {:?}",
+                    endpoint, self.clients
+                );
                 Ok(false)
             }
         }
@@ -865,7 +903,7 @@ impl Rotation {
         endpoint: &SocketAddr,
         msg: bulk::ServerBulk<'_>,
         payload: Option<Vec<u8>>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         match self.clients.binary_search_by(|c| c.endpoint.cmp(endpoint)) {
             Ok(idx) => {
                 let bulk_send = &mut self
@@ -889,17 +927,16 @@ impl Rotation {
                         return Err(e.into());
                     }
                 }
+                Ok(true)
             }
             Err(_idx) => {
-                // Shouldn't happen, but recover by setting to local machine and ungrabbing
                 warn!(
-                    "Requested bulk client {} not found in clients map",
-                    endpoint
+                    "Bulk client {} not found in clients map: {:?}",
+                    endpoint, self.clients
                 );
-                self.set_and_grab_current_client(None).await;
+                Ok(false)
             }
         }
-        Ok(())
     }
 
     /// Removes the client and switches to the server if it was the active client.
