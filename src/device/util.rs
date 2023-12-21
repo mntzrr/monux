@@ -75,7 +75,7 @@ pub struct DeviceInfo {
 pub fn log_device_info(device: &Device, path: &Path, log_prefix: &str, info: bool) -> DeviceInfo {
     let supported_events = device.supported_events();
     let mut dims = BTreeMap::new();
-    let target = if supported_events.contains(EventType::ABSOLUTE) {
+    let target = if supported_events.contains(EventType::ABSOLUTE) && device.properties().contains(evdev::PropType::POINTER) {
         // For each abs axis supported by the device, record its max and min
         // Result will be something like ABS_X(0,100), ABS_Y(0,70), ABS_MT_POSITION_X(0,100) ...
         if let Some(abs_axes) = device.supported_absolute_axes() {
@@ -90,7 +90,7 @@ pub fn log_device_info(device: &Device, path: &Path, log_prefix: &str, info: boo
             }
         }
         event::EventTarget::Touchpad
-    } else if supported_events.contains(EventType::RELATIVE) {
+    } else if supported_events.contains(EventType::RELATIVE) && device.supported_keys().is_some_and(|keys| keys.contains(Key::BTN_LEFT)) {
         event::EventTarget::Mouse
     } else {
         event::EventTarget::Keyboard
