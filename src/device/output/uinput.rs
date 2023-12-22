@@ -194,9 +194,10 @@ impl OutputHandler for VirtualUInputDevices {
         // Send the events to the respective devices.
         // If our mapping is working well, we should only be sending to one device per batch
         trace!(
-            "Emitting {} keyboard/{} mouse/{} touchpad events: keyboard={:?}, mouse={:?}, touchpad={:?}",
-            self.keyboard_events.len(), self.mouse_events.len(), self.touchpad_events.len(),
-            self.keyboard_events, self.mouse_events, self.touchpad_events
+            "Emitting events: keyboard({})={:?} mouse({})={:?} touchpad({})={:?}",
+            self.keyboard_events.len(), self.keyboard_events,
+            self.mouse_events.len(), self.mouse_events,
+            self.touchpad_events.len(), self.touchpad_events,
         );
         if !self.keyboard_events.is_empty() {
             self.keyboard_device.emit(&self.keyboard_events)?;
