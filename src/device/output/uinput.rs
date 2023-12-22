@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use evdev::{uinput, AbsInfo, AbsoluteAxisType, AttributeSet, EvdevEnum, InputEvent, InputEventKind, Key, MiscType, RelativeAxisType};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::device::output::{OutputHandler, VIRTUAL_DEVICE_NAME_PREFIX};
 use crate::device::util;
@@ -17,13 +17,18 @@ pub struct VirtualUInputDevices {
     keyboard_events: Vec<InputEvent>,
     mouse_events: Vec<InputEvent>,
     touchpad_events: Vec<InputEvent>,
+    keyboard_or_mouse_events: Vec<InputEvent>,
     mouse_or_touchpad_events: Vec<InputEvent>,
 
     keyboard_keys: AttributeSet<Key>,
     mouse_keys: AttributeSet<Key>,
     touchpad_keys: AttributeSet<Key>,
+
     mouse_axes: AttributeSet<RelativeAxisType>,
     touchpad_axes: AttributeSet<AbsoluteAxisType>,
+
+    keyboard_misc: AttributeSet<MiscType>,
+    mouse_misc: AttributeSet<MiscType>,
     touchpad_misc: AttributeSet<MiscType>,
 
     keyboard_device: uinput::VirtualDevice,
@@ -34,9 +39,9 @@ pub struct VirtualUInputDevices {
 impl VirtualUInputDevices {
     pub fn new() -> Result<VirtualUInputDevices> {
         let pid = std::process::id();
-        let (keyboard_device, keyboard_keys) = keyboard(pid)
+        let (keyboard_device, keyboard_keys, keyboard_misc) = keyboard(pid)
             .context("Failed to create virtual keyboard for simulated output")?;
-        let (mouse_device, mouse_keys, mouse_axes) = mouse(pid)
+        let (mouse_device, mouse_keys, mouse_misc, mouse_axes) = mouse(pid)
             .context("Failed to create virtual mouse for simulated output")?;
         let (touchpad_device, touchpad_keys, touchpad_misc, touchpad_axes) = touchpad(pid)
             .context("Failed to create virtual touchpad for simulated output")?;
@@ -53,25 +58,36 @@ impl VirtualUInputDevices {
 
   touchpad_axes: {:?}
 
+  keyboard_misc: {:?}
+
+  mouse_misc: {:?}
+
   touchpad_misc: {:?}",
             keyboard_keys,
             mouse_keys,
             touchpad_keys,
             mouse_axes,
             touchpad_axes,
+            keyboard_misc,
+            mouse_misc,
             touchpad_misc
         );
         let ret = VirtualUInputDevices {
             keyboard_events: vec![],
             mouse_events: vec![],
             touchpad_events: vec![],
+            keyboard_or_mouse_events: vec![],
             mouse_or_touchpad_events: vec![],
 
             keyboard_keys,
             mouse_keys,
             touchpad_keys,
+
             mouse_axes,
             touchpad_axes,
+
+            keyboard_misc,
+            mouse_misc,
             touchpad_misc,
 
             keyboard_device,
@@ -116,7 +132,16 @@ impl VirtualUInputDevices {
                 }
             },
             InputEventKind::Misc(e) => {
-                if self.touchpad_misc.contains(e) {
+                if self.keyboard_misc.contains(e) {
+                    // keyboard_misc and mouse_misc have MSC_SCAN overlap
+                    if self.mouse_misc.contains(e) {
+                        self.keyboard_or_mouse_events.push(event);
+                    } else {
+                        self.keyboard_events.push(event);
+                    }
+                } else if self.mouse_misc.contains(e) {
+                    self.mouse_events.push(event);
+                } else if self.touchpad_misc.contains(e) {
                     self.touchpad_events.push(event);
                 } else {
                     info!("Dropping misc event with unsupported code: {:?}", e);
@@ -145,20 +170,37 @@ impl OutputHandler for VirtualUInputDevices {
             self.route_event(event);
         }
 
-        if !self.keyboard_events.is_empty() {
-            self.keyboard_device.emit(&self.keyboard_events)?;
-            self.keyboard_events.clear();
+        // Guess where to route non-definitive events based on any device-only events in the batch.
+        // This likely reorders events vs how we received them, but it shouldn't matter within a batch.
+        if !self.keyboard_or_mouse_events.is_empty() {
+            if !self.mouse_events.is_empty() {
+                self.mouse_events.extend(self.keyboard_or_mouse_events.iter());
+            } else {
+                // Default
+                self.keyboard_events.extend(self.keyboard_or_mouse_events.iter());
+            }
+            self.keyboard_or_mouse_events.clear();
         }
         if !self.mouse_or_touchpad_events.is_empty() {
-            // Guess whether to treat the events as mouse or touchpad,
-            // by checking for mouse-only or touchpad-only events in the batch.
-            // Default to mouse if we can't figure it out.
             if !self.touchpad_events.is_empty() {
                 self.touchpad_events.extend(self.mouse_or_touchpad_events.iter());
             } else {
+                // Default
                 self.mouse_events.extend(self.mouse_or_touchpad_events.iter());
             }
             self.mouse_or_touchpad_events.clear();
+        }
+
+        // Send the events to the respective devices.
+        // If our mapping is working well, we should only be sending to one device per batch
+        trace!(
+            "Emitting {} keyboard/{} mouse/{} touchpad events: keyboard={:?}, mouse={:?}, touchpad={:?}",
+            self.keyboard_events.len(), self.mouse_events.len(), self.touchpad_events.len(),
+            self.keyboard_events, self.mouse_events, self.touchpad_events
+        );
+        if !self.keyboard_events.is_empty() {
+            self.keyboard_device.emit(&self.keyboard_events)?;
+            self.keyboard_events.clear();
         }
         if !self.mouse_events.is_empty() {
             self.mouse_device.emit(&self.mouse_events)?;
@@ -173,7 +215,7 @@ impl OutputHandler for VirtualUInputDevices {
     }
 }
 
-pub fn keyboard(pid: u32) -> Result<(uinput::VirtualDevice, AttributeSet<Key>)> {
+pub fn keyboard(pid: u32) -> Result<(uinput::VirtualDevice, AttributeSet<Key>, AttributeSet<MiscType>)> {
     let mut keys = AttributeSet::<Key>::new();
     // Report as many keys as possible to emit by the virtual device.
     for code in 1..libc::KEY_MAX {
@@ -188,10 +230,15 @@ pub fn keyboard(pid: u32) -> Result<(uinput::VirtualDevice, AttributeSet<Key>)> 
         .name(format!("{} keyboard for pid {}", VIRTUAL_DEVICE_NAME_PREFIX, pid).as_str())
         .with_keys(&keys)?
         .build()?;
-    Ok((device, keys))
+
+    // We don't seem to need to advertise this, but mark it as a possible event so that we aren't dropping it and logging infos about it.
+    let mut misc = AttributeSet::<MiscType>::new();
+    misc.insert(MiscType::MSC_SCAN);
+
+    Ok((device, keys, misc))
 }
 
-pub fn mouse(pid: u32) -> Result<(uinput::VirtualDevice, AttributeSet<Key>, AttributeSet<RelativeAxisType>)> {
+pub fn mouse(pid: u32) -> Result<(uinput::VirtualDevice, AttributeSet<Key>, AttributeSet<MiscType>, AttributeSet<RelativeAxisType>)> {
     let mut keys = AttributeSet::<Key>::new();
     for code in 1..libc::KEY_MAX {
         let key = Key::new(code);
@@ -213,7 +260,12 @@ pub fn mouse(pid: u32) -> Result<(uinput::VirtualDevice, AttributeSet<Key>, Attr
         .with_keys(&keys)?
         .with_relative_axes(&axes)?
         .build()?;
-    Ok((device, keys, axes))
+
+    // We don't seem to need to advertise this, but mark it as a possible event so that we aren't dropping it and logging infos about it.
+    let mut misc = AttributeSet::<MiscType>::new();
+    misc.insert(MiscType::MSC_SCAN);
+
+    Ok((device, keys, misc, axes))
 }
 
 pub fn touchpad(pid: u32) -> Result<(uinput::VirtualDevice, AttributeSet<Key>, AttributeSet<MiscType>, AttributeSet<AbsoluteAxisType>)> {
