@@ -9,8 +9,8 @@ use tokio::sync::broadcast;
 use tokio::task;
 use tracing::{error, info, warn};
 
+use nikau::device::output::{uinput, OutputHandler};
 use nikau::device::{util, watch};
-use nikau::device::output::{OutputHandler, uinput};
 use nikau::logging;
 use nikau::msgs::event;
 
@@ -58,7 +58,9 @@ async fn main() -> Result<()> {
 
     let (grab_tx, _grab_rx) = broadcast::channel(32);
     let handler = task::spawn(async move {
-        if let Err(e) = watch::watch_loop(StubHandler {}, grab_tx, devices, &HashSet::<Key>::new()).await {
+        if let Err(e) =
+            watch::watch_loop(StubHandler {}, grab_tx, devices, &HashSet::<Key>::new()).await
+        {
             error!("Input device watch failure: {:?}", e);
         }
     });
@@ -70,23 +72,55 @@ async fn main() -> Result<()> {
     thread::sleep(Duration::from_secs(1));
 
     for _ in 0..50 {
-        devices.write(vec![from_evdev(evdev::InputEvent::new(EventType::KEY, Key::KEY_R.code(), 1))]).await?;
-        devices.write(vec![from_evdev(evdev::InputEvent::new(EventType::KEY, Key::KEY_R.code(), 0))]).await?;
+        devices
+            .write(vec![from_evdev(evdev::InputEvent::new(
+                EventType::KEY,
+                Key::KEY_R.code(),
+                1,
+            ))])
+            .await?;
+        devices
+            .write(vec![from_evdev(evdev::InputEvent::new(
+                EventType::KEY,
+                Key::KEY_R.code(),
+                0,
+            ))])
+            .await?;
     }
 
     for _ in 0..50 {
-        devices.write(vec![
-            from_evdev(evdev::InputEvent::new(EventType::RELATIVE, evdev::RelativeAxisType::REL_X.0, 5)),
-            from_evdev(evdev::InputEvent::new(EventType::RELATIVE, evdev::RelativeAxisType::REL_Y.0, 5))
-        ]).await?;
+        devices
+            .write(vec![
+                from_evdev(evdev::InputEvent::new(
+                    EventType::RELATIVE,
+                    evdev::RelativeAxisType::REL_X.0,
+                    5,
+                )),
+                from_evdev(evdev::InputEvent::new(
+                    EventType::RELATIVE,
+                    evdev::RelativeAxisType::REL_Y.0,
+                    5,
+                )),
+            ])
+            .await?;
         thread::sleep(Duration::from_micros(5_000));
     }
 
     for i in 100..200 {
-        devices.write(vec![
-            from_evdev(evdev::InputEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_X.0, i)),
-            from_evdev(evdev::InputEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_Y.0, i))
-        ]).await?;
+        devices
+            .write(vec![
+                from_evdev(evdev::InputEvent::new(
+                    EventType::ABSOLUTE,
+                    AbsoluteAxisType::ABS_X.0,
+                    i,
+                )),
+                from_evdev(evdev::InputEvent::new(
+                    EventType::ABSOLUTE,
+                    AbsoluteAxisType::ABS_Y.0,
+                    i,
+                )),
+            ])
+            .await?;
         thread::sleep(Duration::from_micros(5_000));
     }
 
