@@ -1,15 +1,18 @@
+use std::collections::HashSet;
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use evdev::{AbsoluteAxisType, EventType, InputEvent, Key};
+use evdev::{AbsoluteAxisType, EventType, Key};
 use regex::Regex;
 use tokio::sync::broadcast;
 use tokio::task;
 use tracing::{error, info, warn};
 
-use nikau::device::{output, util, watch};
+use nikau::device::{util, watch};
+use nikau::device::output::{OutputHandler, uinput};
 use nikau::logging;
+use nikau::msgs::event;
 
 struct StubHandler {}
 
@@ -55,48 +58,52 @@ async fn main() -> Result<()> {
 
     let (grab_tx, _grab_rx) = broadcast::channel(32);
     let handler = task::spawn(async move {
-        if let Err(e) = watch::watch_loop(StubHandler {}, grab_tx, devices).await {
+        if let Err(e) = watch::watch_loop(StubHandler {}, grab_tx, devices, &HashSet::<Key>::new()).await {
             error!("Input device watch failure: {:?}", e);
         }
     });
 
-    let pid = std::process::id();
-    let mut keyboard =
-        output::keyboard(pid).context("Failed to init virtual device, are you root?")?;
-    let mut mouse = output::mouse(pid)?;
-    let mut touchpad = output::touchpad(pid)?;
+    let mut devices = uinput::VirtualUInputDevices::new()
+        .context("Failed to init virtual devices, are you root?")?;
 
     // Sleep for a bit, otherwise events can be missed. Devices need a bit of time to come up.
     thread::sleep(Duration::from_secs(1));
 
     for _ in 0..50 {
-        keyboard
-            .emit(&[InputEvent::new(EventType::KEY, Key::KEY_R.code(), 1)])
-            .unwrap();
-        keyboard
-            .emit(&[InputEvent::new(EventType::KEY, Key::KEY_R.code(), 0)])
-            .unwrap();
+        devices.write(vec![from_evdev(evdev::InputEvent::new(EventType::KEY, Key::KEY_R.code(), 1))]).await?;
+        devices.write(vec![from_evdev(evdev::InputEvent::new(EventType::KEY, Key::KEY_R.code(), 0))]).await?;
     }
 
     for _ in 0..50 {
-        mouse
-            .emit(&[
-                InputEvent::new(EventType::RELATIVE, evdev::RelativeAxisType::REL_X.0, 5),
-                InputEvent::new(EventType::RELATIVE, evdev::RelativeAxisType::REL_Y.0, 5),
-            ])
-            .unwrap();
+        devices.write(vec![
+            from_evdev(evdev::InputEvent::new(EventType::RELATIVE, evdev::RelativeAxisType::REL_X.0, 5)),
+            from_evdev(evdev::InputEvent::new(EventType::RELATIVE, evdev::RelativeAxisType::REL_Y.0, 5))
+        ]).await?;
         thread::sleep(Duration::from_micros(5_000));
     }
 
     for i in 100..200 {
-        // Position (i * 100) is scaled to fit within SCALED_DIM_MIN/SCALED_DIM_MAX
-        touchpad.emit(&[
-            InputEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_X.0, i * 100),
-            InputEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_Y.0, i * 100),
-        ])?;
+        devices.write(vec![
+            from_evdev(evdev::InputEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_X.0, i)),
+            from_evdev(evdev::InputEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_Y.0, i))
+        ]).await?;
         thread::sleep(Duration::from_micros(5_000));
     }
 
     handler.await?;
     bail!("Exited prematurely");
+}
+
+fn from_evdev(event: evdev::InputEvent) -> event::InputEvent {
+    if event.event_type() == EventType::ABSOLUTE {
+        event::InputEvent {
+            inputi32: None,
+            inputf64: Some(event::InputF64::from_evdev(event, 0, 200)),
+        }
+    } else {
+        event::InputEvent {
+            inputi32: Some(event::InputI32::from_evdev(event)),
+            inputf64: None,
+        }
+    }
 }

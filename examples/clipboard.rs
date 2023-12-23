@@ -46,12 +46,12 @@ async fn main() -> Result<()> {
             if let Some(fetch) = fetch_rx.recv().await {
                 info!("got clipboard lookup from writer, try pasting");
                 // pretend that we're a server fetching a result here...
-                let mut data = Vec::new();
-                data.extend_from_slice(b"hello xorg");
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(b"hello xorg");
                 let d = ClipboardData {
                     requested_type: fetch.requested_type,
                     data_type: None,
-                    data,
+                    bytes,
                     remaining_bytes: 0,
                 };
                 if let Err(_d_again) = fetch.fetch_result_tx.send(d) {
