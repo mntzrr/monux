@@ -7,7 +7,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::device::{Event, watch};
+use crate::device::{watch, Event};
 use crate::msgs::{bulk, event};
 use crate::network::{approval, transport};
 use crate::{rotation, x11clipboard};

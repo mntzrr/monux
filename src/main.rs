@@ -12,7 +12,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::{runtime, task, time};
 use tracing::{error, info, warn};
 
-use nikau::device::{Event, input, output, shortcut, watch};
+use nikau::device::{input, output, shortcut, watch, Event};
 use nikau::network::approval;
 use nikau::{client, logging, server};
 
@@ -212,8 +212,7 @@ async fn server(
     fingerprint: Arc<Mutex<Option<String>>>,
     max_clipboard_size_bytes: u64,
 ) -> Result<()> {
-    let (event_tx, event_rx): (mpsc::Sender<Event>, mpsc::Receiver<Event>) =
-        mpsc::channel(32);
+    let (event_tx, event_rx): (mpsc::Sender<Event>, mpsc::Receiver<Event>) = mpsc::channel(32);
 
     let event_tx2 = event_tx.clone();
     let signals = Signals::new([signal::SIGUSR1, signal::SIGUSR2])?;
@@ -222,22 +221,11 @@ async fn server(
     let (grab_tx, _grab_rx) = broadcast::channel(1);
     let grab_tx2 = grab_tx.clone();
 
-    // TODO server should grab any input devices which contain keys relevant to configured keys_* combos
-    //      this would be paired with a virtual keyboard device to re-emit keys
-    let keys_next = shortcut::parse_action(keys_next, Event::SwitchNext)?;
-    let keys_prev = if let Some(kp) = keys_prev {
-        Some(shortcut::parse_action(kp, Event::SwitchNext)?)
-    } else {
-        None
-    };
-    let mut keys_goto_parsed = vec![];
-    for kg in keys_goto.into_iter() {
-        keys_goto_parsed.push(shortcut::parse_goto(&kg)?);
-    }
-    let input_handler = input::InputHandler::new(keys_next, keys_prev, keys_goto_parsed, event_tx)?;
+    let key_combos = shortcut::parse_key_combos(keys_next, keys_prev, keys_goto)?;
+    let input_handler = input::InputHandler::new(&key_combos, event_tx)?;
 
     let watch_handle = task::spawn(async move {
-        watch::watch_loop(input_handler, grab_tx, devices)
+        watch::watch_loop(input_handler, grab_tx, devices, &key_combos.all_keys)
             .await
             .context(
                 "Failed to listen to any input devices, possible solutions:

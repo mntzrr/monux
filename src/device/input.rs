@@ -6,8 +6,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task;
 use tracing::{debug, info, trace, warn};
 
-use crate::device::{Event, shortcut, util};
 use crate::device::watch::{DeviceHandle, DeviceHandler, GrabEvent};
+use crate::device::{shortcut, util, Event};
 use crate::msgs::event;
 
 pub struct InputHandler {
@@ -22,17 +22,11 @@ struct HandlerConfig {
 
 impl InputHandler {
     pub fn new(
-        keys_next: shortcut::KeysAction,
-        keys_prev: Option<shortcut::KeysAction>,
-        keys_goto: Vec<shortcut::KeysAction>,
+        key_combos: &shortcut::KeyCombos,
         event_tx: mpsc::Sender<Event>,
     ) -> Result<InputHandler> {
         let mut keymap = HashMap::new();
-        add_key_combo(&mut keymap, keys_next)?;
-        if let Some(keys_prev) = keys_prev {
-            add_key_combo(&mut keymap, keys_prev)?;
-        }
-        for entry in keys_goto {
+        for entry in key_combos.combos.iter() {
             add_key_combo(&mut keymap, entry)?;
         }
         if keymap.is_empty() {
@@ -60,11 +54,13 @@ impl InputHandler {
 
 fn add_key_combo(
     keymap: &mut HashMap<Vec<Key>, Event>,
-    keysaction: shortcut::KeysAction,
+    keysaction: &shortcut::KeyCombo,
 ) -> Result<()> {
     // Add combo to keymap, complain if an identical combo already exists
     if !keysaction.keys.is_empty() {
-        if let Some(existing_action) = keymap.insert(keysaction.keys.clone(), keysaction.action.clone()) {
+        if let Some(existing_action) =
+            keymap.insert(keysaction.keys.clone(), keysaction.action.clone())
+        {
             bail!(
                 "Key combination '{:?}' for {:?} collides with existing combination for {:?}",
                 keysaction.keys,

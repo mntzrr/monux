@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Result};
@@ -5,16 +6,43 @@ use evdev::{EventType, Key};
 
 use crate::device::Event;
 
-pub struct KeysAction {
+pub struct KeyCombos {
+    pub combos: Vec<KeyCombo>,
+    pub all_keys: HashSet<Key>,
+}
+
+/// A combination of keys paired with an action to be emitted when the combination is entered by the user
+pub struct KeyCombo {
     pub keys: Vec<Key>,
     pub action: Event,
 }
 
+/// Parses user-provided key shortcuts into a list of combinations paired with actions to be performed
+pub fn parse_key_combos(
+    keys_next: &str,
+    keys_prev: Option<&str>,
+    keys_goto: Vec<String>,
+) -> Result<KeyCombos> {
+    let mut combos = vec![];
+    combos.push(parse_action(keys_next, Event::SwitchNext)?);
+    if let Some(kp) = keys_prev {
+        combos.push(parse_action(kp, Event::SwitchPrev)?);
+    }
+    for kg in keys_goto.into_iter() {
+        combos.push(parse_goto(&kg)?);
+    }
+    let all_keys = combos.iter().flat_map(|combo| combo.keys.clone()).collect();
+    Ok(KeyCombos { combos, all_keys })
+}
+
 /// Parses a user-provided goto shortcut of the form "key1,key2,key3=fingerprint-prefix"
-pub fn parse_goto(keys_goto: &str) -> Result<KeysAction> {
+fn parse_goto(keys_goto: &str) -> Result<KeyCombo> {
     let split: Vec<&str> = keys_goto.split('=').collect();
     if split.len() != 2 {
-        bail!("Invalid --shortcut-goto: Expected 'key1,key2,key3=[fingerprint-prefix]', but was '{}'", keys_goto);
+        bail!(
+            "Invalid --shortcut-goto: Expected 'key1,key2,key3=[fingerprint-prefix]', but was '{}'",
+            keys_goto
+        );
     }
     let keys = split.get(0).expect("entry_split has len=2");
     let fingerprint_prefix = split.get(1).expect("entry_split has len=2").to_string();
@@ -23,7 +51,7 @@ pub fn parse_goto(keys_goto: &str) -> Result<KeysAction> {
 
 /// Parses a user-provided key combination of the form "key1,key2,..." or "key1+key2+...",
 /// paired with some action to be performed
-pub fn parse_action(keys: &str, action: Event) -> Result<KeysAction> {
+fn parse_action(keys: &str, action: Event) -> Result<KeyCombo> {
     // Allow key string to be either 'x,y,z' or 'x+y+z' but not a mix of both
     let keys_iter = if keys.contains(",") {
         keys.split(',')
@@ -42,12 +70,8 @@ pub fn parse_action(keys: &str, action: Event) -> Result<KeysAction> {
     // so doesn't check for keypress ordering. So sorting the keys here shouldn't affect that.
     keys.sort();
 
-    Ok(KeysAction {
-        keys,
-        action,
-    })
+    Ok(KeyCombo { keys, action })
 }
-
 
 /// Result of checking an input event for matching key combination shortcuts
 pub(crate) enum ComboAction {
@@ -63,7 +87,7 @@ pub(crate) enum ComboAction {
 
 /// Checks input events for a specified key combination.
 ///
-/// For now we allow the keys to be pressed in any order, as long as there's a point where they're all being held down at the same time.
+/// Keys may be pressed in any order, as long as there's a point where they're all being pressed at the same time.
 ///
 /// The key combination is only considered "complete" after the combo keys have all been released.
 /// This avoids issues around the server machine thinking device keys are still held down when we grab the device.

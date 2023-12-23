@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -47,6 +47,7 @@ pub async fn watch_loop<F: DeviceHandler>(
     mut handler: F,
     mut grab_tx: broadcast::Sender<GrabEvent>,
     device_filters: Vec<Regex>,
+    all_combo_keys: &HashSet<Key>,
 ) -> Result<()> {
     // Start watch for new and removed devices BEFORE scanning current devices.
     let (device_event_tx, mut device_event_rx): (
@@ -79,6 +80,15 @@ pub async fn watch_loop<F: DeviceHandler>(
         }
         if !matches_filters(&device_filters, &device, &path) {
             continue;
+        }
+        if supports_any_keys(&device, all_combo_keys) {
+            // TODO the device (probably a keyboard) should always be grabbed,
+            // its events should then be routed to a virtual device set when the server is active
+            // (not just virtual keyboard, in case the "keyboard" has non-keyboard event types)
+            debug!(
+                "Device supports one or more configured combo keys: {:?}",
+                device.name()
+            );
         }
         let device_info = util::log_device_info(&device, &path, "Listening to device", true);
         let events = start_device_stream(device, &path)?;
@@ -260,6 +270,17 @@ fn matches_filters(name_filters: &Vec<Regex>, d: &Device, path: &Path) -> bool {
         );
     }
     is_match
+}
+
+fn supports_any_keys(d: &Device, all_combo_keys: &HashSet<Key>) -> bool {
+    if let Some(device_keys) = d.supported_keys() {
+        for key in all_combo_keys.iter() {
+            if device_keys.contains(*key) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn start_device_stream(device: Device, path: &Path) -> Result<EventStream> {
