@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Result};
-use evdev::{EventStream, EventType, InputEvent, Key};
+use evdev::{EventStream, EventType, Key};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task;
 use tracing::{debug, info, trace, warn};
@@ -67,7 +67,13 @@ impl InputHandler {
             config: HandlerConfig {
                 combo_states: keymap
                     .into_iter()
-                    .map(|(keys, action)| ComboState::new(keys, action))
+                    .filter_map(|(keys, action)| {
+                        if keys.is_empty() {
+                            None
+                        } else {
+                            Some(ComboState::new(keys, action))
+                        }
+                    })
                     .collect(),
                 event_tx,
             },
@@ -80,10 +86,11 @@ fn add_key_combo(
     keys_raw: &str,
     action: Event,
 ) -> Result<()> {
-    // Allow keys to be either 'x,y,z' or 'x+y+z' but not a mix of both
-    let keys_iter = match keys_raw.contains(",") {
-        true => keys_raw.split(','),
-        false => keys_raw.split('+'),
+    // Allow key string to be either 'x,y,z' or 'x+y+z' but not a mix of both
+    let keys_iter = if keys_raw.contains(",") {
+        keys_raw.split(',')
+    } else {
+        keys_raw.split('+')
     };
     let mut keys = vec![];
     for key in keys_iter {
@@ -126,6 +133,18 @@ impl DeviceHandler for InputHandler {
     }
 }
 
+/// Result of checking an input event for matching key combination shortcuts
+enum ComboAction {
+    /// The caller should not send the input event.
+    ConsumeEvent,
+    /// The caller should emit the input event as-is.
+    PassEvent,
+    /// The caller should emit the provided switch event, without sending the original input event.
+    ConsumeEventAndEmitAction(Event),
+    /// The caller should emit the provided switch event after sending the original input event as-is.
+    PassEventAndEmitAction(Event),
+}
+
 /// Checks input events for a specified key combination.
 ///
 /// For now we allow the keys to be pressed in any order, as long as there's a point where they're all being held down at the same time.
@@ -137,9 +156,9 @@ struct ComboState {
     /// The action to take
     action: Event,
     /// The combo keys that we're looking for. Indexes are mapped to pressed_keys.
-    combo_keys: Vec<Key>,
+    combo_key_codes: Vec<u16>,
     pressed_keys: bit_vec::BitVec,
-    waiting_for_released_keys: bool,
+    last_keypress: Option<evdev::InputEvent>,
 }
 
 impl ComboState {
@@ -147,40 +166,91 @@ impl ComboState {
         let len = combo_keys.len();
         ComboState {
             action,
-            combo_keys,
+            combo_key_codes: combo_keys.into_iter().map(|k| k.code()).collect(),
             pressed_keys: bit_vec::BitVec::from_elem(len, false),
-            waiting_for_released_keys: false,
+            last_keypress: None,
         }
     }
 
     /// Checks if the provided event completes a combo according to internal state.
     /// If so, then the action to be taken is returned.
-    fn check_combo(&mut self, event: &InputEvent) -> Option<Event> {
-        if self.combo_keys.is_empty() {
-            return None;
+    fn check_combo(&mut self, event: &evdev::InputEvent) -> ComboAction {
+        if event.event_type() != EventType::KEY {
+            // Not a keypress, pass through
+            return ComboAction::PassEvent;
         }
-        if event.event_type() == EventType::KEY {
-            // Check if this key is one of our assigned combo keys.
-            // This search should be cheap as it's limited to the size of the key combo (2-4 keys?)
-            for (idx, combo_key) in self.combo_keys.iter().enumerate() {
-                if event.code() == combo_key.code() {
-                    // This event is for a combo key.
-                    self.pressed_keys.set(idx, event.value() >= 1);
-                    if self.waiting_for_released_keys {
-                        if self.pressed_keys.none() {
-                            // All of the keys are inactive, after previously all being active. The combo is complete.
-                            self.waiting_for_released_keys = false;
-                            return Some(self.action.clone());
-                        }
-                    } else if self.pressed_keys.all() {
-                        // All of the combo keys are active. Now we start waiting for them to be inactive.
-                        self.waiting_for_released_keys = true;
-                        return None;
+        // Check if this key is one of our assigned combo keys.
+        // This search should be cheap as it's limited to the size of the key combo (2-4 keys?)
+        if let Some(idx) = self.key_idx(event.code()) {
+            // The key event is related to our combo. Update our state to reflect the keypress or release.
+            self.pressed_keys.set(idx, event.value() >= 1);
+            if let Some(last_keypress) = &self.last_keypress {
+                // We're in the stage of waiting for keys to be released so that we can activate the switch.
+                // We specifically wait for keys to be released so that a target machine doesn't see a "hanging" keypress.
+                // We want the target machine to see the full press+release cycle before we switch targets.
+                // However, we do consume/block the last keypress event in the combo, when the combo is "activated".
+                // We need to check for the matching release event so that we can block that too.
+                // We only block the last event because before that point we don't know if the user is intending to activate a combo,
+                // and if we consume keys then the user will notice that e.g. their N key isn't working in the ALT+N combo case.
+                let matching = last_keypress.event_type() == event.event_type()
+                    && last_keypress.code() == event.code();
+                if self.pressed_keys.none() {
+                    // Waiting for keys to be released, and all the keys are released.
+                    // The combo is complete.
+                    self.last_keypress = None;
+                    if matching {
+                        // This key being released is the one that we consumed the press on earlier.
+                        // For example, user pressed ALT, N: We consumed the N press.
+                        // Now the user has released ALT and is now releasing N, and we should consume the N release.
+                        ComboAction::ConsumeEventAndEmitAction(self.action.clone())
+                    } else {
+                        // This key being released isn't the one that we consumed earlier.
+                        // In the above example, the user released N first and is now releasing ALT, and ALT's keypress wasn't consumed.
+                        ComboAction::PassEventAndEmitAction(self.action.clone())
+                    }
+                } else {
+                    // Not all keys have been released yet.
+                    // Pass or consume the release event depending on what matching keypress had been consumed.
+                    if matching {
+                        // This key being released is the one that we consumed the press on earlier.
+                        // For example, user pressed ALT, N: We consumed the N press.
+                        // Now the user is releasing N first before releasing ALT, and we should consume the N release.
+                        ComboAction::ConsumeEvent
+                    } else {
+                        // This key being released isn't the one that we consumed earlier.
+                        // In the above example, the user is releasing ALT before releasing N, and ALT's keypress wasn't consumed.
+                        ComboAction::PassEvent
                     }
                 }
+            } else {
+                // Waiting for keys to be pressed before considering the combo to be complete.
+                // We consume the last keypress, for example with ALT,N in that order, the destination machine only sees the ALT press/release, we consume the N press/release.
+                // If the user pressed N before ALT then we consume the ALT press/release instead. It's just whatever key was pressed last.
+                // We only consume the last keypress because we can't speculatively consume keypresses.
+                // For example the user might be pressing N,P: If we consume the N keypress before ALT is pressed, it'll look like the N button isn't working.
+                if self.pressed_keys.all() {
+                    // All the keys are now pressed. Now we start waiting for them to be released.
+                    // We also consume this last keypress event. For example if someone presses Alt+N, we drop the N keypress.
+                    self.last_keypress = Some(event.clone());
+                    ComboAction::ConsumeEvent
+                } else {
+                    // Not all of the keys are pressed. Keep waiting and let this event through since it might not intended as a combo activation.
+                    ComboAction::PassEvent
+                }
+            }
+        } else {
+            // The key isn't relevant to the combo at all. Pass it through.
+            ComboAction::PassEvent
+        }
+    }
+
+    fn key_idx(&self, key_code: u16) -> Option<usize> {
+        for (idx, combo_key_code) in self.combo_key_codes.iter().enumerate() {
+            if key_code == *combo_key_code {
+                return Some(idx);
             }
         }
-        None
+        return None;
     }
 }
 
@@ -199,7 +269,7 @@ async fn read_device_events(
                     Ok(event) => {
                         // 100 limit: Just in case, avoid the risk of collecting queued events forever.
                         //            In practice we should only be collecting 2-3 events between syncs.
-                        if event.event_type() == evdev::EventType::SYNCHRONIZATION
+                        if event.event_type() == EventType::SYNCHRONIZATION
                             || (input_events_batch.len() + combo_events_batch.len()) >= 100 {
                             // Flush events to be handled by the client as a group
                             if !input_events_batch.is_empty() {
@@ -220,11 +290,28 @@ async fn read_device_events(
                         } else {
                             // Check whether this event completes a key combo, which creates an additional event.
                             // No short-circuit: Ensure that all combo_states have a chance to be updated
-                            combo_events_batch.extend(c.combo_states
-                                .iter_mut()
-                                .filter_map(|c| c.check_combo(&event))
-                                .collect::<Vec<Event>>());
-                            input_events_batch.push(convert_device_event(event, stream.device(), &device_info))
+                            let mut any_consume = false;
+                            for cs in c.combo_states.iter_mut() {
+                                match cs.check_combo(&event) {
+                                    ComboAction::ConsumeEvent => {
+                                        any_consume = true;
+                                    }
+                                    ComboAction::PassEvent => {
+                                    }
+                                    ComboAction::ConsumeEventAndEmitAction(action) => {
+                                        any_consume = true;
+                                        combo_events_batch.push(action);
+                                    }
+                                    ComboAction::PassEventAndEmitAction(action) => {
+                                        combo_events_batch.push(action);
+                                    }
+                                }
+                            }
+                            if any_consume {
+                                debug!("Dropping key event as it's the last key completing one or more combos: {:?}", event);
+                            } else {
+                                input_events_batch.push(convert_device_event(event, stream.device(), &device_info))
+                            }
                         }
                     }
                     Err(e) => {
