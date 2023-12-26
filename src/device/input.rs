@@ -6,8 +6,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task;
 use tracing::{debug, info, trace, warn};
 
-use crate::device::watch::{DeviceHandle, DeviceHandler, GrabEvent};
-use crate::device::{shortcut, util, Event};
+use crate::device::handles::{DeviceHandle, DeviceHandler};
+use crate::device::{shortcut, util, Event, GrabEvent, InputBatch};
 use crate::msgs::event;
 
 pub struct InputHandler {
@@ -76,23 +76,58 @@ impl DeviceHandler for InputHandler {
     /// Spawns a task for listening to a device's events and for controlling its grab state.
     fn handle_device_stream(
         &mut self,
-        mut events: EventStream,
-        grab_rx: broadcast::Receiver<GrabEvent>,
-        device_info: util::DeviceInfo,
+        mut stream: EventStream,
+        grab_rx: Option<broadcast::Receiver<GrabEvent>>,
+        mut device_info: util::DeviceInfo,
     ) -> Result<DeviceHandle> {
         let config = self.config.clone();
-        let handle = task::spawn(async move {
-            read_device_events(&mut events, config, grab_rx, device_info).await
-        });
+        let handle = if let Some(grab_rx) = grab_rx {
+            // Device has grab toggling enabled
+            task::spawn(async move {
+                read_device_or_grab_events(&mut stream, config, grab_rx, device_info).await
+            })
+        } else {
+            // Device is to be permanently grabbed
+            handle_grab_event(&mut stream, &mut device_info, GrabEvent::Grab);
+            task::spawn(async move {
+                read_device_events(&mut stream, config, device_info).await
+            })
+        };
         Ok(DeviceHandle { handle })
     }
 }
 
 async fn read_device_events(
     stream: &mut EventStream,
-    mut c: HandlerConfig,
-    mut grab_rx: broadcast::Receiver<GrabEvent>,
+    mut handler_config: HandlerConfig,
     device_info: util::DeviceInfo,
+) {
+    let mut input_events_batch = Vec::new();
+    let mut combo_events_batch = Vec::new();
+    loop {
+        match stream.next_event().await {
+            Ok(event) => {
+                handle_input_event(stream, &mut handler_config, event, &device_info, &mut input_events_batch, &mut combo_events_batch).await
+            }
+            Err(e) => {
+                // Common when the device has been unplugged.
+                // We'll frequently get this error just as inotify is telling us the file is deleted.
+                // Exit to avoid an infinite loop on trying to read the missing file.
+                info!(
+                    "Got an error event for {:?}, removing device (might be unplugged?): {}",
+                    stream.device().name().unwrap_or("(Unnamed device)"),
+                    e
+                );
+            }
+        }
+    }
+}
+
+async fn read_device_or_grab_events(
+    stream: &mut EventStream,
+    mut handler_config: HandlerConfig,
+    mut grab_rx: broadcast::Receiver<GrabEvent>,
+    mut device_info: util::DeviceInfo,
 ) {
     let mut input_events_batch = Vec::new();
     let mut combo_events_batch = Vec::new();
@@ -101,52 +136,7 @@ async fn read_device_events(
             event = stream.next_event() => {
                 match event {
                     Ok(event) => {
-                        // 100 limit: Just in case, avoid the risk of collecting queued events forever.
-                        //            In practice we should only be collecting 2-3 events between syncs.
-                        if event.event_type() == EventType::SYNCHRONIZATION
-                            || (input_events_batch.len() + combo_events_batch.len()) >= 100 {
-                            // Flush events to be handled by the client as a group
-                            if !input_events_batch.is_empty() {
-                                if let Err(e) = c.event_tx.send(Event::Input(input_events_batch)).await {
-                                    warn!("Error sending input events for routing: {:?}", e);
-                                }
-                                input_events_batch = Vec::new();
-                            }
-                            // Follow original events with event(s) from combo completion(s)
-                            if !combo_events_batch.is_empty() {
-                                for combo_event in combo_events_batch {
-                                    if let Err(e) = c.event_tx.send(combo_event).await {
-                                        warn!("Error sending combo events for routing: {:?}", e);
-                                    }
-                                }
-                                combo_events_batch = Vec::new();
-                            }
-                        } else {
-                            // Check whether this event completes a key combo, which creates an additional event.
-                            // No short-circuit: Ensure that all combo_states have a chance to be updated
-                            let mut any_consume = false;
-                            for cs in c.combo_states.iter_mut() {
-                                match cs.check_combo(&event) {
-                                    shortcut::ComboAction::ConsumeEvent => {
-                                        any_consume = true;
-                                    }
-                                    shortcut::ComboAction::PassEvent => {
-                                    }
-                                    shortcut::ComboAction::ConsumeEventAndEmitAction(action) => {
-                                        any_consume = true;
-                                        combo_events_batch.push(action);
-                                    }
-                                    shortcut::ComboAction::PassEventAndEmitAction(action) => {
-                                        combo_events_batch.push(action);
-                                    }
-                                }
-                            }
-                            if any_consume {
-                                debug!("Dropping key event as it's the last key completing one or more combos: {:?}", event);
-                            } else {
-                                input_events_batch.push(convert_device_event(event, stream.device(), &device_info))
-                            }
-                        }
+                        handle_input_event(stream, &mut handler_config, event, &device_info, &mut input_events_batch, &mut combo_events_batch).await
                     }
                     Err(e) => {
                         // Common when the device has been unplugged.
@@ -157,22 +147,14 @@ async fn read_device_events(
                             stream.device().name().unwrap_or("(Unnamed device)"),
                             e
                         );
-                        return;
                     }
                 }
-            },
+            }
             grab = grab_rx.recv() => {
                 match grab {
-                    Ok(GrabEvent::Grab) => {
-                        debug!("Grabbing device: {:?}", stream.device().name().unwrap_or("(Unnamed device)"));
-                        if let Err(e) = stream.device_mut().grab() {
-                            panic!("Failed to grab device {:?}: {:?}", stream.device().name(), e);
-                        }
-                    }
-                    Ok(GrabEvent::Ungrab) => {
-                        debug!("Ungrabbing device: {:?}", stream.device().name().unwrap_or("(Unnamed device)"));
-                        if let Err(e) = stream.device_mut().ungrab() {
-                            panic!("Failed to ungrab device {:?}: {:?}", stream.device().name(), e);
+                    Ok(grab) => {
+                        if !handle_grab_event(stream, &mut device_info, grab) {
+                            return
                         }
                     }
                     Err(e) => {
@@ -186,6 +168,88 @@ async fn read_device_events(
                     }
                 }
             }
+        }
+    }
+}
+
+async fn handle_input_event(
+    stream: &mut EventStream,
+    c: &mut HandlerConfig,
+    event: evdev::InputEvent,
+    device_info: &util::DeviceInfo,
+    input_events_batch: &mut Vec<event::InputEvent>,
+    combo_events_batch: &mut Vec<Event>,
+) {
+    // 100 limit: Just in case, avoid the risk of collecting queued events forever.
+    //            In practice we should only be collecting 2-3 events between syncs.
+    if event.event_type() == EventType::SYNCHRONIZATION
+        || (input_events_batch.len() + combo_events_batch.len()) >= 100 {
+        // Flush events to be handled by the client as a group
+        if !input_events_batch.is_empty() {
+            let event = Event::Input(InputBatch {
+                events: std::mem::replace(input_events_batch, Vec::new()),
+                is_grabbed: device_info.is_grabbed,
+            });
+            if let Err(e) = c.event_tx.send(event).await {
+                warn!("Error sending input events for routing: {:?}", e);
+            }
+        }
+        // Follow original events with event(s) from combo completion(s)
+        if !combo_events_batch.is_empty() {
+            let batch = std::mem::replace(combo_events_batch, Vec::new());
+            for combo_event in batch {
+                if let Err(e) = c.event_tx.send(combo_event).await {
+                    warn!("Error sending combo events for routing: {:?}", e);
+                }
+            }
+        }
+    } else {
+        // Check whether this event completes a key combo, which creates an additional event.
+        // No short-circuit: Ensure that all combo_states have a chance to be updated
+        let mut any_consume = false;
+        for cs in c.combo_states.iter_mut() {
+            match cs.check_combo(&event) {
+                shortcut::ComboAction::ConsumeEvent => {
+                    any_consume = true;
+                }
+                shortcut::ComboAction::PassEvent => {
+                }
+                shortcut::ComboAction::ConsumeEventAndEmitAction(action) => {
+                    any_consume = true;
+                    combo_events_batch.push(action);
+                }
+                shortcut::ComboAction::PassEventAndEmitAction(action) => {
+                    combo_events_batch.push(action);
+                }
+            }
+        }
+        if any_consume {
+            debug!("Dropping key event as it's the last key completing one or more combos: {:?}", event);
+        } else {
+            input_events_batch.push(convert_device_event(event, stream.device(), device_info))
+        }
+    }
+}
+
+fn handle_grab_event(stream: &mut EventStream, device_info: &mut util::DeviceInfo, grab: GrabEvent) -> bool {
+    match grab {
+        GrabEvent::Grab => {
+            debug!("Grabbing device: {:?}", stream.device().name().unwrap_or("(Unnamed device)"));
+            if let Err(e) = stream.device_mut().grab() {
+                warn!("Failed to grab device {:?}, removing device: {}", stream.device().name(), e);
+                return false
+            }
+            device_info.is_grabbed = true;
+            return true
+        }
+        GrabEvent::Ungrab => {
+            debug!("Ungrabbing device: {:?}", stream.device().name().unwrap_or("(Unnamed device)"));
+            if let Err(e) = stream.device_mut().ungrab() {
+                warn!("Failed to ungrab device {:?}, : {}", stream.device().name(), e);
+                return false
+            }
+            device_info.is_grabbed = false;
+            return true
         }
     }
 }

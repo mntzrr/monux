@@ -1,15 +1,13 @@
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use evdev::{Device, EventStream, EventType, Key};
+use evdev::{Device, EventType, Key};
 use notify::Watcher;
 use regex::Regex;
-use tokio::sync::{broadcast, mpsc};
-use tokio::task;
+use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
-use crate::device::{output, util};
+use crate::device::{handles, output, util};
 
 #[derive(Debug)]
 enum DeviceEventKind {
@@ -23,31 +21,9 @@ struct DeviceEvent {
     pub path: PathBuf,
 }
 
-#[derive(Clone, Debug)]
-pub enum GrabEvent {
-    Grab,
-    Ungrab,
-}
-
-pub struct DeviceHandle {
-    pub handle: task::JoinHandle<()>,
-}
-
-/// Trait for watching the addition and removal of devices from the machine
-pub trait DeviceHandler: Send + 'static {
-    fn handle_device_stream(
-        &mut self,
-        events: EventStream,
-        grab_rx: broadcast::Receiver<GrabEvent>,
-        device_info: util::DeviceInfo,
-    ) -> Result<DeviceHandle>;
-}
-
-pub async fn watch_loop<F: DeviceHandler>(
-    mut handler: F,
-    mut grab_tx: broadcast::Sender<GrabEvent>,
+pub async fn watch_loop<H: handles::DeviceHandler>(
+    mut device_handles: handles::DeviceHandles<H>,
     device_filters: Vec<Regex>,
-    all_combo_keys: &HashSet<Key>,
 ) -> Result<()> {
     // Start watch for new and removed devices BEFORE scanning current devices.
     let (device_event_tx, mut device_event_rx): (
@@ -72,46 +48,25 @@ pub async fn watch_loop<F: DeviceHandler>(
     )?;
 
     // Scan current devices
-    let mut devices = HashMap::new();
     for (path, device) in evdev::enumerate() {
         // enumerate() already filters for 'event*' filenames
-        if !compatible_device(&device, &path) {
+        let device_info = util::DeviceInfo::new(&device, false);
+        if !compatible_device(&device, &path, &device_info) {
             continue;
         }
-        if !matches_filters(&device_filters, &device, &path) {
+        if !matches_filters(&device_filters, &device, &path, &device_info) {
             continue;
         }
-        if supports_any_keys(&device, all_combo_keys) {
-            // TODO the device (probably a keyboard) should always be grabbed,
-            // its events should then be routed to a virtual device set when the server is active
-            // (not just virtual keyboard, in case the "keyboard" has non-keyboard event types)
-            debug!(
-                "Device supports one or more configured combo keys: {:?}",
-                device.name()
-            );
-        }
-        let device_info = util::log_device_info(&device, &path, "Listening to device", true);
-        let events = start_device_stream(device, &path)?;
-        devices.insert(
-            path,
-            handler.handle_device_stream(events, grab_tx.subscribe(), device_info)?,
-        );
+        device_handles.add(&path, device)?;
     }
-    if devices.is_empty() {
+    if device_handles.is_empty() {
         bail!("Didn't find any compatible input devices to listen to.");
     }
 
     // Start handler to consume new/removed device events
     loop {
         if let Some(event) = device_event_rx.recv().await {
-            handle_device_event(
-                &mut handler,
-                &mut devices,
-                &mut grab_tx,
-                &device_filters,
-                event,
-            )
-            .await;
+            handle_device_event(&mut device_handles, &device_filters, event).await;
         } else {
             // Channel lost, exit
             return Ok(());
@@ -119,10 +74,8 @@ pub async fn watch_loop<F: DeviceHandler>(
     }
 }
 
-async fn handle_device_event<F: DeviceHandler>(
-    handler: &mut F,
-    devices: &mut HashMap<PathBuf, DeviceHandle>,
-    grab_tx: &mut broadcast::Sender<GrabEvent>,
+async fn handle_device_event<H: handles::DeviceHandler>(
+    device_handles: &mut handles::DeviceHandles<H>,
     device_filters: &Vec<Regex>,
     event: DeviceEvent,
 ) {
@@ -134,45 +87,20 @@ async fn handle_device_event<F: DeviceHandler>(
             }
             match Device::open(&event.path) {
                 Ok(device) => {
-                    if !compatible_device(&device, &event.path) {
+                    let device_info = util::DeviceInfo::new(&device, false);
+                    if !compatible_device(&device, &event.path, &device_info) {
                         return;
                     }
-                    if !matches_filters(device_filters, &device, &event.path) {
+                    if !matches_filters(device_filters, &device, &event.path, &device_info) {
                         return;
                     }
-                    let device_info = util::log_device_info(
-                        &device,
-                        &event.path,
-                        "Listening to new device",
-                        true,
-                    );
-                    match start_device_stream(device, &event.path) {
-                        Ok(stream) => {
-                            match handler.handle_device_stream(
-                                stream,
-                                grab_tx.subscribe(),
-                                device_info,
-                            ) {
-                                Ok(join_handle) => {
-                                    devices.insert(event.path, join_handle);
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to start event handler for device {}: {}",
-                                        event.path.to_string_lossy(),
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            // Avoid exiting loop and aborting program if a new device fails
-                            warn!(
-                                "Failed to read device {}: {}",
-                                event.path.to_string_lossy(),
-                                e
-                            );
-                        }
+                    // Avoid exiting loop and aborting program if a newly added device fails
+                    if let Err(e) = device_handles.add(&event.path, device) {
+                        warn!(
+                            "Failed to set up new device {}: {}",
+                            event.path.to_string_lossy(),
+                            e
+                        );
                     }
                 }
                 Err(e) => {
@@ -186,7 +114,7 @@ async fn handle_device_event<F: DeviceHandler>(
             };
         }
         DeviceEventKind::Deleted => {
-            if let Some(device_handle) = devices.remove(&event.path) {
+            if let Some(device_handle) = device_handles.remove(&event.path) {
                 info!("Removing device: {}", event.path.to_string_lossy());
                 device_handle.handle.abort();
             }
@@ -206,7 +134,7 @@ fn compatible_path(path: &Path) -> bool {
     is_match
 }
 
-fn compatible_device(d: &Device, path: &Path) -> bool {
+fn compatible_device(d: &Device, path: &Path, device_info: &util::DeviceInfo) -> bool {
     // Avoid a situation where we're consuming our own virtual output device, risking an infinite loop.
     // This could happen if client and server are running on the same machine (e.g. for testing)
     if let Some(name) = d.name() {
@@ -236,7 +164,7 @@ fn compatible_device(d: &Device, path: &Path) -> bool {
                 .all(|key| key == Key::KEY_POWER || key == Key::KEY_SLEEP || key == Key::KEY_WAKEUP)
         } else {
             // Key device without any keys? Skip it
-            util::log_device_info(d, path, "Ignoring KEY device lacking supported keys", false);
+            util::log_device_info(d, path, device_info, "Ignoring KEY device lacking supported keys", false);
             false
         }
     } else {
@@ -244,6 +172,7 @@ fn compatible_device(d: &Device, path: &Path) -> bool {
         util::log_device_info(
             d,
             path,
+            device_info,
             "Ignoring device that isn't ABSOLUTE or RELATIVE or KEY",
             false,
         );
@@ -251,8 +180,8 @@ fn compatible_device(d: &Device, path: &Path) -> bool {
     }
 }
 
-fn matches_filters(name_filters: &Vec<Regex>, d: &Device, path: &Path) -> bool {
-    let device_name = d.name().unwrap_or("(Unnamed device)");
+fn matches_filters(name_filters: &Vec<Regex>, device: &Device, path: &Path, device_info: &util::DeviceInfo) -> bool {
+    let device_name = device.name().unwrap_or("(Unnamed device)");
     if name_filters.is_empty() {
         return true;
     }
@@ -263,33 +192,14 @@ fn matches_filters(name_filters: &Vec<Regex>, d: &Device, path: &Path) -> bool {
     let is_match = !matches.is_empty();
     if !is_match {
         util::log_device_info(
-            d,
-            path,
+            &device,
+            &path,
+            device_info,
             "Ignoring device that doesn't match --device name filters",
             true,
         );
     }
     is_match
-}
-
-fn supports_any_keys(d: &Device, all_combo_keys: &HashSet<Key>) -> bool {
-    if let Some(device_keys) = d.supported_keys() {
-        for key in all_combo_keys.iter() {
-            if device_keys.contains(*key) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn start_device_stream(device: Device, path: &Path) -> Result<EventStream> {
-    device.into_event_stream().with_context(|| {
-        format!(
-            "Failed to initialize async fd for device: {}",
-            path.to_string_lossy()
-        )
-    })
 }
 
 async fn send_device_events(event: notify::Event, device_event_tx: &mpsc::Sender<DeviceEvent>) {

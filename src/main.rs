@@ -12,7 +12,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::{runtime, task, time};
 use tracing::{error, info, warn};
 
-use nikau::device::{input, output, shortcut, watch, Event};
+use nikau::device::{handles, input, output, shortcut, watch, Event};
 use nikau::network::approval;
 use nikau::{client, logging, server};
 
@@ -206,12 +206,18 @@ async fn server(
     keys_next: &str,
     keys_prev: Option<&str>,
     keys_goto: Vec<String>,
-    devices: Vec<Regex>,
+    device_filters: Vec<Regex>,
     exit_secs: Option<u32>,
     verifier: Arc<approval::NikauCertVerification>,
     fingerprint: Arc<Mutex<Option<String>>>,
     max_clipboard_size_bytes: u64,
 ) -> Result<()> {
+    // Try to set up virtual devices up-front - exit early if we aren't root
+    let output_handler = output::uinput::VirtualUInputDevices::new()
+        .context("Failed to create virtual devices for output, possible solutions:
+- The server may need to be run as root with 'sudo -E nikau server ...' to allow creating virtual devices.
+- Enable uinput and/or evdev in the kernel, check for /dev/uinput and /dev/input/")?;
+
     let (event_tx, event_rx): (mpsc::Sender<Event>, mpsc::Receiver<Event>) = mpsc::channel(32);
 
     let event_tx2 = event_tx.clone();
@@ -225,13 +231,12 @@ async fn server(
     let input_handler = input::InputHandler::new(&key_combos, event_tx)?;
 
     let watch_handle = task::spawn(async move {
-        watch::watch_loop(input_handler, grab_tx, devices, &key_combos.all_keys)
+        let device_handles = handles::DeviceHandles::new(input_handler, grab_tx, key_combos.all_keys);
+        watch::watch_loop(device_handles, device_filters)
             .await
             .context(
                 "Failed to listen to any input devices, possible solutions:
 - Are any input devices (keyboard, mouse, etc) plugged into the machine?
-- The server may need to be run as root with 'sudo -E nikau server ...' to allow listening to input.
-- Enable uinput and/or evdev in the kernel, check for /dev/uinput and /dev/input/
 - If any '--device' filters are specified, they might be filtering out all current devices",
             )
     });
@@ -244,6 +249,7 @@ async fn server(
             event_rx,
             fingerprint,
             grab_tx2,
+            output_handler,
             // Max compressed clipboard size over the wire
             max_clipboard_size_bytes,
             // Max uncompressed clipboard size, just in case

@@ -10,19 +10,19 @@ use tokio::task;
 use tracing::{error, info, warn};
 
 use nikau::device::output::{uinput, OutputHandler};
-use nikau::device::{util, watch};
+use nikau::device::{handles, util, watch, GrabEvent};
 use nikau::logging;
 use nikau::msgs::event;
 
 struct StubHandler {}
 
-impl watch::DeviceHandler for StubHandler {
+impl handles::DeviceHandler for StubHandler {
     fn handle_device_stream(
         &mut self,
         mut stream: evdev::EventStream,
-        _grab_rx: broadcast::Receiver<watch::GrabEvent>,
+        _grab_rx: Option<broadcast::Receiver<GrabEvent>>,
         _device_info: util::DeviceInfo,
-    ) -> Result<watch::DeviceHandle> {
+    ) -> Result<handles::DeviceHandle> {
         let handle = tokio::spawn(async move {
             let device_name = stream
                 .device()
@@ -40,7 +40,7 @@ impl watch::DeviceHandler for StubHandler {
                 }
             }
         });
-        Ok(watch::DeviceHandle { handle })
+        Ok(handles::DeviceHandle { handle })
     }
 }
 
@@ -57,10 +57,9 @@ async fn main() -> Result<()> {
     };
 
     let (grab_tx, _grab_rx) = broadcast::channel(32);
+    let handles = handles::DeviceHandles::new(StubHandler {}, grab_tx, HashSet::<Key>::new());
     let handler = task::spawn(async move {
-        if let Err(e) =
-            watch::watch_loop(StubHandler {}, grab_tx, devices, &HashSet::<Key>::new()).await
-        {
+        if let Err(e) = watch::watch_loop(handles, devices).await {
             error!("Input device watch failure: {:?}", e);
         }
     });

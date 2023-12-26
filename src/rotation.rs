@@ -9,7 +9,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch as watchchan};
 use tokio::task;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::device::watch;
+use crate::device;
 use crate::msgs::{bulk, event};
 use crate::x11clipboard::{
     reader::{ClipboardReader, ClipboardTypeWatcher},
@@ -209,8 +209,9 @@ pub struct ClipboardSendContentArgs {
     pub data: ClipboardData,
 }
 
-pub struct Rotation {
-    grab_tx: broadcast::Sender<watch::GrabEvent>,
+pub struct Rotation<O: device::output::OutputHandler> {
+    grab_tx: broadcast::Sender<device::GrabEvent>,
+    output_handler: O,
     clients: Vec<ClientInfo>,
     /// Use the endpoint, not the fingerprint, to uniquely identify clients.
     /// This allows situations like a client reconnecting before the old socket has closed.
@@ -223,15 +224,17 @@ pub struct Rotation {
     clipboard_target: Option<ClipboardTarget>,
 }
 
-impl Rotation {
+impl<O: device::output::OutputHandler> Rotation<O> {
     pub async fn new(
-        grab_tx: broadcast::Sender<watch::GrabEvent>,
+        grab_tx: broadcast::Sender<device::GrabEvent>,
+        output_handler: O,
         local_clipboard: Option<LocalClipboard>,
     ) -> Result<Self> {
         // Init required for space to be usable
         let buf = vec![0; 1024];
         Ok(Rotation {
             grab_tx,
+            output_handler,
             clients: Vec::new(),
             current_client: None,
             removed_current_client: None,
@@ -707,7 +710,7 @@ impl Rotation {
             // Try to send switch{true} to the newly assigned current_client.
             // If it fails then current_client is cleaned up.
             if let Ok(()) = self
-                .send_event_current(event::ServerEvent::Switch(event::SwitchEvent {
+                .send_event_to_remote_client(event::ServerEvent::Switch(event::SwitchEvent {
                     enabled: true,
                 }))
                 .await
@@ -783,7 +786,7 @@ impl Rotation {
                         "Sending clipboard types for {} to {}: {}",
                         clipboard_source, current_client, types_str
                     );
-                    self.send_event_current(types_msg).await?;
+                    self.send_event_to_remote_client(types_msg).await?;
                 }
             } else if let Some(local_clipboard) = &mut self.local_clipboard {
                 // The server is active and its clipboard support is enabled.
@@ -810,7 +813,7 @@ impl Rotation {
                     "Sending clipboard types for server to {}: {}",
                     current_client, types_str
                 );
-                self.send_event_current(types_msg).await?;
+                self.send_event_to_remote_client(types_msg).await?;
             }
         }
         Ok(())
@@ -846,12 +849,11 @@ impl Rotation {
 
     /// Sends an event to the currently active client, removing it if sending fails.
     /// If no client is active, this does nothing.
-    pub async fn send_event_current(&mut self, msg: event::ServerEvent<'_>) -> Result<()> {
+    async fn send_event_to_remote_client(&mut self, msg: event::ServerEvent<'_>) -> Result<()> {
         let current_client = match self.current_client {
             Some(client) => client,
             None => {
-                // Ignore input when using the local machine.
-                // We continue reading the input to detect combo presses but that's it.
+                // On local machine, nothing to do
                 return Ok(());
             }
         };
@@ -862,6 +864,24 @@ impl Rotation {
             self.set_and_grab_current_client(None).await;
         }
         Ok(())
+    }
+
+    /// Handles an input event collected from the server.
+    pub async fn send_input_events(&mut self, batch: device::InputBatch) -> Result<()> {
+        if let Some(_) = self.current_client {
+            // Remote client is active, send all input to client and not to local machine.
+            self.send_event_to_remote_client(event::ServerEvent::Input(batch.events)).await
+        } else if batch.is_grabbed {
+            // Local machine is active and device is grabbed, write input to local virtual devices.
+            // For example, we grab keyboards so that we can skip sending switch combos to the local system.
+            self.output_handler.write(batch.events).await
+        } else {
+            // Local machine is active and device isn't grabbed (passthrough), drop input event.
+            // For example, we don't grab mice/touchpads since they aren't relevant to switch combos.
+            // If we send their input to the handler, the input is duplicated between the passthrough
+            // and the virtual device.
+            Ok(())
+        }
     }
 
     /// Sends an event to the specified client, removing it if sending fails.
@@ -1010,9 +1030,9 @@ impl Rotation {
     async fn set_and_grab_current_client(&mut self, client: Option<SocketAddr>) {
         self.current_client = client;
         let grab = if client.is_some() {
-            watch::GrabEvent::Grab
+            device::GrabEvent::Grab
         } else {
-            watch::GrabEvent::Ungrab
+            device::GrabEvent::Ungrab
         };
         if let Err(e) = self.grab_tx.send(grab) {
             // Avoid leaving devices in a bad grabbed state

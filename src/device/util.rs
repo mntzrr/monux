@@ -67,29 +67,36 @@ pub fn axis_scale_type(axis: AbsoluteAxisType) -> AxisScale {
 
 pub struct DeviceInfo {
     pub dims: BTreeMap<u16, (i32, i32)>,
+    pub is_grabbed: bool,
 }
 
-pub fn log_device_info(device: &Device, path: &Path, log_prefix: &str, info: bool) -> DeviceInfo {
-    let mut dims = BTreeMap::new();
-    // For each abs axis supported by the device, record its max and min
-    // Result will be something like ABS_X(0,100), ABS_Y(0,70), ABS_MT_POSITION_X(0,100) ...
-    if let Some(abs_axes) = device.supported_absolute_axes() {
-        if let Ok(state) = device.get_abs_state() {
-            // clippy recommends this ugly way to get a loop counter
-            for (i, s) in (0_u16..).zip(state.into_iter()) {
-                let type_ = AbsoluteAxisType::from_index(i as usize);
-                if abs_axes.contains(type_) && axis_scale_type(type_) != AxisScale::Invalid {
-                    dims.insert(i, (s.minimum, s.maximum));
+impl DeviceInfo {
+    pub fn new(device: &Device, is_grabbed: bool) -> DeviceInfo {
+        let mut dims = BTreeMap::new();
+        // For each abs axis supported by the device, record its max and min
+        // Result will be something like ABS_X(0,100), ABS_Y(0,70), ABS_MT_POSITION_X(0,100) ...
+        if let Some(abs_axes) = device.supported_absolute_axes() {
+            if let Ok(state) = device.get_abs_state() {
+                // clippy recommends this ugly way to get a loop counter
+                for (i, s) in (0_u16..).zip(state.into_iter()) {
+                    let type_ = AbsoluteAxisType::from_index(i as usize);
+                    if abs_axes.contains(type_) && axis_scale_type(type_) != AxisScale::Invalid {
+                        dims.insert(i, (s.minimum, s.maximum));
+                    }
                 }
             }
         }
+        DeviceInfo { dims, is_grabbed }
     }
+}
+
+pub fn log_device_info(device: &Device, path: &Path, device_info: &DeviceInfo, log_prefix: &str, info: bool) {
     // under info, show device name/path only
     let msg = format!(
         "{}: {} @ {}",
         log_prefix,
         device.name().unwrap_or("(Unnamed device)"),
-        path.display()
+        path.display(),
     );
     if info {
         info!("{}", msg);
@@ -97,12 +104,12 @@ pub fn log_device_info(device: &Device, path: &Path, log_prefix: &str, info: boo
         debug!("{}", msg);
     }
     // under debug, show nikau version of device details
-    debug!("Nikau device details:{}", device_info_string(device, &dims));
+    debug!("Nikau device details:{}", device_info_string(device, &device_info.dims));
     // under trace, show evdev version of things too, but note that the abs values are missing:
     trace!("Evdev device details:\n{}", device);
-    DeviceInfo { dims }
 }
 
+/// Summarizes an evdev InputEvent, hiding the key being pressed in the case of a key event.
 pub fn log_event(event: &InputEvent) -> String {
     let kind = match event.kind() {
         InputEventKind::Key(_key) => {

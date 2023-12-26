@@ -82,7 +82,7 @@ struct Connection {
 
     active: bool,
 
-    /// Reusable buffer for receiving keyboard events.
+    /// Reusable buffer for receiving input events.
     event_bytes: Vec<u8>,
     /// Reusable buffer for receiving bulk data (clipboards).
     bulk_recv_bytes: Vec<u8>,

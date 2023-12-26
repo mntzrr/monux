@@ -7,18 +7,19 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::device::{watch, Event};
+use crate::device::{output, Event, GrabEvent};
 use crate::msgs::{bulk, event};
 use crate::network::{approval, transport};
 use crate::{rotation, x11clipboard};
 
-pub async fn run_server(
+pub async fn run_server<O: output::OutputHandler>(
     listen_addr: &SocketAddr,
     cert_verifier: Arc<approval::NikauCertVerification>,
     config_dir: PathBuf,
-    mut input_rx: mpsc::Receiver<Event>,
+    mut event_rx: mpsc::Receiver<Event>,
     fingerprint: Arc<Mutex<Option<String>>>,
-    grab_tx: broadcast::Sender<watch::GrabEvent>,
+    grab_tx: broadcast::Sender<GrabEvent>,
+    output_handler: O,
     max_clipboard_size_bytes: u64,
     max_uncompressed_size_bytes: u64,
 ) -> Result<()> {
@@ -38,7 +39,7 @@ pub async fn run_server(
         }
     };
 
-    let mut rotation = rotation::Rotation::new(grab_tx, local_clipboard).await?;
+    let mut rotation = rotation::Rotation::new(grab_tx, output_handler, local_clipboard).await?;
     let server_endpoint = transport::build_server(listen_addr, cert_verifier)?;
 
     loop {
@@ -52,14 +53,14 @@ pub async fn run_server(
                 rotation.accept(event).await;
             },
             // Listen to local system device input events
-            event = input_rx.recv() => {
+            event = event_rx.recv() => {
                 let event = match event {
                     Some(e) => e,
-                    None => bail!("input_rx is closed, exiting server"),
+                    None => bail!("event_rx is closed, exiting server"),
                 };
                 match event {
-                    Event::Input(events) => {
-                        if let Err(e) = rotation.send_event_current(event::ServerEvent::Input(events)).await {
+                    Event::Input(batch) => {
+                        if let Err(e) = rotation.send_input_events(batch).await {
                             warn!("Failed to send input events to current client: {:?}", e);
                         }
                     }
