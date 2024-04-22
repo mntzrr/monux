@@ -276,7 +276,7 @@ fn zip_files(
     {
         let mut zipwriter = zip::ZipWriter::new(&mut cursor);
         let options =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::ZSTD);
+            zip::write::FileOptions::<()>::default().compression_method(zip::CompressionMethod::ZSTD);
         let mut buf = vec![0; 65536];
         for file_to_zip in files_to_zip {
             zipwriter.start_file(file_to_zip.canonicalize()?.to_string_lossy(), options)?;
