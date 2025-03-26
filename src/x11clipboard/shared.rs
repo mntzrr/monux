@@ -117,9 +117,8 @@ impl XContext {
 
         // Get driver running early, in particular before calling create_window() below
         let driver = task::spawn(async move {
-            if let Err(e) = drive.await {
-                tracing::error!("Error while driving the connection: {}", e);
-            }
+            let Err(e) = drive.await;
+            tracing::error!("Error while driving the connection: {}", e);
         });
 
         let window = conn.generate_id().await?;
