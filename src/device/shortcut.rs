@@ -59,11 +59,18 @@ fn parse_action(keys: &str, action: Event) -> Result<KeyCombo> {
         keys.split('+')
     };
     let mut keys = vec![];
-    for key in keys_iter {
-        keys.push(
-            Key::from_str(format!("KEY_{}", key.trim().to_uppercase()).as_str())
-                .map_err(|e| anyhow!("Unsupported key '{}': {:?}", key, e))?,
-        );
+    for keyname_orig in keys_iter {
+        // First try 'KEY_<X>'
+        let keyname = keyname_orig.trim().to_uppercase();
+        if let Ok(key) = Key::from_str(format!("KEY_{}", keyname).as_str()) {
+            keys.push(key);
+        } else {
+            // Didn't find 'KEY_<X>', try just '<X>' for things like 'BTN_0'
+            keys.push(
+                Key::from_str(format!("{}", keyname).as_str())
+                    .map_err(|e| anyhow!("Unsupported key '{}': Tried KEY_{} and {}, see list of available keys at https://docs.rs/evdev/latest/evdev/struct.KeyCode.html (error: {:?})", keyname_orig, keyname, keyname, e))?,
+            );
+        }
     }
     // Sort the keys to detect duplicates across e.g. "shift+alt+n" and "alt+shift+n".
     // The key combo handling waits for all keys to be held simultaneously in any order and
