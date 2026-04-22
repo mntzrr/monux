@@ -5,12 +5,14 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 
+use crate::clipboard::data::ClipboardData;
+use crate::clipboard::server::LocalClipboard;
 use crate::device::{output, Event, GrabEvent};
 use crate::msgs::{bulk, event};
 use crate::network::{approval, transport};
-use crate::{rotation, x11clipboard};
+use crate::rotation;
 
 pub async fn run_server_events_loop<O: output::OutputHandler>(
     config_dir: PathBuf,
@@ -22,20 +24,12 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     rotation_tx: mpsc::Sender<rotation::RotationEvent>,
     mut rotation_rx: mpsc::Receiver<rotation::RotationEvent>,
 ) -> Result<()> {
-    let local_clipboard = match rotation::LocalClipboard::start(
+    let local_clipboard = LocalClipboard::start(
         config_dir,
         rotation_tx.clone(),
         max_clipboard_size_bytes,
         max_uncompressed_size_bytes,
-    )
-    .await
-    {
-        Ok(c) => Some(c),
-        Err(e) => {
-            info!("Disabled system clipboard support: {}", e);
-            None
-        }
-    };
+    ).await;
 
     let mut rotation = rotation::Rotation::new(grab_tx, output_handler, local_clipboard).await?;
     loop {
@@ -177,7 +171,7 @@ async fn handle_connection(
         .await?;
 
     let mut bulk_bytes = Vec::with_capacity(65536);
-    let mut incoming_clipboard_data: Option<(x11clipboard::ClipboardData, Option<SocketAddr>)> =
+    let mut incoming_clipboard_data: Option<(ClipboardData, Option<SocketAddr>)> =
         None;
     loop {
         tokio::select! {
@@ -265,6 +259,7 @@ async fn handle_event_messages(
             event::ClientEvent::ClipboardTypes(t) => {
                 // Client broadcasted new clipboard types for server (and other clients) to advertise
                 let types: Vec<String> = t.types.split(' ').map(|t| t.to_string()).collect();
+                debug!("Got clipboard type advertisement from client {}: {:?}", source, types);
                 rotation_tx
                     .send(rotation::RotationEvent::ClipboardUpdateSource(
                         rotation::ClipboardUpdateSourceArgs {
@@ -290,7 +285,7 @@ async fn handle_bulk_messages(
     rotation_tx: &mpsc::Sender<rotation::RotationEvent>,
     bytes: &mut Vec<u8>,
     max_clipboard_size_bytes: u64,
-) -> Result<Option<(x11clipboard::ClipboardData, Option<SocketAddr>)>> {
+) -> Result<Option<(ClipboardData, Option<SocketAddr>)>> {
     let mut offset = 0;
     let bytes_len = bytes.len();
     while offset < bytes_len {
@@ -342,7 +337,7 @@ async fn handle_bulk_messages(
                             rotation::ClipboardSendContentArgs {
                                 data_source: source,
                                 request_client: c.request_client,
-                                data: x11clipboard::ClipboardData {
+                                data: ClipboardData {
                                     requested_type: c.requested_type.to_string(),
                                     data_type: c.data_type.map(|t| t.to_string()),
                                     bytes,
@@ -358,7 +353,7 @@ async fn handle_bulk_messages(
                     let mut bytes = Vec::with_capacity(c.content_len_bytes as usize);
                     bytes.extend_from_slice(resp_remainder);
                     return Ok(Some((
-                        x11clipboard::ClipboardData {
+                        ClipboardData {
                             requested_type: c.requested_type.to_string(),
                             data_type: c.data_type.map(|t| t.to_string()),
                             bytes,

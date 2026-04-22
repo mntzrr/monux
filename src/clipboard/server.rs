@@ -1,0 +1,194 @@
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use anyhow::{Result};
+use tokio::sync::{mpsc, watch};
+use tokio::task;
+use tracing::{debug, error, info, warn};
+
+use crate::clipboard::{ClipboardReader, ClipboardWriter, convert, data, wayland, x11};
+use crate::rotation;
+
+/// Wrapper around server-local clipboard storage, if available.
+/// Clipboard contents can still be transferred by the server among clients if this is unavailable.
+pub struct LocalClipboard {
+    reader: Box<dyn ClipboardReader>,
+    writer: Box<dyn ClipboardWriter>,
+}
+
+impl LocalClipboard {
+    pub async fn start(
+        config_dir: PathBuf,
+        rotation_tx: mpsc::Sender<rotation::RotationEvent>,
+        max_clipboard_size_bytes: u64,
+        max_uncompressed_size_bytes: u64,
+    ) -> Option<Self> {
+        match Self::new_wayland(config_dir.clone(), rotation_tx.clone(), max_clipboard_size_bytes, max_uncompressed_size_bytes).await {
+            Ok(Some(c)) => {
+                info!("Using wayland clipboard");
+                return Some(c);
+            }
+            Ok(None) => {
+                info!("Unable to reach wayland clipboard, trying X11");
+            }
+            Err(e) => {
+                warn!("Failed to reach wayland clipboard, trying X11: {}", e);
+            }
+        };
+        match Self::new_x11(config_dir, rotation_tx, max_clipboard_size_bytes, max_uncompressed_size_bytes).await {
+            Ok(c) => {
+                info!("Using X11 clipboard");
+                Some(c)
+            }
+            Err(e) => {
+                info!("Unable to reach X11 clipboard, disabled system clipboard support: {}", e);
+                None
+            }
+        }
+    }
+
+    async fn new_wayland(
+        config_dir: PathBuf,
+        rotation_tx: mpsc::Sender<rotation::RotationEvent>,
+        max_clipboard_size_bytes: u64,
+        max_uncompressed_size_bytes: u64,
+    ) -> Result<Option<Self>> {
+        // The watcher call is set up to be permissive of missing wayland, so let's try that first
+        let (local_regular_types_tx, local_regular_types_rx) = watch::channel(vec![]);
+        if wayland::type_watcher::start(Some(local_regular_types_tx), None)?.is_none() {
+            return Ok(None);
+        }
+        // Wayland should work from here, treat any init issues as an error
+        let reader = wayland::reader::ClipboardReader::new()?;
+        let (clipboard_fetch_tx, clipboard_fetch_rx) = mpsc::channel::<data::ClipboardFetch>(32);
+        let writer = wayland::writer::ClipboardWriter::new(
+            wayland::writer::ClipboardType::Regular,
+            config_dir,
+            max_uncompressed_size_bytes,
+            clipboard_fetch_tx,
+        );
+        Ok(Some(Self::start_impl(
+            Box::new(reader),
+            Box::new(writer),
+            rotation_tx,
+            max_clipboard_size_bytes,
+            clipboard_fetch_rx,
+            local_regular_types_rx,
+        ).await?))
+    }
+
+    async fn new_x11(
+        config_dir: PathBuf,
+        rotation_tx: mpsc::Sender<rotation::RotationEvent>,
+        max_clipboard_size_bytes: u64,
+        max_uncompressed_size_bytes: u64,
+    ) -> Result<Self> {
+        let (local_types_tx, local_types_rx) = watch::channel(vec![]);
+        x11::type_watcher::ClipboardTypeWatcher::start(local_types_tx).await?;
+        let reader = x11::reader::ClipboardReader::new().await?;
+        let (clipboard_fetch_tx, clipboard_fetch_rx) = mpsc::channel::<data::ClipboardFetch>(32);
+        let writer = x11::writer::ClipboardWriter::start(
+            config_dir,
+            max_uncompressed_size_bytes,
+            clipboard_fetch_tx,
+        ).await?;
+        Self::start_impl(
+            Box::new(reader),
+            Box::new(writer),
+            rotation_tx,
+            max_clipboard_size_bytes,
+            clipboard_fetch_rx,
+            local_types_rx,
+        ).await
+    }
+
+    async fn start_impl(
+        reader: Box<dyn ClipboardReader>,
+        writer: Box<dyn ClipboardWriter>,
+        rotation_tx: mpsc::Sender<rotation::RotationEvent>,
+        max_clipboard_size_bytes: u64,
+        mut clipboard_fetch_rx: mpsc::Receiver<data::ClipboardFetch>,
+        mut local_types_rx: watch::Receiver<Vec<String>>,
+    ) -> Result<Self> {
+        task::spawn(async move {
+            loop {
+                tokio::select! {
+                    // Listen to local host requests to get the clipboard
+                    fetch_request = clipboard_fetch_rx.recv() => {
+                        if let Some(fetch_request) = fetch_request {
+                            // Got clipboard paste request from the local machine.
+                            // Pass the request through to the main rotation event handler.
+                            let event = rotation::RotationEvent::ClipboardRequestContent(rotation::ClipboardRequestContentArgs {
+                                request_source: rotation::ClipboardRequestSource::Local(fetch_request.fetch_result_tx),
+                                requested_type: fetch_request.requested_type,
+                                max_size_bytes: max_clipboard_size_bytes,
+                            });
+                            if let Err(e) = rotation_tx.send(event).await {
+                                error!("Failed to queue local clipboard request event: {:?}", e);
+                                break;
+                            }
+                        } else {
+                            error!("Clipboard fetch request queue has closed, exiting clipboard loop");
+                            break;
+                        }
+                    },
+                    // Listen to local host updates to the clipboard types
+                    types_notify = local_types_rx.changed() => {
+                        if let Err(e) = types_notify {
+                            error!("local_types_rx has closed: {}", e);
+                            break;
+                        }
+                        // Another application on the server machine has a clipboard entry.
+                        let event = rotation::RotationEvent::ClipboardUpdateSource(rotation::ClipboardUpdateSourceArgs {
+                            source: None,
+                            types: local_types_rx.borrow().clone(),
+                            max_size_bytes: max_clipboard_size_bytes,
+                        });
+                        if let Err(e) = rotation_tx.send(event).await {
+                            error!("Failed to queue update source event: {:?}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            reader,
+            writer,
+        })
+    }
+
+    /// Reads the clipboard data for the specified type.
+    /// The result may be converted/compressed to a different type for network transfer.
+    pub async fn read(
+        &mut self,
+        requested_type: &str,
+        max_size_bytes: u64,
+        request_client: &SocketAddr,
+    ) -> Result<(Vec<u8>, Option<String>)> {
+        let request_source = format!("client {}", request_client);
+        let original_data = self
+            .reader
+            .read(requested_type, max_size_bytes, &request_source)
+            .await?;
+        let (content, data_type) = convert::read(original_data, max_size_bytes, requested_type).await?;
+        if let Some(data_type) = &data_type {
+            debug!(
+                "Sending clipboard data for requested type {} (data type {}) from server to {}",
+                requested_type, data_type, request_source
+            );
+        } else {
+            debug!(
+                "Sending clipboard data for requested type {} from server to {}",
+                requested_type, request_source
+            );
+        }
+        Ok((content, data_type))
+    }
+
+    /// Advertises with X11 that we have a new clipboard entry available
+    pub fn store_types<K: Into<Vec<String>>>(&self, types: K) -> Result<()> {
+        self.writer.store_types(types.into())
+    }
+}

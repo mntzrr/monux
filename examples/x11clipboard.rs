@@ -7,10 +7,15 @@ use tokio::{task, time};
 use tracing::{error, info};
 
 use nikau::logging;
-use nikau::x11clipboard::{
-    reader::{ClipboardReader, ClipboardTypeWatcher},
+use nikau::clipboard::{
+    ClipboardReader as ClipboardReaderTrait,
+    ClipboardWriter as ClipboardWriterTrait,
+};
+use nikau::clipboard::data::ClipboardData;
+use nikau::clipboard::x11::{
+    reader::ClipboardReader,
+    type_watcher::ClipboardTypeWatcher,
     writer::ClipboardWriter,
-    ClipboardData,
 };
 
 #[tokio::main]
@@ -106,7 +111,7 @@ async fn x11_store_types(clipboard: &mut ClipboardWriter, types: &Vec<&str>) -> 
 }
 
 async fn x11_fetch_data(clipboard: &mut ClipboardReader, type_: &str) -> Result<()> {
-    let (val, _data_type) = clipboard.read(type_, 0, &None).await?;
+    let val = clipboard.read(type_, 0, "local").await?;
     if val.len() > 256 {
         info!("got clipboard from x11: {} bytes", val.len());
     } else {

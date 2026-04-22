@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 
 use nikau::device::{handles, input, output, shortcut, watch, Event};
 use nikau::network::approval;
-use nikau::{client, logging, rotation, server};
+use nikau::{client, clipboard, logging, rotation, server};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -315,14 +315,10 @@ async fn client(
 - The client may need to be run as root with 'sudo -E nikau client ...' to allow creating virtual devices.
 - Enable uinput and/or evdev in the kernel, check for /dev/uinput and /dev/input/")?;
     let max_uncompressed_size_bytes = 10 * max_clipboard_size_bytes;
-    let mut local_clipboard =
-        match client::LocalClipboard::new(config_dir, max_uncompressed_size_bytes).await {
-            Ok(c) => Some(c),
-            Err(e) => {
-                info!("Disabled system clipboard support: {}", e);
-                None
-            }
-        };
+    let mut local_clipboard = clipboard::client::LocalClipboard::new(
+        config_dir,
+        max_uncompressed_size_bytes,
+    ).await;
 
     loop {
         info!("Connecting to server: {}", connect_addr);
@@ -338,7 +334,7 @@ async fn client(
             error!("Client error: {:?}", e);
             // Clear any clipboard status that may have been accumulated while active
             if let Some(lc) = &mut local_clipboard {
-                if let Err(e) = lc.clear_remote_clipboard().await {
+                if let Err(e) = lc.clear_remote_clipboard() {
                     warn!("Failed to clear remote clipboard: {}", e);
                 }
             }

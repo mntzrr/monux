@@ -1,0 +1,294 @@
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, Cursor};
+use std::path::PathBuf;
+
+use anyhow::{bail, Context, Result};
+use rustix::fs::{fcntl_setfl, OFlags};
+use tokio::sync::mpsc;
+use tracing::{debug, error, trace};
+use wayland_client::globals::{registry_queue_init, GlobalListContents};
+use wayland_client::protocol::wl_registry::WlRegistry;
+use wayland_client::protocol::wl_seat;
+use wayland_client::{event_created_child, Connection, Dispatch, EventQueue};
+
+use crate::clipboard::{ClipboardWriter as ClipboardWriterTrait, data};
+use crate::clipboard::wayland::{common, state};
+use crate::clipboard::wayland::data_control::{
+    self, impl_dispatch_device, impl_dispatch_manager, impl_dispatch_offer, impl_dispatch_source,
+};
+
+#[derive(Clone, Debug)]
+pub enum ClipboardType {
+    /// Write to the regular clipboard (Ctrl+C style)
+    Regular,
+    /// Update the primary-selection clipboard (highlighted text style)
+    Primary,
+    /// Update both clipboards
+    Both,
+}
+
+struct State {
+    seats: HashMap<wl_seat::WlSeat, data_control::Device>,
+    prepared_copy_state: Option<PreparedCopyState>,
+    async_runtime: tokio::runtime::Runtime,
+}
+
+struct PreparedCopyState {
+    mime_types: Vec<String>,
+    fetch_data_tx: mpsc::Sender<data::ClipboardFetch>,
+    config_dir: PathBuf,
+    /// Safety limit to the uncompressed size of a clipboard
+    max_uncompressed_size_bytes: u64,
+    /// Populated with clipboard contents on the first retrieval
+    clipboard_data: Option<data::ClipboardData>,
+}
+
+impl Dispatch<wl_seat::WlSeat, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _seat: &wl_seat::WlSeat,
+        _event: <wl_seat::WlSeat as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &wayland_client::Connection,
+        _qh: &wayland_client::QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WlRegistry, GlobalListContents> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlRegistry,
+        _event: <WlRegistry as wayland_client::Proxy>::Event,
+        _data: &GlobalListContents,
+        _conn: &wayland_client::Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl_dispatch_manager!(State);
+
+impl_dispatch_device!(State, wl_seat::WlSeat, |state: &mut Self, event, seat| {
+    match event {
+        Event::DataOffer { id } => id.destroy(),
+        Event::PrimarySelection { .. } => {}
+        Event::Finished => {
+            if let Some(device) = state.seats.remove(seat) {
+                device.destroy();
+            }
+        }
+        _ => (),
+    }
+});
+
+impl_dispatch_offer!(State);
+
+impl_dispatch_source!(State, |state: &mut Self, source: data_control::Source, event| {
+    match event {
+        Event::Send { mime_type, fd } => {
+            let prepared_state = if let Some(state) = state.prepared_copy_state.as_mut() {
+                state
+            } else {
+                error!("Missing prepared_copy_state when serving paste request");
+                return;
+            };
+
+            if !prepared_state.mime_types.contains(&mime_type) {
+                error!("Requested type {} is not advertised={:?}", mime_type, prepared_state.mime_types);
+                return;
+            }
+
+            let copy_result = || {
+                // We need to fetch if the data is missing or the requested type doesn't match what we have
+                let needs_fetch = prepared_state.clipboard_data
+                    .as_ref()
+                    .map(|d| d.requested_type != mime_type)
+                    .unwrap_or(true);
+                if needs_fetch {
+                    // Fetch missing data, setting data to None for retryable failure
+                    prepared_state.clipboard_data = state.async_runtime.block_on(data::fetch_clipboard_data(
+                        &prepared_state.fetch_data_tx,
+                        &mime_type,
+                        prepared_state.max_uncompressed_size_bytes,
+                        &prepared_state.config_dir,
+                    ));
+                } else {
+                    // Reuse fetched data
+                    debug!(
+                        "Reusing existing clipboard with type {}: {} bytes",
+                        mime_type,
+                        prepared_state.clipboard_data
+                            .as_ref()
+                            .map(|d| d.bytes.len())
+                            .unwrap_or(0),
+                    );
+                }
+                let bytes = if let Some(data) = &prepared_state.clipboard_data {
+                    // Use cached or newly fetched data
+                    &data.bytes
+                } else {
+                    // Fetch failed in a retryable way, use empty data
+                    &vec![]
+                };
+                // Clear O_NONBLOCK, otherwise io::copy() will stop halfway.
+                fcntl_setfl(&fd, OFlags::empty()).map_err(io::Error::from)?;
+                let mut source_content = Cursor::new(bytes);
+                io::copy(&mut source_content, &mut File::from(fd))
+            };
+
+            if let Err(err) = copy_result() {
+                error!("Failed to write clipboard data: {}", err);
+            }
+        }
+        Event::Cancelled => source.destroy(),
+        _ => (),
+    }
+});
+
+/// Connects to the wayland environment, or returns Ok(None) if wayland isn't available
+fn init_state() -> Result<(State, data_control::Manager, EventQueue<State>)> {
+    let conn = Connection::connect_to_env()?;
+    let (globals, queue) = registry_queue_init::<State>(&conn)?;
+    let qh = queue.handle();
+
+    let clipboard_manager = common::clipboard_manager(&globals, &qh)
+        .context("Wayland missing both ext-data-control and wlr-data-control support")?;
+
+    let mut seats = HashMap::new();
+    for seat in common::seats(&globals, &qh) {
+        let device = clipboard_manager.get_data_device(&seat, &qh, seat.clone());
+        seats.insert(seat, device);
+    }
+    if seats.is_empty() {
+        bail!("No wayland seats");
+    }
+
+    Ok((
+        State{
+            seats,
+            prepared_copy_state: None,
+            async_runtime: tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?,
+        },
+        clipboard_manager,
+        queue,
+    ))
+}
+
+/// Launches a thread to serve the provided clipboard data to wayland,
+/// automatically exiting the thread when the clipboard gets overridden
+fn write_clipboard(
+    clipboard_type: ClipboardType,
+    mut mime_types: Vec<String>,
+    fetch_data_tx: mpsc::Sender<data::ClipboardFetch>,
+    config_dir: PathBuf,
+    max_uncompressed_size_bytes: u64,
+) -> Result<()> {
+    // Ensure the clipboard we're advertising includes the ignored type,
+    // which ensures we don't treat this clipboard as if it's from another application source on the system.
+    let ignored_type = state::IGNORED_MIME_TYPE.to_string();
+    if !mime_types.contains(&ignored_type) {
+        mime_types.push(ignored_type);
+    }
+    debug!("Advertising {:?} clipboard to wayland: {:?}", clipboard_type, mime_types);
+    let (mut state, clipboard_manager, mut queue) = init_state()
+        .context("Failed to init wayland session for clipboard write")?;
+
+    let mut sources = vec![];
+    for device in state.seats.values() {
+        let data_source = clipboard_manager.create_data_source(&queue.handle());
+
+        for mime_type in &mime_types {
+            data_source.offer(mime_type.clone());
+        }
+
+        match clipboard_type {
+            ClipboardType::Regular => {
+                device.set_selection(Some(&data_source));
+            },
+            ClipboardType::Primary => {
+                device.set_primary_selection(Some(&data_source));
+            },
+            ClipboardType::Both => {
+                device.set_selection(Some(&data_source));
+                device.set_primary_selection(Some(&data_source));
+            },
+        }
+        sources.push(data_source);
+    }
+
+    state.prepared_copy_state = Some(PreparedCopyState{
+        mime_types,
+        fetch_data_tx,
+        config_dir,
+        max_uncompressed_size_bytes,
+        clipboard_data: None,
+    });
+
+    queue.roundtrip(&mut state)?;
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let _ = std::thread::spawn(move || {
+        if let Err(e) = ready_tx.send(()) {
+            error!("Failed to send ready_tx: {}", e);
+            return;
+        }
+        loop {
+            if let Err(e) = queue.blocking_dispatch(&mut state) {
+                error!("Wayland dispatch error when serving copy requests: {}", e);
+                return;
+            }
+            if sources.iter().all(|x| !x.is_alive()) {
+                // Clipboard has updated and the objects we're serving have been dropped
+                break;
+            }
+        }
+        trace!("Exiting clipboard serving thread");
+    });
+    // Wait for thread to have started
+    ready_rx.recv()?;
+
+    Ok(())
+}
+
+/// Task that advertises received clipboard types to local programs,
+/// and fetches clipboard contents from nikau in response to local type requests (pastes).
+pub struct ClipboardWriter {
+    clipboard_type: ClipboardType,
+    config_dir: PathBuf,
+    max_uncompressed_size_bytes: u64,
+    /// Send available clipboard types, received from Nikau server
+    clipboard_fetch_tx: mpsc::Sender<data::ClipboardFetch>,
+}
+
+impl ClipboardWriter {
+    pub fn new(
+        clipboard_type: ClipboardType,
+        config_dir: PathBuf,
+        max_uncompressed_size_bytes: u64,
+        clipboard_fetch_tx: mpsc::Sender<data::ClipboardFetch>,
+    ) -> Self {
+        Self {
+            clipboard_type,
+            config_dir,
+            max_uncompressed_size_bytes,
+            clipboard_fetch_tx,
+        }
+    }
+}
+
+impl ClipboardWriterTrait for ClipboardWriter {
+    /// Advertises with the local environment that we have a new clipboard entry available
+    fn store_types(&self, types: Vec<String>) -> Result<()> {
+        write_clipboard(
+            self.clipboard_type.clone(),
+            types,
+            self.clipboard_fetch_tx.clone(),
+            self.config_dir.clone(),
+            self.max_uncompressed_size_bytes,
+        )
+    }
+}

@@ -1,59 +1,16 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use quinn::{RecvStream, SendStream};
-use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, trace, warn};
 
+use crate::clipboard::{client, data};
 use crate::device::output;
 use crate::msgs::{bulk, event};
 use crate::network::{approval, transport};
-use crate::x11clipboard::{
-    reader::{ClipboardReader, ClipboardTypeWatcher},
-    writer::{ClipboardFetch, ClipboardWriter},
-    ClipboardData,
-};
-
-pub struct LocalClipboard {
-    reader: ClipboardReader,
-    pub writer: ClipboardWriter,
-    fetch_rx: mpsc::Receiver<ClipboardFetch>,
-    local_types_rx: watch::Receiver<Vec<String>>,
-    local_types: Option<Vec<String>>,
-    pub serving_remote_clipboard: bool,
-}
-
-impl LocalClipboard {
-    pub async fn new(config_dir: PathBuf, max_uncompressed_size_bytes: u64) -> Result<Self> {
-        let (fetch_tx, fetch_rx) = mpsc::channel(32);
-        let reader = ClipboardReader::new().await?;
-        let (local_types_tx, local_types_rx) = watch::channel(vec![]);
-        ClipboardTypeWatcher::start(local_types_tx).await?;
-        let writer =
-            ClipboardWriter::start(config_dir, max_uncompressed_size_bytes, fetch_tx).await?;
-        Ok(Self {
-            reader,
-            writer,
-            fetch_rx,
-            local_types_rx,
-            local_types: None,
-            serving_remote_clipboard: false,
-        })
-    }
-
-    pub async fn clear_remote_clipboard(&mut self) -> Result<()> {
-        if self.serving_remote_clipboard {
-            self.local_types = None;
-            self.serving_remote_clipboard = false;
-            self.writer.store_types(vec![])?;
-        }
-        Ok(())
-    }
-}
 
 /// Initializes a new client connection and runs its event loop.
 /// Returns an error on connection failure or other logic error, in which case a new connection can be tried.
@@ -61,7 +18,7 @@ pub async fn run<O: output::OutputHandler>(
     server_addr: &SocketAddr,
     cert_verifier: Arc<approval::NikauCertVerification<'static>>,
     max_clipboard_size_bytes: u64,
-    local_clipboard: &mut Option<LocalClipboard>,
+    local_clipboard: &mut Option<client::LocalClipboard>,
     output_handler: &mut O,
 ) -> Result<()> {
     let (mut client, connect_time) =
@@ -89,10 +46,10 @@ struct Connection {
 
     /// Accumulator of raw clipboard data streamed from the server.
     /// Cleared when the clipboard data has all been received.
-    incoming_clipboard_data: Option<ClipboardData>,
+    incoming_clipboard_data: Option<data::ClipboardData>,
 
     /// Pending fetch request for this connection, if any.
-    waiting_clipboard_fetch: Option<ClipboardFetch>,
+    waiting_clipboard_fetch: Option<data::ClipboardFetch>,
 }
 
 impl Connection {
@@ -155,14 +112,14 @@ impl Connection {
     /// Performs a step of the client event loop, returning an error if the connection should be retried.
     async fn step<O: output::OutputHandler>(
         &mut self,
-        local_clipboard: &mut Option<LocalClipboard>,
+        local_clipboard: &mut Option<client::LocalClipboard>,
         output_handler: &mut O,
         connect_time: &Instant,
     ) -> Result<()> {
         if let Some(local_clipboard) = local_clipboard {
             // Local clipboard enabled: Include watching for local clipboard events
             tokio::select! {
-                local_fetch_request = local_clipboard.fetch_rx.recv() => {
+                local_fetch_request = local_clipboard.clipboard_fetch_rx.recv() => {
                     // Send fetch request to server, keep request and its nested oneshot for handling the response
                     if let Some(local_fetch_request) = local_fetch_request {
                         let msg = bulk::ClientBulk::ClipboardRequest(bulk::ClientClipboardRequest{
@@ -195,9 +152,7 @@ impl Connection {
                         return Err(anyhow!(e));
                     }
                     if self.active {
-                        local_clipboard.local_types.replace(local_clipboard.local_types_rx.borrow().clone());
-                        // Now that we have a local clipboard, don't fetch clipboards from the server.
-                        local_clipboard.serving_remote_clipboard = false;
+                        local_clipboard.set_local_clipboard();
                     }
                 },
                 event_result = self.events_recv.read_chunk(1024, true) => {
@@ -266,7 +221,7 @@ impl Connection {
 
     async fn handle_event_messages<O: output::OutputHandler>(
         &mut self,
-        mut local_clipboard: Option<&mut LocalClipboard>,
+        mut local_clipboard: Option<&mut client::LocalClipboard>,
         output_handler: &mut O,
     ) -> Result<()> {
         let mut offset = 0;
@@ -292,7 +247,7 @@ impl Connection {
                     );
                     self.active = e.enabled;
                     if let Some(local_clipboard) = &mut local_clipboard {
-                        if let Some(types) = &local_clipboard.local_types {
+                        if let Some(types) = &local_clipboard.get_local_clipboard_types() {
                             if !e.enabled && !types.is_empty() {
                                 // We're being disabled and we have a clipboard from a local app.
                                 // It may be from when we were disabled, or from a prior enabled session. That's fine.
@@ -328,11 +283,9 @@ impl Connection {
                     // Announce the types to X11 for local apps to see, and clear any prior types from local apps.
                     if let Some(local_clipboard) = &mut local_clipboard {
                         debug!("Got clipboard types from server: {}", types.types);
-                        local_clipboard.local_types = None;
-                        local_clipboard.serving_remote_clipboard = true;
                         let types: Vec<String> =
                             types.types.split(' ').map(|s| s.to_string()).collect();
-                        local_clipboard.writer.store_types(types)?;
+                        local_clipboard.set_remote_clipboard(types)?;
                     } else {
                         debug!("Ignoring clipboard types from server: {}", types.types);
                     }
@@ -345,7 +298,7 @@ impl Connection {
 
     async fn handle_bulk_data_or_messages(
         &mut self,
-        local_clipboard: Option<&mut LocalClipboard>,
+        local_clipboard: Option<&mut client::LocalClipboard>,
         resp_bytes: Bytes,
     ) -> Result<()> {
         if let Some(c) = &mut self.incoming_clipboard_data {
@@ -405,8 +358,8 @@ impl Connection {
 
     async fn handle_bulk_messages(
         &mut self,
-        mut local_clipboard: Option<&mut LocalClipboard>,
-    ) -> Result<Option<ClipboardData>> {
+        mut local_clipboard: Option<&mut client::LocalClipboard>,
+    ) -> Result<Option<data::ClipboardData>> {
         let mut offset = 0;
         let bytes_len = self.bulk_recv_bytes.len();
         while offset < bytes_len {
@@ -432,19 +385,9 @@ impl Connection {
                             bail!("Got ClipboardRequest event from server when we don't support clipboards, resetting connection");
                         }
                     };
-                    debug!(
-                        "Reading clipboard data for requested type {} to {}",
-                        c.requested_type,
-                        if let Some(c) = c.request_client {
-                            format!("server for {}", c)
-                        } else {
-                            "server".to_string()
-                        }
-                    );
                     // Read the clipboard data from the local application.
                     let (local_clipboard_data, data_type) = local_clipboard
-                        .reader
-                        .read(c.requested_type, c.max_size_bytes, &c.request_client)
+                        .read(c.requested_type, c.max_size_bytes, c.request_client)
                         .await?;
                     let msg = bulk::ClientBulk::ClipboardHeader(bulk::ClientClipboardHeader {
                         requested_type: c.requested_type,
@@ -485,7 +428,7 @@ impl Connection {
                             let mut bytes = Vec::with_capacity(c.content_len_bytes as usize);
                             bytes
                                 .extend_from_slice(&resp_remainder[..c.content_len_bytes as usize]);
-                            let d = ClipboardData {
+                            let d = data::ClipboardData {
                                 requested_type: c.requested_type.to_string(),
                                 data_type: c.data_type.map(|t| t.to_string()),
                                 bytes,
@@ -503,7 +446,7 @@ impl Connection {
                         // Save what we've got so far, and assign remaining_bytes to what's left.
                         let mut bytes = Vec::with_capacity(c.content_len_bytes as usize);
                         bytes.extend_from_slice(resp_remainder);
-                        return Ok(Some(ClipboardData {
+                        return Ok(Some(data::ClipboardData {
                             requested_type: c.requested_type.to_string(),
                             data_type: c.data_type.map(|t| t.to_string()),
                             bytes,
