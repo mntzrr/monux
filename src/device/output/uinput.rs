@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use evdev::{
-    uinput, AbsInfo, AbsoluteAxisType, AttributeSet, EvdevEnum, InputEventKind, Key, MiscType,
-    RelativeAxisType,
+    uinput, AbsInfo, AbsoluteAxisCode, AttributeSet, EvdevEnum, EventSummary, KeyCode, MiscCode,
+    RelativeAxisCode,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -17,16 +17,16 @@ pub const SCALED_DIM_RES_Y: i32 = 960; // for a 3/2 ratio vs X: 65536 / 960 = 68
 
 /// Creates virtual uinput devices on the client machine and emits input events locally.
 pub struct VirtualUInputDevices {
-    keyboard_keys: AttributeSet<Key>,
-    mouse_keys: AttributeSet<Key>,
-    touchpad_keys: AttributeSet<Key>,
+    keyboard_keys: AttributeSet<KeyCode>,
+    mouse_keys: AttributeSet<KeyCode>,
+    touchpad_keys: AttributeSet<KeyCode>,
 
-    mouse_axes: AttributeSet<RelativeAxisType>,
-    touchpad_axes: AttributeSet<AbsoluteAxisType>,
+    mouse_axes: AttributeSet<RelativeAxisCode>,
+    touchpad_axes: AttributeSet<AbsoluteAxisCode>,
 
-    keyboard_misc: AttributeSet<MiscType>,
-    mouse_misc: AttributeSet<MiscType>,
-    touchpad_misc: AttributeSet<MiscType>,
+    keyboard_misc: AttributeSet<MiscCode>,
+    mouse_misc: AttributeSet<MiscCode>,
+    touchpad_misc: AttributeSet<MiscCode>,
 
     keyboard_device: uinput::VirtualDevice,
     mouse_device: uinput::VirtualDevice,
@@ -90,54 +90,54 @@ impl VirtualUInputDevices {
     }
 
     fn route_event(&self, event: evdev::InputEvent) -> Option<EventDest> {
-        match event.kind() {
-            InputEventKind::Key(e) => {
-                if self.keyboard_keys.contains(e) {
+        match event.destructure() {
+            EventSummary::Key(_evt, code, _val) => {
+                if self.keyboard_keys.contains(code) {
                     Some(EventDest::Keyboard)
-                } else if self.mouse_keys.contains(e) {
+                } else if self.mouse_keys.contains(code) {
                     // mouse_keys and touchpad_keys have a lot of BTN_* key overlap
-                    if self.touchpad_keys.contains(e) {
+                    if self.touchpad_keys.contains(code) {
                         Some(EventDest::MouseOrTouchpad)
                     } else {
                         Some(EventDest::Mouse)
                     }
-                } else if self.touchpad_keys.contains(e) {
+                } else if self.touchpad_keys.contains(code) {
                     Some(EventDest::Touchpad)
                 } else {
-                    info!("Dropping key event with unsupported code: {:?}", e);
+                    info!("Dropping key event with unsupported code: {:?}", code);
                     None
                 }
             }
-            InputEventKind::RelAxis(e) => {
-                if self.mouse_axes.contains(e) {
+            EventSummary::RelativeAxis(_evt, code, _val) => {
+                if self.mouse_axes.contains(code) {
                     Some(EventDest::Mouse)
                 } else {
-                    info!("Dropping relaxis event with unsupported code: {:?}", e);
+                    info!("Dropping relaxis event with unsupported code: {:?}", code);
                     None
                 }
             }
-            InputEventKind::AbsAxis(e) => {
-                if self.touchpad_axes.contains(e) {
+            EventSummary::AbsoluteAxis(_evt, code, _val) => {
+                if self.touchpad_axes.contains(code) {
                     Some(EventDest::Touchpad)
                 } else {
-                    info!("Dropping absaxis event with unsupported code: {:?}", e);
+                    info!("Dropping absaxis event with unsupported code: {:?}", code);
                     None
                 }
             }
-            InputEventKind::Misc(e) => {
-                if self.keyboard_misc.contains(e) {
+            EventSummary::Misc(_evt, code, _val) => {
+                if self.keyboard_misc.contains(code) {
                     // keyboard_misc and mouse_misc have MSC_SCAN overlap
-                    if self.mouse_misc.contains(e) {
+                    if self.mouse_misc.contains(code) {
                         Some(EventDest::KeyboardOrMouse)
                     } else {
                         Some(EventDest::Keyboard)
                     }
-                } else if self.mouse_misc.contains(e) {
+                } else if self.mouse_misc.contains(code) {
                     Some(EventDest::Mouse)
-                } else if self.touchpad_misc.contains(e) {
+                } else if self.touchpad_misc.contains(code) {
                     Some(EventDest::Touchpad)
                 } else {
-                    info!("Dropping misc event with unsupported code: {:?}", e);
+                    info!("Dropping misc event with unsupported code: {:?}", code);
                     None
                 }
             }
@@ -337,27 +337,27 @@ pub fn keyboard(
     pid: u32,
 ) -> Result<(
     uinput::VirtualDevice,
-    AttributeSet<Key>,
-    AttributeSet<MiscType>,
+    AttributeSet<KeyCode>,
+    AttributeSet<MiscCode>,
 )> {
-    let mut keys = AttributeSet::<Key>::new();
+    let mut keys = AttributeSet::<KeyCode>::new();
     // Report as many keys as possible to emit by the virtual device.
     for code in 1..libc::KEY_MAX {
-        let key = Key::new(code);
+        let key = KeyCode::new(code);
         // HACK: Include only known KEY_* keys, or else the keyboard will be ignored.
         let key_name = format!("{:?}", key);
         if key_name.starts_with("KEY_") {
             keys.insert(key);
         }
     }
-    let device = uinput::VirtualDeviceBuilder::new()?
+    let device = uinput::VirtualDevice::builder()?
         .name(format!("{} keyboard for pid {}", VIRTUAL_DEVICE_NAME_PREFIX, pid).as_str())
         .with_keys(&keys)?
         .build()?;
 
     // We don't seem to need to advertise this, but mark it as a possible event so that we aren't dropping it and logging infos about it.
-    let mut misc = AttributeSet::<MiscType>::new();
-    misc.insert(MiscType::MSC_SCAN);
+    let mut misc = AttributeSet::<MiscCode>::new();
+    misc.insert(MiscCode::MSC_SCAN);
 
     Ok((device, keys, misc))
 }
@@ -366,13 +366,13 @@ pub fn mouse(
     pid: u32,
 ) -> Result<(
     uinput::VirtualDevice,
-    AttributeSet<Key>,
-    AttributeSet<MiscType>,
-    AttributeSet<RelativeAxisType>,
+    AttributeSet<KeyCode>,
+    AttributeSet<MiscCode>,
+    AttributeSet<RelativeAxisCode>,
 )> {
-    let mut keys = AttributeSet::<Key>::new();
+    let mut keys = AttributeSet::<KeyCode>::new();
     for code in 1..libc::KEY_MAX {
-        let key = Key::new(code);
+        let key = KeyCode::new(code);
         // HACK: Include only BTN_* keys, and exclude BTN_TOOL_* or else the mouse is ignored.
         let key_name = format!("{:?}", key);
         if key_name.starts_with("BTN_") && !key_name.starts_with("BTN_TOOL_") {
@@ -381,20 +381,20 @@ pub fn mouse(
     }
 
     // Claim ALL axes. The mouse will be ignored if it claims keys that aren't relevant to claimed axes.
-    let mut axes = AttributeSet::<RelativeAxisType>::new();
+    let mut axes = AttributeSet::<RelativeAxisCode>::new();
     for code in 0..(libc::REL_CNT as u16) {
-        axes.insert(RelativeAxisType(code));
+        axes.insert(RelativeAxisCode(code));
     }
 
-    let device = uinput::VirtualDeviceBuilder::new()?
+    let device = uinput::VirtualDevice::builder()?
         .name(format!("{} mouse for pid {}", VIRTUAL_DEVICE_NAME_PREFIX, pid).as_str())
         .with_keys(&keys)?
         .with_relative_axes(&axes)?
         .build()?;
 
     // We don't seem to need to advertise this, but mark it as a possible event so that we aren't dropping it and logging infos about it.
-    let mut misc = AttributeSet::<MiscType>::new();
-    misc.insert(MiscType::MSC_SCAN);
+    let mut misc = AttributeSet::<MiscCode>::new();
+    misc.insert(MiscCode::MSC_SCAN);
 
     Ok((device, keys, misc, axes))
 }
@@ -403,9 +403,9 @@ pub fn touchpad(
     pid: u32,
 ) -> Result<(
     uinput::VirtualDevice,
-    AttributeSet<Key>,
-    AttributeSet<MiscType>,
-    AttributeSet<AbsoluteAxisType>,
+    AttributeSet<KeyCode>,
+    AttributeSet<MiscCode>,
+    AttributeSet<AbsoluteAxisCode>,
 )> {
     let mut props = AttributeSet::<evdev::PropType>::new();
     // Doesn't seem to be required, but real touchpads have it:
@@ -413,9 +413,9 @@ pub fn touchpad(
     // Required for movement events to be recognized:
     props.insert(evdev::PropType::POINTER);
 
-    let mut keys = AttributeSet::<Key>::new();
+    let mut keys = AttributeSet::<KeyCode>::new();
     for code in 1..libc::KEY_MAX {
-        let key = Key::new(code);
+        let key = KeyCode::new(code);
         // HACK: Limit to only (most) BTN_* keys or else the device won't work.
         let key_name = format!("{:?}", key);
         if key_name.starts_with("BTN_")
@@ -429,46 +429,46 @@ pub fn touchpad(
         }
     }
 
-    let mut misc = AttributeSet::<MiscType>::new();
-    misc.insert(MiscType::MSC_TIMESTAMP);
+    let mut misc = AttributeSet::<MiscCode>::new();
+    misc.insert(MiscCode::MSC_TIMESTAMP);
 
     let name = format!(
         "{} multi touchpad for pid {}",
         VIRTUAL_DEVICE_NAME_PREFIX, pid
     );
     // These are the valid axes that util::axis_scale_type returns DISCRETE
-    let mut axis_codes = AttributeSet::<AbsoluteAxisType>::new();
+    let mut axis_codes = AttributeSet::<AbsoluteAxisCode>::new();
     let mut axes = vec![
         abs_axis(
-            AbsoluteAxisType::ABS_MISC,
+            AbsoluteAxisCode::ABS_MISC,
             -1,      // min
             1048576, // max (arbitrarily big in case some real device uses big values?)
             0,       // res
             &mut axis_codes,
         ),
         abs_axis(
-            AbsoluteAxisType::ABS_MT_SLOT,
+            AbsoluteAxisCode::ABS_MT_SLOT,
             0,  // min
             32, // max (if this is too big then something panics)
             0,  // res
             &mut axis_codes,
         ),
         abs_axis(
-            AbsoluteAxisType::ABS_MT_TOOL_TYPE,
+            AbsoluteAxisCode::ABS_MT_TOOL_TYPE,
             0,    // min
             4095, // max
             0,    // res
             &mut axis_codes,
         ),
         abs_axis(
-            AbsoluteAxisType::ABS_MT_BLOB_ID,
+            AbsoluteAxisCode::ABS_MT_BLOB_ID,
             -1,      // min
             1048576, // max (arbitrarily big in case some real device uses big IDs)
             0,       // res
             &mut axis_codes,
         ),
         abs_axis(
-            AbsoluteAxisType::ABS_MT_TRACKING_ID,
+            AbsoluteAxisCode::ABS_MT_TRACKING_ID,
             -1,      // min
             1048576, // max (arbitrarily big in case some real device uses big IDs)
             0,       // res
@@ -476,7 +476,7 @@ pub fn touchpad(
         ),
     ];
     for i in 0..libc::ABS_MAX + 1 {
-        let axis = AbsoluteAxisType::from_index(i as usize);
+        let axis = AbsoluteAxisCode::from_index(i as usize);
         match util::axis_scale_type(axis) {
             util::AxisScale::X => {
                 // X axis values: use MAX_X
@@ -514,7 +514,7 @@ pub fn touchpad(
         }
     }
 
-    let mut device_builder = uinput::VirtualDeviceBuilder::new()?
+    let mut device_builder = uinput::VirtualDevice::builder()?
         .name(name.as_str())
         .with_properties(&props)?
         .with_keys(&keys)?
@@ -527,11 +527,11 @@ pub fn touchpad(
 }
 
 fn abs_axis(
-    axis: AbsoluteAxisType,
+    axis: AbsoluteAxisCode,
     min: i32,
     max: i32,
     res: i32,
-    codes: &mut AttributeSet<AbsoluteAxisType>,
+    codes: &mut AttributeSet<AbsoluteAxisCode>,
 ) -> evdev::UinputAbsSetup {
     codes.insert(axis);
     evdev::UinputAbsSetup::new(

@@ -2,18 +2,18 @@ use std::collections::HashSet;
 use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Result};
-use evdev::{EventType, Key};
+use evdev::{EventType, KeyCode};
 
 use crate::device::Event;
 
 pub struct KeyCombos {
     pub combos: Vec<KeyCombo>,
-    pub all_keys: HashSet<Key>,
+    pub all_keys: HashSet<KeyCode>,
 }
 
 /// A combination of keys paired with an action to be emitted when the combination is entered by the user
 pub struct KeyCombo {
-    pub keys: Vec<Key>,
+    pub keys: Vec<KeyCode>,
     pub action: Event,
 }
 
@@ -62,12 +62,12 @@ fn parse_action(keys: &str, action: Event) -> Result<KeyCombo> {
     for keyname_orig in keys_iter {
         // First try 'KEY_<X>'
         let keyname = keyname_orig.trim().to_uppercase();
-        if let Ok(key) = Key::from_str(format!("KEY_{}", keyname).as_str()) {
+        if let Ok(key) = KeyCode::from_str(format!("KEY_{}", keyname).as_str()) {
             keys.push(key);
         } else {
             // Didn't find 'KEY_<X>', try just '<X>' for things like 'BTN_0'
             keys.push(
-                Key::from_str(format!("{}", keyname).as_str())
+                KeyCode::from_str(format!("{}", keyname).as_str())
                     .map_err(|e| anyhow!("Unsupported key '{}': Tried KEY_{} and {}, see list of available keys at https://docs.rs/evdev/latest/evdev/struct.KeyCode.html (error: {:?})", keyname_orig, keyname, keyname, e))?,
             );
         }
@@ -109,7 +109,7 @@ pub(crate) struct ComboState {
 }
 
 impl ComboState {
-    pub(crate) fn new(combo_keys: Vec<Key>, action: Event) -> ComboState {
+    pub(crate) fn new(combo_keys: Vec<KeyCode>, action: Event) -> ComboState {
         let len = combo_keys.len();
         ComboState {
             action,

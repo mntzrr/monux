@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Result};
-use evdev::{EventStream, EventType, Key};
+use evdev::{EventStream, EventType, KeyCode};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task;
 use tracing::{debug, info, trace, warn};
@@ -53,7 +53,7 @@ impl InputHandler {
 }
 
 fn add_key_combo(
-    keymap: &mut HashMap<Vec<Key>, Event>,
+    keymap: &mut HashMap<Vec<KeyCode>, Event>,
     keysaction: &shortcut::KeyCombo,
 ) -> Result<()> {
     // Add combo to keymap, complain if an identical combo already exists
@@ -287,7 +287,7 @@ fn convert_device_event(
     device_info: &util::DeviceInfo,
 ) -> event::InputEvent {
     // Convert the original event before any combo-generated events.
-    let net_event = if let evdev::InputEventKind::AbsAxis(axis) = event.kind() {
+    let net_event = if let evdev::EventSummary::AbsoluteAxis(_evt, axis, _val) = event.destructure() {
         // Special handling for evdev absolute axis (e.g. touchpad) events
         if let Some((axis_min, axis_max)) = device_info.dims.get(&axis.0) {
             // Apply scaling from hardware width to [0.0, 1.0]

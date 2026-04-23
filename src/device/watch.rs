@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use evdev::{Device, EventType, Key};
+use evdev::{Device, EventType, KeyCode};
 use notify::Watcher;
 use regex::Regex;
 use tokio::sync::mpsc;
@@ -161,7 +161,7 @@ fn compatible_device(d: &Device, path: &Path, device_info: &util::DeviceInfo) ->
             // If this button is pressed on the server, we shouldn't send the power event to clients.
             !keys
                 .iter()
-                .all(|key| key == Key::KEY_POWER || key == Key::KEY_SLEEP || key == Key::KEY_WAKEUP)
+                .all(|key| key == KeyCode::KEY_POWER || key == KeyCode::KEY_SLEEP || key == KeyCode::KEY_WAKEUP)
         } else {
             // Key device without any keys? Skip it
             util::log_device_info(

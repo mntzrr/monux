@@ -3,7 +3,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use evdev::{AbsoluteAxisType, EventType, Key};
+use evdev::{AbsoluteAxisCode, EventType, KeyCode, RelativeAxisCode};
 use regex::Regex;
 use tokio::sync::broadcast;
 use tokio::task;
@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
     };
 
     let (grab_tx, _grab_rx) = broadcast::channel(32);
-    let handles = handles::DeviceHandles::new(StubHandler {}, grab_tx, HashSet::<Key>::new());
+    let handles = handles::DeviceHandles::new(StubHandler {}, grab_tx, HashSet::<KeyCode>::new());
     let handler = task::spawn(async move {
         if let Err(e) = watch::watch_loop(handles, devices).await {
             error!("Input device watch failure: {:?}", e);
@@ -73,15 +73,15 @@ async fn main() -> Result<()> {
     for _ in 0..50 {
         devices
             .write(vec![from_evdev(evdev::InputEvent::new(
-                EventType::KEY,
-                Key::KEY_R.code(),
+                EventType::KEY.0,
+                KeyCode::KEY_R.code(),
                 1,
             ))])
             .await?;
         devices
             .write(vec![from_evdev(evdev::InputEvent::new(
-                EventType::KEY,
-                Key::KEY_R.code(),
+                EventType::KEY.0,
+                KeyCode::KEY_R.code(),
                 0,
             ))])
             .await?;
@@ -91,13 +91,13 @@ async fn main() -> Result<()> {
         devices
             .write(vec![
                 from_evdev(evdev::InputEvent::new(
-                    EventType::RELATIVE,
-                    evdev::RelativeAxisType::REL_X.0,
+                    EventType::RELATIVE.0,
+                    RelativeAxisCode::REL_X.0,
                     5,
                 )),
                 from_evdev(evdev::InputEvent::new(
-                    EventType::RELATIVE,
-                    evdev::RelativeAxisType::REL_Y.0,
+                    EventType::RELATIVE.0,
+                    RelativeAxisCode::REL_Y.0,
                     5,
                 )),
             ])
@@ -109,13 +109,13 @@ async fn main() -> Result<()> {
         devices
             .write(vec![
                 from_evdev(evdev::InputEvent::new(
-                    EventType::ABSOLUTE,
-                    AbsoluteAxisType::ABS_X.0,
+                    EventType::ABSOLUTE.0,
+                    AbsoluteAxisCode::ABS_X.0,
                     i,
                 )),
                 from_evdev(evdev::InputEvent::new(
-                    EventType::ABSOLUTE,
-                    AbsoluteAxisType::ABS_Y.0,
+                    EventType::ABSOLUTE.0,
+                    AbsoluteAxisCode::ABS_Y.0,
                     i,
                 )),
             ])

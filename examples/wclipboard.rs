@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use tokio::sync::{mpsc, watch};
 use tokio::task;
 use tracing::{error, info};
@@ -10,7 +10,7 @@ use nikau::clipboard::{
     ClipboardWriter as ClipboardWriterTrait,
     data,
 };
-use nikau::clipboard::wayland::{reader, writer};
+use nikau::clipboard::wayland::{reader, type_watcher, writer};
 use nikau::logging;
 
 #[tokio::main]
@@ -39,11 +39,9 @@ async fn main() -> Result<()> {
             }
         }
     });
-    let mut reader = if let Some(reader) = reader::ClipboardReader::new(Some(regular_types_tx), Some(primary_types_tx))? {
-        reader
-    } else {
-        bail!("no wayland when building paste reader");
-    };
+
+    type_watcher::start(Some(regular_types_tx), Some(primary_types_tx))?;
+    let mut reader = reader::ClipboardReader::new()?;
 
     let text_mime_type = "text/plain";
 
@@ -52,17 +50,17 @@ async fn main() -> Result<()> {
 
     info!("write b");
     write("\n\nHello world!\n")?;
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
     info!("read b 1");
     read(&mut reader, text_mime_type.to_string()).await?;
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     info!("read b 2");
     read(&mut reader, text_mime_type.to_string()).await?;
 
     info!("write c");
     write("\n\nhey hi\n")?;
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
     info!("read c 1");
     read(&mut reader, text_mime_type.to_string()).await?;
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     info!("read c 2");
     read(&mut reader, text_mime_type.to_string()).await?;
 

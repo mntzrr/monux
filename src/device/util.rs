@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use evdev::{AbsoluteAxisType, Device, EvdevEnum, InputEvent, InputEventKind, Key};
+use evdev::{AbsoluteAxisCode, Device, EvdevEnum, InputEvent, EventSummary, KeyCode};
 use tracing::{debug, info, trace};
 
 #[derive(Debug, PartialEq)]
@@ -18,49 +18,49 @@ pub enum AxisScale {
     Invalid,
 }
 
-pub fn axis_scale_type(axis: AbsoluteAxisType) -> AxisScale {
+pub fn axis_scale_type(axis: AbsoluteAxisCode) -> AxisScale {
     match axis {
-        AbsoluteAxisType::ABS_X => AxisScale::X,
-        AbsoluteAxisType::ABS_Y => AxisScale::Y,
-        AbsoluteAxisType::ABS_Z => AxisScale::Other,
-        AbsoluteAxisType::ABS_RX => AxisScale::X,
-        AbsoluteAxisType::ABS_RY => AxisScale::Y,
-        AbsoluteAxisType::ABS_RZ => AxisScale::Other,
-        AbsoluteAxisType::ABS_THROTTLE => AxisScale::Other,
-        AbsoluteAxisType::ABS_RUDDER => AxisScale::Other,
-        AbsoluteAxisType::ABS_WHEEL => AxisScale::Other,
-        AbsoluteAxisType::ABS_GAS => AxisScale::Other,
-        AbsoluteAxisType::ABS_BRAKE => AxisScale::Other,
-        AbsoluteAxisType::ABS_HAT0X => AxisScale::Other,
-        AbsoluteAxisType::ABS_HAT0Y => AxisScale::Other,
-        AbsoluteAxisType::ABS_HAT1X => AxisScale::Other,
-        AbsoluteAxisType::ABS_HAT1Y => AxisScale::Other,
-        AbsoluteAxisType::ABS_HAT2X => AxisScale::Other,
-        AbsoluteAxisType::ABS_HAT2Y => AxisScale::Other,
-        AbsoluteAxisType::ABS_HAT3X => AxisScale::Other,
-        AbsoluteAxisType::ABS_HAT3Y => AxisScale::Other,
-        AbsoluteAxisType::ABS_PRESSURE => AxisScale::Other,
-        AbsoluteAxisType::ABS_DISTANCE => AxisScale::Other,
-        AbsoluteAxisType::ABS_TILT_X => AxisScale::Other,
-        AbsoluteAxisType::ABS_TILT_Y => AxisScale::Other,
-        AbsoluteAxisType::ABS_TOOL_WIDTH => AxisScale::Other,
-        AbsoluteAxisType::ABS_VOLUME => AxisScale::Other,
-        AbsoluteAxisType::ABS_MISC => AxisScale::Discrete,
-        AbsoluteAxisType::ABS_MT_SLOT => AxisScale::Discrete,
-        AbsoluteAxisType::ABS_MT_TOUCH_MAJOR => AxisScale::Other,
-        AbsoluteAxisType::ABS_MT_TOUCH_MINOR => AxisScale::Other,
-        AbsoluteAxisType::ABS_MT_WIDTH_MAJOR => AxisScale::Other,
-        AbsoluteAxisType::ABS_MT_WIDTH_MINOR => AxisScale::Other,
-        AbsoluteAxisType::ABS_MT_ORIENTATION => AxisScale::Other,
-        AbsoluteAxisType::ABS_MT_POSITION_X => AxisScale::X,
-        AbsoluteAxisType::ABS_MT_POSITION_Y => AxisScale::Y,
-        AbsoluteAxisType::ABS_MT_TOOL_TYPE => AxisScale::Discrete,
-        AbsoluteAxisType::ABS_MT_BLOB_ID => AxisScale::Discrete,
-        AbsoluteAxisType::ABS_MT_TRACKING_ID => AxisScale::Discrete,
-        AbsoluteAxisType::ABS_MT_PRESSURE => AxisScale::Other,
-        AbsoluteAxisType::ABS_MT_DISTANCE => AxisScale::Other,
-        AbsoluteAxisType::ABS_MT_TOOL_X => AxisScale::X,
-        AbsoluteAxisType::ABS_MT_TOOL_Y => AxisScale::Y,
+        AbsoluteAxisCode::ABS_X => AxisScale::X,
+        AbsoluteAxisCode::ABS_Y => AxisScale::Y,
+        AbsoluteAxisCode::ABS_Z => AxisScale::Other,
+        AbsoluteAxisCode::ABS_RX => AxisScale::X,
+        AbsoluteAxisCode::ABS_RY => AxisScale::Y,
+        AbsoluteAxisCode::ABS_RZ => AxisScale::Other,
+        AbsoluteAxisCode::ABS_THROTTLE => AxisScale::Other,
+        AbsoluteAxisCode::ABS_RUDDER => AxisScale::Other,
+        AbsoluteAxisCode::ABS_WHEEL => AxisScale::Other,
+        AbsoluteAxisCode::ABS_GAS => AxisScale::Other,
+        AbsoluteAxisCode::ABS_BRAKE => AxisScale::Other,
+        AbsoluteAxisCode::ABS_HAT0X => AxisScale::Other,
+        AbsoluteAxisCode::ABS_HAT0Y => AxisScale::Other,
+        AbsoluteAxisCode::ABS_HAT1X => AxisScale::Other,
+        AbsoluteAxisCode::ABS_HAT1Y => AxisScale::Other,
+        AbsoluteAxisCode::ABS_HAT2X => AxisScale::Other,
+        AbsoluteAxisCode::ABS_HAT2Y => AxisScale::Other,
+        AbsoluteAxisCode::ABS_HAT3X => AxisScale::Other,
+        AbsoluteAxisCode::ABS_HAT3Y => AxisScale::Other,
+        AbsoluteAxisCode::ABS_PRESSURE => AxisScale::Other,
+        AbsoluteAxisCode::ABS_DISTANCE => AxisScale::Other,
+        AbsoluteAxisCode::ABS_TILT_X => AxisScale::Other,
+        AbsoluteAxisCode::ABS_TILT_Y => AxisScale::Other,
+        AbsoluteAxisCode::ABS_TOOL_WIDTH => AxisScale::Other,
+        AbsoluteAxisCode::ABS_VOLUME => AxisScale::Other,
+        AbsoluteAxisCode::ABS_MISC => AxisScale::Discrete,
+        AbsoluteAxisCode::ABS_MT_SLOT => AxisScale::Discrete,
+        AbsoluteAxisCode::ABS_MT_TOUCH_MAJOR => AxisScale::Other,
+        AbsoluteAxisCode::ABS_MT_TOUCH_MINOR => AxisScale::Other,
+        AbsoluteAxisCode::ABS_MT_WIDTH_MAJOR => AxisScale::Other,
+        AbsoluteAxisCode::ABS_MT_WIDTH_MINOR => AxisScale::Other,
+        AbsoluteAxisCode::ABS_MT_ORIENTATION => AxisScale::Other,
+        AbsoluteAxisCode::ABS_MT_POSITION_X => AxisScale::X,
+        AbsoluteAxisCode::ABS_MT_POSITION_Y => AxisScale::Y,
+        AbsoluteAxisCode::ABS_MT_TOOL_TYPE => AxisScale::Discrete,
+        AbsoluteAxisCode::ABS_MT_BLOB_ID => AxisScale::Discrete,
+        AbsoluteAxisCode::ABS_MT_TRACKING_ID => AxisScale::Discrete,
+        AbsoluteAxisCode::ABS_MT_PRESSURE => AxisScale::Other,
+        AbsoluteAxisCode::ABS_MT_DISTANCE => AxisScale::Other,
+        AbsoluteAxisCode::ABS_MT_TOOL_X => AxisScale::X,
+        AbsoluteAxisCode::ABS_MT_TOOL_Y => AxisScale::Y,
         _ => AxisScale::Invalid,
     }
 }
@@ -79,7 +79,7 @@ impl DeviceInfo {
             if let Ok(state) = device.get_abs_state() {
                 // clippy recommends this ugly way to get a loop counter
                 for (i, s) in (0_u16..).zip(state.into_iter()) {
-                    let type_ = AbsoluteAxisType::from_index(i as usize);
+                    let type_ = AbsoluteAxisCode::from_index(i as usize);
                     if abs_axes.contains(type_) && axis_scale_type(type_) != AxisScale::Invalid {
                         dims.insert(i, (s.minimum, s.maximum));
                     }
@@ -120,10 +120,10 @@ pub fn log_device_info(
 
 /// Summarizes an evdev InputEvent, hiding the key being pressed in the case of a key event.
 pub fn log_event(event: &InputEvent) -> String {
-    let kind = match event.kind() {
-        InputEventKind::Key(_key) => {
+    let kind = match event.destructure() {
+        EventSummary::Key(evt, _code, value) => {
             // Replace the key with an X to avoid logging passwords etc
-            InputEventKind::Key(Key::KEY_X)
+            EventSummary::Key(evt, KeyCode::KEY_X, value)
         }
         k => k,
     };
@@ -135,7 +135,7 @@ fn device_info_string(device: &Device, dims: &BTreeMap<u16, (i32, i32)>) -> Stri
     if let Some(abs_axes) = device.supported_absolute_axes() {
         if let Ok(state) = device.get_abs_state() {
             for (i, s) in state.into_iter().enumerate() {
-                let type_ = AbsoluteAxisType::from_index(i);
+                let type_ = AbsoluteAxisCode::from_index(i);
                 if abs_axes.contains(type_) {
                     abs_entries.push(format!("{:?}:{:?}", type_, s));
                 }

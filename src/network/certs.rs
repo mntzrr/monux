@@ -117,7 +117,7 @@ fn write_new_keypair<'a>(
 /// We use this for cert filenames and for comparing certs in confirmation prompts.
 /// This should match the output of "openssl x509 -in <filename> -noout -sha256 -fingerprint"
 pub fn fingerprint(cert: &rustls_pki_types::CertificateDer) -> String {
-    format!("{:x}", Sha256::digest(cert))
+    hex::encode(Sha256::digest(cert))
 }
 
 pub fn write_approved_cert(
