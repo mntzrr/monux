@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, prelude::*};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -15,7 +15,10 @@ pub fn load_known_certs(config_dir: &PathBuf) -> Result<Vec<rustls_pki_types::Ce
         if !filetype.is_file() {
             continue;
         }
-        certs.push(load_cert(path.path())?);
+        match load_cert(path.path()) {
+            Ok(cert) => certs.push(cert),
+            Err(e) => warn!("Skipping unreadable cert file {}: {:?}", path.path().display(), e),
+        }
     }
     Ok(certs)
 }
@@ -39,7 +42,15 @@ pub fn load_keypair<'a>(
 ) -> Result<(rustls_pki_types::CertificateDer<'a>, rustls_pki_types::PrivateKeyDer<'a>)> {
     let file_path = config_dir.join("private.pem");
     if file_path.is_file() {
-        read_existing_keypair(splash_label, &file_path)
+        let keypair = read_existing_keypair(splash_label, &file_path)?;
+        // Repair permissions on existing keypairs that were left at the umask default.
+        ensure_permissions(&file_path, 0o600).with_context(|| {
+            format!(
+                "Failed to set permissions on keypair file: {}",
+                file_path.display()
+            )
+        })?;
+        Ok(keypair)
     } else {
         write_new_keypair(splash_label, &file_path)
     }
@@ -86,12 +97,18 @@ fn write_new_keypair<'a>(
         .context("Failed to generate self-signed cert")?;
 
     info!("Writing a new keypair to {}", file_path.display());
-    let mut outfile = fs::File::create(&file_path).with_context(|| {
-        format!(
-            "Failed to open keypair file for writing: {}",
-            file_path.display()
-        )
-    })?;
+    let mut outfile = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&file_path)
+        .with_context(|| {
+            format!(
+                "Failed to open keypair file for writing: {}",
+                file_path.display()
+            )
+        })?;
     ensure_permissions(&file_path, 0o600).with_context(|| {
         format!(
             "Failed to set permissions on keypair file: {}",
@@ -183,11 +200,12 @@ fn init_known_certs_dir(config_dir: &PathBuf) -> Result<PathBuf> {
 }
 
 fn ensure_permissions(path: &PathBuf, perms: u32) -> Result<()> {
-    let mut permissions = fs::metadata(path)
+    let permissions = fs::metadata(path)
         .with_context(|| format!("Failed to read file metadata: {}", path.display()))?
         .permissions();
-    if permissions.mode() != perms {
-        permissions.set_mode(perms);
+    if permissions.mode() & 0o777 != perms {
+        fs::set_permissions(path, fs::Permissions::from_mode(perms))
+            .with_context(|| format!("Failed to set permissions on file: {}", path.display()))?;
     }
     Ok(())
 }

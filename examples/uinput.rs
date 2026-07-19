@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use evdev::{AbsoluteAxisCode, EventType, KeyCode, RelativeAxisCode};
 use regex::Regex;
-use tokio::sync::broadcast;
+use tokio::sync::watch as tokio_watch;
 use tokio::task;
 use tracing::{error, info, warn};
 
@@ -20,7 +20,7 @@ impl handles::DeviceHandler for StubHandler {
     fn handle_device_stream(
         &mut self,
         mut stream: evdev::EventStream,
-        _grab_rx: Option<broadcast::Receiver<GrabEvent>>,
+        _grab_rx: Option<tokio_watch::Receiver<GrabEvent>>,
         _device_info: util::DeviceInfo,
     ) -> Result<handles::DeviceHandle> {
         let handle = tokio::spawn(async move {
@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
         Err(_e) => vec![],
     };
 
-    let (grab_tx, _grab_rx) = broadcast::channel(32);
+    let (grab_tx, _grab_rx) = tokio_watch::channel(GrabEvent::Ungrab);
     let handles = handles::DeviceHandles::new(StubHandler {}, grab_tx, HashSet::<KeyCode>::new());
     let handler = task::spawn(async move {
         if let Err(e) = watch::watch_loop(handles, devices).await {

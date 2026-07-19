@@ -45,7 +45,7 @@ pub fn build_client(
     cert_verifier: Arc<approval::NikauCertVerification<'static>>,
     mode: NetworkMode,
 ) -> Result<quinn::Endpoint> {
-    let socket = create_socket(*bind_addr, false, mode)
+    let socket = create_socket(*bind_addr, mode)
         .context("Failed to create client UDP socket")?;
     let runtime = quinn::default_runtime()
         .ok_or_else(|| anyhow::anyhow!("no async runtime found"))?;
@@ -66,7 +66,7 @@ pub fn build_server(
     cert_verifier: Arc<approval::NikauCertVerification<'static>>,
     mode: NetworkMode,
 ) -> Result<quinn::Endpoint> {
-    let socket = create_socket(*listen_addr, true, mode)
+    let socket = create_socket(*listen_addr, mode)
         .context("Failed to create server UDP socket")?;
     let runtime = quinn::default_runtime()
         .ok_or_else(|| anyhow::anyhow!("no async runtime found"))?;
@@ -84,11 +84,7 @@ pub fn build_server(
     .with_context(|| format!("Failed to listen on {}", listen_addr))
 }
 
-fn create_socket(
-    bind_addr: SocketAddr,
-    is_server: bool,
-    mode: NetworkMode,
-) -> Result<std::net::UdpSocket> {
+fn create_socket(bind_addr: SocketAddr, mode: NetworkMode) -> Result<std::net::UdpSocket> {
     let domain = if bind_addr.is_ipv6() {
         libc::AF_INET6
     } else {
@@ -103,11 +99,6 @@ fn create_socket(
     let close_fd = || unsafe { libc::close(fd) };
 
     let apply_socket_opts = || -> Result<()> {
-        if is_server {
-            let one: libc::c_int = 1;
-            setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &one)?;
-        }
-
         setsockopt(
             fd,
             libc::SOL_SOCKET,
@@ -293,9 +284,11 @@ pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<()
             postcard::take_from_bytes_cobs::<shared::VersionBootstrapMessage>(buf)
                 .map_err(|e| anyhow!("Failed to deserialize message: {:?}", e))?;
         version = versionmsg.version;
-        // Remove this message from the front of buf
-        let consumed = resp.bytes.len() - resp_remainder.len();
+        // Remove this message from the front of buf.
+        // resp_remainder is relative to buf, which may have had content before this call.
+        let remainder_len = resp_remainder.len();
         let buf_len = buf.len();
+        let consumed = buf_len - remainder_len;
         buf.copy_within(consumed..buf_len, 0);
         buf.truncate(buf_len - consumed);
     }

@@ -32,11 +32,7 @@ pub async fn watch_loop<H: handles::DeviceHandler>(
     ) = mpsc::channel(32);
     let mut watcher = notify::RecommendedWatcher::new(
         move |res: Result<notify::Event, notify::Error>| match res {
-            Ok(event) => tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(send_device_events(event, &device_event_tx)),
+            Ok(event) => send_device_events(event, &device_event_tx),
             Err(e) => warn!("filesystem watch error: {:?}", e),
         },
         notify::Config::default(),
@@ -213,18 +209,15 @@ fn matches_filters(
     is_match
 }
 
-async fn send_device_events(event: notify::Event, device_event_tx: &mpsc::Sender<DeviceEvent>) {
+fn send_device_events(event: notify::Event, device_event_tx: &mpsc::Sender<DeviceEvent>) {
     match event.kind {
         notify::EventKind::Create(notify::event::CreateKind::File) => {
             debug!("File created: {:?}", event);
             for path in event.paths {
-                if let Err(e) = device_event_tx
-                    .send(DeviceEvent {
-                        kind: DeviceEventKind::Created,
-                        path,
-                    })
-                    .await
-                {
+                if let Err(e) = device_event_tx.try_send(DeviceEvent {
+                    kind: DeviceEventKind::Created,
+                    path,
+                }) {
                     warn!("Failed to queue device create event: {:?}", e);
                 }
             }
@@ -232,13 +225,10 @@ async fn send_device_events(event: notify::Event, device_event_tx: &mpsc::Sender
         notify::EventKind::Remove(notify::event::RemoveKind::File) => {
             debug!("File deleted: {:?}", event);
             for path in event.paths {
-                if let Err(e) = device_event_tx
-                    .send(DeviceEvent {
-                        kind: DeviceEventKind::Deleted,
-                        path,
-                    })
-                    .await
-                {
+                if let Err(e) = device_event_tx.try_send(DeviceEvent {
+                    kind: DeviceEventKind::Deleted,
+                    path,
+                }) {
                     warn!("Failed to queue device delete event: {:?}", e);
                 }
             }

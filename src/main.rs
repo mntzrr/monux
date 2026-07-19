@@ -90,8 +90,8 @@ struct ClientArgs {
     host: Option<String>,
 
     /// Server port
-    #[arg(short = 'p', long, default_value_t = 1213, value_name = "port")]
-    port: u16,
+    #[arg(short = 'p', long, value_name = "port")]
+    port: Option<u16>,
 
     /// Server certificate fingerprint to automatically accept without prompting (repeat for multiple fingerprints)
     #[arg(long, alias = "fingerprints", value_name = "fingerprint")]
@@ -155,6 +155,10 @@ fn main() -> Result<()> {
             } else {
                 NetworkMode::Local
             };
+            let max_clipboard_size_bytes = args
+                .max_clipboard_size_kb
+                .checked_mul(1024)
+                .context("--max-clipboard-size-kb is too large")?;
             rt.block_on(async {
                 server(
                     config_dir,
@@ -166,21 +170,22 @@ fn main() -> Result<()> {
                     args.exit_secs,
                     verifier,
                     fingerprint,
-                    args.max_clipboard_size_kb * 1024,
+                    max_clipboard_size_bytes,
                     mode,
                 )
                 .await
             })?;
         }
         Commands::Client(args) => {
+            let port = args.port.unwrap_or(1213);
             let connect_addr: SocketAddr = match &args.host {
                 Some(host) => {
                     if let Ok(host_ip) = host.parse::<IpAddr>() {
                         // It's an IP.
-                        SocketAddr::new(host_ip, args.port)
+                        SocketAddr::new(host_ip, port)
                     } else {
                         // Its a hostname? Try resolving it.
-                        let mut socket_addrs = format!("{}:{}", host, args.port)
+                        let mut socket_addrs = format!("{}:{}", host, port)
                             .to_socket_addrs()
                             .map_err(|e| anyhow!("Failed to resolve --host={}: {:?}", host, e))?;
                         if let Some(first) = socket_addrs.next() {
@@ -191,6 +196,9 @@ fn main() -> Result<()> {
                     }
                 }
                 None => {
+                    if args.port.is_some() {
+                        warn!("--port is ignored when the server is auto-discovered via mDNS");
+                    }
                     // Discover the server on the local network via mDNS.
                     info!("No server host provided, discovering via mDNS...");
                     rt.block_on(async { discovery::discover_server(None).await })?
@@ -207,12 +215,16 @@ fn main() -> Result<()> {
             } else {
                 NetworkMode::Local
             };
+            let max_clipboard_size_bytes = args
+                .max_clipboard_size_kb
+                .checked_mul(1024)
+                .context("--max-clipboard-size-kb is too large")?;
             rt.block_on(async {
                 client(
                     config_dir,
                     connect_addr,
                     verifier,
-                    args.max_clipboard_size_kb * 1024,
+                    max_clipboard_size_bytes,
                     mode,
                 )
                 .await

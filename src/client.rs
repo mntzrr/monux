@@ -61,7 +61,10 @@ impl Connection {
         max_clipboard_size_bytes: u64,
         mode: transport::NetworkMode,
     ) -> Result<(Self, Instant)> {
-        let bind_addr: SocketAddr = "0.0.0.0:0".parse().expect("Failed to parse 0.0.0.0:0");
+        let bind_addr: SocketAddr = match server_addr {
+            SocketAddr::V4(_) => "0.0.0.0:0".parse().expect("Failed to parse 0.0.0.0:0"),
+            SocketAddr::V6(_) => "[::]:0".parse().expect("Failed to parse [::]:0"),
+        };
         let client_endpoint = transport::build_client(&bind_addr, cert_verifier, mode)?;
         // Connect to server, our custom cert verifiers result in server_name being ignored
         let conn = client_endpoint

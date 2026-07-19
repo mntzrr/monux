@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use quinn::SendStream;
 use serde::Serialize;
 use tokio::sync::{oneshot, watch};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::clipboard::{data, server};
 use crate::device;
@@ -134,7 +134,6 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// This allows situations like a client reconnecting before the old socket has closed.
     current_client: Option<SocketAddr>,
     removed_current_client: Option<DefunctClientInfo>,
-    buf: Vec<u8>,
 
     /// Tracking the current clipboard owner, whether it's at the server or a client.
     clipboard_target: Option<ClipboardTarget>,
@@ -150,15 +149,12 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         output_handler: O,
         local_clipboard: Option<server::LocalClipboard>,
     ) -> Result<Self> {
-        // Init required for space to be usable
-        let buf = vec![0; 1024];
         Ok(Rotation {
             grab_tx,
             output_handler,
             clients: Vec::new(),
             current_client: None,
             removed_current_client: None,
-            buf,
             clipboard_target: None,
             local_clipboard,
             waiting_clipboard_tx: None,
@@ -722,13 +718,12 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         F: Fn(&ClientInfo) -> bool,
     {
         let mut clients_to_remove = vec![];
+        let mut last_err = None;
         for client in self.clients.iter_mut() {
             if test_fn(client) {
-                if let Err(e) =
-                    send_message_to_client(&mut client.events_send, &msg, &mut self.buf).await
-                {
+                if let Err(e) = send_message_to_client(&mut client.events_send, &msg).await {
                     clients_to_remove.push(client.endpoint);
-                    return Err(e);
+                    last_err = Some(e);
                 }
             }
         }
@@ -740,7 +735,11 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 should_clear_clipboard = true;
             }
         }
-        Ok(should_clear_clipboard)
+        if let Some(e) = last_err {
+            Err(e)
+        } else {
+            Ok(should_clear_clipboard)
+        }
     }
 
     /// Sends an event to the currently active client, removing it if sending fails.
@@ -789,6 +788,15 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         endpoint: &SocketAddr,
         msg: event::ServerEvent<'_>,
     ) -> Result<bool> {
+        // Serialize up front: a serialization failure is a problem with the message,
+        // not with the client's connection, so it shouldn't kick the client out.
+        let serializedmsg = match postcard::to_stdvec_cobs(&msg) {
+            Ok(m) => m,
+            Err(e) => {
+                error!("Failed to serialize event message: {:?}", e);
+                return Err(anyhow!("Failed to serialize event message: {:?}", e));
+            }
+        };
         match self.clients.binary_search_by(|c| c.endpoint.cmp(endpoint)) {
             Ok(idx) => {
                 let events_send = &mut self
@@ -796,7 +804,16 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                     .get_mut(idx)
                     .expect("missing current_client")
                     .events_send;
-                if let Err(e) = send_message_to_client(events_send, &msg, &mut self.buf).await {
+                trace!(
+                    "Sending {} byte serialized message: {:X?}",
+                    serializedmsg.len(),
+                    &serializedmsg
+                );
+                if let Err(e) = events_send
+                    .write_all(&serializedmsg)
+                    .await
+                    .context("Failed to send serialized message")
+                {
                     if self.handle_client_removal(endpoint).await {
                         self.clipboard_clear().await;
                     }
@@ -829,7 +846,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                     .expect("missing current_client")
                     .bulk_send;
                 // Try sending the message, then the payload. Stop on the first failure, to handle below.
-                if let Err(e) = send_message_to_client(bulk_send, &msg, &mut self.buf).await {
+                if let Err(e) = send_message_to_client(bulk_send, &msg).await {
                     if self.handle_client_removal(endpoint).await {
                         self.clipboard_clear().await;
                     }
@@ -971,29 +988,19 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     }
 }
 
-async fn send_message_to_client<T>(
-    send: &mut quinn::SendStream,
-    msg: &T,
-    buf: &mut Vec<u8>,
-) -> Result<()>
+async fn send_message_to_client<T>(send: &mut quinn::SendStream, msg: &T) -> Result<()>
 where
     T: Serialize + ?Sized,
 {
     // Serialize message data: postcard with cobs encoding for event framing
-    let buf_len = buf.len();
-    let serializedmsg = postcard::to_slice_cobs(&msg, buf).map_err(|e| {
-        anyhow!(
-            "Failed to serialize message into buf.len={}: {:?}",
-            buf_len,
-            e
-        )
-    })?;
+    let serializedmsg = postcard::to_stdvec_cobs(&msg)
+        .map_err(|e| anyhow!("Failed to serialize message: {:?}", e))?;
     trace!(
         "Sending {} byte serialized message: {:X?}",
         serializedmsg.len(),
         &serializedmsg
     );
-    send.write_all(serializedmsg)
+    send.write_all(&serializedmsg)
         .await
         .context("Failed to send serialized message")
 }
