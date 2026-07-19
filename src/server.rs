@@ -75,8 +75,9 @@ pub async fn run_server_connections_loop(
     fingerprint: Arc<Mutex<Option<String>>>,
     max_clipboard_size_bytes: u64,
     rotation_tx: mpsc::Sender<rotation::RotationEvent>,
+    mode: transport::NetworkMode,
 ) -> Result<()> {
-    let server_endpoint = transport::build_server(listen_addr, cert_verifier)
+    let server_endpoint = transport::build_server(listen_addr, cert_verifier, mode)
         .context("Failed to set up server endpoint")?;
     // Task launcher for new client connections
     loop {

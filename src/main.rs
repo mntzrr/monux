@@ -13,7 +13,7 @@ use tokio::{runtime, task, time};
 use tracing::{error, info, warn};
 
 use nikau::device::{handles, input, output, shortcut, watch, Event};
-use nikau::network::approval;
+use nikau::network::{approval, transport::NetworkMode};
 use nikau::{client, clipboard, logging, rotation, server};
 
 #[derive(Parser)]
@@ -77,6 +77,11 @@ struct ServerArgs {
     /// Maximum size in KB for transferring clipboard data (default: 5MB)
     #[arg(long, default_value_t = 5120, value_name = "kb")]
     max_clipboard_size_kb: u64,
+
+    /// Use conservative tuning suitable for traversing the public internet (WWW).
+    /// The default is low-latency tuning for local networks.
+    #[arg(long)]
+    www: bool,
 }
 
 #[derive(Args)]
@@ -95,6 +100,11 @@ struct ClientArgs {
     /// Maximum size in KB for transferring clipboard data (default: 5MB)
     #[arg(long, default_value_t = 5120, value_name = "kb")]
     max_clipboard_size_kb: u64,
+
+    /// Use conservative tuning suitable for traversing the public internet (WWW).
+    /// The default is low-latency tuning for local networks.
+    #[arg(long)]
+    www: bool,
 }
 
 /// Listens for SIGUSR1 and SIGUSR2, treating them as "switch to next client" and "switch to prev client" respectively.
@@ -140,6 +150,11 @@ fn main() -> Result<()> {
                 &config_dir,
                 fingerprint.clone(),
             )?;
+            let mode = if args.www {
+                NetworkMode::Www
+            } else {
+                NetworkMode::Local
+            };
             rt.block_on(async {
                 server(
                     config_dir,
@@ -152,6 +167,7 @@ fn main() -> Result<()> {
                     verifier,
                     fingerprint,
                     args.max_clipboard_size_kb * 1024,
+                    mode,
                 )
                 .await
             })?;
@@ -177,12 +193,18 @@ fn main() -> Result<()> {
                 &config_dir,
                 Arc::new(Mutex::new(None)),
             )?;
+            let mode = if args.www {
+                NetworkMode::Www
+            } else {
+                NetworkMode::Local
+            };
             rt.block_on(async {
                 client(
                     config_dir,
                     connect_addr,
                     verifier,
                     args.max_clipboard_size_kb * 1024,
+                    mode,
                 )
                 .await
             })?;
@@ -211,6 +233,7 @@ async fn server(
     verifier: Arc<approval::NikauCertVerification<'static>>,
     fingerprint: Arc<Mutex<Option<String>>>,
     max_clipboard_size_bytes: u64,
+    mode: NetworkMode,
 ) -> Result<()> {
     // Try to set up virtual devices up-front - exit early if we aren't root
     let output_handler = output::uinput::VirtualUInputDevices::new()
@@ -266,6 +289,7 @@ async fn server(
             fingerprint,
             max_clipboard_size_bytes,
             rotation_tx2,
+            mode,
         )
         .await
     });
@@ -308,6 +332,7 @@ async fn client(
     connect_addr: SocketAddr,
     verifier: Arc<approval::NikauCertVerification<'static>>,
     max_clipboard_size_bytes: u64,
+    mode: NetworkMode,
 ) -> Result<()> {
     // Try to set up virtual devices up-front - exit early if we aren't root
     let mut output_handler = output::uinput::VirtualUInputDevices::new()
@@ -328,6 +353,7 @@ async fn client(
             max_clipboard_size_bytes,
             &mut local_clipboard,
             &mut output_handler,
+            mode,
         )
         .await
         {

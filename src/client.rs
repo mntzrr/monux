@@ -20,9 +20,10 @@ pub async fn run<O: output::OutputHandler>(
     max_clipboard_size_bytes: u64,
     local_clipboard: &mut Option<client::LocalClipboard>,
     output_handler: &mut O,
+    mode: transport::NetworkMode,
 ) -> Result<()> {
     let (mut client, connect_time) =
-        Connection::new(server_addr, cert_verifier, max_clipboard_size_bytes).await?;
+        Connection::new(server_addr, cert_verifier, max_clipboard_size_bytes, mode).await?;
     loop {
         client
             .step(local_clipboard, output_handler, &connect_time)
@@ -58,9 +59,10 @@ impl Connection {
         server_addr: &SocketAddr,
         cert_verifier: Arc<approval::NikauCertVerification<'static>>,
         max_clipboard_size_bytes: u64,
+        mode: transport::NetworkMode,
     ) -> Result<(Self, Instant)> {
         let bind_addr: SocketAddr = "0.0.0.0:0".parse().expect("Failed to parse 0.0.0.0:0");
-        let client_endpoint = transport::build_client(&bind_addr, cert_verifier)?;
+        let client_endpoint = transport::build_client(&bind_addr, cert_verifier, mode)?;
         // Connect to server, our custom cert verifiers result in server_name being ignored
         let conn = client_endpoint
             .connect(*server_addr, "__ignored__")?

@@ -31,17 +31,27 @@ const SOCKET_PRIORITY: libc::c_int = 6;
 /// DSCP EF (Expedited Forwarding) TOS value, for low-latency forwarding.
 const SOCKET_TOS: libc::c_int = 0xb8;
 
+/// Network profile for the QUIC transport.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum NetworkMode {
+    /// Low-latency tuning for local networks (LAN, direct WiFi, wired links).
+    Local,
+    /// Conservative tuning for traversing the public internet (WWW/WAN).
+    Www,
+}
+
 pub fn build_client(
     bind_addr: &SocketAddr,
     cert_verifier: Arc<approval::NikauCertVerification<'static>>,
+    mode: NetworkMode,
 ) -> Result<quinn::Endpoint> {
-    let socket = create_socket(*bind_addr, false)
+    let socket = create_socket(*bind_addr, false, mode)
         .context("Failed to create client UDP socket")?;
     let runtime = quinn::default_runtime()
         .ok_or_else(|| anyhow::anyhow!("no async runtime found"))?;
 
     let mut client_config = ClientConfig::new(approval::rustls_client_config(cert_verifier)?);
-    client_config.transport_config(transport_config());
+    client_config.transport_config(transport_config(mode));
 
     let mut client_endpoint =
         Endpoint::new(EndpointConfig::default(), None, socket, runtime).with_context(|| {
@@ -54,15 +64,16 @@ pub fn build_client(
 pub fn build_server(
     listen_addr: &SocketAddr,
     cert_verifier: Arc<approval::NikauCertVerification<'static>>,
+    mode: NetworkMode,
 ) -> Result<quinn::Endpoint> {
-    let socket = create_socket(*listen_addr, true)
+    let socket = create_socket(*listen_addr, true, mode)
         .context("Failed to create server UDP socket")?;
     let runtime = quinn::default_runtime()
         .ok_or_else(|| anyhow::anyhow!("no async runtime found"))?;
 
     let mut server_config =
         ServerConfig::with_crypto(approval::rustls_server_config(cert_verifier)?);
-    server_config.transport_config(transport_config());
+    server_config.transport_config(transport_config(mode));
 
     Endpoint::new(
         EndpointConfig::default(),
@@ -73,7 +84,11 @@ pub fn build_server(
     .with_context(|| format!("Failed to listen on {}", listen_addr))
 }
 
-fn create_socket(bind_addr: SocketAddr, is_server: bool) -> Result<std::net::UdpSocket> {
+fn create_socket(
+    bind_addr: SocketAddr,
+    is_server: bool,
+    mode: NetworkMode,
+) -> Result<std::net::UdpSocket> {
     let domain = if bind_addr.is_ipv6() {
         libc::AF_INET6
     } else {
@@ -108,19 +123,21 @@ fn create_socket(bind_addr: SocketAddr, is_server: bool) -> Result<std::net::Udp
 
         #[cfg(target_os = "linux")]
         {
-            setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_PRIORITY,
-                &SOCKET_PRIORITY,
-            )?;
+            if mode == NetworkMode::Local {
+                setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_PRIORITY,
+                    &SOCKET_PRIORITY,
+                )?;
 
-            let (level, opt) = if bind_addr.is_ipv6() {
-                (libc::IPPROTO_IPV6, libc::IPV6_TCLASS)
-            } else {
-                (libc::IPPROTO_IP, libc::IP_TOS)
-            };
-            setsockopt(fd, level, opt, &SOCKET_TOS)?;
+                let (level, opt) = if bind_addr.is_ipv6() {
+                    (libc::IPPROTO_IPV6, libc::IPV6_TCLASS)
+                } else {
+                    (libc::IPPROTO_IP, libc::IP_TOS)
+                };
+                setsockopt(fd, level, opt, &SOCKET_TOS)?;
+            }
         }
         Ok(())
     };
@@ -203,27 +220,39 @@ fn setsockopt<T>(
     Ok(())
 }
 
-fn transport_config() -> Arc<TransportConfig> {
+fn transport_config(mode: NetworkMode) -> Arc<TransportConfig> {
     let mut transport_config = TransportConfig::default();
 
-    // Ask the peer to acknowledge every ack-eliciting packet with minimal delay.
-    // This is a small increase in ACK traffic but significantly speeds up loss
-    // detection on low-RTT local networks.
-    let mut ack_config = AckFrequencyConfig::default();
-    ack_config.ack_eliciting_threshold(VarInt::from_u32(0));
-    ack_config.max_ack_delay(Some(Duration::from_micros(100)));
-    ack_config.reordering_threshold(VarInt::from_u32(0));
+    match mode {
+        NetworkMode::Local => {
+            // Ask the peer to acknowledge every ack-eliciting packet with minimal delay.
+            // This is a small increase in ACK traffic but significantly speeds up loss
+            // detection on low-RTT local networks.
+            let mut ack_config = AckFrequencyConfig::default();
+            ack_config.ack_eliciting_threshold(VarInt::from_u32(0));
+            ack_config.max_ack_delay(Some(Duration::from_micros(100)));
+            ack_config.reordering_threshold(VarInt::from_u32(0));
 
-    transport_config
-        //.max_concurrent_bidi_streams(2_u8.into()) // events + bulk
-        .max_concurrent_uni_streams(0_u8.into()) // we only use bidirectional streams
-        .keep_alive_interval(Some(Duration::from_millis(KEEPALIVE_MILLIS)))
-        .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(TIMEOUT_MILLIS))))
-        // Local-network tuning: assume ~1 ms RTT rather than the default 333 ms.
-        .initial_rtt(Duration::from_millis(1))
-        // BBR reacts faster and keeps smaller queues than Cubic on low-loss local links.
-        .congestion_controller_factory(Arc::new(BbrConfig::default()))
-        .ack_frequency_config(Some(ack_config));
+            transport_config
+                //.max_concurrent_bidi_streams(2_u8.into()) // events + bulk
+                .max_concurrent_uni_streams(0_u8.into()) // we only use bidirectional streams
+                .keep_alive_interval(Some(Duration::from_millis(KEEPALIVE_MILLIS)))
+                .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(TIMEOUT_MILLIS))))
+                // Local-network tuning: assume ~1 ms RTT rather than the default 333 ms.
+                .initial_rtt(Duration::from_millis(1))
+                // BBR reacts faster and keeps smaller queues than Cubic on low-loss local links.
+                .congestion_controller_factory(Arc::new(BbrConfig::default()))
+                .ack_frequency_config(Some(ack_config));
+        }
+        NetworkMode::Www => {
+            transport_config
+                //.max_concurrent_bidi_streams(2_u8.into()) // events + bulk
+                .max_concurrent_uni_streams(0_u8.into()) // we only use bidirectional streams
+                .keep_alive_interval(Some(Duration::from_millis(KEEPALIVE_MILLIS)))
+                .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(TIMEOUT_MILLIS))));
+        }
+    }
+
     Arc::new(transport_config)
 }
 
