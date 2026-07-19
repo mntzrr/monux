@@ -60,7 +60,13 @@ pub async fn process_event(
                 if reply.type_ == atoms.incr {
                     if let Some(mut value) = reply.value32() {
                         if let Some(size) = value.next() {
-                            buf.reserve(size as usize);
+                            // Clamp the advertised size so a bogus huge hint can't cause a huge
+                            // pre-allocation (max_size_bytes == 0 means no limit).
+                            buf.reserve(if max_size_bytes > 0 {
+                                (size as usize).min(max_size_bytes as usize)
+                            } else {
+                                size as usize
+                            });
                         }
                     }
                     context
@@ -71,6 +77,18 @@ pub async fn process_event(
                         .await?;
                     is_incr = true;
                     continue;
+                }
+
+                if max_size_bytes > 0 && (buf.len() + reply.value.len()) > max_size_bytes as usize {
+                    // Same handling as the INCR branch below: send back a zero-byte clipboard
+                    // so that the receiving client (and its WM) can stop waiting.
+                    warn!(
+                        "Sending empty clipboard data: size read so far ({}) exceeds max={}",
+                        buf.len() + reply.value.len(),
+                        max_size_bytes
+                    );
+                    buf.clear();
+                    break;
                 }
 
                 buf.extend_from_slice(&reply.value);

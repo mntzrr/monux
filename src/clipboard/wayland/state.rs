@@ -174,7 +174,11 @@ impl_dispatch_device!(State, wl_seat::WlSeat, |state: &mut Self, event, seat: &w
                     // This is our own advertisement, not from another application
                     debug!("ignoring wayland regular clipboard offer with mime types: {:?}", mime_types);
                     // Ensure any prior offer is cleaned up
-                    let _ = seat_data.regular_offer.take();
+                    if let Some(old_offer_data) = seat_data.regular_offer.take() {
+                        old_offer_data.offer.destroy();
+                    }
+                    // This offer is being ignored, destroy it too
+                    offer.destroy();
                 } else {
                     debug!("storing wayland regular clipboard offer with mime types: {:?}", mime_types);
                     if let Some(tx) = &state.regular_types_tx {
@@ -217,7 +221,11 @@ impl_dispatch_device!(State, wl_seat::WlSeat, |state: &mut Self, event, seat: &w
                     // This is our own advertisement, not from another application
                     debug!("ignoring wayland primary clipboard offer with mime types: {:?}", mime_types);
                     // Ensure any prior offer is cleaned up
-                    let _ = seat_data.primary_offer.take();
+                    if let Some(old_offer_data) = seat_data.primary_offer.take() {
+                        old_offer_data.offer.destroy();
+                    }
+                    // This offer is being ignored, destroy it too
+                    offer.destroy();
                 } else {
                     debug!("storing wayland primary clipboard offer with mime types: {:?}", mime_types);
                     if let Some(tx) = &state.primary_types_tx {

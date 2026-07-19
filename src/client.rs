@@ -400,9 +400,17 @@ impl Connection {
                         }
                     };
                     // Read the clipboard data from the local application.
-                    let (local_clipboard_data, data_type) = local_clipboard
+                    // On read failure, reply with an empty header so that the requester just sets nothing.
+                    let (local_clipboard_data, data_type) = match local_clipboard
                         .read(c.requested_type, c.max_size_bytes, c.request_client)
-                        .await?;
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(e) => {
+                            warn!("Failed to read local clipboard of type {}: {:?}", c.requested_type, e);
+                            (Vec::new(), None)
+                        }
+                    };
                     let msg = bulk::ClientBulk::ClipboardHeader(bulk::ClientClipboardHeader {
                         requested_type: c.requested_type,
                         data_type: data_type.as_ref().map(|t| t.as_str()),
@@ -416,15 +424,17 @@ impl Connection {
                         .write_all(&serializedmsg)
                         .await
                         .context("Failed to send clipboard content header")?;
-                    self.bulk_send
-                        .write_all(&local_clipboard_data)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "Failed to send {} byte clipboard content",
-                                local_clipboard_data.len()
-                            )
-                        })?;
+                    if !local_clipboard_data.is_empty() {
+                        self.bulk_send
+                            .write_all(&local_clipboard_data)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Failed to send {} byte clipboard content",
+                                    local_clipboard_data.len()
+                                )
+                            })?;
+                    }
                 }
                 bulk::ServerBulk::ClipboardHeader(c) => {
                     if c.content_len_bytes > self.max_clipboard_size_bytes {

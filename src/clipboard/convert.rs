@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::task;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use crate::clipboard::limited;
 
@@ -102,7 +102,7 @@ pub async fn write(
             write_uri_file_paths(paths)
         }
         (requested_type, data_type) => {
-            error!("Clipboard data conversion from data_type={} to requested_type={} isn't supported, writing empty clipboard", data_type, requested_type);
+            warn!("Clipboard data conversion from data_type={} to requested_type={} isn't supported, writing empty clipboard", data_type, requested_type);
             Ok(vec![])
         }
     }
@@ -196,30 +196,54 @@ fn write_zstd(
     Ok(buf)
 }
 
+/// Cap on the number of file entries in a clipboard zip payload.
+const MAX_ZIP_ENTRIES: usize = 10_000;
+
+/// Counter for giving each unpack its own unique temp directory.
+static UNPACK_DIR_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Unzips a zip file to a temporary directory under config_dir and returns the list of files.
 fn unpack_zip_payload(
     zipdata: Vec<u8>,
     mut max_uncompressed_size_bytes: u64,
     config_dir: &PathBuf,
 ) -> Result<Vec<PathBuf>> {
-    let clipboard_dir = config_dir.join("clipboard");
-    // Wipe temp directory to get a clean slate
-    if clipboard_dir.exists() {
-        debug!("Clearing temp directory: {}", clipboard_dir.display());
-        if clipboard_dir.is_dir() {
-            std::fs::remove_dir_all(&clipboard_dir)?;
-        } else {
-            bail!(
-                "Temp directory exists, but isn't a directory: {}",
-                clipboard_dir.display()
-            );
-        }
-    }
+    // Use a unique temp directory per unpack rather than wiping a shared one:
+    // two unpacks may run at the same time.
+    let dir_id = UNPACK_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let clipboard_dir = config_dir.join(format!(
+        "clipboard-{}-{}",
+        std::process::id(),
+        dir_id
+    ));
     debug!("Creating temp directory: {}", clipboard_dir.display());
     std::fs::create_dir_all(&clipboard_dir)?;
 
+    // Remove older temp dirs from this process, keeping the current and previous
+    // generation (a paste may still be referencing files from the previous one).
+    let dir_prefix = format!("clipboard-{}-", std::process::id());
+    if let Ok(entries) = std::fs::read_dir(config_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(id_str) = name.strip_prefix(&dir_prefix) else { continue };
+            let Ok(id) = id_str.parse::<usize>() else { continue };
+            if id + 1 < dir_id {
+                debug!("Removing stale temp directory: {}", entry.path().display());
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+
     // Unzip payload into temp directory
     let mut ziparchive = zip::read::ZipArchive::new(std::io::Cursor::new(zipdata))?;
+    if ziparchive.len() > MAX_ZIP_ENTRIES {
+        bail!(
+            "Zip payload has {} entries, exceeding limit of {}",
+            ziparchive.len(),
+            MAX_ZIP_ENTRIES
+        );
+    }
     let mut files = vec![];
     for i in 0..ziparchive.len() {
         let mut zipfile = ziparchive.by_index(i)?;
@@ -238,12 +262,8 @@ fn unpack_zip_payload(
                 format!("Failed to create temp directory: {}", parent.display())
             })?;
         }
-        let outfile = File::create(&destpath).with_context(|| {
-            format!(
-                "Failed to open keypair file for writing: {}",
-                destpath.display()
-            )
-        })?;
+        let outfile = File::create(&destpath)
+            .with_context(|| format!("Failed to create temp file: {}", destpath.display()))?;
         let mut limited_outfile = limited::LimitedWrite::new(outfile, max_uncompressed_size_bytes);
         std::io::copy(&mut zipfile, &mut limited_outfile)
             .with_context(|| format!("Failed to unzip file: {}", destpath.display()))?;
@@ -258,6 +278,9 @@ fn build_zip_payload(file_uri_strs: Vec<&str>, max_compressed_size_bytes: u64) -
     // Start by collecting all of the filenames, including any needed recursive scanning.
     let mut files_to_zip = vec![];
     for uri_str in file_uri_strs {
+        if files_to_zip.len() >= MAX_ZIP_ENTRIES {
+            bail!("Too many files in clipboard: exceeding limit of {}", MAX_ZIP_ENTRIES);
+        }
         let uri = url::Url::parse(&uri_str)?;
         let path = uri
             .to_file_path()
@@ -265,9 +288,19 @@ fn build_zip_payload(file_uri_strs: Vec<&str>, max_compressed_size_bytes: u64) -
         if path.is_dir() {
             // Recursively scan the directory, omitting the directory path itself
             for entry in walkdir::WalkDir::new(path).min_depth(1).into_iter() {
-                let entry = entry?;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        // Skip entries that vanished or can't be read mid-walk
+                        warn!("Skipping unreadable directory entry: {}", e);
+                        continue;
+                    }
+                };
                 if entry.path().is_file() {
                     files_to_zip.push(entry.into_path());
+                    if files_to_zip.len() >= MAX_ZIP_ENTRIES {
+                        bail!("Too many files in clipboard: exceeding limit of {}", MAX_ZIP_ENTRIES);
+                    }
                 }
             }
         } else if path.is_file() {
@@ -299,8 +332,23 @@ fn zip_files(
             zip::write::FileOptions::<()>::default().compression_method(zip::CompressionMethod::ZSTD);
         let mut buf = vec![0; 65536];
         for file_to_zip in files_to_zip {
-            zipwriter.start_file(file_to_zip.canonicalize()?.to_string_lossy(), options)?;
-            let mut file = std::fs::File::open(file_to_zip)?;
+            let file_name = match file_to_zip.canonicalize() {
+                Ok(path) => path.to_string_lossy().to_string(),
+                Err(e) => {
+                    // File vanished between listing and zipping: skip it instead of aborting
+                    warn!("Skipping file that can't be read for zipping: {:?}: {}", file_to_zip, e);
+                    continue;
+                }
+            };
+            let mut file = match std::fs::File::open(file_to_zip) {
+                Ok(file) => file,
+                Err(e) => {
+                    // File vanished between listing and zipping: skip it instead of aborting
+                    warn!("Skipping file that can't be read for zipping: {:?}: {}", file_to_zip, e);
+                    continue;
+                }
+            };
+            zipwriter.start_file(file_name, options)?;
             loop {
                 match file.read(&mut buf)? {
                     0 => {

@@ -1,12 +1,14 @@
+use std::time::Duration;
+
 use anyhow::{anyhow, bail, Context, Result};
-use tokio::{sync::watch, task};
+use tokio::{sync::watch, task, time};
 use tracing::{debug, warn};
 use x11rb_async::connection::Connection;
 use x11rb_async::protocol::xproto::{Atom, ConnectionExt};
 use x11rb_async::protocol::xfixes;
 use x11rb_async::x11_utils::TryParse;
 
-use crate::clipboard::x11::{events, shared};
+use crate::clipboard::{CLIPBOARD_TIMEOUT_SECS, x11::{events, shared}};
 
 /// Task that listens for updates to the clipboard types (local cut or copy).
 /// Sends out an event when an update occurs, indicating a new clipboard is available.
@@ -48,6 +50,8 @@ impl ClipboardTypeWatcher {
                     Err(e) => {
                         warn!("Failed to wait for new clipboard types: {}", e);
                         // This can happen if the context is lost (e.g. WM crash?). Try to create a new context.
+                        // Wait a bit first so that a persistent failure doesn't hot-loop.
+                        time::sleep(Duration::from_secs(CLIPBOARD_TIMEOUT_SECS)).await;
                         match new_watcher().await {
                             Ok(w) => {
                                 watcher = w;
@@ -102,15 +106,27 @@ impl ClipboardTypeWatcher {
         .await?;
 
         let mut buf = Vec::new();
-        events::process_event(
-            &self.context,
-            &self.atoms,
-            &mut buf,
-            0,
-            target,
-            self.atoms.recv_clipboard,
+        // Mirror the clipboard reader: don't let a stuck X11 exchange block forever.
+        match time::timeout(
+            Duration::from_secs(CLIPBOARD_TIMEOUT_SECS),
+            events::process_event(
+                &self.context,
+                &self.atoms,
+                &mut buf,
+                0,
+                target,
+                self.atoms.recv_clipboard,
+            ),
         )
-        .await?;
+        .await
+        {
+            Ok(result) => result?,
+            Err(_e) => {
+                warn!("X11 clipboard type watch read timed out after {}s", CLIPBOARD_TIMEOUT_SECS);
+                // Discard any partially-read data so we don't advertise a bogus type list.
+                buf.clear();
+            }
+        }
 
         self.context
             .conn

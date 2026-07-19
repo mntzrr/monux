@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 use std::os::fd::AsFd;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use os_pipe::{pipe, PipeReader};
-use tracing::{debug, trace};
+use tokio::{task, time};
+use tracing::{debug, trace, warn};
 use wayland_client::globals::registry_queue_init;
 use wayland_client::{Connection, EventQueue};
 
-use crate::clipboard::{ClipboardReader as ClipboardReaderTrait, limited};
+use crate::clipboard::{CLIPBOARD_TIMEOUT_SECS, ClipboardReader as ClipboardReaderTrait, limited};
 use crate::clipboard::wayland::{common, state};
 
 #[derive(Debug)]
@@ -100,9 +102,25 @@ impl ClipboardReaderTrait for ClipboardReader {
             bail!("No clipboard available");
         };
 
-        let mut limited = limited::LimitedCursor::new(max_size_bytes);
-        std::io::copy(&mut pipe_reader, &mut limited)?;
-        let buf = limited.into_inner();
+        // Read on a worker thread with a timeout: a hung local app could otherwise
+        // block the pipe read forever, freezing the whole event loop.
+        let buf = match time::timeout(
+            Duration::from_secs(CLIPBOARD_TIMEOUT_SECS),
+            task::spawn_blocking(move || -> Result<Vec<u8>> {
+                let mut limited = limited::LimitedCursor::new(max_size_bytes);
+                std::io::copy(&mut pipe_reader, &mut limited)?;
+                Ok(limited.into_inner())
+            }),
+        )
+        .await
+        {
+            Ok(Ok(read_result)) => read_result?,
+            Ok(Err(e)) => bail!("Wayland clipboard read worker failed: {:?}", e),
+            Err(_e) => {
+                warn!("Wayland clipboard read timed out after {}s", CLIPBOARD_TIMEOUT_SECS);
+                Vec::new()
+            }
+        };
         debug!(
             "Read {} for {}: {} bytes",
             requested_type,

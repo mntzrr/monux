@@ -110,8 +110,14 @@ async fn serve(
                 }
 
                 // Advertise the new clipboard (or lack thereof) to X11
+                let owner = if state.clipboard_info.is_some() {
+                    context.window
+                } else {
+                    // Clipboard was cleared: release ownership rather than holding it with nothing to serve.
+                    Window::from(AtomEnum::NONE)
+                };
                 context.conn.set_selection_owner(
-                    context.window,
+                    owner,
                     state.atoms.clipboard,
                     Time::CURRENT_TIME
                 ).await?.check().await?;
@@ -223,11 +229,11 @@ impl ClipboardServerState {
                                 PropMode::REPLACE,
                                 event.requestor,
                                 event.property,
-                                Atom::from(AtomEnum::ATOM),
-                                8,
+                                Atom::from(AtomEnum::INTEGER),
+                                32,
                                 1,
                                 // CURRENT_TIME
-                                &[0 as u8],
+                                &0u32.to_ne_bytes(),
                             )
                             .await?;
                     } else {
@@ -275,13 +281,18 @@ impl ClipboardServerState {
                             // Data is missing due to retryable failure, send empty bytes
                             &vec![]
                         };
-                        send_clipboard_data(
+                        if let Err(e) = send_clipboard_data(
                             bytes,
                             &context,
                             &event,
                             self.max_chunk_size_bytes,
                             self.atoms.incr,
-                        ).await?;
+                        ).await {
+                            // Sending failed: drop any stale transfer state for this request.
+                            self.selection_to_property.remove(&event.selection);
+                            self.property_to_state.remove(&event.property);
+                            return Err(e);
+                        }
                         self.selection_to_property
                             .insert(event.selection, event.property);
                         self.property_to_state.insert(
@@ -296,6 +307,13 @@ impl ClipboardServerState {
                     }
                 }
 
+                // If we have no clipboard to serve (e.g. it was cleared), refuse the
+                // request by reporting a NONE property, rather than claiming success.
+                let property = if self.clipboard_info.is_some() {
+                    event.property
+                } else {
+                    Atom::from(AtomEnum::NONE)
+                };
                 context
                     .conn
                     .send_event(
@@ -309,7 +327,7 @@ impl ClipboardServerState {
                             requestor: event.requestor,
                             selection: event.selection,
                             target: event.target,
-                            property: event.property,
+                            property,
                         },
                     )
                     .await?;
@@ -321,24 +339,36 @@ impl ClipboardServerState {
                 };
 
                 // Requestor has deleted the last chunk of clipboard content, write the next chunk
-                let state = match self.property_to_state.get_mut(&event.atom) {
-                    Some(val) => val,
-                    None => return Ok(()),
-                };
+                if !self.property_to_state.contains_key(&event.atom) {
+                    return Ok(());
+                }
                 let clipboard_bytes = match &self.clipboard_info {
                     Some(clipboard_info) => match &clipboard_info.data {
                         Some(bytes) => bytes,
-                        None => return Ok(()),
+                        // Clipboard data is gone mid-transfer: abort and drop the transfer state
+                        None => {
+                            self.property_to_state.remove(&event.atom);
+                            return Ok(());
+                        }
                     },
-                    None => return Ok(()),
+                    None => {
+                        self.property_to_state.remove(&event.atom);
+                        return Ok(());
+                    }
                 };
+                let state = self
+                    .property_to_state
+                    .get_mut(&event.atom)
+                    .expect("property_to_state entry checked above");
 
-                let mut len = clipboard_bytes.bytes.len() - state.pos;
+                let mut len = clipboard_bytes.bytes.len().saturating_sub(state.pos);
                 // Enforce a max size per chunk
                 if len > self.max_chunk_size_bytes {
                     len = self.max_chunk_size_bytes;
                 }
-                let data = &clipboard_bytes.bytes[state.pos..][..len];
+                // If pos is past the end (stale state, e.g. the clipboard changed mid-copy),
+                // len is 0: an empty final chunk is sent, ending the transfer below.
+                let data = &clipboard_bytes.bytes[state.pos.min(clipboard_bytes.bytes.len())..][..len];
                 context
                     .conn
                     .change_property(

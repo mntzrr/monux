@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Cursor};
+use std::io::{self, Write};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use rustix::fs::{fcntl_setfl, OFlags};
 use tokio::sync::mpsc;
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_seat;
@@ -132,10 +133,40 @@ impl_dispatch_source!(State, |state: &mut Self, source: data_control::Source, ev
                     // Fetch failed in a retryable way, use empty data
                     &vec![]
                 };
-                // Clear O_NONBLOCK, otherwise io::copy() will stop halfway.
-                fcntl_setfl(&fd, OFlags::empty()).map_err(io::Error::from)?;
-                let mut source_content = Cursor::new(bytes);
-                io::copy(&mut source_content, &mut File::from(fd))
+                // Set O_NONBLOCK and write via a poll() loop with a deadline,
+                // so that a stuck paste reader can't hang us forever.
+                fcntl_setfl(&fd, OFlags::NONBLOCK).map_err(io::Error::from)?;
+                let mut file = File::from(fd);
+                let raw_fd = file.as_raw_fd();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut written: usize = 0;
+                while written < bytes.len() {
+                    match file.write(&bytes[written..]) {
+                        Ok(0) => break,
+                        Ok(n) => written += n,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                            if remaining.is_zero() {
+                                warn!(
+                                    "Timed out writing clipboard data to paste request, aborting ({} of {} bytes written)",
+                                    written,
+                                    bytes.len()
+                                );
+                                return Ok(written as u64);
+                            }
+                            let mut pfd = libc::pollfd {
+                                fd: raw_fd,
+                                events: libc::POLLOUT,
+                                revents: 0,
+                            };
+                            if unsafe { libc::poll(&mut pfd, 1, remaining.as_millis() as libc::c_int) } < 0 {
+                                return Err(io::Error::last_os_error());
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(written as u64)
             };
 
             if let Err(err) = copy_result() {
@@ -187,6 +218,27 @@ fn write_clipboard(
     config_dir: PathBuf,
     max_uncompressed_size_bytes: u64,
 ) -> Result<()> {
+    let (mut state, clipboard_manager, mut queue) = init_state()
+        .context("Failed to init wayland session for clipboard write")?;
+
+    if mime_types.is_empty() {
+        // Clearing the clipboard: explicitly release the selection, so compositors
+        // that require an explicit clear don't keep offering the stale clipboard.
+        debug!("Clearing {:?} clipboard in wayland", clipboard_type);
+        for device in state.seats.values() {
+            match clipboard_type {
+                ClipboardType::Regular => device.set_selection(None),
+                ClipboardType::Primary => device.set_primary_selection(None),
+                ClipboardType::Both => {
+                    device.set_selection(None);
+                    device.set_primary_selection(None);
+                }
+            }
+        }
+        queue.roundtrip(&mut state)?;
+        return Ok(());
+    }
+
     // Ensure the clipboard we're advertising includes the ignored type,
     // which ensures we don't treat this clipboard as if it's from another application source on the system.
     let ignored_type = state::IGNORED_MIME_TYPE.to_string();
@@ -194,8 +246,6 @@ fn write_clipboard(
         mime_types.push(ignored_type);
     }
     debug!("Advertising {:?} clipboard to wayland: {:?}", clipboard_type, mime_types);
-    let (mut state, clipboard_manager, mut queue) = init_state()
-        .context("Failed to init wayland session for clipboard write")?;
 
     let mut sources = vec![];
     for device in state.seats.values() {

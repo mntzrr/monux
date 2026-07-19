@@ -62,6 +62,7 @@ pub fn start(
             // Have to explicitly pump the queue, otherwise we don't get anything
             if let Err(e) = queue.blocking_dispatch(&mut state) {
                 error!("Error in wayland clipboard type watcher queue dispatch: {}", e);
+                return;
             }
         }
     });
