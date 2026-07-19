@@ -27,6 +27,12 @@ This fork adds low-latency tuning for local networks and a `--www` mode for use 
 ```bash
 git clone https://github.com/mntzrr/nikau.git
 cd nikau
+./install.sh
+```
+
+Or install directly with cargo:
+
+```bash
 cargo install --path .
 ```
 
