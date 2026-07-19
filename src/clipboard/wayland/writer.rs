@@ -278,12 +278,20 @@ fn write_clipboard(
         clipboard_data: None,
     });
 
-    queue.roundtrip(&mut state)?;
-
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    // All queue dispatch (including the initial roundtrip that publishes the
+    // sources) must happen on this dedicated plain thread: the Send handler uses
+    // block_on, which panics if it ever runs on a tokio worker thread, and a
+    // paste request (e.g. from a clipboard manager) can legally arrive as early
+    // as the first roundtrip.
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
     let _ = std::thread::spawn(move || {
-        if let Err(e) = ready_tx.send(()) {
-            error!("Failed to send ready_tx: {}", e);
+        if let Err(e) = queue.roundtrip(&mut state) {
+            error!("Wayland roundtrip error when serving copy requests: {}", e);
+            let _ = ready_tx.send(Err(e.into()));
+            return;
+        }
+        if ready_tx.send(Ok(())).is_err() {
+            error!("Failed to send ready_tx");
             return;
         }
         loop {
@@ -298,8 +306,11 @@ fn write_clipboard(
         }
         trace!("Exiting clipboard serving thread");
     });
-    // Wait for thread to have started
-    ready_rx.recv()?;
+    // Wait for the thread to have published the clipboard (or failed to)
+    match ready_rx.recv() {
+        Ok(result) => result?,
+        Err(e) => bail!("Clipboard serving thread died before startup: {}", e),
+    }
 
     Ok(())
 }
