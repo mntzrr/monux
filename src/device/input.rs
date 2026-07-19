@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{bail, Result};
 use evdev::{EventStream, EventType, KeyCode};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task;
+use tokio::time;
 use tracing::{debug, info, trace, warn};
 
 use crate::device::handles::{DeviceHandle, DeviceHandler};
@@ -88,8 +90,20 @@ impl DeviceHandler for InputHandler {
             })
         } else {
             // Device is to be permanently grabbed
-            handle_grab_event(&mut stream, &mut device_info, GrabEvent::Grab);
-            task::spawn(async move { read_device_events(&mut stream, config, device_info).await })
+            task::spawn(async move {
+                // Don't read events until the grab succeeds. Without the grab,
+                // events would leak through to the local system while also being
+                // routed onwards by nikau. Another process (e.g. a stale nikau
+                // server) may hold the grab temporarily, so keep retrying.
+                while !handle_grab_event(&mut stream, &mut device_info, GrabEvent::Grab) {
+                    warn!(
+                        "Failed to grab {:?}, retrying in 5s",
+                        stream.device().name().unwrap_or("(Unnamed device)")
+                    );
+                    time::sleep(Duration::from_secs(5)).await;
+                }
+                read_device_events(&mut stream, config, device_info).await
+            })
         };
         Ok(DeviceHandle { handle })
     }
@@ -253,7 +267,7 @@ fn handle_grab_event(
             );
             if let Err(e) = stream.device_mut().grab() {
                 warn!(
-                    "Failed to grab device {:?}, removing device: {}",
+                    "Failed to grab device {:?}: {}",
                     stream.device().name(),
                     e
                 );
