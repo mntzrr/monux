@@ -12,4 +12,8 @@ pub const VIRTUAL_DEVICE_NAME_PREFIX: &str = "nikau virtual";
 #[async_trait]
 pub trait OutputHandler {
     async fn write(&mut self, event: Vec<event::InputEvent>) -> Result<()>;
+
+    /// Releases all keys/buttons currently held on the output devices.
+    /// Used to avoid stuck keys when the input stream ends or moves to another machine.
+    async fn release_all(&mut self) -> Result<()>;
 }

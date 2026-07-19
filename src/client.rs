@@ -9,7 +9,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::clipboard::{client, data};
 use crate::device::output;
-use crate::msgs::{bulk, event};
+use crate::msgs::{bulk, event, shared};
 use crate::network::{approval, transport};
 
 /// Initializes a new client connection and runs its event loop.
@@ -174,7 +174,6 @@ impl Connection {
                     // Copy the immutable response data into a mutable buffer
                     self.event_bytes.extend_from_slice(&resp.bytes);
                     self.handle_event_messages(Some(local_clipboard), output_handler).await?;
-                    self.event_bytes.clear();
                 },
                 bulk_result = self.bulk_recv.read_chunk(65536, true) => {
                     let resp = bulk_result
@@ -206,7 +205,6 @@ impl Connection {
                     // Copy the immutable response data into a mutable buffer
                     self.event_bytes.extend_from_slice(&resp.bytes);
                     self.handle_event_messages(None, output_handler).await?;
-                    self.event_bytes.clear();
                 },
                 bulk_result = self.bulk_recv.read_chunk(65536, true) => {
                     let resp = bulk_result
@@ -232,7 +230,10 @@ impl Connection {
         let mut offset = 0;
         let bytes_len = self.event_bytes.len();
         while offset < self.event_bytes.len() {
-            // Assumption: We shouldn't be getting a ServerMessage that's broken up into separate fragments
+            // A partial frame (no COBS terminator yet) is kept for the next chunk.
+            if !shared::has_complete_cobs_frame(&self.event_bytes[offset..]) {
+                break;
+            }
             let (msg, resp_remainder) = postcard::take_from_bytes_cobs::<event::ServerEvent>(
                 &mut self.event_bytes[offset..],
             )
@@ -251,6 +252,11 @@ impl Connection {
                         if e.enabled { "active" } else { "inactive" }
                     );
                     self.active = e.enabled;
+                    if !e.enabled {
+                        // This client was deactivated: release any held keys so they
+                        // don't stay stuck on the virtual devices.
+                        output_handler.release_all().await?;
+                    }
                     if let Some(local_clipboard) = &mut local_clipboard {
                         if let Some(types) = &local_clipboard.get_local_clipboard_types() {
                             if !e.enabled && !types.is_empty() {
@@ -298,6 +304,8 @@ impl Connection {
             }
             offset += consumed;
         }
+        // Retain any unconsumed partial frame for the next chunk.
+        self.event_bytes.drain(..offset);
         Ok(())
     }
 
@@ -346,7 +354,6 @@ impl Connection {
                 {
                     self.incoming_clipboard_data.replace(updated_clipboard_data);
                 }
-                self.bulk_recv_bytes.clear();
             }
         } else {
             // Not in the middle of a raw clipboard dump. Must be a postcard message.
@@ -356,7 +363,6 @@ impl Connection {
             {
                 self.incoming_clipboard_data.replace(updated_clipboard_data);
             }
-            self.bulk_recv_bytes.clear();
         }
         Ok(())
     }
@@ -368,7 +374,10 @@ impl Connection {
         let mut offset = 0;
         let bytes_len = self.bulk_recv_bytes.len();
         while offset < bytes_len {
-            // Assumption: We shouldn't be getting a BulkMessage that's broken up into separate fragments
+            // A partial frame (no COBS terminator yet) is kept for the next chunk.
+            if !shared::has_complete_cobs_frame(&self.bulk_recv_bytes[offset..]) {
+                break;
+            }
             let (msg, resp_remainder) = postcard::take_from_bytes_cobs::<bulk::ServerBulk>(
                 &mut self.bulk_recv_bytes[offset..],
             )
@@ -449,18 +458,23 @@ impl Connection {
                     } else {
                         // Need to collect more data.
                         // Save what we've got so far, and assign remaining_bytes to what's left.
-                        let mut bytes = Vec::with_capacity(c.content_len_bytes as usize);
-                        bytes.extend_from_slice(resp_remainder);
-                        return Ok(Some(data::ClipboardData {
+                        let mut payload = Vec::with_capacity(c.content_len_bytes as usize);
+                        payload.extend_from_slice(resp_remainder);
+                        let d = data::ClipboardData {
                             requested_type: c.requested_type.to_string(),
                             data_type: c.data_type.map(|t| t.to_string()),
-                            bytes,
+                            bytes: payload,
                             remaining_bytes: c.content_len_bytes as usize - resp_remainder.len(),
-                        }));
+                        };
+                        // All bytes were consumed (into the pending clipboard data).
+                        self.bulk_recv_bytes.clear();
+                        return Ok(Some(d));
                     }
                 }
             }
         }
+        // Retain any unconsumed partial frame for the next chunk.
+        self.bulk_recv_bytes.drain(..offset);
         Ok(None)
     }
 }

@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, watch as watchchan};
 use tokio::{runtime, task, time};
 use tracing::{error, info, warn};
 
+use nikau::device::output::OutputHandler;
 use nikau::device::{handles, input, output, shortcut, watch, Event};
 use nikau::network::{approval, transport::NetworkMode};
 use nikau::{client, clipboard, discovery, logging, rotation, server};
@@ -393,6 +394,11 @@ async fn client(
                 if let Err(e) = lc.clear_remote_clipboard() {
                     warn!("Failed to clear remote clipboard: {}", e);
                 }
+            }
+            // Release any keys still held on the virtual devices so they don't
+            // stay stuck while we're disconnected.
+            if let Err(e) = output_handler.release_all().await {
+                warn!("Failed to release held keys after connection loss: {:?}", e);
             }
             // Wait a bit before retrying. Often happens when waiting for server to approve the cert.
             time::sleep(Duration::from_secs(5)).await

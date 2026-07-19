@@ -81,4 +81,9 @@ impl OutputHandler for GadgetDevices {
         debug!("Got events: {:?}", events);
         Ok(())
     }
+
+    async fn release_all(&mut self) -> Result<()> {
+        // Experimental backend: key press state isn't tracked yet.
+        Ok(())
+    }
 }

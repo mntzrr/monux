@@ -4,6 +4,7 @@ use evdev::{
     uinput, AbsInfo, AbsoluteAxisCode, AttributeSet, EvdevEnum, EventSummary, KeyCode, MiscCode,
     RelativeAxisCode,
 };
+use std::collections::HashSet;
 use tracing::{debug, info, trace, warn};
 
 use crate::device::output::{OutputHandler, VIRTUAL_DEVICE_NAME_PREFIX};
@@ -31,6 +32,9 @@ pub struct VirtualUInputDevices {
     keyboard_device: uinput::VirtualDevice,
     mouse_device: uinput::VirtualDevice,
     touchpad_device: uinput::VirtualDevice,
+
+    /// Currently held keys/buttons, so they can be released on deactivation/disconnect.
+    pressed_keys: HashSet<u16>,
 }
 
 impl VirtualUInputDevices {
@@ -84,6 +88,7 @@ impl VirtualUInputDevices {
             keyboard_device,
             mouse_device,
             touchpad_device,
+            pressed_keys: HashSet::new(),
         };
         info!("Created virtual uinput devices: keyboard, mouse, touchpad");
         Ok(ret)
@@ -160,6 +165,38 @@ enum EventDest {
 
 #[async_trait]
 impl OutputHandler for VirtualUInputDevices {
+    async fn release_all(&mut self) -> Result<()> {
+        if self.pressed_keys.is_empty() {
+            return Ok(());
+        }
+        debug!(
+            "Releasing {} held keys/buttons on virtual devices",
+            self.pressed_keys.len()
+        );
+        let mut releases: Vec<event::InputEvent> = self
+            .pressed_keys
+            .iter()
+            .map(|code| event::InputEvent {
+                inputi32: Some(event::InputI32 {
+                    type_: evdev::EventType::KEY.0,
+                    code: *code,
+                    value: 0,
+                }),
+                inputf64: None,
+            })
+            .collect();
+        releases.push(event::InputEvent {
+            inputi32: Some(event::InputI32 {
+                type_: evdev::EventType::SYNCHRONIZATION.0,
+                code: 0,
+                value: 0,
+            }),
+            inputf64: None,
+        });
+        // write() routes the releases to the right devices and clears the tracking set.
+        self.write(releases).await
+    }
+
     async fn write(&mut self, events: Vec<event::InputEvent>) -> Result<()> {
         let events = events
             .iter()
@@ -186,6 +223,17 @@ impl OutputHandler for VirtualUInputDevices {
             .collect::<Vec<(evdev::InputEvent, EventDest)>>();
         if events.is_empty() {
             return Ok(());
+        }
+
+        // Track held keys/buttons so release_all() can unstick them later.
+        for (e, _dest) in &events {
+            if e.event_type() == evdev::EventType::KEY {
+                if e.value() == 0 {
+                    self.pressed_keys.remove(&e.code());
+                } else {
+                    self.pressed_keys.insert(e.code());
+                }
+            }
         }
 
         // Collect stats on how many events apply to each device

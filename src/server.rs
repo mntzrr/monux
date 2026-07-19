@@ -10,7 +10,7 @@ use tracing::{debug, error, trace, warn};
 use crate::clipboard::data::ClipboardData;
 use crate::clipboard::server::LocalClipboard;
 use crate::device::{output, Event, GrabEvent};
-use crate::msgs::{bulk, event};
+use crate::msgs::{bulk, event, shared};
 use crate::network::{approval, transport};
 use crate::rotation;
 
@@ -184,7 +184,6 @@ async fn handle_connection(
                 // Copy the immutable response data into a mutable buffer
                 event_bytes.extend_from_slice(&resp.bytes);
                 handle_event_messages(conn.remote_address(), &rotation_tx, &mut event_bytes, max_clipboard_size_bytes).await?;
-                event_bytes.clear();
             },
             bulk_result = bulk_recv.read_chunk(65536, true) => {
                 let resp = bulk_result
@@ -215,13 +214,11 @@ async fn handle_connection(
                     if !bulk_bytes.is_empty() {
                         // Handle any data following the clipboard entry.
                         incoming_clipboard_data = handle_bulk_messages(conn.remote_address(), &rotation_tx, &mut bulk_bytes, max_clipboard_size_bytes).await?;
-                        bulk_bytes.clear();
                     }
                 } else {
                     // Copy the immutable response data into a mutable buffer
                     bulk_bytes.extend_from_slice(&resp.bytes);
                     incoming_clipboard_data = handle_bulk_messages(conn.remote_address(), &rotation_tx, &mut bulk_bytes, max_clipboard_size_bytes).await?;
-                    bulk_bytes.clear();
                 }
             },
         }
@@ -237,6 +234,10 @@ async fn handle_event_messages(
     let mut offset = 0;
     let bytes_len = bytes.len();
     while offset < bytes_len {
+        // A partial frame (no COBS terminator yet) is kept for the next chunk.
+        if !shared::has_complete_cobs_frame(&bytes[offset..]) {
+            break;
+        }
         let bytes2 = bytes.clone();
         let (msg, resp_remainder) = postcard::take_from_bytes_cobs::<event::ClientEvent>(
             &mut bytes[offset..],
@@ -278,6 +279,8 @@ async fn handle_event_messages(
         }
         offset += consumed;
     }
+    // Retain any unconsumed partial frame for the next chunk.
+    bytes.drain(..offset);
     Ok(())
 }
 
@@ -290,6 +293,10 @@ async fn handle_bulk_messages(
     let mut offset = 0;
     let bytes_len = bytes.len();
     while offset < bytes_len {
+        // A partial frame (no COBS terminator yet) is kept for the next chunk.
+        if !shared::has_complete_cobs_frame(&bytes[offset..]) {
+            break;
+        }
         let (msg, resp_remainder) =
             postcard::take_from_bytes_cobs::<bulk::ClientBulk>(&mut bytes[offset..])
                 .map_err(|e| anyhow!("Failed to deserialize bulk message: {:?}", e))?;
@@ -351,20 +358,25 @@ async fn handle_bulk_messages(
                 } else {
                     // Need to collect more data.
                     // Save what we've got so far, and assign remaining_bytes to what's left.
-                    let mut bytes = Vec::with_capacity(c.content_len_bytes as usize);
-                    bytes.extend_from_slice(resp_remainder);
-                    return Ok(Some((
+                    let mut payload = Vec::with_capacity(c.content_len_bytes as usize);
+                    payload.extend_from_slice(resp_remainder);
+                    let d = (
                         ClipboardData {
                             requested_type: c.requested_type.to_string(),
                             data_type: c.data_type.map(|t| t.to_string()),
-                            bytes,
+                            bytes: payload,
                             remaining_bytes: c.content_len_bytes as usize - resp_remainder.len(),
                         },
                         c.request_client,
-                    )));
+                    );
+                    // All bytes were consumed (into the pending clipboard data).
+                    bytes.clear();
+                    return Ok(Some(d));
                 }
             }
         }
     }
+    // Retain any unconsumed partial frame for the next chunk.
+    bytes.drain(..offset);
     Ok(None)
 }

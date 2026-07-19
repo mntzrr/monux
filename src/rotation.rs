@@ -942,6 +942,13 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     }
 
     async fn set_and_grab_current_client(&mut self, client: Option<SocketAddr>) {
+        if self.current_client.is_none() && client.is_some() {
+            // Switching away from the local machine: release any keys held on the
+            // local virtual devices so they don't get stuck pressed.
+            if let Err(e) = self.output_handler.release_all().await {
+                warn!("Failed to release held keys on local virtual devices: {:?}", e);
+            }
+        }
         self.current_client = client;
         let grab = if client.is_some() {
             device::GrabEvent::Grab
