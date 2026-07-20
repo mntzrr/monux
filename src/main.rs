@@ -171,7 +171,8 @@ fn main() -> Result<()> {
             if args.port == 0 {
                 bail!("--port 0 (ephemeral port) is not supported: the mDNS advertisement must match the actual listen port");
             }
-            let _server_lock = single_instance::acquire("server")?;
+            let server_lock = single_instance::acquire("server")?;
+            settle_after_takeover(&server_lock);
             let fingerprint = Arc::new(Mutex::new(None));
             let verifier = approval::MonuxCertVerification::new(
                 "server",
@@ -214,7 +215,8 @@ fn main() -> Result<()> {
             })?;
         }
         Commands::Client(args) => {
-            let _client_lock = single_instance::acquire("client")?;
+            let client_lock = single_instance::acquire("client")?;
+            settle_after_takeover(&client_lock);
             // When no host is given, the server address comes from mDNS discovery,
             // which allows re-discovering it after repeated connection failures.
             let from_discovery = args.host.is_none();
@@ -290,6 +292,19 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// After taking over from a previous instance, give udev and the compositor a
+/// moment to process the previous instance's virtual-device teardown before we
+/// create ours. Without this, rapid restarts race: the old devices' evdev
+/// remove events can be processed after the new devices' add events for the
+/// same devpath, making the compositor drop our brand-new virtual keyboard
+/// (seen in the wild as all keyboard input going dead after a few restarts).
+fn settle_after_takeover(lock: &single_instance::InstanceLock) {
+    if lock.took_over {
+        info!("Settling briefly after taking over from the previous instance");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
 }
 
 fn init_config_dir() -> Result<PathBuf> {

@@ -38,6 +38,11 @@ const LOCK_DIR_ENV: &str = "MONUX_LOCK_DIR";
 /// Holds the single-instance flock for the lifetime of the process.
 pub struct InstanceLock {
     _file: fs::File,
+    /// True when this instance took over from a previous live instance (we
+    /// SIGTERM'd it), rather than starting on a free lock. Callers that
+    /// create devices (uinput) should let the previous instance's device
+    /// teardown settle before creating their own.
+    pub took_over: bool,
 }
 
 /// Filesystem path of the lock file for `kind` ("server" or "client").
@@ -78,7 +83,10 @@ pub fn acquire(kind: &str) -> Result<InstanceLock> {
     let _ = fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o666));
     if try_lock(&file) {
         write_pid(&file);
-        return Ok(InstanceLock { _file: file });
+        return Ok(InstanceLock {
+            _file: file,
+            took_over: false,
+        });
     }
 
     // Another instance holds the lock and is alive (flocks can't go stale).
@@ -122,7 +130,10 @@ pub fn acquire(kind: &str) -> Result<InstanceLock> {
         if try_lock(&file) {
             info!("Previous monux {} exited, taking over", kind);
             write_pid(&file);
-            return Ok(InstanceLock { _file: file });
+            return Ok(InstanceLock {
+                _file: file,
+                took_over: true,
+            });
         }
         if Instant::now() >= deadline {
             bail!(
