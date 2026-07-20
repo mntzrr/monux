@@ -32,6 +32,11 @@ enum Commands {
 
     /// Runs a Monux client
     Client(ClientArgs),
+
+    /// Persists machine-local settings that optimize this machine for local KVM
+    /// (input device access, /dev/uinput permissions, WiFi power saving).
+    /// Requires root: run with 'sudo monux setup'.
+    Setup,
 }
 
 #[derive(Args)]
@@ -143,6 +148,12 @@ async fn shutdown_signal() {
 fn main() -> Result<()> {
     logging::init_logging();
     let cli = Cli::parse();
+
+    // Setup doesn't need the config dir, devices, or the async runtime.
+    if let Commands::Setup = &cli.command {
+        return monux::setup::run();
+    }
+
     let config_dir = init_config_dir()?;
 
     let rt = Arc::new(
@@ -153,6 +164,9 @@ fn main() -> Result<()> {
     );
 
     match cli.command {
+        Commands::Setup => {
+            unreachable!("setup is handled before runtime initialization")
+        }
         Commands::Server(args) => {
             if args.port == 0 {
                 bail!("--port 0 (ephemeral port) is not supported: the mDNS advertisement must match the actual listen port");
