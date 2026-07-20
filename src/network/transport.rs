@@ -153,7 +153,10 @@ fn create_socket(bind_addr: SocketAddr, mode: NetworkMode) -> Result<std::net::U
                 sin_family: libc::AF_INET as libc::sa_family_t,
                 sin_port: v4.port().to_be(),
                 sin_addr: libc::in_addr {
-                    s_addr: u32::from_be_bytes(v4.ip().octets()),
+                    // s_addr must hold the octets in network (memory) order;
+                    // from_ne_bytes preserves the in-memory octet order on any
+                    // host endianness (from_be_bytes would byte-swap them).
+                    s_addr: u32::from_ne_bytes(v4.ip().octets()),
                 },
                 sin_zero: [0; 8],
             };
@@ -308,4 +311,23 @@ pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<()
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Binding to a concrete IPv4 address must use that exact address: a
+    /// byte-swapped s_addr (e.g. 1.0.0.127 instead of 127.0.0.1) makes the
+    /// bind fail with EADDRNOTAVAIL, or worse, bind the wrong address.
+    #[test]
+    fn binds_to_concrete_ipv4_addr() {
+        let socket = create_socket("127.0.0.1:0".parse().unwrap(), NetworkMode::Local)
+            .expect("failed to bind loopback");
+        let addr = socket.local_addr().expect("no local addr");
+        assert_eq!(
+            addr.ip(),
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+    }
 }
