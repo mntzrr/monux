@@ -300,11 +300,12 @@ async fn server(
     max_clipboard_size_bytes: u64,
     mode: NetworkMode,
 ) -> Result<()> {
-    // Try to set up virtual devices up-front - exit early if we aren't root
+    // Try to set up virtual devices up-front - exit early if we can't access uinput
     let output_handler = output::uinput::VirtualUInputDevices::new()
         .context("Failed to create virtual devices for output, possible solutions:
-- The server may need to be run as root with 'sudo -E nikau server ...' to allow creating virtual devices.
-- Enable uinput and/or evdev in the kernel, check for /dev/uinput and /dev/input/")?;
+- Add your user to the 'input' group and log back in: 'sudo usermod -aG input $USER'
+- Enable uinput and/or evdev in the kernel, check for /dev/uinput and /dev/input/
+- As a fallback, run as root with 'sudo -E nikau server ...' (-E keeps clipboard support)")?;
 
     let (event_tx, event_rx): (mpsc::Sender<Event>, mpsc::Receiver<Event>) = mpsc::channel(256);
 
@@ -436,11 +437,12 @@ async fn client(
     mode: NetworkMode,
     from_discovery: bool,
 ) -> Result<()> {
-    // Try to set up virtual devices up-front - exit early if we aren't root
+    // Try to set up virtual devices up-front - exit early if we can't access uinput
     let mut output_handler = output::uinput::VirtualUInputDevices::new()
         .context("Failed to create virtual devices for output, possible solutions:
-- The client may need to be run as root with 'sudo -E nikau client ...' to allow creating virtual devices.
-- Enable uinput and/or evdev in the kernel, check for /dev/uinput and /dev/input/")?;
+- Add your user to the 'input' group and log back in: 'sudo usermod -aG input $USER'
+- Enable uinput and/or evdev in the kernel, check for /dev/uinput and /dev/input/
+- As a fallback, run as root with 'sudo -E nikau client ...' (-E keeps clipboard support)")?;
     let max_uncompressed_size_bytes = 10 * max_clipboard_size_bytes;
     let mut local_clipboard = clipboard::client::LocalClipboard::new(
         config_dir,

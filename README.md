@@ -20,7 +20,16 @@ This fork adds low-latency tuning for local networks and a `--www` mode for use 
 
 - Linux with `uinput` and `evdev` kernel modules enabled (`/dev/uinput` and `/dev/input/` should exist).
 - A Rust toolchain (`rustup` recommended).
-- Root privileges at runtime (for direct access to input devices).
+- Read/write access to `/dev/uinput` and `/dev/input/event*`. On most distributions this means your user must be in the `input` group:
+
+  ```bash
+  sudo usermod -aG input $USER
+  # log out and back in for the change to take effect
+  ```
+
+  If `/dev/uinput` is not group-writable on your distribution, add a udev rule such as `SUBSYSTEM=="misc", KERNEL=="uinput", GROUP="input", MODE="0660"` under `/etc/udev/rules.d/`.
+
+  No root privileges are needed at runtime. Running as your regular user also gives nikau access to your Wayland/X11 session for clipboard sharing. (Running as root is possible but not recommended; if you do, use `sudo -E` or the clipboard will be silently disabled.)
 
 ### From this repository
 
@@ -49,32 +58,32 @@ Remove or edit `.cargo/config.toml` and change `target-cpu=native` to `target-cp
 Run the server on the machine with the physical input devices:
 
 ```bash
-sudo nikau server
+nikau server
 ```
 
 Run the client on each machine you want to control:
 
 ```bash
-sudo nikau client <server-ip-or-hostname>
+nikau client <server-ip-or-hostname>
 ```
 
 On a local network you can omit the host and let the client discover the server via mDNS:
 
 ```bash
-sudo nikau client
+nikau client
 ```
 
 The first time a client connects, verify the fingerprint shown on both sides matches, then approve it. Approved certificates are stored in `~/.config/nikau/known_certs/`.
 
-Switch between the server and connected clients using `LeftAlt+N` (next) and `LeftAlt+P` (previous), or send `SIGUSR1` / `SIGUSR2` to the server process.
+Switch between the server and connected clients using `LeftShift+LeftAlt+R` (next) and `LeftAlt+P` (previous), or send `SIGUSR1` / `SIGUSR2` to the server process. Shortcuts are configurable via `--shortcut` / `--shortcut-prev`.
 
 ### Local network vs. internet
 
 By default Nikau is tuned for low-latency local networks (LAN, wired links, direct WiFi). Use `--www` on both server and client when connecting over the public internet:
 
 ```bash
-sudo nikau server --www
-sudo nikau client --www <server-host-or-ip>
+nikau server --www
+nikau client --www <server-host-or-ip>
 ```
 
 `--www` uses conservative QUIC settings (default congestion control and RTT estimation) and skips socket QoS flags.
