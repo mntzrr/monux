@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::fs;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -15,6 +17,18 @@ use crate::msgs::{bulk, event};
 /// If the selected client reconnects within 10 seconds of being removed, then reselect it automatically.
 /// This is intended to help with fast recovery following networking flakes.
 const REMOVED_CLIENT_RECOVERY_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Name of the file (inside the config dir) recording the fingerprint of the
+/// client currently switched active. Written on every switch to a client,
+/// removed on switch back to the local machine and on graceful shutdown.
+/// When the server exits unexpectedly (crash, kill -9) the file survives, and
+/// the next server instance uses it to re-activate that client on reconnect.
+pub const ACTIVE_CLIENT_STATE_FILE: &str = "active_client";
+
+/// How old the active-client state may be before it is ignored on startup.
+/// Crash recovery is expected to happen soon after the crash; resuming a
+/// days-old session would be surprising.
+const ACTIVE_CLIENT_MAX_AGE: Duration = Duration::from_secs(3600);
 
 /// Channels for communicating with a connected client.
 #[derive(Debug)]
@@ -141,6 +155,13 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// This allows situations like a client reconnecting before the old socket has closed.
     current_client: Option<SocketAddr>,
     removed_current_client: Option<DefunctClientInfo>,
+    /// Path of the file recording the active client's fingerprint for
+    /// crash recovery (see ACTIVE_CLIENT_STATE_FILE).
+    active_client_path: PathBuf,
+    /// Fingerprint of the client that was active when the previous server
+    /// instance exited unexpectedly. That client is re-activated
+    /// automatically when it reconnects.
+    pending_resume_fingerprint: Option<String>,
 
     /// Tracking the current clipboard owner, whether it's at the server or a client.
     clipboard_target: Option<ClipboardTarget>,
@@ -158,13 +179,24 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         grab_tx: watch::Sender<device::GrabEvent>,
         output_handler: O,
         local_clipboard: Option<server::LocalClipboard>,
+        config_dir: &Path,
     ) -> Result<Self> {
+        let active_client_path = active_client_state_path(config_dir);
+        let pending_resume_fingerprint = load_pending_resume(&active_client_path);
+        if let Some(pending) = &pending_resume_fingerprint {
+            info!(
+                "A client ({}) was active when the server last exited unexpectedly; it will be re-activated when it reconnects",
+                pending
+            );
+        }
         Ok(Rotation {
             grab_tx,
             output_handler,
             clients: Vec::new(),
             current_client: None,
             removed_current_client: None,
+            active_client_path,
+            pending_resume_fingerprint,
             clipboard_target: None,
             local_clipboard,
             pending_clipboard_requests: HashMap::new(),
@@ -279,6 +311,19 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             } else if removed_current_client.expired(&now) {
                 // Clean up expired client info
                 self.removed_current_client = None;
+            }
+        }
+
+        // Crash recovery: this client was active when the previous server
+        // instance exited unexpectedly. Re-activate it immediately.
+        if let Some(pending) = &self.pending_resume_fingerprint {
+            if *pending == fingerprint {
+                self.pending_resume_fingerprint = None;
+                info!(
+                    "Resuming session: re-activating client {} that was active before the unexpected server exit",
+                    endpoint
+                );
+                self.update_current_client(Some(endpoint)).await;
             }
         }
 
@@ -1014,6 +1059,24 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             }
         }
         self.current_client = client;
+        // Record which client is active (or none) so that an unexpected exit
+        // mid-session can be recovered on the next server start. This is the
+        // single funnel for current_client changes, incl. client removal.
+        match client {
+            Some(endpoint) => {
+                if let Some(fingerprint) = self
+                    .clients
+                    .iter()
+                    .find(|c| c.endpoint == endpoint)
+                    .map(|c| c.fingerprint.clone())
+                {
+                    if let Err(e) = fs::write(&self.active_client_path, &fingerprint) {
+                        warn!("Failed to record active client state: {:?}", e);
+                    }
+                }
+            }
+            None => clear_active_client(&self.active_client_path),
+        }
         let grab = if client.is_some() {
             device::GrabEvent::Grab
         } else {
@@ -1074,4 +1137,107 @@ where
     send.write_all(&serializedmsg)
         .await
         .context("Failed to send serialized message")
+}
+
+/// Path of the file recording the active client's fingerprint (see
+/// ACTIVE_CLIENT_STATE_FILE).
+pub fn active_client_state_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(ACTIVE_CLIENT_STATE_FILE)
+}
+
+/// Reads the fingerprint of the client that was active when the previous
+/// server instance exited unexpectedly. Returns None when there is nothing to
+/// resume: no state file, a stale one, or an empty one. The file is removed in
+/// any case; it is rewritten on the next switch to a client.
+fn load_pending_resume(path: &Path) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    let stale = match metadata.modified().ok().and_then(|m| m.elapsed().ok()) {
+        Some(age) => age > ACTIVE_CLIENT_MAX_AGE,
+        // Unreadable mtime or an mtime in the future (clock skew): treat as
+        // fresh, resuming is the safer direction for crash recovery.
+        None => false,
+    };
+    if stale {
+        debug!("Ignoring stale active-client state file: {}", path.display());
+        let _ = fs::remove_file(path);
+        return None;
+    }
+    let fingerprint = fs::read_to_string(path).ok()?.trim().to_string();
+    let _ = fs::remove_file(path);
+    if fingerprint.is_empty() {
+        None
+    } else {
+        Some(fingerprint)
+    }
+}
+
+/// Removes the active-client state file, if present. Called on switches back
+/// to the local machine and on graceful server shutdown, so that only an
+/// unexpected exit (crash, kill -9) leaves a session behind to resume.
+pub fn clear_active_client(path: &Path) {
+    if let Err(e) = fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!("Failed to clear active client state: {:?}", e);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nikau-test-{}-{}", std::process::id(), name));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn pending_resume_roundtrip() {
+        let dir = temp_dir("roundtrip");
+        let path = active_client_state_path(&dir);
+        fs::write(&path, "deadbeef").unwrap();
+        assert_eq!(load_pending_resume(&path), Some("deadbeef".to_string()));
+        // The file is consumed by the load.
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_resume_missing_or_empty() {
+        let dir = temp_dir("empty");
+        let path = active_client_state_path(&dir);
+        assert_eq!(load_pending_resume(&path), None);
+        fs::write(&path, "  \n").unwrap();
+        assert_eq!(load_pending_resume(&path), None);
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_resume_stale_is_ignored() {
+        let dir = temp_dir("stale");
+        let path = active_client_state_path(&dir);
+        fs::write(&path, "deadbeef").unwrap();
+        let stale_mtime =
+            std::time::SystemTime::now() - ACTIVE_CLIENT_MAX_AGE - Duration::from_secs(60);
+        let file = fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(stale_mtime).unwrap();
+        drop(file);
+        assert_eq!(load_pending_resume(&path), None);
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_active_client_is_idempotent() {
+        let dir = temp_dir("clear");
+        let path = active_client_state_path(&dir);
+        // Missing file: no-op, no warning-worthy error.
+        clear_active_client(&path);
+        fs::write(&path, "deadbeef").unwrap();
+        clear_active_client(&path);
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

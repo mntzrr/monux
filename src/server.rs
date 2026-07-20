@@ -26,13 +26,14 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     mut rotation_rx: mpsc::Receiver<rotation::RotationEvent>,
 ) -> Result<()> {
     let local_clipboard = LocalClipboard::start(
-        config_dir,
+        config_dir.clone(),
         rotation_tx.clone(),
         max_clipboard_size_bytes,
         max_uncompressed_size_bytes,
     ).await;
 
-    let mut rotation = rotation::Rotation::new(grab_tx, output_handler, local_clipboard).await?;
+    let mut rotation =
+        rotation::Rotation::new(grab_tx, output_handler, local_clipboard, &config_dir).await?;
     loop {
         tokio::select! {
             // Listen and forward rotation events to rotation
