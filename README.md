@@ -44,6 +44,14 @@ After installation, the binary is available as `monux` in `~/.local/bin`, which 
 
 Remove or edit `.cargo/config.toml` and change `target-cpu=native` to `target-cpu=x86-64`, then rebuild. This produces a binary that runs on any x86-64 CPU.
 
+## Updating
+
+```bash
+monux update
+```
+
+This pulls the latest source from GitHub into `~/.cache/monux/src`, rebuilds it on this machine (with `target-cpu=native`), and installs over the existing binary. Run it on each machine (server and clients), then restart any running `monux server` / `monux client` to pick up the new version. `monux --version` prints the commit the binary was built from, so you can check that all machines match.
+
 ## Usage
 
 Run the server on the machine with the physical input devices (it re-executes with `sudo -E` for you and prompts for your password once):

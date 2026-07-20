@@ -75,6 +75,7 @@ esac
 echo
 echo "Run server: monux server   (re-executes with sudo -E, prompts once for password)"
 echo "Run client: monux client [host]"
+echo "Update later with: monux update"
 echo
 echo "The server elevates with sudo for reliable input + clipboard. To run"
 echo "without sudo (keyboard/mouse only, clipboard disabled):"

@@ -18,7 +18,12 @@ use monux::network::{approval, transport::NetworkMode};
 use monux::{client, clipboard, discovery, logging, rotation, server, single_instance};
 
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author,
+    version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("MONUX_GIT_SHA")),
+    about,
+    long_about = None
+)]
 #[command(propagate_version = true)]
 struct Cli {
     #[command(subcommand)]
@@ -37,6 +42,9 @@ enum Commands {
     /// (input device access, /dev/uinput permissions, WiFi power saving).
     /// Requires root: run with 'sudo monux setup'.
     Setup,
+
+    /// Updates monux to the latest version from GitHub, rebuilding from source
+    Update(UpdateArgs),
 }
 
 #[derive(Args)]
@@ -113,6 +121,13 @@ struct ClientArgs {
     www: bool,
 }
 
+#[derive(Args)]
+struct UpdateArgs {
+    /// Rebuild and reinstall even if already up to date
+    #[arg(long)]
+    force: bool,
+}
+
 /// Listens for SIGUSR1 and SIGUSR2, treating them as "switch to next client" and "switch to prev client" respectively.
 fn handle_signals(mut signals: Signals, out: mpsc::Sender<Event>) {
     let mut iter = signals.into_iter();
@@ -149,9 +164,11 @@ fn main() -> Result<()> {
     logging::init_logging();
     let cli = Cli::parse();
 
-    // Setup doesn't need the config dir, devices, or the async runtime.
-    if let Commands::Setup = &cli.command {
-        return monux::setup::run();
+    // Setup and update don't need the config dir, devices, or the async runtime.
+    match &cli.command {
+        Commands::Setup => return monux::setup::run(),
+        Commands::Update(args) => return monux::update::run(args.force),
+        _ => {}
     }
 
     let config_dir = init_config_dir()?;
@@ -164,8 +181,8 @@ fn main() -> Result<()> {
     );
 
     match cli.command {
-        Commands::Setup => {
-            unreachable!("setup is handled before runtime initialization")
+        Commands::Setup | Commands::Update(_) => {
+            unreachable!("setup and update are handled before runtime initialization")
         }
         Commands::Server(args) => {
             maybe_elevate()?;
