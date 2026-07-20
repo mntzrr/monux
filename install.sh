@@ -49,6 +49,18 @@ for stale in "$HOME/.cargo/bin/nikau" "$HOME/.cargo/bin/monux" "$HOME/.local/bin
 done
 
 echo "Installed monux to $(which monux 2>/dev/null || echo "$HOME/.local/bin/monux")"
+
+# 'sudo monux ...' (e.g. 'sudo monux setup') fails with "command not found"
+# because sudo resets PATH to secure_path, which excludes ~/.local/bin.
+# /usr/local/bin is in secure_path, so link the binary there too (needs sudo).
+if [ ! -e /usr/local/bin/monux ]; then
+    if sudo -n true 2>/dev/null || sudo -v; then
+        sudo ln -sf "$HOME/.local/bin/monux" /usr/local/bin/monux
+        echo "Linked /usr/local/bin/monux -> $HOME/.local/bin/monux (so 'sudo monux' works)"
+    else
+        echo "note: skipped linking /usr/local/bin/monux; use 'sudo ~/.local/bin/monux <cmd>' with sudo"
+    fi
+fi
 case ":$PATH:" in
     *":$HOME/.local/bin:"*) ;;
     *)
