@@ -1217,7 +1217,6 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "walkdir",
- "wayland-backend",
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-wlr",
