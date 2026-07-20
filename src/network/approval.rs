@@ -78,6 +78,12 @@ pub struct NikauCertVerification<'a> {
 }
 
 impl<'a> NikauCertVerification<'a> {
+    /// The fingerprint of our own certificate, for display so that peers can
+    /// verify or pre-approve us.
+    pub fn our_fingerprint(&self) -> String {
+        certs::fingerprint(&self.our_cert)
+    }
+
     pub fn new(
         splash_label: &str,
         approved_cert_fingerprints: Vec<String>,

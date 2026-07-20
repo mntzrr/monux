@@ -209,7 +209,7 @@ fn common_prefix_len(a: &IpAddr, b: &IpAddr) -> u32 {
 }
 
 /// Picks the addresses to advertise for a server listening on `listen_ip`.
-fn advertise_ips(listen_ip: IpAddr) -> Result<Vec<IpAddr>> {
+pub fn advertise_ips(listen_ip: IpAddr) -> Result<Vec<IpAddr>> {
     if !listen_ip.is_unspecified() {
         // A concrete --listen address was provided: advertise exactly that.
         return Ok(vec![listen_ip]);

@@ -167,6 +167,11 @@ fn main() -> Result<()> {
                 // unknown peers must be pre-approved via --fingerprints instead.
                 !args.www,
             )?;
+            info!(
+                "Our certificate fingerprint: {} (pre-approve this server on clients with '--fingerprints {}')",
+                verifier.our_fingerprint(),
+                verifier.our_fingerprint()
+            );
             let mode = if args.www {
                 NetworkMode::Www
             } else {
@@ -233,6 +238,11 @@ fn main() -> Result<()> {
                 // approval prompts stay enabled even in --www mode (unlike the server).
                 true,
             )?;
+            info!(
+                "Our certificate fingerprint: {} (pre-approve this client on the server with '--fingerprints {}')",
+                verifier.our_fingerprint(),
+                verifier.our_fingerprint()
+            );
             let mode = if args.www {
                 NetworkMode::Www
             } else {
@@ -349,6 +359,15 @@ async fn server(
     };
 
     info!("Listening for clients: {}", listen_addr);
+    if let Ok(ips) = discovery::advertise_ips(listen_addr.ip()) {
+        if !ips.is_empty() {
+            info!(
+                "Local IP address(es) for clients: {}; connect with 'nikau client {}' or omit the address for mDNS auto-discovery",
+                ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>().join(", "),
+                ips[0]
+            );
+        }
+    }
     if let Some(exit_secs) = exit_secs {
         info!("Exiting in {} seconds...", exit_secs);
         tokio::select! {
