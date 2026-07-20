@@ -13,6 +13,27 @@ mod limited;
 
 pub const CLIPBOARD_TIMEOUT_SECS: u64 = 5;
 
+/// Clipboard writes (advertising types to the local environment) can block for
+/// a long time: each call opens a fresh wayland connection, does roundtrips,
+/// and spawns a serving thread. Running them on the rotation or client event
+/// loop stalls input forwarding — fatal under clipboard-manager churn (e.g.
+/// wl-clip-persist re-owning every clipboard, wl-paste --watch pollers), where
+/// dozens of advertisements arrive in bursts. This dispatcher serializes them
+/// on a dedicated thread instead.
+pub(crate) fn spawn_writer_dispatcher(
+    writer: Box<dyn ClipboardWriter>,
+) -> std::sync::mpsc::Sender<Vec<String>> {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<String>>();
+    std::thread::spawn(move || {
+        while let Ok(types) = rx.recv() {
+            if let Err(e) = writer.store_types(types) {
+                tracing::warn!("Failed to advertise clipboard types: {}", e);
+            }
+        }
+    });
+    tx
+}
+
 /// Trait for watching the addition and removal of devices from the machine
 #[async_trait]
 pub trait ClipboardReader: Send {

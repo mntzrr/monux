@@ -6,7 +6,7 @@ use anyhow::{Result};
 use tokio::sync::{Mutex, mpsc, watch};
 use tracing::{debug, info, warn};
 
-use crate::clipboard::{ClipboardWriter, data, serve, wayland, x11};
+use crate::clipboard::{data, serve, wayland, x11};
 
 /// Wrapper around client-local clipboard storage, if available.
 pub struct LocalClipboard {
@@ -15,7 +15,9 @@ pub struct LocalClipboard {
     /// Serializes serves and caches the last payload, so request bursts
     /// (e.g. clipboard managers fetching every type) can't pile up CPU work.
     reader: Arc<Mutex<serve::SharedClipboardReader>>,
-    writer: Box<dyn ClipboardWriter>,
+    /// Queue to the writer dispatcher thread: keeps blocking clipboard
+    /// advertisements off the client event loop (see spawn_writer_dispatcher).
+    types_tx: std::sync::mpsc::Sender<Vec<String>>,
     // TODO can we nest a tokio select here instead of exposing these upstream?:
     pub clipboard_fetch_rx: mpsc::Receiver<data::ClipboardFetch>,
     pub local_types_rx: watch::Receiver<Vec<String>>,
@@ -67,7 +69,7 @@ impl LocalClipboard {
         );
         Ok(Some(Self{
             reader: serve::SharedClipboardReader::new(Box::new(reader)),
-            writer: Box::new(writer),
+            types_tx: crate::clipboard::spawn_writer_dispatcher(Box::new(writer)),
             clipboard_fetch_rx,
             local_types_rx: local_regular_types_rx,
             local_types: None,
@@ -84,7 +86,7 @@ impl LocalClipboard {
             x11::writer::ClipboardWriter::start(config_dir, max_uncompressed_size_bytes, clipboard_fetch_tx).await?;
         Ok(Self {
             reader: serve::SharedClipboardReader::new(Box::new(reader)),
-            writer: Box::new(writer),
+            types_tx: crate::clipboard::spawn_writer_dispatcher(Box::new(writer)),
             clipboard_fetch_rx,
             local_types_rx,
             local_types: None,
@@ -142,7 +144,9 @@ impl LocalClipboard {
         if self.serving_remote_clipboard {
             self.local_types = None;
             self.serving_remote_clipboard = false;
-            self.writer.store_types(vec![])?;
+            // Non-blocking: the actual advertisement happens on the writer
+            // dispatcher thread; a failed send only means we're shutting down.
+            let _ = self.types_tx.send(vec![]);
         }
         Ok(())
     }
@@ -151,7 +155,9 @@ impl LocalClipboard {
     pub fn set_remote_clipboard(&mut self, types: Vec<String>) -> Result<()> {
         self.local_types = None;
         self.serving_remote_clipboard = true;
-        self.writer.store_types(types)?;
+        // Non-blocking: the actual advertisement happens on the writer
+        // dispatcher thread; a failed send only means we're shutting down.
+        let _ = self.types_tx.send(types);
         Ok(())
     }
 }

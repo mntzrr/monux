@@ -18,7 +18,9 @@ pub struct LocalClipboard {
     /// Serializes serves and caches the last payload, so request bursts
     /// (e.g. clipboard managers fetching every type) can't pile up CPU work.
     reader: Arc<Mutex<serve::SharedClipboardReader>>,
-    writer: Box<dyn ClipboardWriter>,
+    /// Queue to the writer dispatcher thread (see spawn_writer_dispatcher):
+    /// keeps blocking clipboard advertisements off the rotation loop.
+    types_tx: std::sync::mpsc::Sender<Vec<String>>,
 }
 
 impl LocalClipboard {
@@ -163,7 +165,7 @@ impl LocalClipboard {
 
         Ok(Self {
             reader: serve::SharedClipboardReader::new(reader),
-            writer,
+            types_tx: crate::clipboard::spawn_writer_dispatcher(writer),
         })
     }
 
@@ -201,8 +203,13 @@ impl LocalClipboard {
         Ok((content, data_type))
     }
 
-    /// Advertises with X11 that we have a new clipboard entry available
+    /// Advertises to the local environment that we have a new clipboard entry
+    /// available. Non-blocking: the actual wayland/X11 work happens on the
+    /// writer dispatcher thread, so the rotation loop never stalls on it.
     pub fn store_types<K: Into<Vec<String>>>(&self, types: K) -> Result<()> {
-        self.writer.store_types(types.into())
+        // The dispatcher thread exits (and this send fails) only if the
+        // clipboard is being torn down; a failed advertisement is not fatal.
+        let _ = self.types_tx.send(types.into());
+        Ok(())
     }
 }

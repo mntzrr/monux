@@ -486,6 +486,17 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         if let Some(reader) = self.local_clipboard.as_ref().map(|lc| lc.reader_handle()) {
             reader.lock().await.invalidate();
         }
+        // Break clipboard-manager ping-pong: an update identical to the current
+        // target (e.g. wl-clip-persist re-owning the same clipboard, or a
+        // wl-paste --watch echo of it) must not trigger another round of
+        // type advertisements, or the two machines churn each other forever.
+        // The serve cache was still invalidated above: content may differ.
+        if let Some(current) = &self.clipboard_target {
+            if current.source == source && current.types == types {
+                debug!("Ignoring duplicate clipboard source update (unchanged source and types)");
+                return Ok(());
+            }
+        }
         // Save the clipboard types/source for future retrievals and client switches
         self.clipboard_target = Some(ClipboardTarget {
             source,
