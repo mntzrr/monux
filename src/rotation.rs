@@ -31,6 +31,12 @@ pub const ACTIVE_CLIENT_STATE_FILE: &str = "active_client";
 /// days-old session would be surprising.
 const ACTIVE_CLIENT_MAX_AGE: Duration = Duration::from_secs(3600);
 
+/// Minimum spacing between processed clipboard source updates. Clipboard
+/// managers (wl-clip-persist, wl-paste --watch) can turn one copy into dozens
+/// of updates per second; each processed update costs a fresh wayland
+/// connection and data source on the compositor, so bursts are collapsed.
+const CLIPBOARD_UPDATE_DEBOUNCE: Duration = Duration::from_millis(300);
+
 /// Channels for communicating with a connected client.
 #[derive(Debug)]
 struct ClientInfo {
@@ -179,6 +185,10 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// Self-handle for spawned tasks (e.g. per-client bulk writers) to report
     /// events back to the rotation loop, such as client removal on stream failure.
     rotation_tx: mpsc::Sender<RotationEvent>,
+    /// When the last clipboard source update was processed; used to debounce
+    /// machine-paced update bursts from clipboard managers (see
+    /// CLIPBOARD_UPDATE_DEBOUNCE).
+    last_clipboard_update: Option<Instant>,
 }
 
 impl<O: device::output::OutputHandler> Rotation<O> {
@@ -210,6 +220,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             pending_clipboard_requests: HashMap::new(),
             next_clipboard_request_id: 0,
             rotation_tx,
+            last_clipboard_update: None,
         })
     }
 
@@ -480,6 +491,17 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         max_size_bytes: u64,
     ) -> Result<()> {
         debug!("Announcing new clipboard source: source={:?} current={:?} with max_size_bytes={} has types={:?}", source, self.current_client, max_size_bytes, types);
+        // Debounce machine-paced bursts: clipboard managers (wl-clip-persist,
+        // wl-paste --watch) can turn one copy into dozens of source updates per
+        // second, and each processed update costs a fresh wayland connection
+        // and source on the compositor. Collapse bursts to one update per
+        // CLIPBOARD_UPDATE_DEBOUNCE; legit copies are human-paced and unaffected.
+        if let Some(last) = self.last_clipboard_update {
+            if last.elapsed() < CLIPBOARD_UPDATE_DEBOUNCE {
+                debug!("Debouncing rapid clipboard source update");
+                return Ok(());
+            }
+        }
         // The clipboard changed hands: drop any cached served payload so
         // stale contents are never served. Clone the reader handle first:
         // only the Arc may cross the await (LocalClipboard isn't Sync).
@@ -492,11 +514,12 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         // type advertisements, or the two machines churn each other forever.
         // The serve cache was still invalidated above: content may differ.
         if let Some(current) = &self.clipboard_target {
-            if current.source == source && current.types == types {
+            if current.source == source && types_equal(&current.types, &types) {
                 debug!("Ignoring duplicate clipboard source update (unchanged source and types)");
                 return Ok(());
             }
         }
+        self.last_clipboard_update = Some(Instant::now());
         // Save the clipboard types/source for future retrievals and client switches
         self.clipboard_target = Some(ClipboardTarget {
             source,
@@ -1236,6 +1259,19 @@ where
         .context("Failed to send serialized message")
 }
 
+/// Compares two clipboard mime-type lists as sets (order- and
+/// duplicate-insensitive), since different sources advertise the same
+/// clipboard with slightly different lists (e.g. wl-copy repeating text/plain).
+fn types_equal(a: &[String], b: &[String]) -> bool {
+    let mut a: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+    let mut b: Vec<&str> = b.iter().map(|s| s.as_str()).collect();
+    a.sort_unstable();
+    a.dedup();
+    b.sort_unstable();
+    b.dedup();
+    a == b
+}
+
 /// Shows a best-effort desktop notification about an input switch, so that an
 /// accidental switch (e.g. a switch shortcut colliding with a compositor bind)
 /// is visible at a glance instead of looking like dead keys. Uses notify-send
@@ -1362,5 +1398,33 @@ mod tests {
         clear_active_client(&path);
         assert!(!path.exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn types_equal_is_set_based() {
+        let six = vec![
+            "text/plain".to_string(),
+            "text/plain".to_string(),
+            "text/plain;charset=utf-8".to_string(),
+            "TEXT".to_string(),
+            "STRING".to_string(),
+            "UTF8_STRING".to_string(),
+        ];
+        let five = vec![
+            "text/plain".to_string(),
+            "text/plain;charset=utf-8".to_string(),
+            "TEXT".to_string(),
+            "STRING".to_string(),
+            "UTF8_STRING".to_string(),
+        ];
+        // Same set, despite the duplicate entry and different lengths
+        assert!(types_equal(&six, &five));
+        // Order-insensitive
+        let mut reordered = five.clone();
+        reordered.reverse();
+        assert!(types_equal(&five, &reordered));
+        // Genuinely different types
+        let other = vec!["image/png".to_string()];
+        assert!(!types_equal(&five, &other));
     }
 }
