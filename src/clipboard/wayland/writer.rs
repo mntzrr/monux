@@ -28,8 +28,12 @@ pub enum ClipboardType {
 struct State {
     seats: HashMap<wl_seat::WlSeat, data_control::Device>,
     prepared_copy_state: Option<PreparedCopyState>,
-    async_runtime: tokio::runtime::Runtime,
 }
+
+/// Clipboard contents for the currently advertised clipboard, fetched in the
+/// background so that paste (Send) requests never block the dispatch thread
+/// waiting on a network/timeout fetch. Maps the requested mime type to its data.
+type ClipboardCache = std::sync::Arc<std::sync::Mutex<Option<(String, Vec<u8>)>>>;
 
 struct PreparedCopyState {
     mime_types: Vec<String>,
@@ -37,8 +41,44 @@ struct PreparedCopyState {
     config_dir: PathBuf,
     /// Safety limit to the uncompressed size of a clipboard
     max_uncompressed_size_bytes: u64,
-    /// Populated with clipboard contents on the first retrieval
-    clipboard_data: Option<data::ClipboardData>,
+    /// Populated in the background (see spawn_fetch), never by blocking the
+    /// dispatch thread.
+    clipboard_data: ClipboardCache,
+}
+
+/// Fetches clipboard data for a mime type on a background thread and stores it
+/// in the shared cache. Doing this off the dispatch thread is what keeps the
+/// wayland writer (and, through backpressure, the compositor) responsive while
+/// clipboard managers hammer us with paste requests.
+fn spawn_fetch(
+    mime_type: String,
+    fetch_data_tx: mpsc::Sender<data::ClipboardFetch>,
+    max_uncompressed_size_bytes: u64,
+    config_dir: PathBuf,
+    clipboard_data: ClipboardCache,
+) {
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                error!("Failed to create clipboard fetch runtime: {}", e);
+                return;
+            }
+        };
+        let result = rt.block_on(data::fetch_clipboard_data(
+            &fetch_data_tx,
+            &mime_type,
+            max_uncompressed_size_bytes,
+            &config_dir,
+        ));
+        if let Some(d) = result {
+            debug!("Background-fetched clipboard type {}: {} bytes", d.requested_type, d.bytes.len());
+            *clipboard_data.lock().unwrap() = Some((d.requested_type, d.bytes));
+        }
+    });
 }
 
 impl Dispatch<wl_seat::WlSeat, ()> for State {
@@ -98,36 +138,27 @@ impl_dispatch_source!(State, |state: &mut Self, source: data_control::Source, ev
             }
 
             let copy_result = || {
-                // We need to fetch if the data is missing or the requested type doesn't match what we have
-                let needs_fetch = prepared_state.clipboard_data
-                    .as_ref()
-                    .map(|d| d.requested_type != mime_type)
-                    .unwrap_or(true);
-                if needs_fetch {
-                    // Fetch missing data, setting data to None for retryable failure
-                    prepared_state.clipboard_data = state.async_runtime.block_on(data::fetch_clipboard_data(
-                        &prepared_state.fetch_data_tx,
-                        &mime_type,
-                        prepared_state.max_uncompressed_size_bytes,
-                        &prepared_state.config_dir,
-                    ));
-                } else {
-                    // Reuse fetched data
-                    debug!(
-                        "Reusing existing clipboard with type {}: {} bytes",
-                        mime_type,
-                        prepared_state.clipboard_data
-                            .as_ref()
-                            .map(|d| d.bytes.len())
-                            .unwrap_or(0),
-                    );
-                }
-                let bytes = if let Some(data) = &prepared_state.clipboard_data {
-                    // Use cached or newly fetched data
-                    &data.bytes
-                } else {
-                    // Fetch failed in a retryable way, use empty data
-                    &vec![]
+                // Serve from the shared cache; on a miss, serve empty and fetch
+                // in the background so the NEXT request for this type is cached.
+                // The dispatch thread must never block on a fetch: during
+                // clipboard-manager storms that backpressures the compositor's
+                // wayland connection to us, freezing input.
+                let cached = prepared_state.clipboard_data.lock().unwrap().clone();
+                let bytes = match cached {
+                    Some((cached_type, cached_bytes)) if cached_type == mime_type => {
+                        debug!("Reusing cached clipboard with type {}: {} bytes", mime_type, cached_bytes.len());
+                        cached_bytes
+                    }
+                    _ => {
+                        spawn_fetch(
+                            mime_type.clone(),
+                            prepared_state.fetch_data_tx.clone(),
+                            prepared_state.max_uncompressed_size_bytes,
+                            prepared_state.config_dir.clone(),
+                            prepared_state.clipboard_data.clone(),
+                        );
+                        Vec::new()
+                    }
                 };
                 // Set O_NONBLOCK and write via a poll() loop with a deadline,
                 // so that a stuck paste reader can't hang us forever.
@@ -203,9 +234,6 @@ fn init_state() -> Result<(State, data_control::Manager, EventQueue<State>)> {
         State{
             seats,
             prepared_copy_state: None,
-            async_runtime: tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?,
         },
         clipboard_manager,
         queue,
@@ -254,12 +282,25 @@ fn write_clipboard(
         }
 
         state.prepared_copy_state = Some(PreparedCopyState{
-            mime_types,
-            fetch_data_tx,
-            config_dir,
+            mime_types: mime_types.clone(),
+            fetch_data_tx: fetch_data_tx.clone(),
+            config_dir: config_dir.clone(),
             max_uncompressed_size_bytes,
-            clipboard_data: None,
+            clipboard_data: std::sync::Arc::new(std::sync::Mutex::new(None)),
         });
+        // Pre-fetch the primary mime type in the background so the cache is
+        // warm before the first paste request arrives (skipping our own
+        // ignored marker type).
+        if let Some(primary) = mime_types.iter().find(|t| **t != state::IGNORED_MIME_TYPE).cloned() {
+            let prepared = state.prepared_copy_state.as_ref().expect("just set");
+            spawn_fetch(
+                primary,
+                fetch_data_tx.clone(),
+                max_uncompressed_size_bytes,
+                config_dir.clone(),
+                prepared.clipboard_data.clone(),
+            );
+        }
     }
 
     // All queue dispatch (including the initial roundtrip that publishes the
