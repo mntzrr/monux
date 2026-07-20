@@ -73,6 +73,10 @@ pub struct NikauCertVerification<'a> {
     /// Disabled for the server in --www mode, where internet-facing peers must
     /// be pre-approved instead of prompting on the console.
     allow_interactive_prompts: bool,
+    /// Server instance name discovered via mDNS (client side only), shown in
+    /// the approval prompt so the user can sanity-check which machine they are
+    /// connecting to. mDNS is unauthenticated, so this is a hint, not proof.
+    discovered_server_name: Mutex<Option<String>>,
     /// For rustls verify calls
     crypto_provider: Arc<rustls::crypto::CryptoProvider>,
 }
@@ -82,6 +86,14 @@ impl<'a> NikauCertVerification<'a> {
     /// verify or pre-approve us.
     pub fn our_fingerprint(&self) -> String {
         certs::fingerprint(&self.our_cert)
+    }
+
+    /// Records the mDNS-discovered server instance name, for display in the
+    /// client-side approval prompt.
+    pub fn set_discovered_server_name(&self, name: String) {
+        if let Ok(mut slot) = self.discovered_server_name.lock() {
+            *slot = Some(name);
+        }
     }
 
     pub fn new(
@@ -117,6 +129,7 @@ impl<'a> NikauCertVerification<'a> {
             }),
             fingerprint,
             allow_interactive_prompts,
+            discovered_server_name: Mutex::new(None),
             crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
         }))
     }
@@ -172,7 +185,12 @@ impl<'a> NikauCertVerification<'a> {
 
         // Must release lock on self.known_certs during prompt to avoid breaking connectivity,
         // especially on the server, where it can break all clients until the server is restarted.
-        if prompt_unknown_cert(their_cert, we_are_server) {
+        let discovered_server_name = self
+            .discovered_server_name
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if prompt_unknown_cert(their_cert, we_are_server, discovered_server_name.as_deref()) {
             info!("{} cert approved: {}", their_name, their_cert_fingerprint);
             if let Err(e) =
                 certs::write_approved_cert(their_cert, &their_cert_fingerprint, &self.config_dir)
@@ -350,7 +368,11 @@ impl<'a> rustls::server::danger::ClientCertVerifier for NikauCertVerification<'a
     }
 }
 
-fn prompt_unknown_cert(their_cert: &rustls_pki_types::CertificateDer, we_are_server: bool) -> bool {
+fn prompt_unknown_cert(
+    their_cert: &rustls_pki_types::CertificateDer,
+    we_are_server: bool,
+    discovered_server_name: Option<&str>,
+) -> bool {
     let their_cert_fingerprint = certs::fingerprint(their_cert);
     if atty::isnt(atty::Stream::Stdin) {
         warn!("Stdin is not a TTY, skipping user certificate approval prompt. Approve this cert by running the {} with '--fingerprints {}'", if we_are_server { "server" } else { "client" }, their_cert_fingerprint);
@@ -373,11 +395,14 @@ Allow this new client and save its certificate for future connections? ({}s time
             their_cert_fingerprint, PROMPT_TIMEOUT_SECS
         )
     } else {
+        let discovered_line = discovered_server_name
+            .map(|name| format!("The server was discovered via mDNS as: {}\n", name))
+            .unwrap_or_default();
         format!(
             "APPROVAL NEEDED: New unknown server connection
 
 The client has connected to a new unknown server.
-Only approve this if you are expecting to be connecting to a new server.
+{}Only approve this if you are expecting to be connecting to a new server.
 You will also likely need to confirm this connection on the server as well.
 
 Confirm that the server startup image has this fingerprint:
@@ -385,7 +410,7 @@ Confirm that the server startup image has this fingerprint:
 
 Allow this new server and save its certificate for future connections? ({}s timeout) [y/N]
 > ",
-            their_cert_fingerprint, PROMPT_TIMEOUT_SECS
+            discovered_line, their_cert_fingerprint, PROMPT_TIMEOUT_SECS
         )
     };
     prompt_yn(&message, false)

@@ -77,8 +77,9 @@ impl Drop for DiscoveryRegistration {
 }
 
 /// Discovers a Nikau server on the local network via mDNS.
-/// Returns the first server found.
-pub async fn discover_server(timeout: Option<Duration>) -> Result<SocketAddr> {
+/// Returns the first server found, along with its advertised instance name
+/// (normally the server's hostname) for display in e.g. approval prompts.
+pub async fn discover_server(timeout: Option<Duration>) -> Result<(SocketAddr, String)> {
     let timeout = timeout.unwrap_or(DEFAULT_DISCOVERY_TIMEOUT);
     let daemon = ServiceDaemon::new().context("Failed to create mDNS daemon")?;
     let receiver = daemon
@@ -168,6 +169,7 @@ pub async fn discover_server(timeout: Option<Duration>) -> Result<SocketAddr> {
             first_instance.as_deref().unwrap_or("<unknown>")
         );
     }
+    let fullname = first_instance.ok_or_else(|| anyhow!("Discovered server has no addresses"))?;
     let addr = pick_addr(&instance_addrs, instance_port)
         .ok_or_else(|| anyhow!("Discovered server has no addresses"))?;
     info!(
@@ -176,7 +178,12 @@ pub async fn discover_server(timeout: Option<Duration>) -> Result<SocketAddr> {
         addr
     );
     let _ = daemon.shutdown();
-    Ok(addr)
+    // Strip the service-type suffix, leaving the bare instance (host) name.
+    let instance_name = fullname
+        .strip_suffix(&format!(".{}", SERVICE_TYPE))
+        .unwrap_or(&fullname)
+        .to_string();
+    Ok((addr, instance_name))
 }
 
 /// Picks an address to connect to. A server may advertise several addresses

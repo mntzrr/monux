@@ -203,6 +203,8 @@ fn main() -> Result<()> {
             // which allows re-discovering it after repeated connection failures.
             let from_discovery = args.host.is_none();
             let port = args.port.unwrap_or(1213);
+            // Server instance name from mDNS discovery, for the approval prompt.
+            let mut discovered_server_name: Option<String> = None;
             let connect_addr: SocketAddr = match &args.host {
                 Some(host) => {
                     if let Ok(host_ip) = host.parse::<IpAddr>() {
@@ -226,7 +228,10 @@ fn main() -> Result<()> {
                     }
                     // Discover the server on the local network via mDNS.
                     info!("No server host provided, discovering via mDNS...");
-                    rt.block_on(async { discovery::discover_server(None).await })?
+                    let (addr, name) =
+                        rt.block_on(async { discovery::discover_server(None).await })?;
+                    discovered_server_name = Some(name);
+                    addr
                 }
             };
             let verifier = approval::NikauCertVerification::new(
@@ -238,6 +243,9 @@ fn main() -> Result<()> {
                 // approval prompts stay enabled even in --www mode (unlike the server).
                 true,
             )?;
+            if let Some(name) = discovered_server_name {
+                verifier.set_discovered_server_name(name);
+            }
             info!(
                 "Our certificate fingerprint: {} (pre-approve this client on the server with '--fingerprints {}')",
                 verifier.our_fingerprint(),
@@ -470,7 +478,7 @@ async fn client(
                         consecutive_failures
                     );
                     match discovery::discover_server(None).await {
-                        Ok(new_addr) => {
+                        Ok((new_addr, new_name)) => {
                             if new_addr != connect_addr {
                                 info!(
                                     "Discovered server at new address: {} (was {})",
@@ -478,6 +486,7 @@ async fn client(
                                 );
                             }
                             connect_addr = new_addr;
+                            verifier.set_discovered_server_name(new_name);
                         }
                         Err(e) => {
                             warn!(

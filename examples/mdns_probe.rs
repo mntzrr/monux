@@ -9,7 +9,7 @@ use nikau::logging;
 #[tokio::main]
 async fn main() -> Result<()> {
     logging::init_logging();
-    let addr = discovery::discover_server(Some(Duration::from_secs(5))).await?;
-    println!("discovered: {}", addr);
+    let (addr, name) = discovery::discover_server(Some(Duration::from_secs(5))).await?;
+    println!("discovered: {} ({})", addr, name);
     Ok(())
 }
