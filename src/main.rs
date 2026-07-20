@@ -168,6 +168,7 @@ fn main() -> Result<()> {
             unreachable!("setup is handled before runtime initialization")
         }
         Commands::Server(args) => {
+            maybe_elevate()?;
             if args.port == 0 {
                 bail!("--port 0 (ephemeral port) is not supported: the mDNS advertisement must match the actual listen port");
             }
@@ -322,6 +323,28 @@ fn settle_after_takeover(lock: &single_instance::InstanceLock) {
         info!("Settling briefly after taking over from the previous instance");
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
+}
+
+/// The server runs most reliably as root: as the session user with the
+/// Wayland clipboard active, aggressive clipboard managers can stall input on
+/// some compositors. Rather than making the user type 'sudo -E monux server',
+/// re-exec with sudo -E, which preserves the session environment so clipboard
+/// sharing keeps working. Opt out with MONUX_NO_ELEVATE=1 (e.g. for
+/// 'WAYLAND_DISPLAY= monux server' to intentionally disable the clipboard).
+fn maybe_elevate() -> Result<()> {
+    if unsafe { libc::geteuid() } == 0 || std::env::var_os("MONUX_NO_ELEVATE").is_some() {
+        return Ok(());
+    }
+    let exe = std::env::current_exe()
+        .context("Failed to find our own executable for sudo re-exec")?;
+    info!("Re-executing with sudo for reliable input + clipboard (MONUX_NO_ELEVATE=1 to opt out)...");
+    let status = std::process::Command::new("sudo")
+        .arg("-E")
+        .arg(&exe)
+        .args(std::env::args().skip(1))
+        .status()
+        .context("Failed to re-exec with sudo")?;
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn init_config_dir() -> Result<PathBuf> {

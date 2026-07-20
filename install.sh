@@ -73,8 +73,9 @@ EOF
 esac
 
 echo
-echo "Run server: monux server"
+echo "Run server: monux server   (re-executes with sudo -E, prompts once for password)"
 echo "Run client: monux client [host]"
 echo
-echo "No sudo needed: monux uses your 'input' group membership for device"
-echo "access, and your session for clipboard sharing."
+echo "The server elevates with sudo for reliable input + clipboard. To run"
+echo "without sudo (keyboard/mouse only, clipboard disabled):"
+echo "  MONUX_NO_ELEVATE=1 WAYLAND_DISPLAY= monux server"
