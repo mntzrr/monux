@@ -83,14 +83,6 @@ impl Device {
             Device::Ext(device) => device.set_selection(source.map(Source::ext)),
         }
     }
-
-    #[track_caller]
-    pub fn set_primary_selection(&self, source: Option<&Source>) {
-        match self {
-            Device::Zwlr(device) => device.set_primary_selection(source.map(Source::zwlr)),
-            Device::Ext(device) => device.set_primary_selection(source.map(Source::ext)),
-        }
-    }
 }
 
 impl Source {

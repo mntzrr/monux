@@ -18,7 +18,6 @@ async fn main() -> Result<()> {
     logging::init_logging();
 
     let (regular_types_tx, mut regular_types_rx) = watch::channel(vec![]);
-    let (primary_types_tx, mut primary_types_rx) = watch::channel(vec![]);
     task::spawn(async move {
         loop {
             tokio::select! {
@@ -29,18 +28,11 @@ async fn main() -> Result<()> {
                     }
                     info!("[UPDATE] regular mime types: {:?}", regular_types_rx.borrow().clone());
                 },
-                changed = primary_types_rx.changed() => {
-                    if let Err(e) = changed {
-                        info!("failed to read primary mime types update: {}", e);
-                        break;
-                    }
-                    info!("[UPDATE] primary mime types: {:?}", primary_types_rx.borrow().clone());
-                },
             }
         }
     });
 
-    type_watcher::start(Some(regular_types_tx), Some(primary_types_tx))?;
+    type_watcher::start(Some(regular_types_tx))?;
     let mut reader = reader::ClipboardReader::new()?;
 
     let text_mime_type = "text/plain";

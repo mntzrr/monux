@@ -13,14 +13,6 @@ use wayland_client::{Connection, EventQueue};
 use crate::clipboard::{CLIPBOARD_TIMEOUT_SECS, ClipboardReader as ClipboardReaderTrait, limited};
 use crate::clipboard::wayland::{common, state};
 
-#[derive(Debug)]
-pub enum ClipboardType {
-    /// The regular clipboard (Ctrl+C style)
-    Regular,
-    /// The primary-selection clipboard (highlighted text style)
-    Primary,
-}
-
 /// Retrieves clipboard data from other applications on the system.
 /// Watches clipboard mime types, and reads clipboard data.
 pub struct ClipboardReader {
@@ -46,7 +38,7 @@ impl ClipboardReader {
         if seats.is_empty() {
             bail!("No wayland seats found");
         }
-        let mut state = state::State::new(seats, None, None);
+        let mut state = state::State::new(seats, None);
 
         // Initial load of clipboard/mimetype data
         queue.roundtrip(&mut state)?;
@@ -57,23 +49,20 @@ impl ClipboardReader {
         })
     }
 
-    fn get_offer(&mut self, clipboard: ClipboardType, mime_type: String) -> Result<Option<PipeReader>> {
+    fn get_offer(&mut self, mime_type: String) -> Result<Option<PipeReader>> {
         // Refresh state data to find a matching offer
         self.queue.roundtrip(&mut self.state)?;
 
         // Just scan the seats for the first match (has the requested mime type).
         // Keep it simple until/unless we know we need multi-seat support.
-        let matching_offer = match clipboard {
-            ClipboardType::Primary => self.state.find_primary_offer(&mime_type),
-            ClipboardType::Regular => self.state.find_regular_offer(&mime_type),
-        };
+        let matching_offer = self.state.find_regular_offer(&mime_type);
         let matching_offer = if let Some(found) = matching_offer {
             found
         } else {
-            debug!("didn't find {:?} clipboard with type {} in wayland", clipboard, mime_type);
+            debug!("didn't find clipboard with type {} in wayland", mime_type);
             return Ok(None);
         };
-        trace!("fetching {:?} clipboard with type {} from wayland", clipboard, mime_type);
+        trace!("fetching clipboard with type {} from wayland", mime_type);
         let (read, write) = pipe().context("Couldn't create a pipe for clipboard content transfer")?;
 
         matching_offer.receive(mime_type, write.as_fd());
@@ -96,7 +85,7 @@ impl ClipboardReaderTrait for ClipboardReader {
         max_size_bytes: u64,
         request_source: &str,
     ) -> Result<Vec<u8>> {
-        let mut pipe_reader = if let Some(rdr) = self.get_offer(ClipboardType::Regular, requested_type.to_string())? {
+        let mut pipe_reader = if let Some(rdr) = self.get_offer(requested_type.to_string())? {
             rdr
         } else {
             bail!("No clipboard available");

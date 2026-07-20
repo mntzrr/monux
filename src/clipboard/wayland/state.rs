@@ -28,14 +28,11 @@ pub struct SeatData {
     device: Option<data_control::Device>,
 
     /// Mime types for offers that are being streamed.
-    /// Moved to regular_mime_types or primary_mime_types when the stream finishes.
+    /// Moved to regular_offer when the stream finishes.
     pending_offer_types: HashMap<data_control::Offer, Vec<String>>,
 
     /// The regular clipboard's offer, if any.
     regular_offer: Option<OfferData>,
-
-    /// The primary-selection clipboard's offer, if any.
-    primary_offer: Option<OfferData>,
 }
 
 impl SeatData {
@@ -44,7 +41,6 @@ impl SeatData {
             device: Some(device),
             pending_offer_types: HashMap::new(),
             regular_offer: None,
-            primary_offer: None,
         }
     }
 }
@@ -58,22 +54,17 @@ pub struct State {
 
     /// Output for regular clipboard mime type updates
     regular_types_tx: Option<watch::Sender<Vec<String>>>,
-
-    /// Output for primary clipboard mime type updates
-    primary_types_tx: Option<watch::Sender<Vec<String>>>,
 }
 
 impl State {
     pub fn new(
         seats: HashMap<wl_seat::WlSeat, SeatData>,
         regular_types_tx: Option<watch::Sender<Vec<String>>>,
-        primary_types_tx: Option<watch::Sender<Vec<String>>>,
     ) -> Self {
         Self {
             seats,
             pending_offer_seats: HashMap::new(),
             regular_types_tx,
-            primary_types_tx,
         }
     }
 
@@ -83,21 +74,6 @@ impl State {
         let mut found: Option<data_control::Offer> = None;
         for (_seat, data) in self.seats.iter() {
             if let Some(offer_data) = &data.regular_offer {
-                if offer_data.mime_types.contains(mime_type) {
-                    found = Some(offer_data.offer.clone());
-                    break;
-                }
-            }
-        }
-        found
-    }
-
-    pub fn find_primary_offer(&self, mime_type: &String) -> Option<data_control::Offer> {
-        // Just scan the seats for the first match (has the requested mime type).
-        // Keep it simple until/unless we know we need multi-seat support.
-        let mut found: Option<data_control::Offer> = None;
-        for (_seat, data) in self.seats.iter() {
-            if let Some(offer_data) = &data.primary_offer {
                 if offer_data.mime_types.contains(mime_type) {
                     found = Some(offer_data.offer.clone());
                     break;
@@ -197,51 +173,24 @@ impl_dispatch_device!(State, wl_seat::WlSeat, |state: &mut Self, event, seat: &w
             }
         }
         Event::PrimarySelection { id } => {
-            // End of primary clipboard's offer - save offer and transfer pending mime types
+            // We only track the regular clipboard. This arm just consumes the
+            // pending state that the DataOffer arm created and destroys the offer,
+            // otherwise the pending maps would leak an entry on every
+            // primary-selection change (every text highlight).
+            let offer = if let Some(offer) = id.map(data_control::Offer::from) {
+                offer
+            } else {
+                return;
+            };
+            state.pending_offer_seats.remove(&offer);
             let seat_data = if let Some(seat) = state.seats.get_mut(seat) {
                 seat
             } else {
                 error!("Unknown seat in device/PrimarySelection event: {:?}", seat);
                 return;
             };
-            let offer = if let Some(offer) = id.map(data_control::Offer::from) {
-                offer
-            } else {
-                // Offer revoked: ensure any prior offer is cleaned up
-                if let Some(old_offer_data) = seat_data.primary_offer.take() {
-                    old_offer_data.offer.destroy();
-                }
-                return;
-            };
-            // Clear up offer->seat mapping now that offer is no longer pending
-            state.pending_offer_seats.remove(&offer);
-            // Move collected mime types
-            if let Some(mime_types) = seat_data.pending_offer_types.remove(&offer) {
-                if mime_types.contains(&IGNORED_MIME_TYPE.to_string()) {
-                    // This is our own advertisement, not from another application
-                    debug!("ignoring wayland primary clipboard offer with mime types: {:?}", mime_types);
-                    // Ensure any prior offer is cleaned up
-                    if let Some(old_offer_data) = seat_data.primary_offer.take() {
-                        old_offer_data.offer.destroy();
-                    }
-                    // This offer is being ignored, destroy it too
-                    offer.destroy();
-                } else {
-                    debug!("storing wayland primary clipboard offer with mime types: {:?}", mime_types);
-                    if let Some(tx) = &state.primary_types_tx {
-                        // Advertise the local offer to the upstream client or server
-                        if let Err(e) = tx.send(mime_types.clone()) {
-                            error!("Failed to notify upsteam of changed clipboard mime types: {}", e);
-                        }
-                    }
-                    // Ensure any prior offer is cleaned up
-                    if let Some(old_offer_data) = seat_data.primary_offer.replace(OfferData{offer, mime_types}) {
-                        old_offer_data.offer.destroy();
-                    }
-                }
-            } else {
-                error!("Missing pending mime types for primary clipboard offer");
-            }
+            seat_data.pending_offer_types.remove(&offer);
+            offer.destroy();
         }
         Event::Finished => {
             // Destroy the device stored in the seat as it's no longer valid.

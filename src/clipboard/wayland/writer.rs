@@ -23,10 +23,6 @@ use crate::clipboard::wayland::data_control::{
 pub enum ClipboardType {
     /// Write to the regular clipboard (Ctrl+C style)
     Regular,
-    /// Update the primary-selection clipboard (highlighted text style)
-    Primary,
-    /// Update both clipboards
-    Both,
 }
 
 struct State {
@@ -235,14 +231,7 @@ fn write_clipboard(
         // that require an explicit clear don't keep offering the stale clipboard.
         debug!("Clearing {:?} clipboard in wayland", clipboard_type);
         for device in state.seats.values() {
-            match clipboard_type {
-                ClipboardType::Regular => device.set_selection(None),
-                ClipboardType::Primary => device.set_primary_selection(None),
-                ClipboardType::Both => {
-                    device.set_selection(None);
-                    device.set_primary_selection(None);
-                }
-            }
+            device.set_selection(None);
         }
     } else {
         // Ensure the clipboard we're advertising includes the ignored type,
@@ -260,18 +249,7 @@ fn write_clipboard(
                 data_source.offer(mime_type.clone());
             }
 
-            match clipboard_type {
-                ClipboardType::Regular => {
-                    device.set_selection(Some(&data_source));
-                },
-                ClipboardType::Primary => {
-                    device.set_primary_selection(Some(&data_source));
-                },
-                ClipboardType::Both => {
-                    device.set_selection(Some(&data_source));
-                    device.set_primary_selection(Some(&data_source));
-                },
-            }
+            device.set_selection(Some(&data_source));
             sources.push(data_source);
         }
 

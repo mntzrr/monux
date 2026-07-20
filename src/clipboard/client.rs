@@ -47,7 +47,7 @@ impl LocalClipboard {
     async fn new_wayland(config_dir: PathBuf, max_uncompressed_size_bytes: u64) -> Result<Option<Self>> {
         // The watcher call is set up to be permissive of missing wayland, so let's try that first
         let (local_regular_types_tx, local_regular_types_rx) = watch::channel(vec![]);
-        if wayland::type_watcher::start(Some(local_regular_types_tx), None)?.is_none() {
+        if wayland::type_watcher::start(Some(local_regular_types_tx))?.is_none() {
             return Ok(None);
         }
         // Wayland should work from here, treat any init issues as an error

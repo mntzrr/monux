@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
             info!("[TYPES] regular: {:?}", regular_types_rx.borrow().clone());
         }
     });
-    type_watcher::start(Some(regular_types_tx), None)?;
+    type_watcher::start(Some(regular_types_tx))?;
 
     // 2. Writer: advertise text/plain and serve "hello-from-nikau" on paste.
     let (fetch_tx, mut fetch_rx) = mpsc::channel(32);

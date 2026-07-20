@@ -13,7 +13,6 @@ use crate::clipboard::wayland::{common, state};
 /// If wayland is unavailable, this returns Ok(None).
 pub fn start(
     regular_types_tx: Option<watch::Sender<Vec<String>>>,
-    primary_types_tx: Option<watch::Sender<Vec<String>>>,
 ) -> Result<Option<()>> {
     let conn = match Connection::connect_to_env() {
         Ok(conn) => conn,
@@ -47,8 +46,8 @@ pub fn start(
         warn!("Disabling wayland clipboard support: No seats found");
         return Ok(None);
     }
-    // State handles advertising the regular and/or primary clipboard types to upstream listeners
-    let mut state = state::State::new(seats, regular_types_tx, primary_types_tx);
+    // State handles advertising the regular clipboard types to upstream listeners
+    let mut state = state::State::new(seats, regular_types_tx);
 
     queue.roundtrip(&mut state).context("Failed to initialize Wayland state")?;
 
