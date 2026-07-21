@@ -10,6 +10,9 @@
 //! - WiFi power saving disabled persistently via NetworkManager, and applied
 //!   immediately to current wireless interfaces (power saving buffers packets
 //!   and causes 60-300ms latency spikes, felt as stutter)
+//! - raised net.core.rmem_max/wmem_max so the QUIC UDP socket buffers aren't
+//!   silently clamped to the stock ~208 KiB (clamped buffers drop packets
+//!   during clipboard bursts)
 
 use std::path::Path;
 use std::process::Command;
@@ -19,6 +22,12 @@ use anyhow::{bail, Context, Result};
 const NM_POWERSAVE_CONF_PATH: &str = "/etc/NetworkManager/conf.d/99-monux-disable-wifi-powersave.conf";
 const UDEV_RULE_PATH: &str = "/etc/udev/rules.d/99-monux-uinput.rules";
 const MODULES_LOAD_PATH: &str = "/etc/modules-load.d/monux-uinput.conf";
+const SYSCTL_BUF_CONF_PATH: &str = "/etc/sysctl.d/90-monux-udp-buffers.conf";
+
+/// Target for net.core.{r,w}mem_max: comfortably above the 2 MiB that monux
+/// requests for its QUIC UDP socket buffers (the kernel clamps SO_SNDBUF/
+/// SO_RCVBUF to these sysctls).
+const SOCK_MEM_MAX: u64 = 2_621_440;
 
 fn powersave_conf_content() -> &'static str {
     "[connection]\nwifi.powersave = 2\n"
@@ -26,6 +35,13 @@ fn powersave_conf_content() -> &'static str {
 
 fn udev_rule_content() -> &'static str {
     "SUBSYSTEM==\"misc\", KERNEL==\"uinput\", GROUP=\"input\", MODE=\"0660\"\n"
+}
+
+fn sysctl_buf_conf_content() -> String {
+    format!(
+        "net.core.rmem_max = {}\nnet.core.wmem_max = {}\n",
+        SOCK_MEM_MAX, SOCK_MEM_MAX
+    )
 }
 
 pub fn run() -> Result<()> {
@@ -42,6 +58,7 @@ pub fn run() -> Result<()> {
     setup_input_group(&mut failures);
     setup_uinput_access(&mut failures);
     setup_wifi_powersave(&mut failures);
+    setup_socket_buffers(&mut failures);
 
     println!();
     if failures == 0 {
@@ -231,6 +248,39 @@ fn setup_wifi_powersave(failures: &mut u32) {
     }
 }
 
+/// Reads a numeric /proc sysctl value, e.g. /proc/sys/net/core/rmem_max.
+fn read_proc_sysctl(path: &str) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn setup_socket_buffers(failures: &mut u32) {
+    const RMEM_PROC: &str = "/proc/sys/net/core/rmem_max";
+    const WMEM_PROC: &str = "/proc/sys/net/core/wmem_max";
+    let rmem = read_proc_sysctl(RMEM_PROC);
+    let wmem = read_proc_sysctl(WMEM_PROC);
+    if rmem.is_some_and(|v| v >= SOCK_MEM_MAX) && wmem.is_some_and(|v| v >= SOCK_MEM_MAX) {
+        println!("[ok]   udp buffers: net.core.rmem_max/wmem_max already >= {}", SOCK_MEM_MAX);
+        return;
+    }
+
+    // Persist for future boots, then apply immediately (don't require a reboot).
+    if let Err(e) = std::fs::write(SYSCTL_BUF_CONF_PATH, sysctl_buf_conf_content()) {
+        *failures += 1;
+        println!("[fail] udp buffers: could not write {}: {}", SYSCTL_BUF_CONF_PATH, e);
+        return;
+    }
+    println!("[done] udp buffers: wrote {}", SYSCTL_BUF_CONF_PATH);
+    let rmem = format!("net.core.rmem_max={}", SOCK_MEM_MAX);
+    let wmem = format!("net.core.wmem_max={}", SOCK_MEM_MAX);
+    match run_cmd("sysctl", &["-w", &rmem, &wmem]) {
+        Ok(_) => println!("[done] udp buffers: applied immediately (net.core.rmem_max=wmem_max={})", SOCK_MEM_MAX),
+        Err(e) => {
+            *failures += 1;
+            println!("[fail] udp buffers: persisted but immediate apply failed (takes effect on reboot): {}", e);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +304,13 @@ mod tests {
     #[test]
     fn powersave_conf_disables() {
         assert!(powersave_conf_content().contains("wifi.powersave = 2"));
+    }
+
+    #[test]
+    fn sysctl_conf_covers_both_buffers() {
+        let content = sysctl_buf_conf_content();
+        assert!(content.contains("net.core.rmem_max = 2621440"));
+        assert!(content.contains("net.core.wmem_max = 2621440"));
     }
 
     #[test]
