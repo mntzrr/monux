@@ -128,19 +128,16 @@ fn create_socket(bind_addr: SocketAddr, mode: NetworkMode) -> Result<std::net::U
         verify_socket_buf(fd, libc::SO_SNDBUF, "net.core.wmem_max");
         verify_socket_buf(fd, libc::SO_RCVBUF, "net.core.rmem_max");
 
-        #[cfg(target_os = "linux")]
-        {
-            if mode == NetworkMode::Local {
-                setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_PRIORITY,
-                    &SOCKET_PRIORITY,
-                )?;
-                // Note: no DSCP mark here. quinn-udp sets the ECN codepoint via a
-                // per-packet cmsg, which overrides any socket-level IP_TOS/IPV6_TCLASS,
-                // so a setsockopt DSCP mark would be dead code.
-            }
+        if mode == NetworkMode::Local {
+            setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PRIORITY,
+                &SOCKET_PRIORITY,
+            )?;
+            // Note: no DSCP mark here. quinn-udp sets the ECN codepoint via a
+            // per-packet cmsg, which overrides any socket-level IP_TOS/IPV6_TCLASS,
+            // so a setsockopt DSCP mark would be dead code.
         }
         Ok(())
     };
