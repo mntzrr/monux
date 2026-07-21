@@ -25,7 +25,11 @@ const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("MONUX_GIT_SH
     author,
     version = VERSION,
     about,
-    long_about = None
+    long_about = format!(
+        "{}\n\nWire protocol version: {}",
+        env!("CARGO_PKG_DESCRIPTION"),
+        monux::msgs::shared::PROTOCOL_VERSION
+    )
 )]
 #[command(propagate_version = true)]
 struct Cli {
