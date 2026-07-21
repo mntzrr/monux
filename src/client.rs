@@ -434,9 +434,10 @@ impl Connection {
                                 // when a drop makes the server clear the rotation's clipboard
                                 // state, a clipboard copied before the drop would otherwise
                                 // silently vanish. This cannot resurrect a stale clipboard
-                                // over a genuinely newer one: the server announces any
-                                // clipboard owned elsewhere when it adds the client, before
-                                // switching it active on this ordered stream, and that
+                                // over a genuinely newer one: the server pushes the types of
+                                // any clipboard owned elsewhere BEFORE the Switch(true) that
+                                // activates us, on this ordered events stream (both when
+                                // adding the client and when switching to it), and that
                                 // announcement replaces our local types (set_remote_clipboard).
                                 // Still holding local types at the first activation therefore
                                 // means the rotation has nothing newer. Later activations on

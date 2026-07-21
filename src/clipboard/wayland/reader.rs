@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::os::fd::AsFd;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -16,9 +18,12 @@ use crate::clipboard::wayland::{common, state};
 /// Retrieves clipboard data from other applications on the system.
 /// Watches clipboard mime types, and reads clipboard data.
 pub struct ClipboardReader {
-    /// None only while a blocking roundtrip task owns the queue (or after one
-    /// panicked, in which case every read fails fast).
-    inner: Option<ReaderInner>,
+    /// Shared owner of the queue/state: a read moves them onto a blocking
+    /// worker thread, and the worker ALWAYS puts them back when done — even
+    /// if the awaiting read was cancelled (e.g. a client-side read timeout) —
+    /// so a wedged compositor roundtrip can never strand them on the detached
+    /// worker and permanently kill the reader (see run_on_worker).
+    slot: Arc<BlockingSlot<ReaderInner>>,
 }
 
 /// The wayland event queue and its dispatch state. Roundtrips block on the
@@ -27,6 +32,88 @@ pub struct ClipboardReader {
 struct ReaderInner {
     queue: EventQueue<state::State>,
     state: state::State,
+}
+
+/// Shared slot for state that blocking workers borrow and always return (see
+/// run_on_worker). The state is None only while a worker owns it, or forever
+/// after a worker panicked (later users then fail fast).
+struct BlockingSlot<T> {
+    state: Mutex<Option<T>>,
+    /// True while a worker owns the state. Lets an empty slot distinguish
+    /// "roundtrip still running after its caller gave up" (retry later) from
+    /// "roundtrip panicked" (permanent).
+    work_active: AtomicBool,
+}
+
+impl<T> BlockingSlot<T> {
+    fn new(state: T) -> Self {
+        Self {
+            state: Mutex::new(Some(state)),
+            work_active: AtomicBool::new(false),
+        }
+    }
+
+    /// Hands out the state for one worker, marking it busy. Fails fast when
+    /// the state is gone: still owned by an earlier roundtrip (busy), or lost
+    /// to a panicked one (permanent).
+    fn take(&self) -> Result<T> {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = guard.take().with_context(|| {
+            if self.work_active.load(Ordering::Relaxed) {
+                "Wayland clipboard roundtrip still in progress after its caller gave up (wedged compositor?)"
+            } else {
+                "Wayland clipboard reader was lost to a failed roundtrip"
+            }
+        })?;
+        self.work_active.store(true, Ordering::Relaxed);
+        Ok(state)
+    }
+
+    /// Puts the state back and marks the slot idle. Called by the worker
+    /// itself, so it also runs when the awaiting caller was cancelled.
+    fn restore(&self, state: T) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(state);
+        self.work_active.store(false, Ordering::Relaxed);
+    }
+
+    /// Marks the slot dead-idle after a panicked worker: the state is gone
+    /// for good, so later takers get the permanent "lost" error instead of a
+    /// misleading "still in progress".
+    fn mark_dead(&self) {
+        self.work_active.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Runs `work` with the slot's state on the blocking thread pool, returning
+/// its result. The worker ALWAYS restores the state on completion, even when
+/// this future is dropped while awaiting (spawn_blocking tasks keep running
+/// detached), so a cancelled caller (e.g. a read timeout) can't strand the
+/// state. A panicked worker never restores: the slot stays empty and later
+/// callers fail fast. Reads stay serialized: at most one worker owns the
+/// state at any time.
+async fn run_on_worker<T, R, F>(slot: &Arc<BlockingSlot<T>>, work: F) -> Result<R>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+    F: FnOnce(T) -> (T, R) + Send + 'static,
+{
+    let state = slot.take()?;
+    let worker_slot = slot.clone();
+    let join = task::spawn_blocking(move || {
+        let (state, result) = work(state);
+        // Restore unconditionally: this detached closure is the only place
+        // that can put the state back, whatever happened to the caller.
+        worker_slot.restore(state);
+        result
+    });
+    match join.await {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            slot.mark_dead();
+            Err(e).context("Wayland clipboard roundtrip worker failed")
+        }
+    }
 }
 
 impl ClipboardReader {
@@ -53,7 +140,7 @@ impl ClipboardReader {
         queue.roundtrip(&mut state)?;
 
         Ok(Self{
-            inner: Some(ReaderInner { queue, state }),
+            slot: Arc::new(BlockingSlot::new(ReaderInner { queue, state })),
         })
     }
 }
@@ -98,20 +185,13 @@ impl ClipboardReaderTrait for ClipboardReader {
         // The roundtrips inside get_offer block on the compositor; run them on
         // a blocking worker so a wedged compositor can't park an async
         // executor thread for the duration.
-        let inner = self
-            .inner
-            .take()
-            .context("Wayland clipboard reader was lost to a failed roundtrip")?;
         let mime_type = requested_type.to_string();
-        let (inner, offer) = task::spawn_blocking(move || {
-            let mut inner = inner;
+        let offer = run_on_worker(&self.slot, move |mut inner| {
             let offer = inner.get_offer(mime_type);
             (inner, offer)
         })
-        .await
-        .context("Wayland clipboard roundtrip worker failed")?;
-        self.inner = Some(inner);
-        let mut pipe_reader = if let Some(rdr) = offer? {
+        .await??;
+        let mut pipe_reader = if let Some(rdr) = offer {
             rdr
         } else {
             bail!("No clipboard available");
@@ -143,5 +223,61 @@ impl ClipboardReaderTrait for ClipboardReader {
             buf.len()
         );
         Ok(buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Completing work returns its result and hands the state back, so the
+    /// slot is immediately usable for the next read.
+    #[tokio::test]
+    async fn completed_work_restores_state() {
+        let slot = Arc::new(BlockingSlot::new(41u32));
+        let result = run_on_worker(&slot, |n| (n, n + 1)).await.unwrap();
+        assert_eq!(result, 42);
+        let result = run_on_worker(&slot, |n| (n, n + 1)).await.unwrap();
+        assert_eq!(result, 42);
+        assert!(!slot.work_active.load(Ordering::Relaxed));
+    }
+
+    /// A caller cancelled mid-roundtrip (e.g. the client-side 4s read
+    /// timeout) drops the awaiting future, but the detached worker still
+    /// restores the state when it finishes: the reader is never lost to a
+    /// slow compositor.
+    #[tokio::test]
+    async fn cancelled_caller_still_gets_state_restored() {
+        let slot = Arc::new(BlockingSlot::new(7u32));
+        let slow = run_on_worker(&slot, |n| {
+            std::thread::sleep(Duration::from_millis(200));
+            (n, n)
+        });
+        // The caller gives up before the wedged roundtrip returns.
+        assert!(time::timeout(Duration::from_millis(20), slow).await.is_err());
+        // While the worker still owns the state, reads fail fast as busy...
+        let busy = run_on_worker(&slot, |n| (n, n)).await;
+        assert!(format!("{:?}", busy.unwrap_err()).contains("still in progress"));
+        // ...but once the detached worker finishes, the state is back and
+        // reads proceed again.
+        time::sleep(Duration::from_millis(400)).await;
+        let result = run_on_worker(&slot, |n| (n, n + 1)).await.unwrap();
+        assert_eq!(result, 8);
+        assert!(!slot.work_active.load(Ordering::Relaxed));
+    }
+
+    /// A panicked worker never restores the state: later callers fail fast
+    /// with the permanent "lost" error (same as before the shared-slot change).
+    #[tokio::test]
+    async fn panicked_worker_leaves_the_reader_lost() {
+        let slot = Arc::new(BlockingSlot::new(1u32));
+        let result: Result<u32> = run_on_worker(&slot, |_| -> (u32, u32) {
+            panic!("compositor roundtrip exploded");
+        })
+        .await;
+        assert!(format!("{:?}", result.unwrap_err()).contains("worker failed"));
+        // The state is gone: every later read fails fast with the original error.
+        let lost = run_on_worker(&slot, |n| (n, n)).await;
+        assert!(format!("{:?}", lost.unwrap_err()).contains("lost to a failed roundtrip"));
     }
 }

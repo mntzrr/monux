@@ -273,7 +273,9 @@ impl OutputHandler for VirtualUInputDevices {
             }),
             inputf64: None,
         });
-        // write() routes the releases to the right devices and clears the tracking set.
+        // write() routes the releases to the right devices and clears them from
+        // the tracking set (on failure it keeps them tracked, so a later
+        // release_all can retry).
         self.write(releases).await
     }
 
@@ -310,6 +312,10 @@ impl OutputHandler for VirtualUInputDevices {
         // duplicated presses (event delivered twice) and catch-up bursts (a
         // backlog flushed after a stall).
         let mut key_events_in_batch = 0u32;
+        // Releases untracked by this batch, with their original press time. If
+        // the emit below fails, these are re-tracked so the kernel's still-held
+        // keys stay visible to a later release_all retry.
+        let mut removed_releases: Vec<(u16, Instant)> = Vec::new();
         let mut filtered_events: Vec<(evdev::InputEvent, EventDest)> =
             Vec::with_capacity(events.len());
         for (e, dest) in events {
@@ -318,6 +324,7 @@ impl OutputHandler for VirtualUInputDevices {
                 match e.value() {
                     0 => {
                         if let Some(since) = self.pressed_keys.remove(&e.code()) {
+                            removed_releases.push((e.code(), since));
                             let held = since.elapsed();
                             if held > Duration::from_millis(600) {
                                 debug!(
@@ -370,12 +377,32 @@ impl OutputHandler for VirtualUInputDevices {
             self.last_key_event_at = Some(Instant::now());
         }
 
+        // Hand the batch to the kernel. If that fails, the releases untracked
+        // above may never have taken effect on the device: re-track them (with
+        // their original press times) so the keys don't stay pressed in the
+        // kernel while invisible to a later release_all retry.
+        if let Err(e) = self.emit_routed_events(&events) {
+            for (code, since) in removed_releases {
+                self.pressed_keys.insert(code, since);
+            }
+            return Err(e.into());
+        }
+
+        Ok(())
+    }
+}
+
+impl VirtualUInputDevices {
+    /// Routes a prepared batch to the right virtual device(s) and emits it.
+    /// Split from write() so the caller can roll back its pressed-key tracking
+    /// when the kernel never saw the events.
+    fn emit_routed_events(&mut self, events: &[(evdev::InputEvent, EventDest)]) -> std::io::Result<()> {
         // Collect stats on how many events apply to each device
         // We specifically avoid grouping the events themselves so that ordering is preserved
         let mut keyboard_count = 0;
         let mut mouse_count = 0;
         let mut touchpad_count = 0;
-        for e in &events {
+        for e in events {
             match e.1 {
                 EventDest::Keyboard => {
                     keyboard_count += 1;
@@ -448,7 +475,7 @@ impl OutputHandler for VirtualUInputDevices {
             let mut keyboard_events = vec![];
             let mut mouse_events = vec![];
             let mut touchpad_events = vec![];
-            for event in &events {
+            for event in events {
                 match event.1 {
                     EventDest::Keyboard => {
                         keyboard_events.push(event.0);

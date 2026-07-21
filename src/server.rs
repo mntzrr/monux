@@ -121,12 +121,18 @@ pub async fn run_server_connections_loop(
         transport::NetworkMode::Www => Duration::from_secs(15),
     };
     // Task launcher for new client connections
+    // Monotonic token tagging each accepted connection: a reconnect can reuse
+    // the same addr:port, and the token lets the rotation tell a late removal
+    // from the old (dead) connection apart from the healthy new entry.
+    let mut next_conn_token: u64 = 1;
     loop {
         let conn = server_endpoint.accept().await;
         let conn = match conn {
             Some(c) => c,
             None => bail!("Server endpoint is closed, exiting server"),
         };
+        let conn_token = next_conn_token;
+        next_conn_token += 1;
         let remote_addr = conn.remote_address();
         if mode == transport::NetworkMode::Www && !conn.remote_address_validated() {
             // On the public internet, require the client to validate its source
@@ -176,12 +182,17 @@ pub async fn run_server_connections_loop(
                         // Now that we have extracted the client cert fingerprint, spawn.
                         task::spawn(async move {
                             if let Err(e) =
-                                handle_connection(conn, fingerprint, rotation_tx_cpy.clone(), max_clipboard_size_bytes)
+                                handle_connection(conn, fingerprint, rotation_tx_cpy.clone(), max_clipboard_size_bytes, conn_token)
                                 .await
                             {
                                 // Always try to remove the client from rotation, even if it wasn't added yet.
+                                // The token lets the rotation ignore this removal if the endpoint
+                                // was since reused by a newer connection.
                                 if let Err(e) = rotation_tx_cpy
-                                    .send(rotation::RotationEvent::RemoveClient(remote_addr))
+                                    .send(rotation::RotationEvent::RemoveClient {
+                                        endpoint: remote_addr,
+                                        conn_token,
+                                    })
                                     .await {
                                         error!("Failed to send remove client event: {:?}", e);
                                     };
@@ -207,6 +218,7 @@ async fn handle_connection(
     fingerprint: String,
     rotation_tx: mpsc::Sender<rotation::RotationEvent>,
     max_clipboard_size_bytes: u64,
+    conn_token: u64,
 ) -> Result<()> {
     let (mut events_send, mut events_recv) = conn
         .accept_bi()
@@ -247,6 +259,7 @@ async fn handle_connection(
                 events_send,
                 bulk_send,
                 conn: conn.clone(),
+                conn_token,
             },
         ))
         .await?;

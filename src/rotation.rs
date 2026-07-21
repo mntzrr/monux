@@ -70,6 +70,12 @@ struct ClientInfo {
     /// Whether the peer accepts QUIC datagrams. Disabled permanently on the
     /// first UnsupportedByPeer/Disabled error, falling back to the stream.
     datagrams_ok: bool,
+    /// Unique-per-process token of the accepted connection that owns this
+    /// entry (see server.rs). A reconnect can reuse the same addr:port and
+    /// replace this entry in place; the old connection's late RemoveClient
+    /// then carries a stale token and is ignored instead of killing the
+    /// healthy new entry.
+    conn_token: u64,
 }
 
 /// Keeps track of the most recently disconnected client,
@@ -109,9 +115,15 @@ struct ClipboardTarget {
 pub enum RotationEvent {
     /// Request to add a client to the rotation
     AddClient(AddClientArgs),
-    /// Request to remove a disconnected client from the rotation
-    /// If the client currently owns the clipboard, that status is cleared
-    RemoveClient(SocketAddr),
+    /// Request to remove a disconnected client from the rotation.
+    /// If the client currently owns the clipboard, that status is cleared.
+    /// Internal channel message only (never on the wire). Ignored when
+    /// conn_token doesn't match the stored entry: the endpoint was reused by
+    /// a newer connection and the removal belongs to the dead old one.
+    RemoveClient {
+        endpoint: SocketAddr,
+        conn_token: u64,
+    },
     /// Request to update the current clipboard location and info
     ClipboardUpdateSource(ClipboardUpdateSourceArgs),
     /// Request to fetch a current clipboard's content
@@ -126,6 +138,8 @@ pub struct AddClientArgs {
     pub events_send: SendStream,
     pub bulk_send: SendStream,
     pub conn: quinn::Connection,
+    /// Token of the accepted connection (see ClientInfo::conn_token).
+    pub conn_token: u64,
 }
 
 /// Outcome of a pointer-motion datagram send attempt.
@@ -397,11 +411,16 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                     args.events_send,
                     args.bulk_send,
                     args.conn,
+                    args.conn_token,
                 )
                 .await
             }
-            RotationEvent::RemoveClient(endpoint) => {
-                self.remove_client_and_clear_clipboard(endpoint).await
+            RotationEvent::RemoveClient {
+                endpoint,
+                conn_token,
+            } => {
+                self.remove_client_and_clear_clipboard(endpoint, conn_token)
+                    .await
             }
             RotationEvent::ClipboardUpdateSource(args) => {
                 if let Err(e) = self
@@ -447,6 +466,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         events_send: SendStream,
         bulk_send: SendStream,
         conn: quinn::Connection,
+        conn_token: u64,
     ) {
         // Dedicated writer task for this client's bulk stream: clipboard payloads
         // can be megabytes, and writing them inline would stall input forwarding
@@ -462,7 +482,10 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                     if let Err(e) = bulk_send.write_all(&bytes).await {
                         warn!("Bulk stream to {} failed, removing client: {:?}", endpoint, e);
                         let _ = rotation_tx
-                            .send(RotationEvent::RemoveClient(endpoint))
+                            .send(RotationEvent::RemoveClient {
+                                endpoint,
+                                conn_token,
+                            })
                             .await;
                         return;
                     }
@@ -476,12 +499,14 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             bulk_tx,
             conn,
             datagrams_ok: true,
+            conn_token,
         };
         // Clients stay sorted by endpoint as an arbitrary consistent order across
         // sessions. An identical endpoint can already be present when a reconnect
         // lands before the old connection's removal: update that entry in place
         // instead of inserting a duplicate (a later removal would clear only the
-        // first copy, leaving a dead one behind).
+        // first copy, leaving a dead one behind). The old connection's late
+        // removal is then ignored via its stale conn_token (see RemoveClient).
         match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
             Ok(idx) => self.clients[idx] = info,
             Err(idx) => self.clients.insert(idx, info),
@@ -497,6 +522,32 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 .collect::<Vec<String>>()
                 .join(", ")
         );
+
+        // Announce clipboard to client, if its IP doesn't match the clipboard owner's IP.
+        // Matching IP would indicate that the client is reconnecting but we haven't disconnected the old one yet.
+        // This runs BEFORE any re-activation below: the types must reach the
+        // client before Switch(true) on the ordered events stream, so the
+        // client replaces any stale local types (set_remote_clipboard) before
+        // its first-activation re-announce check runs (see update_current_client).
+        if let Some(clipboard_target) = &self.clipboard_target {
+            if match clipboard_target.source {
+                // Client has clipboard. Make sure it's not the same client IP.
+                Some(clipboard_source) => clipboard_source.ip() != endpoint.ip(),
+                // Server has clipboard.
+                None => true,
+            } {
+                // Tell the new client about the current clipboard status.
+                let types_str = clipboard_target.types.join(" ");
+                let types_msg = event::ServerEvent::ClipboardTypes(event::ClipboardTypes {
+                    types: &types_str,
+                    max_size_bytes: clipboard_target.max_size_bytes,
+                });
+                if let Err(e) = self.send_event(&endpoint, types_msg).await {
+                    // This shouldn't happen in practice, given we just added the client...
+                    warn!("Newly added client already failed and was removed: {:?}", e);
+                }
+            }
+        }
 
         // If the new client has the same IP as the currently enabled client, it's probably a fast retry
         // where we haven't removed the prior session yet. Mark the new client as enabled/current.
@@ -537,31 +588,22 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 self.update_current_client(Some(endpoint)).await;
             }
         }
-
-        // Announce clipboard to client, if its IP doesn't match the clipboard owner's IP.
-        // Matching IP would indicate that the client is reconnecting but we haven't disconnected the old one yet.
-        if let Some(clipboard_target) = &self.clipboard_target {
-            if match clipboard_target.source {
-                // Client has clipboard. Make sure it's not the same client IP.
-                Some(clipboard_source) => clipboard_source.ip() != endpoint.ip(),
-                // Server has clipboard.
-                None => true,
-            } {
-                // Tell the new client about the current clipboard status.
-                let types_str = clipboard_target.types.join(" ");
-                let types_msg = event::ServerEvent::ClipboardTypes(event::ClipboardTypes {
-                    types: &types_str,
-                    max_size_bytes: clipboard_target.max_size_bytes,
-                });
-                if let Err(e) = self.send_event(&endpoint, types_msg).await {
-                    // This shouldn't happen in practice, given we just added the client...
-                    warn!("Newly added client already failed and was removed: {:?}", e);
-                }
-            }
-        }
     }
 
-    async fn remove_client_and_clear_clipboard(&mut self, endpoint: SocketAddr) {
+    async fn remove_client_and_clear_clipboard(&mut self, endpoint: SocketAddr, conn_token: u64) {
+        // A reconnect can reuse the same addr:port before the old connection's
+        // teardown lands: add_client then replaces the entry in place, and the
+        // old connection's late removal must not kill the healthy new entry.
+        // Tokens are unique per accepted connection (see server.rs).
+        if let Ok(idx) = self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
+            if self.clients[idx].conn_token != conn_token {
+                debug!(
+                    "Ignoring stale removal of {}: token {} belongs to a replaced connection",
+                    endpoint, conn_token
+                );
+                return;
+            }
+        }
         if self.handle_client_removal(&endpoint).await {
             self.clipboard_clear().await;
         }
@@ -584,9 +626,50 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         false
     }
 
+    /// Runs the same held-key cleanup on the CURRENT target that a real switch
+    /// runs on the old one, for a switch request dropped by SWITCH_DEBOUNCE.
+    /// The user pressed the full chord intending to switch: the chord's
+    /// modifier presses were forwarded to the current target, but ComboState
+    /// consumes their releases once the chord fires (see device::shortcut), so
+    /// without this the target would keep the chord's modifiers logically
+    /// pressed until each is tapped again.
+    async fn release_current_target_keys(&mut self) {
+        match self.current_client {
+            Some(endpoint) => {
+                // Mirror of the deactivation a real switch sends the old
+                // client: the client releases its held keys on Switch(false)
+                // (see client.rs). Re-activate right away, since the rotation
+                // stays on this client.
+                let _ = self
+                    .send_event(
+                        &endpoint,
+                        event::ServerEvent::Switch(event::SwitchEvent { enabled: false }),
+                    )
+                    .await;
+                let _ = self
+                    .send_event(
+                        &endpoint,
+                        event::ServerEvent::Switch(event::SwitchEvent { enabled: true }),
+                    )
+                    .await;
+            }
+            None => {
+                // Mirror of set_and_grab_current_client switching away from the
+                // local machine.
+                if let Err(e) = self.output_handler.release_all().await {
+                    warn!(
+                        "Failed to release held keys on local virtual devices after debounced switch: {:?}",
+                        e
+                    );
+                }
+            }
+        }
+    }
+
     /// Switches to the previous client (or to the server) in the arbitrary rotation.
     pub async fn prev_client(&mut self) {
         if self.switch_debounced() {
+            self.release_current_target_keys().await;
             return;
         }
         if let Some(current_client) = &self.current_client {
@@ -616,6 +699,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// Switches to the next client (or to the server) in the arbitrary rotation.
     pub async fn next_client(&mut self) {
         if self.switch_debounced() {
+            self.release_current_target_keys().await;
             return;
         }
         if let Some(current_client) = &self.current_client {
@@ -1100,6 +1184,22 @@ impl<O: device::output::OutputHandler> Rotation<O> {
 
         self.set_and_grab_current_client(new_client).await;
 
+        // Notify the new client (or server) about any current clipboard info,
+        // or a noop if it fails. INVARIANT: the types are pushed on the ordered
+        // events stream BEFORE Switch(true) below, so a (re-)activated client
+        // replaces any stale local types (set_remote_clipboard) before its
+        // first-activation re-announce check runs — a stale clipboard must
+        // never shadow a genuinely newer one (see client.rs).
+        // This may be overridden if the old client sends a clipboard update
+        // following the switch, or it won't, if the old client doesn't have a
+        // clipboard update to send.
+        if let Err(e) = self.update_current_client_clipboard().await {
+            warn!(
+                "Failed to send clipboard update to active client/server: {:?}",
+                e
+            );
+        }
+
         if let Some(new_client) = new_client {
             // Try to send switch{true} to the newly assigned current_client.
             // If it fails then current_client is cleaned up.
@@ -1130,18 +1230,6 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                     .join(", ")
             );
             notify_switch("Input on this machine");
-        }
-
-        // Notify the new client (or server) about any current clipboard info, or a noop if it fails.
-        // This may be overridden if the old client sends a clipboard update following the switch,
-        // or it won't, if the old client doesn't have a clipboard update to send.
-        // log_info=false: Avoid duplicate info-level logging of clipboard types, between the server
-        // switch and then (potentially) an update from the client that's being deactivated.
-        if let Err(e) = self.update_current_client_clipboard().await {
-            warn!(
-                "Failed to send clipboard update to active client/server: {:?}",
-                e
-            );
         }
 
         // AFTER setting up the new client, lets send enabled=false to the old client.
@@ -2022,11 +2110,13 @@ mod tests {
     /// Stub output handler that just counts what it's asked to write.
     struct StubOutput {
         written: usize,
+        released: usize,
     }
 
     #[async_trait::async_trait]
     impl device::output::OutputHandler for StubOutput {
         async fn release_all(&mut self) -> Result<()> {
+            self.released += 1;
             Ok(())
         }
         async fn write(&mut self, events: Vec<event::InputEvent>) -> Result<()> {
@@ -2042,7 +2132,7 @@ mod tests {
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
         let mut rotation = Rotation::new(
             grab_tx,
-            StubOutput { written: 0 },
+            StubOutput { written: 0, released: 0 },
             None,
             &dir,
             rotation_tx,
@@ -2078,7 +2168,7 @@ mod tests {
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
         let mut rotation = Rotation::new(
             grab_tx,
-            StubOutput { written: 0 },
+            StubOutput { written: 0, released: 0 },
             None,
             &dir,
             rotation_tx,
@@ -2124,7 +2214,7 @@ mod tests {
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
         let mut rotation = Rotation::new(
             grab_tx,
-            StubOutput { written: 0 },
+            StubOutput { written: 0, released: 0 },
             None,
             &dir,
             rotation_tx,
@@ -2142,13 +2232,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn debounced_switch_still_releases_current_target_keys() {
+        let dir = temp_dir("debounce-release");
+        let (grab_tx, _grab_rx) = watch::channel(device::GrabEvent::Ungrab);
+        let (rotation_tx, _rotation_rx) = mpsc::channel(8);
+        let mut rotation = Rotation::new(
+            grab_tx,
+            StubOutput { written: 0, released: 0 },
+            None,
+            &dir,
+            rotation_tx,
+            None,
+            Arc::new(DiagnosticsMirror::new()),
+        )
+        .await
+        .unwrap();
+
+        // The first switch request is processed (with no clients connected the
+        // rotation stays on the local machine). A re-fire within
+        // SWITCH_DEBOUNCE — e.g. the user pressing the full chord again while
+        // cycling rapidly — is dropped by the debounce...
+        rotation.next_client().await;
+        assert_eq!(rotation.output_handler.released, 0);
+        rotation.next_client().await;
+        // ...but the current target (here the local machine) must still get
+        // the same held-key cleanup a real switch runs on the old target: the
+        // chord's modifier presses were forwarded to it, and ComboState
+        // consumes their releases once the chord fires.
+        assert_eq!(rotation.output_handler.released, 1);
+        // Same for the prev direction.
+        rotation.prev_client().await;
+        assert_eq!(rotation.output_handler.released, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn empty_local_types_update_clears_clipboard_target() {
         let dir = temp_dir("clipclear");
         let (grab_tx, _grab_rx) = watch::channel(device::GrabEvent::Ungrab);
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
         let mut rotation = Rotation::new(
             grab_tx,
-            StubOutput { written: 0 },
+            StubOutput { written: 0, released: 0 },
             None,
             &dir,
             rotation_tx,
