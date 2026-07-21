@@ -148,7 +148,8 @@ struct ClientArgs {
 
 #[derive(Args)]
 struct UpdateArgs {
-    /// Rebuild and reinstall even if already up to date
+    /// Rebuild and reinstall even if already up to date, and bypass the
+    /// server protocol-compatibility gate
     #[arg(long)]
     force: bool,
 }
@@ -208,7 +209,15 @@ fn main() -> Result<()> {
             maybe_elevate("to persist system settings")?;
             return monux::setup::run();
         }
-        Commands::Update(args) => return monux::update::run(args.force, false),
+        Commands::Update(args) => {
+            // Gate on the server's protocol version when this machine acts as
+            // a client, so an update can't break the connection. The config
+            // dir may not exist yet; the constraint is simply absent then.
+            let constraint = home::home_dir()
+                .map(|h| h.join(".config").join("monux"))
+                .and_then(|dir| monux::update::server_protocol_constraint(&dir));
+            return monux::update::run(args.force, false, constraint).map(|_| ());
+        }
         _ => {}
     }
 
@@ -232,7 +241,8 @@ fn main() -> Result<()> {
             let server_lock = single_instance::acquire("server")?;
             settle_after_takeover(&server_lock);
             if args.auto_update {
-                rt.spawn(monux::autoupdate::run());
+                // The server leads protocol upgrades: no compatibility gate.
+                rt.spawn(monux::autoupdate::run(None));
             }
             let fingerprint = Arc::new(Mutex::new(None));
             let verifier = approval::MonuxCertVerification::new(
@@ -288,7 +298,7 @@ fn main() -> Result<()> {
             let client_lock = single_instance::acquire("client")?;
             settle_after_takeover(&client_lock);
             if args.auto_update {
-                rt.spawn(monux::autoupdate::run());
+                rt.spawn(monux::autoupdate::run(Some(config_dir.clone())));
             }
             // When no host is given, the server address comes from mDNS discovery,
             // which allows re-discovering it after repeated connection failures.
@@ -647,7 +657,7 @@ async fn client(
 - As a fallback, run as root with 'sudo -E monux client ...' (-E keeps clipboard support)")?;
     let max_uncompressed_size_bytes = 10 * max_clipboard_size_bytes;
     let mut local_clipboard = clipboard::client::LocalClipboard::new(
-        config_dir,
+        config_dir.clone(),
         max_uncompressed_size_bytes,
     ).await;
 
@@ -667,6 +677,7 @@ async fn client(
                 &mut local_clipboard,
                 &mut output_handler,
                 mode,
+                &config_dir,
             ) => {
                 // client::run only returns on failure (its loop never exits otherwise).
                 if let Err(e) = run_result {

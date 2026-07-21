@@ -46,7 +46,18 @@ pub fn is_newer_remote(remote_sha: &str, current_revision: &str) -> bool {
     current_base != "unknown" && !current_base.is_empty() && !remote_sha.starts_with(current_base)
 }
 
-pub fn run(force: bool, low_priority: bool) -> Result<()> {
+/// How an update attempt ended.
+pub enum UpdateStatus {
+    /// A new build was installed.
+    Installed,
+    /// Already up to date; nothing was built.
+    AlreadyCurrent,
+    /// The new source speaks a different protocol version than our server;
+    /// nothing was built (see the protocol_constraint parameter of run).
+    SkippedIncompatible,
+}
+
+pub fn run(force: bool, low_priority: bool, protocol_constraint: Option<u64>) -> Result<UpdateStatus> {
     let repo = repo_url();
     let src_dir = match std::env::var_os("MONUX_UPDATE_CACHE") {
         Some(dir) => PathBuf::from(dir),
@@ -88,7 +99,23 @@ pub fn run(force: bool, low_priority: bool) -> Result<()> {
             "monux is already up to date ({}). Use --force to rebuild anyway.",
             CURRENT_REVISION
         );
-        return Ok(());
+        return Ok(UpdateStatus::AlreadyCurrent);
+    }
+
+    // The update gate: a client never installs a build whose protocol version
+    // differs from its server's — it would be unable to reconnect. Checked
+    // from the pulled source, before the expensive build.
+    if !force {
+        if let Some(server_version) = protocol_constraint {
+            let source_version = source_protocol_version(&src_dir)?;
+            if source_version != server_version {
+                info!(
+                    "Not updating to {}: it speaks protocol v{}, but the server speaks v{}. Update the server first; this gate opens automatically once this client reconnects to it (or use --force to override).",
+                    latest, source_version, server_version
+                );
+                return Ok(UpdateStatus::SkippedIncompatible);
+            }
+        }
     }
     info!("Updating monux: {} -> {}", CURRENT_REVISION, latest);
 
@@ -124,7 +151,53 @@ pub fn run(force: bool, low_priority: bool) -> Result<()> {
         latest,
         root.join("bin/monux").display()
     );
-    Ok(())
+    Ok(UpdateStatus::Installed)
+}
+
+/// Reads the protocol version a source checkout speaks, straight from its
+/// shared.rs — no build needed.
+fn source_protocol_version(src_dir: &Path) -> Result<u64> {
+    let shared_rs = src_dir.join("src").join("msgs").join("shared.rs");
+    let text = std::fs::read_to_string(&shared_rs)
+        .with_context(|| format!("Failed to read {}", shared_rs.display()))?;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("pub const PROTOCOL_VERSION: u64 =") {
+            if let Some(num) = rest.trim().strip_suffix(';') {
+                return num.trim().parse().with_context(|| {
+                    format!("Failed to parse PROTOCOL_VERSION in {}", shared_rs.display())
+                });
+            }
+        }
+    }
+    bail!("PROTOCOL_VERSION not found in {}", shared_rs.display())
+}
+
+/// Name of the file (inside the config dir) recording the protocol version of
+/// the server this machine last talked to as a client.
+const SERVER_PROTOCOL_VERSION_FILE: &str = "server_protocol_version";
+
+/// Records the server's protocol version for the update gate (best-effort).
+/// Called by the client on every handshake, including refused ones — that is
+/// what re-opens the gate after the server upgrades ahead of us.
+pub fn record_server_protocol_version(config_dir: &Path, version: u64) {
+    if let Err(e) = std::fs::write(
+        config_dir.join(SERVER_PROTOCOL_VERSION_FILE),
+        version.to_string(),
+    ) {
+        tracing::warn!("Failed to record server protocol version: {:?}", e);
+    }
+}
+
+/// The protocol version of the server this machine acts as a client to, if it
+/// has ever connected to one. Used to gate updates so a client never installs
+/// a build its server couldn't talk to.
+pub fn server_protocol_constraint(config_dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(config_dir.join(SERVER_PROTOCOL_VERSION_FILE))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Install next to the currently running binary (<root>/bin/monux -> <root>),
@@ -220,5 +293,31 @@ mod tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "unknown"
         ));
+    }
+
+    #[test]
+    fn parses_own_source_protocol_version() {
+        // Guards the gate against repo layout drift: the parser must find the
+        // constant this very binary was built with.
+        let own = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(
+            source_protocol_version(own).unwrap(),
+            crate::msgs::shared::PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn server_protocol_constraint_roundtrip() {
+        let dir =
+            std::env::temp_dir().join(format!("monux-test-constraint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Never connected: no constraint.
+        assert_eq!(server_protocol_constraint(&dir), None);
+        record_server_protocol_version(&dir, 7);
+        assert_eq!(server_protocol_constraint(&dir), Some(7));
+        // A later handshake overwrites (e.g. the server upgraded).
+        record_server_protocol_version(&dir, 8);
+        assert_eq!(server_protocol_constraint(&dir), Some(8));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -24,9 +24,11 @@ pub async fn run<O: output::OutputHandler>(
     local_clipboard: &mut Option<client::LocalClipboard>,
     output_handler: &mut O,
     mode: transport::NetworkMode,
+    config_dir: &std::path::Path,
 ) -> Result<()> {
     let (mut client, connect_time) =
-        Connection::new(server_addr, cert_verifier, max_clipboard_size_bytes, mode).await?;
+        Connection::new(server_addr, cert_verifier, max_clipboard_size_bytes, mode, config_dir)
+            .await?;
     loop {
         if let Err(e) = client
             .step(local_clipboard, output_handler, &connect_time)
@@ -83,6 +85,7 @@ impl Connection {
         cert_verifier: Arc<approval::MonuxCertVerification<'static>>,
         max_clipboard_size_bytes: u64,
         mode: transport::NetworkMode,
+        config_dir: &std::path::Path,
     ) -> Result<(Self, Instant)> {
         let bind_addr: SocketAddr = match server_addr {
             SocketAddr::V4(_) => "0.0.0.0:0".parse().expect("Failed to parse 0.0.0.0:0"),
@@ -111,7 +114,13 @@ impl Connection {
         // if it can't support the other's version.
         let mut event_bytes = Vec::with_capacity(1024);
         transport::send_version(&mut events_send).await?;
-        transport::recv_version(&mut events_recv, &mut event_bytes).await?;
+        let server_version = transport::recv_version(&mut events_recv, &mut event_bytes).await?;
+        // Record the server's version (even on mismatch) for the update gate:
+        // 'monux update' refuses builds our server couldn't talk to. Recording
+        // a refused handshake too is what unblocks the gate after the server
+        // upgrades ahead of us.
+        crate::update::record_server_protocol_version(config_dir, server_version);
+        transport::ensure_compatible_version(server_version)?;
 
         let (mut bulk_send, mut bulk_recv) = conn
             .open_bi()
@@ -122,7 +131,8 @@ impl Connection {
         // This is required in order to initialize the bulk stream,
         // otherwise the server times out waiting for the stream to open.
         transport::send_version(&mut bulk_send).await?;
-        transport::recv_version(&mut bulk_recv, &mut event_bytes).await?;
+        let server_version = transport::recv_version(&mut bulk_recv, &mut event_bytes).await?;
+        transport::ensure_compatible_version(server_version)?;
 
         Ok((
             Self {

@@ -212,9 +212,11 @@ async fn handle_connection(
     // Receive version from client and close the connection if it's not supported.
     // Future versions could follow the version message with more data. We ignore/discard it here.
     let mut event_bytes = Vec::with_capacity(1024);
-    transport::recv_version(&mut events_recv, &mut event_bytes).await?;
-    // Reply with our own version so that the client can diagnose a mismatch too.
+    let client_version = transport::recv_version(&mut events_recv, &mut event_bytes).await?;
+    // Reply with our own version BEFORE rejecting a mismatch, so that the
+    // client learns it (its update gate needs it to catch up after we upgrade).
     transport::send_version(&mut events_send).await?;
+    transport::ensure_compatible_version(client_version)?;
 
     // Start second stream for bulk messages
     let (mut bulk_send, mut bulk_recv) = conn
@@ -225,8 +227,9 @@ async fn handle_connection(
     // Receive the version a second time, on the bulk stream.
     // Sending some data is required to initialize the bulk stream, so let's just repeat ourselves.
     // Maybe we'll want to have different per-stream versions someday? Probably not.
-    transport::recv_version(&mut bulk_recv, &mut event_bytes).await?;
+    let client_version = transport::recv_version(&mut bulk_recv, &mut event_bytes).await?;
     transport::send_version(&mut bulk_send).await?;
+    transport::ensure_compatible_version(client_version)?;
 
     // Add client to the rotation after a successful init
     rotation_tx

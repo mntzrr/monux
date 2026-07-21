@@ -73,7 +73,10 @@ fn schedule_restart() {
 }
 
 /// Runs the auto-update loop; spawn it on the tokio runtime.
-pub async fn run() {
+/// `gate_config_dir`: for clients, the config dir holding the server's
+/// recorded protocol version — updates that would break compatibility with
+/// the server are skipped. Servers pass None: they lead protocol upgrades.
+pub async fn run(gate_config_dir: Option<std::path::PathBuf>) {
     tokio::time::sleep(initial_delay()).await;
     // Test hook: pretend an update was installed, exercising the automatic
     // restart without a rebuild. Fires once per boot lineage (the re-exec'd
@@ -87,7 +90,9 @@ pub async fn run() {
     }
     // The sha of the last update attempt, so a persistent failure (or a
     // successful install whose restart is still pending) doesn't rebuild
-    // every interval.
+    // every interval. Deliberately NOT set when the update gate skips a
+    // build: the gate opens once the server is updated, which the next
+    // check picks up.
     let mut last_attempted: Option<String> = None;
     loop {
         let repo = update::repo_url();
@@ -100,12 +105,33 @@ pub async fn run() {
                         "monux update available ({}), rebuilding in the background...",
                         short(&remote_sha)
                     );
-                    last_attempted = Some(remote_sha.clone());
-                    let result = tokio::task::spawn_blocking(|| update::run(false, true)).await;
+                    let constraint = gate_config_dir
+                        .as_deref()
+                        .and_then(update::server_protocol_constraint);
+                    let result =
+                        tokio::task::spawn_blocking(move || update::run(false, true, constraint))
+                            .await;
                     match result {
-                        Ok(Ok(())) => restart_after_grace(&remote_sha, true).await,
-                        Ok(Err(e)) => warn!("Background monux update failed: {:?}", e),
-                        Err(e) => error!("Background monux update task failed: {:?}", e),
+                        Ok(Ok(update::UpdateStatus::Installed)) => {
+                            last_attempted = Some(remote_sha.clone());
+                            restart_after_grace(&remote_sha, true).await;
+                        }
+                        Ok(Ok(update::UpdateStatus::AlreadyCurrent)) => {
+                            // The remote moved between our check and the pull.
+                            last_attempted = Some(remote_sha.clone());
+                        }
+                        Ok(Ok(update::UpdateStatus::SkippedIncompatible)) => {
+                            // Logged by update::run; last_attempted stays unset
+                            // so the next check retries (the gate may have opened).
+                        }
+                        Ok(Err(e)) => {
+                            last_attempted = Some(remote_sha.clone());
+                            warn!("Background monux update failed: {:?}", e);
+                        }
+                        Err(e) => {
+                            last_attempted = Some(remote_sha.clone());
+                            error!("Background monux update task failed: {:?}", e);
+                        }
                     }
                 } else {
                     debug!("monux is up to date ({})", short(&remote_sha));

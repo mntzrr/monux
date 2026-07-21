@@ -61,9 +61,11 @@ To pick up the new version, restart the processes — the session then heals its
 
 Active-session resumption survives server restarts for up to an hour (see `active_client` in `~/.config/monux`).
 
+**Protocol-compatibility gate:** a client never installs a build whose protocol version differs from its server's — such a build would be unable to reconnect. The client records the server's protocol version at every connection, including handshakes the server refused, and `monux update` (manual or automatic) checks the new source against it before building. If they differ, the update is skipped with a log message telling you to update the server first; once the server is updated, the client learns the new version on its next (refused) connection attempt and the gate opens by itself. `monux update --force` bypasses the gate.
+
 ### Automatic updates
 
-Pass `--auto-update` to `monux server` and/or `monux client` to have them check the GitHub repo once shortly after startup and then daily. When a newer commit appears, it is rebuilt and installed in the background at low CPU priority; a few seconds later (after a desktop notification) the process restarts itself into the new binary. The restart drops the session for a few seconds, which then heals itself: clients reconnect automatically and whichever machine was active is re-activated (see above). This is handy for machines you can't easily reach — e.g. keeping a client up to date without SSH access. Auto-update trusts the configured GitHub repo and this machine's git setup implicitly; leave it off if you prefer to review changes first.
+Pass `--auto-update` to `monux server` and/or `monux client` to have them check the GitHub repo once shortly after startup and then daily. When a newer commit appears, it is rebuilt and installed in the background at low CPU priority; a few seconds later (after a desktop notification) the process restarts itself into the new binary. The restart drops the session for a few seconds, which then heals itself: clients reconnect automatically and whichever machine was active is re-activated (see above). This is handy for machines you can't easily reach — e.g. keeping a client up to date without SSH access. Clients are additionally protected by the protocol-compatibility gate above: a client only auto-updates to builds its server can talk to, so enable it on both sides without fearing a version split. Auto-update trusts the configured GitHub repo and this machine's git setup implicitly; leave it off if you prefer to review changes first.
 
 ## Usage
 

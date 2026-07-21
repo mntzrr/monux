@@ -321,7 +321,10 @@ pub async fn send_version(send: &mut SendStream) -> Result<()> {
     Ok(())
 }
 
-pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<()> {
+/// Returns the peer's protocol version. Does NOT check it against ours:
+/// callers learn the version either way (a client records it for the update
+/// gate), then call ensure_compatible_version.
+pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<u64> {
     debug!("Waiting to receive version");
     let resp = recv
         .read_chunk(1024, true)
@@ -349,10 +352,15 @@ pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<()
         buf.copy_within(consumed..buf_len, 0);
         buf.truncate(buf_len - consumed);
     }
-    if version != shared::PROTOCOL_VERSION {
+    Ok(version)
+}
+
+/// Errors when the peer's protocol version doesn't match ours.
+pub fn ensure_compatible_version(their_version: u64) -> Result<()> {
+    if their_version != shared::PROTOCOL_VERSION {
         bail!(
             "Their protocol version {} doesn't match our expected version {}. You need to update monux across your server and client(s) so that the protocol versions line up. Use 'monux -V' to check the version.",
-            version,
+            their_version,
             shared::PROTOCOL_VERSION
         );
     }
