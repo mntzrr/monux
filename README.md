@@ -118,7 +118,7 @@ By default the server coalesces pointer motion to **250 updates per second**: hi
 
 ## Troubleshooting
 
-If input (e.g. the Enter key) stops registering on the server machine while `monux server` runs, the server log tells you what monux sees. The first log line records the exact build (`monux v0.3.3+<sha> starting`) — always include it when reporting.
+If input (e.g. the Enter key) stops registering on the server machine while `monux server` runs, the server log tells you what monux sees. The first log line records the exact build (`monux v1.0.0+<sha> starting`) — always include it when reporting.
 
 **While the freeze is happening** (switch to a TTY or SSH in):
 
