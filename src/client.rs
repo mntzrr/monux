@@ -269,6 +269,10 @@ impl Connection {
     ) -> Result<()> {
         let mut offset = 0;
         let bytes_len = self.event_bytes.len();
+        // Input events from all complete messages in this chunk are coalesced
+        // into a single write per wake, so a burst of queued messages costs one
+        // uinput write batch instead of one per message.
+        let mut pending_input: Vec<event::InputEvent> = Vec::new();
         while offset < self.event_bytes.len() {
             // A partial frame (no COBS terminator yet) is kept for the next chunk.
             if !shared::has_complete_cobs_frame(&self.event_bytes[offset..]) {
@@ -287,6 +291,12 @@ impl Connection {
             );
             match msg {
                 event::ServerEvent::Switch(e) => {
+                    // Preserve ordering: apply queued input before handling this.
+                    if !pending_input.is_empty() {
+                        output_handler
+                            .write(std::mem::take(&mut pending_input))
+                            .await?;
+                    }
                     info!(
                         "This client is {}",
                         if e.enabled { "active" } else { "inactive" }
@@ -325,11 +335,17 @@ impl Connection {
                         }
                     }
                 }
-                event::ServerEvent::Input(events) => {
-                    // User input events
-                    output_handler.write(events).await?;
+                event::ServerEvent::Input(mut events) => {
+                    // User input events: coalesced and written after the loop.
+                    pending_input.append(&mut events);
                 }
                 event::ServerEvent::ClipboardTypes(types) => {
+                    // Preserve ordering: apply queued input before handling this.
+                    if !pending_input.is_empty() {
+                        output_handler
+                            .write(std::mem::take(&mut pending_input))
+                            .await?;
+                    }
                     // Receiving types announcement from server (following recent activation)
                     // Announce the types to X11 for local apps to see, and clear any prior types from local apps.
                     if let Some(local_clipboard) = &mut local_clipboard {
@@ -343,6 +359,9 @@ impl Connection {
                 }
             }
             offset += consumed;
+        }
+        if !pending_input.is_empty() {
+            output_handler.write(pending_input).await?;
         }
         // Retain any unconsumed partial frame for the next chunk.
         self.event_bytes.drain(..offset);

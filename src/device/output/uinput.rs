@@ -5,6 +5,7 @@ use evdev::{
     RelativeAxisCode,
 };
 use std::collections::HashSet;
+use std::os::fd::AsRawFd;
 use tracing::{debug, info, trace, warn};
 
 use crate::device::output::{OutputHandler, VIRTUAL_DEVICE_NAME_PREFIX};
@@ -109,7 +110,7 @@ impl VirtualUInputDevices {
                 } else if self.touchpad_keys.contains(code) {
                     Some(EventDest::Touchpad)
                 } else {
-                    info!("Dropping key event with unsupported code: {:?}", code);
+                    debug!("Dropping key event with unsupported code: {:?}", code);
                     None
                 }
             }
@@ -117,7 +118,7 @@ impl VirtualUInputDevices {
                 if self.mouse_axes.contains(code) {
                     Some(EventDest::Mouse)
                 } else {
-                    info!("Dropping relaxis event with unsupported code: {:?}", code);
+                    debug!("Dropping relaxis event with unsupported code: {:?}", code);
                     None
                 }
             }
@@ -125,7 +126,7 @@ impl VirtualUInputDevices {
                 if self.touchpad_axes.contains(code) {
                     Some(EventDest::Touchpad)
                 } else {
-                    info!("Dropping absaxis event with unsupported code: {:?}", code);
+                    debug!("Dropping absaxis event with unsupported code: {:?}", code);
                     None
                 }
             }
@@ -142,16 +143,59 @@ impl VirtualUInputDevices {
                 } else if self.touchpad_misc.contains(code) {
                     Some(EventDest::Touchpad)
                 } else {
-                    info!("Dropping misc event with unsupported code: {:?}", code);
+                    debug!("Dropping misc event with unsupported code: {:?}", code);
                     None
                 }
             }
             _ => {
-                info!("Dropping event with unsupported type: {:?}", event);
+                debug!("Dropping event with unsupported type: {:?}", event);
                 None
             }
         }
     }
+}
+
+/// Emits a batch of events plus the terminating SYN_REPORT with a single
+/// writev() syscall. evdev's VirtualDevice::emit issues two separate write()
+/// calls (events, then SYN_REPORT); at high event rates (e.g. an 8000 Hz
+/// gaming mouse) halving the syscall count keeps up more comfortably.
+fn emit_events(device: &mut uinput::VirtualDevice, events: &[evdev::InputEvent]) -> std::io::Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    let syn = evdev::InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0);
+    // SAFETY: evdev::InputEvent is a newtype over the kernel's struct input_event
+    // and the evdev crate itself byte-casts event slices to write them
+    // (evdev::write_events), so viewing the slices as byte iovecs is sound.
+    let event_bytes = unsafe {
+        std::slice::from_raw_parts(events.as_ptr() as *const u8, std::mem::size_of_val(events))
+    };
+    let syn_bytes = unsafe {
+        std::slice::from_raw_parts(&syn as *const _ as *const u8, std::mem::size_of_val(&syn))
+    };
+    let iov = [
+        libc::iovec {
+            iov_base: event_bytes.as_ptr() as *mut libc::c_void,
+            iov_len: event_bytes.len(),
+        },
+        libc::iovec {
+            iov_base: syn_bytes.as_ptr() as *mut libc::c_void,
+            iov_len: syn_bytes.len(),
+        },
+    ];
+    // SAFETY: the fd is valid (owned by device) and the iovecs point to live data.
+    let written = unsafe { libc::writev(device.as_raw_fd(), iov.as_ptr(), iov.len() as libc::c_int) };
+    if written < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let expected = (event_bytes.len() + syn_bytes.len()) as isize;
+    if written != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "partial write to uinput device",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(PartialEq)]
@@ -278,7 +322,7 @@ impl OutputHandler for VirtualUInputDevices {
                     .map(|e| util::log_event(e))
                     .collect::<Vec<String>>()
             );
-            self.keyboard_device.emit(&events)?;
+            emit_events(&mut self.keyboard_device, &events)?;
         } else if mouse_count == events.len() {
             // All of the events can be classified as mouse
             let events = events
@@ -293,7 +337,7 @@ impl OutputHandler for VirtualUInputDevices {
                     .map(|e| util::log_event(e))
                     .collect::<Vec<String>>()
             );
-            self.mouse_device.emit(&events)?;
+            emit_events(&mut self.mouse_device, &events)?;
         } else if touchpad_count == events.len() {
             // All of the events can be classified as touchpad
             let events = events
@@ -308,7 +352,7 @@ impl OutputHandler for VirtualUInputDevices {
                     .map(|e| util::log_event(e))
                     .collect::<Vec<String>>()
             );
-            self.touchpad_device.emit(&events)?;
+            emit_events(&mut self.touchpad_device, &events)?;
         } else {
             // Events don't all 'fit' in one device, group by device
             let mut keyboard_events = vec![];
@@ -366,14 +410,13 @@ impl OutputHandler for VirtualUInputDevices {
                     .collect::<Vec<String>>(),
             );
             if !keyboard_events.is_empty() {
-                info!("emit keeb: {:?}", keyboard_events);
-                self.keyboard_device.emit(&keyboard_events)?;
+                emit_events(&mut self.keyboard_device, &keyboard_events)?;
             }
             if !mouse_events.is_empty() {
-                self.mouse_device.emit(&mouse_events)?;
+                emit_events(&mut self.mouse_device, &mouse_events)?;
             }
             if !touchpad_events.is_empty() {
-                self.touchpad_device.emit(&touchpad_events)?;
+                emit_events(&mut self.touchpad_device, &touchpad_events)?;
             }
         }
 
