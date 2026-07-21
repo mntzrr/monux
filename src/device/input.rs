@@ -136,12 +136,15 @@ async fn read_device_events(
             Err(e) => {
                 // Common when the device has been unplugged.
                 // We'll frequently get this error just as inotify is telling us the file is deleted.
-                // Exit to avoid an infinite loop on trying to read the missing file.
+                // Exit the reader: retrying a dead fd spins at 100% CPU and
+                // floods the log until the inotify handler aborts this task.
+                // The watch's Deleted handler cleans up the device handle.
                 info!(
                     "Got an error event for {:?}, removing device (might be unplugged?): {}",
                     stream.device().name().unwrap_or("(Unnamed device)"),
                     e
                 );
+                return;
             }
         }
     }
@@ -179,12 +182,15 @@ async fn read_device_or_grab_events(
                     Err(e) => {
                         // Common when the device has been unplugged.
                         // We'll frequently get this error just as inotify is telling us the file is deleted.
-                        // Exit to avoid an infinite loop on trying to read the missing file.
+                        // Exit the reader: retrying a dead fd spins at 100% CPU and
+                        // floods the log until the inotify handler aborts this task.
+                        // The watch's Deleted handler cleans up the device handle.
                         info!(
                             "Got an error event for {:?}, removing device (might be unplugged?): {}",
                             stream.device().name().unwrap_or("(Unnamed device)"),
                             e
                         );
+                        return;
                     }
                 }
             }
@@ -321,6 +327,16 @@ fn handle_grab_event(
                 stream.device().name().unwrap_or("(Unnamed device)")
             );
             if let Err(e) = stream.device_mut().ungrab() {
+                if e.raw_os_error() == Some(libc::ENODEV) {
+                    // The device is already gone (unplugged): nothing to ungrab,
+                    // and no reason to warn or retry.
+                    debug!(
+                        "Not ungrabbing {:?}: device already gone",
+                        stream.device().name()
+                    );
+                    device_info.is_grabbed = false;
+                    return true;
+                }
                 warn!(
                     "Failed to ungrab device {:?}, : {}",
                     stream.device().name(),

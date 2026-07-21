@@ -105,23 +105,44 @@ pub fn acquire(kind: &str) -> Result<InstanceLock> {
     // process whose executable is actually monux running the matching kind.
     // comm (exact exe name) rules out wrapper shells whose cmdline merely
     // contains the monux invocation.
-    let comm = fs::read_to_string(format!("/proc/{}/comm", pid)).unwrap_or_default();
-    let cmdline = fs::read_to_string(format!("/proc/{}/cmdline", pid))
-        .map(|s| s.replace('\0', " "))
-        .unwrap_or_default();
-    if comm.trim() != "monux" || !cmdline.contains(kind) {
+    let comm = fs::read_to_string(format!("/proc/{}/comm", pid));
+    let cmdline =
+        fs::read_to_string(format!("/proc/{}/cmdline", pid)).map(|s| s.replace('\0', " "));
+    let verified = matches!(
+        (&comm, &cmdline),
+        (Ok(c), Ok(cl)) if c.trim() == "monux" && cl.contains(kind)
+    );
+    if !verified {
+        if comm.is_err() && cmdline.is_err() {
+            // /proc/<pid> is unreadable for another user's process (hidepid):
+            // the holder is likely root, and we can neither verify nor signal it.
+            bail!(
+                "Another monux {0} (pid {1}) is already running as a different user (likely root), so it can't be inspected or signaled from here. Stop it manually: sudo kill {1}",
+                kind, pid
+            );
+        }
         bail!(
             "Another monux {0} is already running, but the pid recorded in {1} ({2}) doesn't look like a monux {0} process (comm: '{3}'). Refusing to kill it; stop the old instance manually.",
-            kind, path.display(), pid, comm.trim()
+            kind,
+            path.display(),
+            pid,
+            comm.map(|c| c.trim().to_string()).unwrap_or_default()
         );
     }
     info!("Asking existing monux {} (pid {}) to shut down...", kind, pid);
     if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EPERM) {
+            bail!(
+                "Another monux {0} (pid {1}) is already running as a different user (likely root). Stop it manually: sudo kill {1}",
+                kind, pid
+            );
+        }
         bail!(
             "Failed to SIGTERM existing monux {} (pid {}): {}. Stop it manually.",
             kind,
             pid,
-            std::io::Error::last_os_error()
+            err
         );
     }
 

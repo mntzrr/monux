@@ -161,7 +161,12 @@ fn handle_signals(mut signals: Signals, out: mpsc::Sender<Event>) {
                 }
             }
             other => {
-                info!("no signals here? {:?}", other);
+                // None means the signal stream closed; exit instead of spinning on it.
+                warn!(
+                    "Unexpected signal iterator state: {:?}, exiting signal handler",
+                    other
+                );
+                return;
             }
         }
     }
