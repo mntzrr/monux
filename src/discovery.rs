@@ -1,12 +1,23 @@
+use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo, TxtProperties};
 use tracing::{debug, info, warn};
 
 /// mDNS service type used to advertise and discover Monux servers on the local network.
 const SERVICE_TYPE: &str = "_monux._udp.local.";
+
+/// TXT property under which a server advertises its wire protocol version, so
+/// clients can refresh their update gate (see update.rs) from the LAN instead
+/// of waiting for a handshake.
+const PROTOCOL_VERSION_PROPERTY: &str = "pv";
+
+/// How long `monux update` browses for advertised server protocol versions
+/// before falling back to the recorded gate value: long enough for a running
+/// server to answer, short enough that the command doesn't appear to hang.
+const SERVER_VERSION_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Default time to wait for a server to be discovered on the LAN.
 const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -37,13 +48,22 @@ impl DiscoveryRegistration {
         let port = listen_addr.port();
         let ips = advertise_ips(listen_addr.ip())?;
 
+        // Advertise the wire protocol version so clients can refresh their
+        // update gate from the LAN (see update.rs). Like all mDNS data this
+        // is unauthenticated — acceptable because the gate is only a
+        // convenience; real compatibility is enforced at the handshake.
+        let properties = HashMap::from([(
+            PROTOCOL_VERSION_PROPERTY.to_string(),
+            crate::msgs::shared::PROTOCOL_VERSION.to_string(),
+        )]);
+
         let service_info = ServiceInfo::new(
             SERVICE_TYPE,
             &instance_name,
             &host_name,
             &ips[..],
             port,
-            None,
+            properties,
         )
         .context("Failed to create mDNS service info")?;
 
@@ -184,6 +204,73 @@ pub async fn discover_server(timeout: Option<Duration>) -> Result<(SocketAddr, S
         .unwrap_or(&fullname)
         .to_string();
     Ok((addr, instance_name))
+}
+
+/// Extracts a server's advertised protocol version from its mDNS TXT
+/// properties: `None` when the property is absent (servers predate the
+/// advertisement) or isn't a number — both mean "no information".
+fn protocol_version_of(properties: &TxtProperties) -> Option<u64> {
+    properties
+        .get_property_val_str(PROTOCOL_VERSION_PROPERTY)?
+        .parse()
+        .ok()
+}
+
+/// Picks the update-gate constraint from the protocol versions discovered on
+/// the LAN: the minimum, so a client never upgrades beyond any server it
+/// might pair with. `None` when nothing was discovered.
+pub fn protocol_version_constraint(discovered: &[u64]) -> Option<u64> {
+    discovered.iter().min().copied()
+}
+
+/// Synchronously collects the distinct protocol versions (sorted) advertised
+/// by Monux servers on the LAN, for the update gate in `monux update` — which
+/// runs before the tokio runtime exists, hence the blocking API. Best-effort
+/// within a short timeout; servers without the property are skipped.
+pub fn discover_server_protocol_versions() -> Result<Vec<u64>> {
+    let daemon = ServiceDaemon::new().context("Failed to create mDNS daemon")?;
+    let versions = collect_server_protocol_versions(&daemon);
+    if let Err(e) = daemon.shutdown() {
+        debug!("Failed to shutdown mDNS daemon: {}", e);
+    }
+    versions
+}
+
+fn collect_server_protocol_versions(daemon: &ServiceDaemon) -> Result<Vec<u64>> {
+    let receiver = daemon
+        .browse(SERVICE_TYPE)
+        .context("Failed to browse for Monux servers")?;
+    let deadline = Instant::now() + SERVER_VERSION_DISCOVERY_TIMEOUT;
+    let mut versions = BTreeSet::new();
+    loop {
+        let remaining = match deadline.checked_duration_since(Instant::now()) {
+            Some(remaining) => remaining,
+            None => break,
+        };
+        match receiver.recv_timeout(remaining) {
+            Ok(ServiceEvent::ServiceResolved(resolved)) => {
+                match protocol_version_of(resolved.get_properties()) {
+                    Some(version) => {
+                        debug!(
+                            "Discovered Monux server {} advertising protocol v{}",
+                            resolved.get_fullname(),
+                            version
+                        );
+                        versions.insert(version);
+                    }
+                    None => debug!(
+                        "Discovered Monux server {} without a protocol version; skipping it",
+                        resolved.get_fullname()
+                    ),
+                }
+            }
+            Ok(other) => debug!("mDNS event: {:?}", other),
+            // Timeout (normal: no more servers answered) or the browse stream
+            // ending: return what we have.
+            Err(_) => break,
+        }
+    }
+    Ok(versions.into_iter().collect())
 }
 
 /// Picks an address to connect to. A server may advertise several addresses
@@ -329,6 +416,26 @@ fn get_local_ip() -> Result<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_advertised_protocol_version() {
+        use mdns_sd::IntoTxtProperties;
+        let props = HashMap::from([("pv".to_string(), "8".to_string())]).into_txt_properties();
+        assert_eq!(protocol_version_of(&props), Some(8));
+        // No property (a pre-advertisement server) or a malformed one: no
+        // information, never an error.
+        let empty = HashMap::<String, String>::new().into_txt_properties();
+        assert_eq!(protocol_version_of(&empty), None);
+        let junk = HashMap::from([("pv".to_string(), "eight".to_string())]).into_txt_properties();
+        assert_eq!(protocol_version_of(&junk), None);
+    }
+
+    #[test]
+    fn constraint_is_the_minimum_discovered_version() {
+        assert_eq!(protocol_version_constraint(&[]), None);
+        assert_eq!(protocol_version_constraint(&[8]), Some(8));
+        assert_eq!(protocol_version_constraint(&[8, 7, 9]), Some(7));
+    }
 
     #[test]
     fn prefix_len_prefers_same_subnet() {
