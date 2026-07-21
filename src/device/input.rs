@@ -15,6 +15,68 @@ use crate::msgs::event;
 /// How long to wait before retrying a failed device grab/ungrab.
 const GRAB_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How long to wait for a keyboard to become quiescent (no keys held) before
+/// grabbing it anyway.
+const GRAB_QUIESCENT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Poll interval while waiting for held keys to be released before grabbing.
+const GRAB_QUIESCENT_POLL: Duration = Duration::from_millis(50);
+
+/// Grabs a permanently-grabbed (keyboard-class) device, first waiting until no
+/// keys are held on it. Grabbing while a key is held leaves the compositor
+/// believing the key is still down — it saw the press before the grab but
+/// never sees the release (it goes to monux instead) — and its own key-repeat
+/// then injects phantom keypresses (seen in the wild as an Enter flood right
+/// after launching `monux server<Enter>`, until the next real keypress).
+/// Waiting for quiescence guarantees the compositor always sees complete
+/// press+release pairs. Falls back to grabbing anyway (with a loud log) after
+/// GRAB_QUIESCENT_TIMEOUT, e.g. when a key is stuck held in the kernel because
+/// a wireless dongle lost a release packet.
+async fn grab_keyboard_when_quiescent(stream: &mut EventStream, device_info: &mut util::DeviceInfo) {
+    let start = std::time::Instant::now();
+    loop {
+        let held: Vec<u16> = match stream.device().get_key_state() {
+            Ok(state) => state.iter().map(|k| k.0).collect(),
+            Err(e) => {
+                debug!(
+                    "Failed to query key state for {:?} ({}), grabbing without a quiescence check",
+                    stream.device().name().unwrap_or("(Unnamed device)"),
+                    e
+                );
+                break;
+            }
+        };
+        if held.is_empty() {
+            break;
+        }
+        if start.elapsed() >= GRAB_QUIESCENT_TIMEOUT {
+            warn!(
+                "Grabbing {:?} with keys still held ({:?}): if the compositor starts repeating a key, press and release it once",
+                stream.device().name().unwrap_or("(Unnamed device)"),
+                held
+            );
+            break;
+        }
+        debug!(
+            "Waiting to grab {:?}: keys currently held ({:?})",
+            stream.device().name().unwrap_or("(Unnamed device)"),
+            held
+        );
+        time::sleep(GRAB_QUIESCENT_POLL).await;
+    }
+    // Don't read events until the grab succeeds. Without the grab, events
+    // would leak through to the local system while also being routed onwards
+    // by monux. Another process (e.g. a stale monux server) may hold the grab
+    // temporarily, so keep retrying.
+    while !handle_grab_event(stream, device_info, GrabEvent::Grab) {
+        warn!(
+            "Failed to grab {:?}, retrying in {:?}",
+            stream.device().name().unwrap_or("(Unnamed device)"),
+            GRAB_RETRY_INTERVAL
+        );
+        time::sleep(GRAB_RETRY_INTERVAL).await;
+    }
+}
+
 pub struct InputHandler {
     config: HandlerConfig,
 }
@@ -94,18 +156,7 @@ impl DeviceHandler for InputHandler {
         } else {
             // Device is to be permanently grabbed
             task::spawn(async move {
-                // Don't read events until the grab succeeds. Without the grab,
-                // events would leak through to the local system while also being
-                // routed onwards by monux. Another process (e.g. a stale monux
-                // server) may hold the grab temporarily, so keep retrying.
-                while !handle_grab_event(&mut stream, &mut device_info, GrabEvent::Grab) {
-                    warn!(
-                        "Failed to grab {:?}, retrying in {:?}",
-                        stream.device().name().unwrap_or("(Unnamed device)"),
-                        GRAB_RETRY_INTERVAL
-                    );
-                    time::sleep(GRAB_RETRY_INTERVAL).await;
-                }
+                grab_keyboard_when_quiescent(&mut stream, &mut device_info).await;
                 read_device_events(&mut stream, config, device_info).await
             })
         };
