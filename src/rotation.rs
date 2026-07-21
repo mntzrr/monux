@@ -39,6 +39,12 @@ const ACTIVE_CLIENT_MAX_AGE: Duration = Duration::from_secs(3600);
 /// connection and data source on the compositor, so bursts are collapsed.
 const CLIPBOARD_UPDATE_DEBOUNCE: Duration = Duration::from_millis(300);
 
+/// Minimum spacing between processed rotation switches (next/prev). When the
+/// rotation loop is briefly blocked (e.g. a network hiccup delaying a write),
+/// every frustrated shortcut press queues another switch; without a debounce
+/// they then execute back-to-back and the rotation ends up on a random side.
+const SWITCH_DEBOUNCE: Duration = Duration::from_millis(500);
+
 /// Channels for communicating with a connected client.
 #[derive(Debug)]
 struct ClientInfo {
@@ -263,6 +269,8 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// Flush interval for motion coalescing; None = forward every batch
     /// immediately (e.g. --motion-hz 0 for gaming).
     motion_flush_interval: Option<Duration>,
+    /// When the last next/prev switch was processed (see SWITCH_DEBOUNCE).
+    last_switch_at: Option<Instant>,
 }
 
 impl<O: device::output::OutputHandler> Rotation<O> {
@@ -303,6 +311,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             pending_motion: (0, 0, 0),
             motion_dirty: false,
             motion_flush_interval,
+            last_switch_at: None,
         })
     }
 
@@ -484,8 +493,28 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
     }
 
+    /// Returns true if a next/prev switch request should be ignored because one
+    /// was just processed (see SWITCH_DEBOUNCE); otherwise records it and
+    /// returns false.
+    fn switch_debounced(&mut self) -> bool {
+        if let Some(last) = self.last_switch_at {
+            if last.elapsed() < SWITCH_DEBOUNCE {
+                debug!(
+                    "Ignoring switch request: a switch happened {:?} ago",
+                    last.elapsed()
+                );
+                return true;
+            }
+        }
+        self.last_switch_at = Some(Instant::now());
+        false
+    }
+
     /// Switches to the previous client (or to the server) in the arbitrary rotation.
     pub async fn prev_client(&mut self) {
+        if self.switch_debounced() {
+            return;
+        }
         if let Some(current_client) = &self.current_client {
             // Currently on remote machine, find its entry in the list and go to the prev one
             let idx = match self
@@ -512,6 +541,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
 
     /// Switches to the next client (or to the server) in the arbitrary rotation.
     pub async fn next_client(&mut self) {
+        if self.switch_debounced() {
+            return;
+        }
         if let Some(current_client) = &self.current_client {
             // Currently on remote machine, find its entry in the list and go to the next one
             let idx = match self
@@ -1869,6 +1901,29 @@ mod tests {
         rotation.flush_pending_motion().await;
         assert!(!rotation.motion_dirty());
         assert_eq!(rotation.pending_motion, (0, 0, 0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn switch_requests_are_debounced() {
+        let dir = temp_dir("debounce");
+        let (grab_tx, _grab_rx) = watch::channel(device::GrabEvent::Ungrab);
+        let (rotation_tx, _rotation_rx) = mpsc::channel(8);
+        let mut rotation = Rotation::new(
+            grab_tx,
+            StubOutput { written: 0 },
+            None,
+            &dir,
+            rotation_tx,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The first switch request is processed; an immediate repeat (e.g. a
+        // queued frustrated press after a stall) is dropped.
+        assert!(!rotation.switch_debounced());
+        assert!(rotation.switch_debounced());
         let _ = fs::remove_dir_all(&dir);
     }
 
