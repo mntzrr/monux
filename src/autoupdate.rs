@@ -1,10 +1,11 @@
-//! Optional background auto-update (`--auto-update`): periodically checks the
-//! update repo for a newer commit and, when one appears, rebuilds and installs
-//! it at low CPU priority, then restarts the process to apply it. The restart
-//! is the ordinary graceful shutdown (SIGTERM to ourselves) followed by main
-//! re-exec'ing the new binary, so the session drops for a few seconds and then
-//! heals itself: clients reconnect automatically and the server re-activates
-//! whichever machine was active (session resumption in rotation.rs).
+//! Background auto-update (on by default; `--no-auto-update` opts out):
+//! periodically checks the update repo for a newer commit and, when one
+//! appears, rebuilds and installs it at low CPU priority, then restarts the
+//! process to apply it. The restart is the ordinary graceful shutdown
+//! (SIGTERM to ourselves) followed by main re-exec'ing the new binary, so the
+//! session drops for a few seconds and then heals itself: clients reconnect
+//! automatically and the server re-activates whichever machine was active
+//! (session resumption in rotation.rs).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
