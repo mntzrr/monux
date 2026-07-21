@@ -20,7 +20,7 @@ This fork adds low-latency tuning for local networks and a `--www` mode for use 
 
 - Linux with `uinput` and `evdev` kernel modules enabled (`/dev/uinput` and `/dev/input/` should exist).
 - A Rust toolchain (`rustup` recommended).
-- sudo privileges at runtime. `monux server` **re-executes itself with `sudo -E` automatically** (prompting for your password once), which preserves your session environment (`WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`) so clipboard sharing works. Opt out with `MONUX_NO_ELEVATE=1` if you want to run non-root (see *Server: sudo vs non-sudo* below).
+- Access to input devices: your user in the `input` group with `/dev/uinput` group-writable. `monux setup` persists both for you (it re-executes with sudo and prompts for your password; log out and back in after the group change). Running the server as root with `sudo -E monux server` also works as a fallback, `-E` preserving your session so clipboard sharing works.
 
 ### From this repository
 
@@ -54,7 +54,7 @@ This pulls the latest source from GitHub into `~/.cache/monux/src`, rebuilds it 
 
 ## Usage
 
-Run the server on the machine with the physical input devices (it re-executes with `sudo -E` for you and prompts for your password once):
+Run the server on the machine with the physical input devices:
 
 ```bash
 monux server
@@ -76,9 +76,9 @@ The first time a client connects, verify the fingerprint shown on both sides mat
 
 ### Server: sudo vs non-sudo
 
-`monux server` elevates itself with `sudo -E` automatically (preserving your session, so clipboard sharing works). This is the recommended way: it's the most reliable setup for both input and clipboard.
+The server runs as your normal user (in the `input` group, with `/dev/uinput` accessible — see `monux setup`). This is the recommended setup.
 
-To run without elevation (`MONUX_NO_ELEVATE=1 monux server`): keyboard/mouse work, but **only with clipboard sharing disabled** (`WAYLAND_DISPLAY= monux server`). With the Wayland clipboard active, clipboard managers that aggressively re-own/poll the clipboard (e.g. `wl-clip-persist`, `wl-paste --watch`) can, on some compositors, backpressure the compositor's connection to monux and freeze keyboard input. If you hit this, let the server elevate (the default) or disable the clipboard.
+`sudo -E monux server` remains available as a fallback (e.g. if device permissions aren't set up); `-E` preserves your session environment so clipboard sharing keeps working. Note that running as root did **not** prove to prevent intermittent input freezes: with aggressive clipboard managers (`wl-clip-persist`, `wl-paste --watch`) a stall is still possible on some compositors. If you hit freezes, see *Troubleshooting* — `WAYLAND_DISPLAY= monux server` (clipboard sharing disabled) is the isolation test.
 
 Switch between the server and connected clients using `LeftShift+LeftAlt+R` (next) and `LeftAlt+P` (previous), or send `SIGUSR1` / `SIGUSR2` to the server process. Shortcuts are configurable via `--shortcut` / `--shortcut-prev`.
 
