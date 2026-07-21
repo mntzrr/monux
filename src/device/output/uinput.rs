@@ -310,7 +310,9 @@ impl OutputHandler for VirtualUInputDevices {
         // duplicated presses (event delivered twice) and catch-up bursts (a
         // backlog flushed after a stall).
         let mut key_events_in_batch = 0u32;
-        for (e, _dest) in &events {
+        let mut filtered_events: Vec<(evdev::InputEvent, EventDest)> =
+            Vec::with_capacity(events.len());
+        for (e, dest) in events {
             if e.event_type() == evdev::EventType::KEY {
                 key_events_in_batch += 1;
                 match e.value() {
@@ -335,10 +337,23 @@ impl OutputHandler for VirtualUInputDevices {
                         }
                     }
                     // value == 2: auto-repeat, keep the original press timestamp
-                    _ => {}
+                    _ => {
+                        if !self.pressed_keys.contains_key(&e.code()) {
+                            // Repeat for a key we never saw pressed (e.g. held
+                            // across a switch): this target never got the press,
+                            // so drop the repeat instead of injecting it.
+                            trace!(
+                                "Dropping auto-repeat for key {} with no matching press",
+                                e.code()
+                            );
+                            continue;
+                        }
+                    }
                 }
             }
+            filtered_events.push((e, dest));
         }
+        let events = filtered_events;
         if key_events_in_batch >= 12 {
             if let Some(last) = self.last_key_event_at {
                 let gap = last.elapsed();

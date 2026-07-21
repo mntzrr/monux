@@ -80,6 +80,9 @@ struct Connection {
     last_motion_seq: u64,
     /// Bitmap of which of the last 64 motion frames have been applied.
     motion_applied_mask: u64,
+    /// Whether writes to the virtual input devices are currently failing
+    /// (see note_output_result).
+    output_write_failing: bool,
 }
 
 impl Connection {
@@ -194,6 +197,7 @@ impl Connection {
                 quinn_conn: conn,
                 last_motion_seq: 0,
                 motion_applied_mask: 0,
+                output_write_failing: false,
             },
             connect_time,
         ))
@@ -202,6 +206,33 @@ impl Connection {
     /// Exposes the QUIC connection for stats logging on connection loss.
     fn conn(&self) -> &quinn::Connection {
         &self.quinn_conn
+    }
+
+    /// Records the result of a write to the virtual input devices without
+    /// tearing down the connection: a transient uinput failure (e.g. ENODEV
+    /// while udev settles, or a partial writev) is logged once, repeat
+    /// failures are suppressed while they continue, and the first success
+    /// after a failing streak is logged as a recovery.
+    /// Associated function (not &mut self) so it can be called while
+    /// deserialized messages still borrow other fields.
+    fn note_output_result(output_write_failing: &mut bool, result: Result<()>) {
+        match result {
+            Ok(()) => {
+                if *output_write_failing {
+                    info!("Writes to virtual input devices succeeded again");
+                    *output_write_failing = false;
+                }
+            }
+            Err(e) => {
+                if !*output_write_failing {
+                    warn!(
+                        "Failed to write to virtual input devices, dropping events until writes recover: {:?}",
+                        e
+                    );
+                    *output_write_failing = true;
+                }
+            }
+        }
     }
 
     /// Performs a step of the client event loop, returning an error if the connection should be retried.
@@ -360,9 +391,12 @@ impl Connection {
                 event::ServerEvent::Switch(e) => {
                     // Preserve ordering: apply queued input before handling this.
                     if !pending_input.is_empty() {
-                        output_handler
-                            .write(std::mem::take(&mut pending_input))
-                            .await?;
+                        Self::note_output_result(
+                            &mut self.output_write_failing,
+                            output_handler
+                                .write(std::mem::take(&mut pending_input))
+                                .await,
+                        );
                     }
                     info!(
                         "This client is {}",
@@ -372,7 +406,10 @@ impl Connection {
                     if !e.enabled {
                         // This client was deactivated: release any held keys so they
                         // don't stay stuck on the virtual devices.
-                        output_handler.release_all().await?;
+                        Self::note_output_result(
+                            &mut self.output_write_failing,
+                            output_handler.release_all().await,
+                        );
                     }
                     if let Some(local_clipboard) = &mut local_clipboard {
                         if let Some(types) = &local_clipboard.get_local_clipboard_types() {
@@ -409,9 +446,12 @@ impl Connection {
                 event::ServerEvent::ClipboardTypes(types) => {
                     // Preserve ordering: apply queued input before handling this.
                     if !pending_input.is_empty() {
-                        output_handler
-                            .write(std::mem::take(&mut pending_input))
-                            .await?;
+                        Self::note_output_result(
+                            &mut self.output_write_failing,
+                            output_handler
+                                .write(std::mem::take(&mut pending_input))
+                                .await,
+                        );
                     }
                     // Receiving types announcement from server (following recent activation)
                     // Announce the types to X11 for local apps to see, and clear any prior types from local apps.
@@ -428,7 +468,10 @@ impl Connection {
             offset += consumed;
         }
         if !pending_input.is_empty() {
-            output_handler.write(pending_input).await?;
+            Self::note_output_result(
+                &mut self.output_write_failing,
+                output_handler.write(pending_input).await,
+            );
         }
         // Retain any unconsumed partial frame for the next chunk.
         self.event_bytes.drain(..offset);
@@ -470,7 +513,11 @@ impl Connection {
         if dy != 0 {
             events.push(event::motion_event(evdev::RelativeAxisCode::REL_Y.0, dy));
         }
-        output_handler.write(events).await
+        Self::note_output_result(
+            &mut self.output_write_failing,
+            output_handler.write(events).await,
+        );
+        Ok(())
     }
 
     async fn handle_bulk_data_or_messages(

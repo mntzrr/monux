@@ -283,14 +283,11 @@ async fn handle_input_event(
                     any_consume = true;
                     combo_events_batch.push(action);
                 }
-                shortcut::ComboAction::PassEventAndEmitAction(action) => {
-                    combo_events_batch.push(action);
-                }
             }
         }
         if any_consume {
             debug!(
-                "Dropping key event as it's the last key completing one or more combos: {:?}",
+                "Dropping key event consumed by one or more key combos: {:?}",
                 event
             );
         } else {

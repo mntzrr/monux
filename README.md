@@ -95,7 +95,7 @@ The server runs as your normal user (in the `input` group, with `/dev/uinput` ac
 
 `sudo -E monux server` remains available as a fallback (e.g. if device permissions aren't set up); `-E` preserves your session environment so clipboard sharing keeps working. Note that running as root did **not** prove to prevent intermittent input freezes: with aggressive clipboard managers (`wl-clip-persist`, `wl-paste --watch`) a stall is still possible on some compositors. If you hit freezes, see *Troubleshooting* — `WAYLAND_DISPLAY= monux server` (clipboard sharing disabled) is the isolation test.
 
-Switch between the server and connected clients using `LeftShift+LeftAlt+R` (next) and `LeftAlt+P` (previous), or send `SIGUSR1` / `SIGUSR2` to the server process. Shortcuts are configurable via `--shortcut` / `--shortcut-prev`.
+Switch between the server and connected clients using `LeftShift+LeftAlt+R` (next) and `LeftAlt+P` (previous), or send `SIGUSR1` / `SIGUSR2` to the server process. Shortcuts are configurable via `--shortcut` / `--shortcut-prev`. The switch fires the moment the full combo is pressed; keep holding the modifier keys and tap the last key again to cycle through further clients.
 
 Every switch also shows a desktop notification (via `notify-send`), so an unexpected switch is visible immediately.
 
