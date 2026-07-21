@@ -108,15 +108,10 @@ struct ServerArgs {
     #[arg(long, default_value_t = 250, value_name = "hz")]
     motion_hz: u32,
 
-    /// Kept for compatibility: auto-update is on by default now. Overrides a
-    /// previous --no-auto-update.
-    #[arg(long, overrides_with = "no_auto_update", hide = true)]
-    auto_update: bool,
-
     /// Disable the automatic background update (on by default): a daily check
     /// at low CPU priority, then an automatic restart into the new binary.
     /// The session resumes automatically on reconnect.
-    #[arg(long, overrides_with = "auto_update")]
+    #[arg(long)]
     no_auto_update: bool,
 }
 
@@ -142,15 +137,10 @@ struct ClientArgs {
     #[arg(long)]
     www: bool,
 
-    /// Kept for compatibility: auto-update is on by default now. Overrides a
-    /// previous --no-auto-update.
-    #[arg(long, overrides_with = "no_auto_update", hide = true)]
-    auto_update: bool,
-
     /// Disable the automatic background update (on by default): a daily check
     /// at low CPU priority, then an automatic restart into the new binary.
     /// The session resumes automatically on reconnect.
-    #[arg(long, overrides_with = "auto_update")]
+    #[arg(long)]
     no_auto_update: bool,
 }
 
@@ -248,9 +238,7 @@ fn main() -> Result<()> {
             }
             let server_lock = single_instance::acquire("server")?;
             settle_after_takeover(&server_lock);
-            // On by default; overrides_with guarantees the two flags are
-            // never set at once.
-            if args.auto_update || !args.no_auto_update {
+            if !args.no_auto_update {
                 // The server leads protocol upgrades: no compatibility gate.
                 rt.spawn(monux::autoupdate::run(None));
             }
@@ -307,9 +295,7 @@ fn main() -> Result<()> {
         Commands::Client(args) => {
             let client_lock = single_instance::acquire("client")?;
             settle_after_takeover(&client_lock);
-            // On by default; overrides_with guarantees the two flags are
-            // never set at once.
-            if args.auto_update || !args.no_auto_update {
+            if !args.no_auto_update {
                 rt.spawn(monux::autoupdate::run(Some(config_dir.clone())));
             }
             // When no host is given, the server address comes from mDNS discovery,
