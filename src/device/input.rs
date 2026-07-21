@@ -293,14 +293,34 @@ async fn handle_input_event(
         } else {
             input_events_batch.push(convert_device_event(event, stream.device(), device_info))
         }
-        if event.event_type() == EventType::KEY && crate::device::key_traced(event.code()) {
-            info!(
-                "KEYTRACE capture: code={} value={} consumed={} device={:?}",
-                event.code(),
-                event.value(),
-                any_consume,
-                stream.device().name().unwrap_or("(Unnamed device)")
-            );
+        if event.event_type() == EventType::KEY {
+            // A zero timestamp marks a synthetic event injected by the evdev
+            // crate's SYN_DROPPED resync. Rare, and always suspicious for key
+            // events: a synthetic press whose release is lost is a stuck key
+            // (and compositor-visible phantom input) in the making.
+            let synthetic = event
+                .timestamp()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.is_zero())
+                .unwrap_or(false);
+            if synthetic {
+                info!(
+                    "Synthetic (resync-injected) key event: code={} value={} device={:?}",
+                    event.code(),
+                    event.value(),
+                    stream.device().name().unwrap_or("(Unnamed device)")
+                );
+            }
+            if crate::device::key_traced(event.code()) {
+                info!(
+                    "KEYTRACE capture: code={} value={} synthetic={} consumed={} device={:?}",
+                    event.code(),
+                    event.value(),
+                    synthetic,
+                    any_consume,
+                    stream.device().name().unwrap_or("(Unnamed device)")
+                );
+            }
         }
     }
 }
