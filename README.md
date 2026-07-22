@@ -124,6 +124,22 @@ Every switch also shows a desktop notification (via `notify-send`), so an unexpe
 
 > **Pick a shortcut that doesn't collide with your compositor/WM/application binds.** monux consumes only the *last* key of the combo, so if the same combo is bound elsewhere (e.g. `Alt+Shift+R` toggling your clipboard manager), pressing it fires *both* actions — and a switch you didn't mean to make looks exactly like dead keys: your input silently goes to the other machine. The notification exists to make such accidents obvious.
 
+### Screen-edge switching (Hyprland)
+
+As an alternative to shortcuts, the server can switch input when you push the cursor against a screen edge and hold it there briefly — the classic "screen-edge KVM" behavior. It's opt-in: map an edge to a client with `--edge-map` (repeatable, and values may be comma-separated):
+
+```bash
+monux server --edge-map right=auto
+monux server --edge-map right=aa11bb --edge-map left=laptop
+monux server '--edge-map right=auto,left=laptop'
+```
+
+The target is a client fingerprint prefix (see the `Added client ...` log line), a hostname (resolved via the system resolver, including `<name>.local` mDNS records, and matched to a connected client by IP), or `auto` for "exactly one connected client" (an error while zero or several clients are connected). Targets are re-resolved against the live client list on every connect and at switch time, so reconnects and IP changes are tolerated; the server logs the resolution at startup and on every client (dis)connect. Switching fires through the same path as the goto shortcuts, so pause mode and no-op handling behave identically.
+
+Detection is event-driven: monux places a 1px-wide, fully transparent layer-shell strip on each exposed segment of a mapped edge and the compositor reports the cursor entering/leaving it — no cursor-position polling. With multiple monitors, only the *exposed* parts of an edge count: where two outputs abut, the cursor crosses over instead of switching (two side-by-side monitors expose the right edge only on the rightmost one; differing heights and vertical offsets produce the expected step segments). Each end of an exposed segment has a corner dead zone (~8%), so flinging the cursor into a screen corner never triggers a switch. The switch fires after the cursor dwells on the edge for 250 ms (tune with `--edge-dwell-ms`), and a short re-arm cooldown prevents accidental repeat switches while parked on the edge.
+
+Caveats: this requires a Hyprland session on the server (the layout comes from Hyprland's IPC, re-queried when it changes) — on other compositors the feature disables itself with a warning. Fullscreen games (and anything else that pins or rapidly slams the pointer into an edge) can trigger a switch mid-game; pause monux with the `--pause-shortcut` chord before gaming, or raise `--edge-dwell-ms`.
+
 ### Client silence: the liveness check
 
 While a client owns the input, the server pings it every 2 seconds and the client answers immediately (any data received from the client counts, not just pongs). If nothing arrives for ~6 seconds (~12 with `--www`, matching its relaxed QUIC timers) — the classic symptom of a WiFi link that black-holed — the server switches back to the local machine and ungrabs, so keystrokes stop flowing into the void: `No sign of life from current client <addr> ... switching to the local machine and ungrabbing`. The client is **not** disconnected or removed from the rotation; the 25s QUIC idle timeout still owns that, and pinging continues meanwhile. When the client answers again, the server requires 3 consecutive heard-events (each received chunk counts once, so pongs buffered during a freeze can complete this in a single burst on thaw) **and** at least 5 seconds spent in the silenced state — whichever finishes later (hysteresis against a flapping link) — then re-activates it automatically: `Client <addr> is answering again ... re-activating it`. Switching by hand in the meantime — to another client, or deliberately to the local machine — always wins: the client is then just marked healthy again, without yanking input. Manually switching to a silenced client is allowed; the same silence check applies and ungrabs again if the silence continues.

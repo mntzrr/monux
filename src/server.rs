@@ -101,6 +101,7 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     bulk_throttle_mbps: Option<f64>,
     mode: transport::NetworkMode,
     diagnostics: Arc<rotation::DiagnosticsMirror>,
+    edge_client_tx: Option<watch::Sender<Vec<(SocketAddr, String)>>>,
 ) -> Result<()> {
     let local_clipboard = LocalClipboard::start(
         config_dir.clone(),
@@ -111,6 +112,9 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
 
     let mut rotation =
         rotation::Rotation::new(grab_tx, output_handler, local_clipboard, &config_dir, rotation_tx, motion_flush_interval, bulk_throttle_mbps, mode, diagnostics).await?;
+    if let Some(tx) = edge_client_tx {
+        rotation.set_edge_client_publisher(tx);
+    }
     // Input-flow heartbeat: makes "user is typing but nothing arrives anywhere"
     // visible in the log, instead of silent (the dead-Enter investigations).
     let mut status_tick = time::interval(Duration::from_secs(10));

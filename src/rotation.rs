@@ -572,6 +572,11 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// Loop-independent mirror of this rotation's diagnostic state, dumped by
     /// the SIGHUP handler without involving the loop (see DiagnosticsMirror).
     diagnostics: Arc<DiagnosticsMirror>,
+    /// Publishes the live client list (endpoint + fingerprint) to the
+    /// screen-edge switcher (edge.rs), which resolves --edge-map targets
+    /// against it on every change and at switch time. None when --edge-map
+    /// isn't in use.
+    edge_client_tx: Option<watch::Sender<Vec<(SocketAddr, String)>>>,
 }
 
 /// Computes the target of a previous-client switch (None = local machine).
@@ -705,7 +710,38 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             last_ping_tick: None,
             went_local_via_silence: false,
             diagnostics,
+            edge_client_tx: None,
         })
+    }
+
+    /// Hands the screen-edge switcher (edge.rs) the channel it reads the live
+    /// client list from, seeding it with the current (startup: empty) list.
+    /// Called once from the server events loop when --edge-map is in use.
+    pub fn set_edge_client_publisher(&mut self, tx: watch::Sender<Vec<(SocketAddr, String)>>) {
+        let entries = self.edge_client_entries();
+        // An empty seed (always the case at startup) would only trigger a
+        // spurious change notification; the channel already starts empty.
+        if !entries.is_empty() {
+            let _ = tx.send(entries);
+        }
+        self.edge_client_tx = Some(tx);
+    }
+
+    /// The current client list as (endpoint, fingerprint) pairs, in the
+    /// shape the edge switcher resolves --edge-map targets against.
+    fn edge_client_entries(&self) -> Vec<(SocketAddr, String)> {
+        self.clients
+            .iter()
+            .map(|c| (c.endpoint, c.fingerprint.clone()))
+            .collect()
+    }
+
+    /// Republishes the client list to the edge switcher after a change. A
+    /// dead receiver means the edge switcher is gone (server shutting down).
+    fn publish_edge_clients(&self) {
+        if let Some(tx) = &self.edge_client_tx {
+            let _ = tx.send(self.edge_client_entries());
+        }
     }
 
     pub async fn accept(&mut self, event: RotationEvent) {
@@ -839,6 +875,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         // with the clients entry (see handle_client_removal). The new client
         // gets the full miss window before the silence detector can fire.
         self.liveness.insert(endpoint, LivenessState::new());
+        self.publish_edge_clients();
 
         info!(
             "Added client {} @ {} to rotation: {}",
@@ -2628,6 +2665,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 return false;
             }
         }
+        self.publish_edge_clients();
         let client_list = self
             .clients
             .iter()

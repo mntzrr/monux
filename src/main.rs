@@ -225,6 +225,21 @@ struct ServerArgs {
     #[arg(long, default_value_t = 40.0, value_name = "mbps", value_parser = parse_bulk_throttle)]
     bulk_throttle_mbps: f64,
 
+    /// Screen-edge switching (Hyprland only for now): switch input to a client
+    /// when the cursor is pushed against this screen edge and dwells there.
+    /// Repeatable and comma-separated: '--edge-map right=auto --edge-map left=aa11bb'
+    /// or '--edge-map right=auto,left=laptop'. The target is a client fingerprint
+    /// prefix (see the 'Added client ...' log line), a hostname, or 'auto' for
+    /// exactly-one-connected-client. Multi-monitor setups expose only the outer
+    /// edge segments; ~8% at each end of a segment is a corner dead zone.
+    #[arg(long, value_name = "direction=target")]
+    edge_map: Option<Vec<String>>,
+
+    /// How long the cursor must dwell on a mapped screen edge before the
+    /// switch fires, in milliseconds (see --edge-map)
+    #[arg(long, default_value_t = 250, value_name = "ms")]
+    edge_dwell_ms: u64,
+
     /// Disable the automatic background update (on by default): a daily check
     /// at low CPU priority, then an automatic restart into the new binary.
     /// The session resumes automatically on reconnect.
@@ -607,6 +622,11 @@ fn main() -> Result<()> {
                     mbps
                 );
             }
+            // Screen-edge switching is opt-in: no --edge-map, no edge manager.
+            let edge_map = match &args.edge_map {
+                Some(specs) => Some(monux::edge::parse_edge_map(specs)?),
+                None => None,
+            };
             rt.block_on(async {
                 server(
                     config_dir,
@@ -628,6 +648,8 @@ fn main() -> Result<()> {
                     mode,
                     motion_flush_interval,
                     bulk_throttle_mbps,
+                    edge_map,
+                    Duration::from_millis(args.edge_dwell_ms),
                     !args.no_auto_update,
                     !args.no_indicator,
                 )
@@ -864,6 +886,8 @@ async fn server(
     mode: NetworkMode,
     motion_flush_interval: Option<Duration>,
     bulk_throttle_mbps: Option<f64>,
+    edge_map: Option<monux::edge::EdgeMap>,
+    edge_dwell: Duration,
     auto_update: bool,
     auto_indicator: bool,
 ) -> Result<()> {
@@ -920,6 +944,20 @@ async fn server(
     });
     let grab_tx2 = grab_tx.clone();
 
+    // Screen-edge switching (opt-in via --edge-map): the edge manager owns the
+    // layer-shell strips and dwell timers, resolves targets against the live
+    // client list that the rotation loop publishes through this watch channel,
+    // and fires switches as Event::SwitchTo — the same entry point as goto
+    // chords, so debounce/pause/no-op cleanup all apply.
+    let edge_client_tx = match edge_map {
+        Some(map) => {
+            let (tx, rx) = watchchan::channel(Vec::new());
+            task::spawn(monux::edge::run(map, edge_dwell, event_tx.clone(), rx));
+            Some(tx)
+        }
+        None => None,
+    };
+
     let key_combos = shortcut::parse_key_combos(keys_next, keys_prev, keys_goto, keys_pause)?;
     if let Some(kp) = keys_pause {
         info!("Pause/resume shortcut: {} (ungrabs ALL devices; press again to resume)", kp);
@@ -956,6 +994,7 @@ async fn server(
             bulk_throttle_mbps,
             mode,
             diagnostics,
+            edge_client_tx,
         )
         .await
     });
@@ -1273,5 +1312,35 @@ mod tests {
     fn server_and_client_accept_no_indicator() {
         assert!(Cli::try_parse_from(["monux", "server", "--no-indicator"]).is_ok());
         assert!(Cli::try_parse_from(["monux", "client", "--no-indicator"]).is_ok());
+    }
+
+    #[test]
+    fn server_accepts_edge_map_and_dwell() {
+        let cli = Cli::try_parse_from([
+            "monux",
+            "server",
+            "--edge-map",
+            "right=auto",
+            "--edge-map",
+            "left=aa11bb,top=laptop",
+            "--edge-dwell-ms",
+            "400",
+        ])
+        .unwrap();
+        let Commands::Server(args) = cli.command else {
+            panic!("expected the server subcommand")
+        };
+        let specs = args.edge_map.expect("edge map should be set");
+        assert_eq!(specs, vec!["right=auto", "left=aa11bb,top=laptop"]);
+        assert_eq!(args.edge_dwell_ms, 400);
+        assert!(monux::edge::parse_edge_map(&specs).is_ok());
+
+        // Defaults: no edge map, 250ms dwell.
+        let cli = Cli::try_parse_from(["monux", "server"]).unwrap();
+        let Commands::Server(args) = cli.command else {
+            panic!("expected the server subcommand")
+        };
+        assert!(args.edge_map.is_none());
+        assert_eq!(args.edge_dwell_ms, 250);
     }
 }

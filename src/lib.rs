@@ -4,6 +4,7 @@ pub mod clipboard;
 pub mod control;
 pub mod device;
 pub mod discovery;
+pub mod edge;
 pub mod indicator;
 pub mod indicator_spawn;
 pub mod logging;
