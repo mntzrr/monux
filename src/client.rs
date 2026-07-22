@@ -1020,12 +1020,47 @@ impl LinkMonitor {
     }
 }
 
+/// Details of an in-progress link degradation, for the recovery summary.
+struct DegradationEpisode {
+    start: Instant,
+    peak_rtt: Duration,
+    sent_at_start: u64,
+    lost_at_start: u64,
+}
+
+impl DegradationEpisode {
+    fn start_now(now: Instant, rtt: Duration, sent: u64, lost: u64) -> Self {
+        Self {
+            start: now,
+            peak_rtt: rtt,
+            sent_at_start: sent,
+            lost_at_start: lost,
+        }
+    }
+
+    fn record(&mut self, rtt: Duration) {
+        self.peak_rtt = self.peak_rtt.max(rtt);
+    }
+
+    /// "degraded for 47s, peak rtt 213ms, 12 of 900 packets lost in that window"
+    fn summary(&self, now: Instant, sent: u64, lost: u64) -> String {
+        format!(
+            "degraded for {:.0}s, peak rtt {:?}, {} of {} packets lost in that window",
+            now.duration_since(self.start).as_secs_f64(),
+            self.peak_rtt,
+            lost.saturating_sub(self.lost_at_start),
+            sent.saturating_sub(self.sent_at_start),
+        )
+    }
+}
+
 /// Samples the connection's QUIC path stats on a timer and warns — at most
 /// once per LINK_NOTIFY_COOLDOWN — when the link degrades past LAN
 /// expectations, plus once when it recovers. The message points at the
 /// WiFi/link, not monux. Exits when the connection closes.
 async fn monitor_link(conn: quinn::Connection) {
     let mut monitor = LinkMonitor::new();
+    let mut episode: Option<DegradationEpisode> = None;
     let mut interval = tokio::time::interval(LINK_SAMPLE_INTERVAL);
     // The first interval tick is immediate: consume it and take the loss
     // baseline, so every judged window is a genuine post-connect interval.
@@ -1075,11 +1110,22 @@ async fn monitor_link(conn: quinn::Connection) {
         match monitor.check(path.rtt, loss_rate, Instant::now()) {
             LinkVerdict::Steady => {}
             LinkVerdict::Degraded => {
-                warn!(
-                    "Link degraded: rtt={:?} loss={:.1}% over the last {:?} — a WiFi/link issue, not monux",
+                episode = Some(DegradationEpisode::start_now(
+                    Instant::now(),
                     path.rtt,
+                    path.sent_packets,
+                    path.lost_packets,
+                ));
+                warn!(
+                    "Link degraded: rtt={:.0}ms (threshold {:?}) loss={:.1}% windowed (lifetime {}/{} lost, {} congestion events, {} black holes, cwnd {}) — a WiFi/link issue, not monux. Checklist: power save off on both machines ('iw dev <iface> get power_save'), 2.4GHz congestion (wireless peripherals, neighbors), prefer 5GHz; large clipboard transfers are already paced (--bulk-throttle-mbps).",
+                    rtt_ms,
+                    LINK_RTT_WARN,
                     loss_rate * 100.0,
-                    LINK_SAMPLE_INTERVAL
+                    path.lost_packets,
+                    path.sent_packets,
+                    path.congestion_events,
+                    path.black_holes_detected,
+                    path.cwnd
                 );
                 notify::notify(
                     "monux-link",
@@ -1094,7 +1140,13 @@ async fn monitor_link(conn: quinn::Connection) {
                 );
             }
             LinkVerdict::Recovered => {
-                info!("Link recovered: rtt={:?}", path.rtt);
+                match episode
+                    .take()
+                    .map(|e| e.summary(Instant::now(), path.sent_packets, path.lost_packets))
+                {
+                    Some(summary) => info!("Link recovered: rtt={:?} ({})", path.rtt, summary),
+                    None => info!("Link recovered: rtt={:?}", path.rtt),
+                }
                 notify::notify(
                     "monux-link",
                     notify::Urgency::Low,
@@ -1107,12 +1159,33 @@ async fn monitor_link(conn: quinn::Connection) {
                 );
             }
         }
+        // While degraded, keep the episode's peak RTT up to date for the
+        // recovery summary.
+        if monitor.degraded {
+            if let Some(e) = &mut episode {
+                e.record(path.rtt);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn degradation_episode_tracks_peak_and_window_loss() {
+        let t0 = Instant::now();
+        let mut e = DegradationEpisode::start_now(t0, Duration::from_millis(60), 1000, 5);
+        e.record(Duration::from_millis(200));
+        e.record(Duration::from_millis(80));
+        let s = e.summary(t0 + Duration::from_secs(47), 1900, 17);
+        assert!(
+            s.contains("47s") && s.contains("200ms") && s.contains("12 of 900"),
+            "summary should carry duration, peak rtt and window loss: {}",
+            s
+        );
+    }
 
     const REL: u16 = evdev::EventType::RELATIVE.0;
     const KEY: u16 = evdev::EventType::KEY.0;

@@ -1804,11 +1804,12 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             let path = c.conn.stats().path;
             if path.rtt > HEARTBEAT_LINK_RTT_WARN {
                 info!(
-                    "Link to {} is degraded: rtt={:.0}ms, {} of {} packets lost over the connection's lifetime — a WiFi/link issue, not monux",
+                    "Link to {} is degraded: rtt={:.0}ms, {} of {} packets lost over the connection's lifetime, {} congestion events — a WiFi/link issue, not monux (check power save on both machines, 2.4GHz congestion, prefer 5GHz)",
                     c.endpoint,
                     path.rtt.as_secs_f64() * 1000.0,
                     path.lost_packets,
                     path.sent_packets,
+                    path.congestion_events,
                 );
             }
         }
