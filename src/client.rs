@@ -14,7 +14,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::clipboard::{CLIPBOARD_SERVE_TIMEOUT_SECS, client, data};
 use crate::device::output;
 use crate::msgs::{bulk, event, shared};
-use crate::network::{approval, transport};
+use crate::network::{approval, throttle::BulkThrottle, transport};
 use crate::notify;
 
 /// Client-side scaling for relative pointer/scroll deltas (--mouse-scale,
@@ -117,6 +117,7 @@ pub async fn run<O: output::OutputHandler>(
     mouse_scale: f64,
     scroll_scale: f64,
     control_state: Arc<crate::control::ClientStateMirror>,
+    bulk_throttle_mbps: Option<f64>,
 ) -> Result<()> {
     let (mut client, connect_time) = Connection::new(
         server_addr,
@@ -127,6 +128,7 @@ pub async fn run<O: output::OutputHandler>(
         mouse_scale,
         scroll_scale,
         control_state,
+        bulk_throttle_mbps,
     )
     .await?;
     client.control_state.set_connected(client.conn().clone());
@@ -231,6 +233,7 @@ impl Connection {
         mouse_scale: f64,
         scroll_scale: f64,
         control_state: Arc<crate::control::ClientStateMirror>,
+        bulk_throttle_mbps: Option<f64>,
     ) -> Result<(Self, Instant)> {
         let bind_addr: SocketAddr = match server_addr {
             SocketAddr::V4(_) => "0.0.0.0:0".parse().expect("Failed to parse 0.0.0.0:0"),
@@ -308,6 +311,12 @@ impl Connection {
         let (bulk_tx, mut bulk_rx) = mpsc::channel::<Vec<u8>>(bulk::BULK_QUEUE_CAPACITY);
         {
             let mut bulk_send = bulk_send;
+            // Paces large frames so a clipboard transfer can't fill the
+            // kernel/WiFi driver FIFO ahead of latency-sensitive input
+            // (bufferbloat; see BulkThrottle). The wayland pre-fetch — pulling
+            // the whole clipboard, up to the max size, on every advertisement —
+            // flows through this same writer, so it is paced too.
+            let mut throttle = bulk_throttle_mbps.map(BulkThrottle::new);
             task::spawn(async move {
                 while let Some(bytes) = bulk_rx.recv().await {
                     trace!("Sending {} byte bulk message", bytes.len());
@@ -316,6 +325,12 @@ impl Connection {
                         // side, which resets the connection.
                         error!("Failed to write {} bytes to the bulk stream: {:?}", bytes.len(), e);
                         return;
+                    }
+                    if let Some(throttle) = &mut throttle {
+                        let wait = throttle.charge(bytes.len(), Instant::now());
+                        if !wait.is_zero() {
+                            tokio::time::sleep(wait).await;
+                        }
                     }
                 }
             });
@@ -1037,6 +1052,26 @@ async fn monitor_link(conn: quinn::Connection) {
         } else {
             lost as f64 / sent as f64
         };
+        // Every sample leaves evidence in the log, independent of the
+        // notification cooldown below: debug for routine samples, info once
+        // past the warn thresholds (RTT spikes like WiFi bufferbloat show up
+        // here even when no notification fires).
+        let rtt_ms = path.rtt.as_secs_f64() * 1000.0;
+        if path.rtt > LINK_RTT_WARN || loss_rate > LINK_LOSS_WARN {
+            info!(
+                "Link stats: rtt={:.0}ms loss={:.1}% over the last {:?} (above warn thresholds)",
+                rtt_ms,
+                loss_rate * 100.0,
+                LINK_SAMPLE_INTERVAL
+            );
+        } else {
+            debug!(
+                "Link stats: rtt={:.0}ms loss={:.1}% over the last {:?}",
+                rtt_ms,
+                loss_rate * 100.0,
+                LINK_SAMPLE_INTERVAL
+            );
+        }
         match monitor.check(path.rtt, loss_rate, Instant::now()) {
             LinkVerdict::Steady => {}
             LinkVerdict::Degraded => {

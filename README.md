@@ -202,6 +202,17 @@ If input (e.g. the Enter key) stops registering on the server machine while `mon
 - Freeze windows that self-heal after seconds-to-a-minute point at a blocking wait that timed out — check whether they line up with clipboard warnings above.
 - On connection loss, both sides log `Connection stats on drop: rtt=... lost_packets=N/M congestion_events=... black_holes=...`. High loss/congestion/black-holes means a lossy link (WiFi interference, weak signal); near-zero loss with a normal RTT means the *peer* went silent (CPU stall on that machine, or WiFi buffering/power saving there despite setup — recheck `iw dev` on the client).
 
+### RTT spikes and degraded links (WiFi)
+
+Latency-sensitive input shares the link with bulk clipboard traffic, and QUIC's stream priorities only order data *inside* the connection — the kernel/WiFi driver queue below is FIFO, so an unthrottled multi-MB clipboard transfer fills it and input packets behind it wait for the whole backlog to drain (bufferbloat, seen as RTT spikes for the duration of the transfer). monux therefore paces bulk transfers to **40 Mbps by default** on both server and client (`--bulk-throttle-mbps`), keeping that queue short so input stays responsive; large clipboard transfers take slightly longer (5 MB ≈ 1 s at 40 Mbps). Set `--bulk-throttle-mbps 0` to disable, or tune the rate to your link.
+
+When the link is degraded, monux says so in several places: a desktop notification (at most once per 5 minutes, plus once on recovery), the client's `Link stats:` / `Link degraded:` log lines (every 15s sample), and the server's 10-second input-status heartbeat (`Link to <client> is degraded: rtt=...`, only while above the threshold). If you see sporadic RTT spikes on WiFi, the checklist:
+
+1. **Power saving off on BOTH machines** — check with `iw dev <iface> get power_save` (`monux system setup` disables it, but only on the machine where you ran it).
+2. **2.4 GHz congestion** — wireless peripherals, Bluetooth, USB3 ports, and the neighbors' networks all share the band; sporadic spikes that correlate with nothing on either machine are usually this.
+3. **Move the AP and clients to 5 GHz** — the single biggest fix when the hardware allows it.
+4. Read the trend around a spike in the client's debug-level `Link stats:` lines (rtt and window loss every 15s).
+
 ## License
 
 This project is licensed under the AGPLv3 (or later versions) and is copyright Nicholas Parker.

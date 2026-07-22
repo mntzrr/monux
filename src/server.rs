@@ -26,6 +26,7 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     rotation_tx: mpsc::Sender<rotation::RotationEvent>,
     mut rotation_rx: mpsc::Receiver<rotation::RotationEvent>,
     motion_flush_interval: Option<Duration>,
+    bulk_throttle_mbps: Option<f64>,
     diagnostics: Arc<rotation::DiagnosticsMirror>,
 ) -> Result<()> {
     let local_clipboard = LocalClipboard::start(
@@ -36,7 +37,7 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     ).await;
 
     let mut rotation =
-        rotation::Rotation::new(grab_tx, output_handler, local_clipboard, &config_dir, rotation_tx, motion_flush_interval, diagnostics).await?;
+        rotation::Rotation::new(grab_tx, output_handler, local_clipboard, &config_dir, rotation_tx, motion_flush_interval, bulk_throttle_mbps, diagnostics).await?;
     // Input-flow heartbeat: makes "user is typing but nothing arrives anywhere"
     // visible in the log, instead of silent (the dead-Enter investigations).
     let mut status_tick = time::interval(Duration::from_secs(10));

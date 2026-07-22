@@ -185,6 +185,17 @@ struct ServerArgs {
     #[arg(long, default_value_t = 250, value_name = "hz")]
     motion_hz: u32,
 
+    /// Pace clipboard/bulk transfers to this many megabits per second
+    /// (0 disables). QUIC stream priorities only order data inside the
+    /// connection; the kernel/WiFi driver queue below is FIFO, so an
+    /// unthrottled multi-MB clipboard transfer fills it and input packets
+    /// behind it wait for the whole backlog to drain (bufferbloat: RTT
+    /// spikes for the duration of the transfer). Pacing keeps that queue
+    /// short so input stays responsive, at the cost of slower large
+    /// clipboard transfers (5MB takes ~1s at 40Mbps).
+    #[arg(long, default_value_t = 40.0, value_name = "mbps", value_parser = parse_bulk_throttle)]
+    bulk_throttle_mbps: f64,
+
     /// Disable the automatic background update (on by default): a daily check
     /// at low CPU priority, then an automatic restart into the new binary.
     /// The session resumes automatically on reconnect.
@@ -226,6 +237,17 @@ struct ClientArgs {
     #[arg(long, default_value = "1.0", value_name = "scale", value_parser = parse_input_scale)]
     scroll_scale: f64,
 
+    /// Pace clipboard/bulk transfers to this many megabits per second
+    /// (0 disables). QUIC stream priorities only order data inside the
+    /// connection; the kernel/WiFi driver queue below is FIFO, so an
+    /// unthrottled multi-MB clipboard transfer fills it and input packets
+    /// behind it wait for the whole backlog to drain (bufferbloat: RTT
+    /// spikes for the duration of the transfer). Pacing keeps that queue
+    /// short so input stays responsive, at the cost of slower large
+    /// clipboard transfers (5MB takes ~1s at 40Mbps).
+    #[arg(long, default_value_t = 40.0, value_name = "mbps", value_parser = parse_bulk_throttle)]
+    bulk_throttle_mbps: f64,
+
     /// Disable the automatic background update (on by default): a daily check
     /// at low CPU priority, then an automatic restart into the new binary.
     /// The session resumes automatically on reconnect.
@@ -253,6 +275,27 @@ fn parse_input_scale(s: &str) -> std::result::Result<f64, String> {
         _ => Err(format!(
             "scale must be a number between {} and {}",
             MIN_INPUT_SCALE, MAX_INPUT_SCALE
+        )),
+    }
+}
+
+/// Accepted range for --bulk-throttle-mbps when enabled (0 disables): wide
+/// enough for any WiFi/LAN link, narrow enough to catch typos.
+const MIN_BULK_THROTTLE_MBPS: f64 = 0.1;
+const MAX_BULK_THROTTLE_MBPS: f64 = 10_000.0;
+
+/// clap value parser for --bulk-throttle-mbps on server and client.
+fn parse_bulk_throttle(s: &str) -> std::result::Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if v == 0.0 => Ok(v),
+        Ok(v)
+            if v.is_finite() && (MIN_BULK_THROTTLE_MBPS..=MAX_BULK_THROTTLE_MBPS).contains(&v) =>
+        {
+            Ok(v)
+        }
+        _ => Err(format!(
+            "throttle must be 0 (disabled) or a number between {} and {}",
+            MIN_BULK_THROTTLE_MBPS, MAX_BULK_THROTTLE_MBPS
         )),
     }
 }
@@ -486,6 +529,14 @@ fn main() -> Result<()> {
                     args.motion_hz
                 );
             }
+            let bulk_throttle_mbps =
+                (args.bulk_throttle_mbps > 0.0).then_some(args.bulk_throttle_mbps);
+            if let Some(mbps) = bulk_throttle_mbps {
+                info!(
+                    "Pacing bulk transfers to {} Mbps (--bulk-throttle-mbps 0 to disable)",
+                    mbps
+                );
+            }
             rt.block_on(async {
                 server(
                     config_dir,
@@ -506,6 +557,7 @@ fn main() -> Result<()> {
                     max_clipboard_size_bytes,
                     mode,
                     motion_flush_interval,
+                    bulk_throttle_mbps,
                     !args.no_auto_update,
                 )
                 .await
@@ -584,6 +636,14 @@ fn main() -> Result<()> {
                     args.mouse_scale, args.scroll_scale
                 );
             }
+            let bulk_throttle_mbps =
+                (args.bulk_throttle_mbps > 0.0).then_some(args.bulk_throttle_mbps);
+            if let Some(mbps) = bulk_throttle_mbps {
+                info!(
+                    "Pacing bulk transfers to {} Mbps (--bulk-throttle-mbps 0 to disable)",
+                    mbps
+                );
+            }
             rt.block_on(async {
                 client(
                     config_dir,
@@ -594,6 +654,7 @@ fn main() -> Result<()> {
                     from_discovery,
                     args.mouse_scale,
                     args.scroll_scale,
+                    bulk_throttle_mbps,
                     !args.no_auto_update,
                 )
                 .await
@@ -730,6 +791,7 @@ async fn server(
     max_clipboard_size_bytes: u64,
     mode: NetworkMode,
     motion_flush_interval: Option<Duration>,
+    bulk_throttle_mbps: Option<f64>,
     auto_update: bool,
 ) -> Result<()> {
     // Try to set up virtual devices up-front - exit early if we can't access uinput
@@ -813,6 +875,7 @@ async fn server(
             rotation_tx,
             rotation_rx,
             motion_flush_interval,
+            bulk_throttle_mbps,
             diagnostics,
         )
         .await
@@ -916,6 +979,7 @@ async fn client(
     from_discovery: bool,
     mouse_scale: f64,
     scroll_scale: f64,
+    bulk_throttle_mbps: Option<f64>,
     auto_update: bool,
 ) -> Result<()> {
     // Try to set up virtual devices up-front - exit early if we can't access uinput
@@ -971,6 +1035,7 @@ async fn client(
                 mouse_scale,
                 scroll_scale,
                 control_state.clone(),
+                bulk_throttle_mbps,
             ) => {
                 // client::run only returns on failure (its loop never exits otherwise).
                 if let Err(e) = run_result {

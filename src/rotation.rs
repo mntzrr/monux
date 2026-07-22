@@ -17,6 +17,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::clipboard::{CLIPBOARD_SERVE_TIMEOUT_SECS, data, server};
 use crate::device;
 use crate::msgs::{bulk, event};
+use crate::network::throttle::BulkThrottle;
 
 /// If the selected client reconnects within this long after being removed, then reselect it
 /// automatically. This is intended to help with fast recovery following networking flakes.
@@ -62,6 +63,11 @@ const CLIPBOARD_UPDATE_DEBOUNCE: Duration = Duration::from_millis(300);
 /// switch-away presents as dead keys with the client keeping the grab (see
 /// switch_allowed).
 const SWITCH_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// RTT above which a client's link is called degraded in the input-status
+/// heartbeat (mirrors LINK_RTT_WARN in client.rs). Only crossings are logged
+/// — the heartbeat fires every 10s, so healthy links must stay silent.
+const HEARTBEAT_LINK_RTT_WARN: Duration = Duration::from_millis(50);
 
 /// Channels for communicating with a connected client.
 #[derive(Debug)]
@@ -450,6 +456,9 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// Flush interval for motion coalescing; None = forward every batch
     /// immediately (e.g. --motion-hz 0 for gaming).
     motion_flush_interval: Option<Duration>,
+    /// Pacing rate for the per-client bulk writers (--bulk-throttle-mbps);
+    /// None = unthrottled. Each writer task gets its own token bucket.
+    bulk_throttle_mbps: Option<f64>,
     /// When the last next/prev switch was processed (see SWITCH_DEBOUNCE).
     last_switch_at: Option<Instant>,
     /// Loop-independent mirror of this rotation's diagnostic state, dumped by
@@ -542,6 +551,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         config_dir: &Path,
         rotation_tx: mpsc::Sender<RotationEvent>,
         motion_flush_interval: Option<Duration>,
+        bulk_throttle_mbps: Option<f64>,
         diagnostics: Arc<DiagnosticsMirror>,
     ) -> Result<Self> {
         let active_client_path = active_client_state_path(config_dir);
@@ -576,6 +586,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             motion_dirty: false,
             motion_history: VecDeque::new(),
             motion_flush_interval,
+            bulk_throttle_mbps,
             last_switch_at: None,
             diagnostics,
         })
@@ -657,6 +668,12 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         {
             let rotation_tx = self.rotation_tx.clone();
             let mut bulk_send = bulk_send;
+            // Paces large frames so a clipboard transfer can't fill the
+            // kernel/WiFi driver FIFO ahead of latency-sensitive input
+            // (bufferbloat; see BulkThrottle). The wayland pre-fetch — pulling
+            // the whole clipboard, up to the max size, on every advertisement —
+            // flows through this same writer, so it is paced too.
+            let mut throttle = self.bulk_throttle_mbps.map(BulkThrottle::new);
             task::spawn(async move {
                 while let Some(bytes) = bulk_rx.recv().await {
                     trace!("Sending {} byte bulk message to {}", bytes.len(), endpoint);
@@ -669,6 +686,12 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                             })
                             .await;
                         return;
+                    }
+                    if let Some(throttle) = &mut throttle {
+                        let wait = throttle.charge(bytes.len(), Instant::now());
+                        if !wait.is_zero() {
+                            tokio::time::sleep(wait).await;
+                        }
                     }
                 }
             });
@@ -1773,6 +1796,22 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// is active but nothing is forwarded. Called on a timer from the server
     /// events loop; counters reset each call.
     pub fn log_input_status(&mut self) {
+        // Per-client link quality, surfaced only past the warn threshold: a
+        // degraded link is evidence worth having in every window (even an
+        // otherwise idle one, which returns early below), while a healthy
+        // link must not add a log line every 10s.
+        for c in &self.clients {
+            let path = c.conn.stats().path;
+            if path.rtt > HEARTBEAT_LINK_RTT_WARN {
+                info!(
+                    "Link to {} is degraded: rtt={:.0}ms, {} of {} packets lost over the connection's lifetime — a WiFi/link issue, not monux",
+                    c.endpoint,
+                    path.rtt.as_secs_f64() * 1000.0,
+                    path.lost_packets,
+                    path.sent_packets,
+                );
+            }
+        }
         let counts = std::mem::take(&mut self.status_counts);
         let secs = self.status_window_start.elapsed().as_secs_f64().max(0.1);
         self.status_window_start = Instant::now();
@@ -2668,6 +2707,7 @@ mod tests {
             &dir,
             rotation_tx,
             None,
+            None,
             Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
         .await
@@ -2719,6 +2759,7 @@ mod tests {
             &dir,
             rotation_tx,
             Some(Duration::from_millis(8)),
+            None,
             Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
         .await
@@ -2768,6 +2809,7 @@ mod tests {
             &dir,
             rotation_tx,
             None,
+            None,
             Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
         .await
@@ -2794,6 +2836,7 @@ mod tests {
             None,
             &dir,
             rotation_tx,
+            None,
             None,
             Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
@@ -2945,6 +2988,7 @@ mod tests {
             &dir,
             rotation_tx,
             None,
+            None,
             Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
         .await
@@ -2981,6 +3025,7 @@ mod tests {
             &dir,
             rotation_tx,
             None,
+            None,
             Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
         .await
@@ -3016,6 +3061,7 @@ mod tests {
             None,
             &dir,
             rotation_tx,
+            None,
             None,
             Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
@@ -3062,6 +3108,7 @@ mod tests {
             None,
             &dir,
             rotation_tx,
+            None,
             None,
             Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
@@ -3268,6 +3315,7 @@ mod tests {
             &dir,
             rotation_tx,
             None,
+            None,
             Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
         .await
@@ -3306,6 +3354,7 @@ mod tests {
             None,
             &dir,
             rotation_tx,
+            None,
             None,
             diagnostics.clone(),
         )
