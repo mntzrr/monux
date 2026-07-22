@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::sync::{mpsc, watch};
@@ -15,6 +16,77 @@ use crate::device::{output, Event, GrabState};
 use crate::msgs::{bulk, event, shared};
 use crate::network::{approval, transport};
 use crate::rotation;
+
+/// Marker for a refused protocol mismatch. The refusal was already logged
+/// with full context by PeerVersions, so the accept loop logs it at debug
+/// instead of erroring again per retry.
+#[derive(Debug)]
+struct VersionMismatch;
+
+impl std::fmt::Display for VersionMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("protocol version mismatch (already logged)")
+    }
+}
+
+impl std::error::Error for VersionMismatch {}
+
+/// How often to repeat the friendly refusal log for the same client.
+const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Tracks per-client protocol versions so a version-mismatched client reads
+/// like the self-healing flow it is (it will auto-update and return), not
+/// like a broken connection erroring every few seconds — and so the moment
+/// it catches up is visible too.
+#[derive(Default)]
+struct PeerVersions {
+    /// addr -> version from the last successful exchange (for the update note).
+    seen: HashMap<SocketAddr, u64>,
+    /// addr -> when we last logged a refusal for it (rate limit).
+    last_refusal_log: HashMap<SocketAddr, Instant>,
+}
+
+impl PeerVersions {
+    /// Judges a client version from the exchange: Ok when compatible (and a
+    /// log line when the client just upgraded), Err when it must be refused
+    /// (a rate-limited, self-healing-framed warning on the first/log-worthy
+    /// refusal, silence otherwise).
+    fn check(&mut self, addr: SocketAddr, version: u64) -> Result<(), ()> {
+        let ours = shared::PROTOCOL_VERSION;
+        if version == ours {
+            if let Some(old) = self.seen.insert(addr, version) {
+                if old < version {
+                    info!(
+                        "Client {} updated protocol v{} -> v{} and reconnected",
+                        addr, old, version
+                    );
+                }
+            }
+            return Ok(());
+        }
+        // Refuse, but keep the last seen version for the eventual upgrade note.
+        self.seen.insert(addr, version);
+        let should_log = self
+            .last_refusal_log
+            .get(&addr)
+            .is_none_or(|last| last.elapsed() >= REFUSAL_LOG_INTERVAL);
+        if should_log {
+            self.last_refusal_log.insert(addr, Instant::now());
+            if version < ours {
+                warn!(
+                    "Client {} speaks protocol v{} but we speak v{}: it's outdated and will auto-update and reconnect shortly (refusing until then)",
+                    addr, version, ours
+                );
+            } else {
+                warn!(
+                    "Client {} speaks protocol v{} but we speak v{}: THIS server is outdated — update it so the versions line up",
+                    addr, version, ours
+                );
+            }
+        }
+        Err(())
+    }
+}
 
 pub async fn run_server_events_loop<O: output::OutputHandler>(
     config_dir: PathBuf,
@@ -189,6 +261,9 @@ pub async fn run_server_connections_loop(
     mode: transport::NetworkMode,
 ) -> Result<()> {
     let server_endpoint = bind_server_with_retry(listen_addr, cert_verifier, mode).await?;
+    // Protocol-version tracker: turns refusal spam into the self-healing
+    // story (outdated client auto-updating) and notes when it catches up.
+    let peer_versions = Arc::new(Mutex::new(PeerVersions::default()));
     // How long a single connection handshake may take before it is dropped.
     // Local mode must outlast the interactive approval prompt (60s), which runs
     // inside the handshake. Www mode never prompts, so it can be much stricter.
@@ -229,6 +304,7 @@ pub async fn run_server_connections_loop(
         };
         let rotation_tx_cpy = rotation_tx.clone();
         let fingerprint_cpy = fingerprint.clone();
+        let peer_versions_cpy = peer_versions.clone();
         // Complete the handshake in a spawned task so that a slow or stuck peer
         // cannot block the accept loop for other clients. We still wait to spawn
         // the connection task until we've gotten the fingerprint, to avoid
@@ -258,7 +334,7 @@ pub async fn run_server_connections_loop(
                         // Now that we have extracted the client cert fingerprint, spawn.
                         task::spawn(async move {
                             if let Err(e) =
-                                handle_connection(conn, fingerprint, rotation_tx_cpy.clone(), max_clipboard_size_bytes, conn_token)
+                                handle_connection(conn, fingerprint, rotation_tx_cpy.clone(), max_clipboard_size_bytes, conn_token, peer_versions_cpy)
                                 .await
                             {
                                 // Always try to remove the client from rotation, even if it wasn't added yet.
@@ -272,7 +348,13 @@ pub async fn run_server_connections_loop(
                                     .await {
                                         error!("Failed to send remove client event: {:?}", e);
                                     };
-                                error!("Client connection error: {:?}", e);
+                                if e.downcast_ref::<VersionMismatch>().is_some() {
+                                    // Already logged with full context by the
+                                    // version check; don't error per retry.
+                                    debug!("Refused client connection from {}: protocol mismatch", remote_addr);
+                                } else {
+                                    error!("Client connection error: {:?}", e);
+                                }
                             }
                         });
                     } else {
@@ -295,6 +377,7 @@ async fn handle_connection(
     rotation_tx: mpsc::Sender<rotation::RotationEvent>,
     max_clipboard_size_bytes: u64,
     conn_token: u64,
+    peer_versions: Arc<Mutex<PeerVersions>>,
 ) -> Result<()> {
     let (mut events_send, mut events_recv) = conn
         .accept_bi()
@@ -308,6 +391,16 @@ async fn handle_connection(
     // Reply with our own version BEFORE rejecting a mismatch, so that the
     // client learns it (its update gate needs it to catch up after we upgrade).
     transport::send_version(&mut events_send).await?;
+    // Judge the client's version with context (an upgrade note on success, a
+    // friendly rate-limited refusal otherwise) before the hard gate.
+    if peer_versions
+        .lock()
+        .expect("peer versions lock poisoned")
+        .check(conn.remote_address(), client_version)
+        .is_err()
+    {
+        return Err(VersionMismatch.into());
+    }
     transport::ensure_compatible_version(client_version)?;
 
     // Start second stream for bulk messages
@@ -584,4 +677,55 @@ async fn handle_bulk_messages(
     // Retain any unconsumed partial frame for the next chunk.
     bytes.drain(..offset);
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr() -> SocketAddr {
+        "127.0.0.1:12345".parse().unwrap()
+    }
+
+    #[test]
+    fn matching_version_passes_and_records() {
+        let mut pv = PeerVersions::default();
+        assert!(pv.check(addr(), shared::PROTOCOL_VERSION).is_ok());
+        assert!(pv.check(addr(), shared::PROTOCOL_VERSION).is_ok());
+    }
+
+    #[test]
+    fn older_version_refuses_with_rate_limited_log() {
+        let mut pv = PeerVersions::default();
+        let old = shared::PROTOCOL_VERSION - 1;
+        assert!(pv.check(addr(), old).is_err());
+        assert!(pv.last_refusal_log.contains_key(&addr()));
+        // A second refusal inside the window is not logged again.
+        let first = *pv.last_refusal_log.get(&addr()).unwrap();
+        assert!(pv.check(addr(), old).is_err());
+        assert_eq!(*pv.last_refusal_log.get(&addr()).unwrap(), first);
+        // After the window passes, it logs again (new timestamp).
+        *pv.last_refusal_log.get_mut(&addr()).unwrap() =
+            Instant::now() - REFUSAL_LOG_INTERVAL - Duration::from_secs(1);
+        assert!(pv.check(addr(), old).is_err());
+        assert_ne!(*pv.last_refusal_log.get(&addr()).unwrap(), first);
+    }
+
+    #[test]
+    fn newer_version_refuses_as_server_outdated() {
+        let mut pv = PeerVersions::default();
+        assert!(pv.check(addr(), shared::PROTOCOL_VERSION + 1).is_err());
+    }
+
+    #[test]
+    fn upgrade_is_noted_on_reconnect() {
+        let mut pv = PeerVersions::default();
+        let old = shared::PROTOCOL_VERSION - 1;
+        // Refused while old, then comes back matching: the upgrade note fires.
+        assert!(pv.check(addr(), old).is_err());
+        assert!(pv.check(addr(), shared::PROTOCOL_VERSION).is_ok());
+        // No note when nothing changed since the last seen version.
+        assert!(pv.check(addr(), shared::PROTOCOL_VERSION).is_ok());
+        assert_eq!(pv.seen.get(&addr()), Some(&shared::PROTOCOL_VERSION));
+    }
 }
