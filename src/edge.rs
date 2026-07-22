@@ -5,30 +5,28 @@
 //! (Event::SwitchTo → Rotation::set_client), so debounce/pause/no-op cleanup
 //! all apply for free; there is no protocol change.
 //!
-//! Detection is event-driven, zero polling of the pointer position: for every
-//! EXPOSED segment of a mapped edge (see exposed_segments) a 1px-wide,
-//! fully transparent wlr-layer-shell strip is placed at the very screen edge
-//! (overlay layer, exclusive zone -1 so bars/panels don't displace it). The
-//! compositor then delivers pointer Enter/Leave events as the cursor is
-//! pushed into/away from the edge. An enter starts a dwell timer
-//! (--edge-dwell-ms); a leave before the deadline cancels it; a completed
-//! dwell fires the switch once and a short re-arm cooldown prevents
-//! machine-gunning. Each strip runs on its own wayland connection and
-//! dispatch thread, mirroring the clipboard type_watcher pattern (but with an
-//! interruptible read loop so layout changes can rebuild strips).
+//! Detection polls the cursor position from Hyprland's IPC every
+//! POLL_INTERVAL (Hyprland delivers no usable pointer enter/leave at screen
+//! edges — verified empirically with layer-shell probes — so an event-driven
+//! design is not viable there). The cursor is "on" a mapped edge when its
+//! coordinate crosses that edge's line within an EXPOSED segment of it (see
+//! exposed_segments), minus a corner dead zone at each segment end. Edge
+//! contact is debounced (a state must hold for two consecutive polls), then
+//! the dwell timer (--edge-dwell-ms) runs; a leave before the deadline
+//! cancels it; a completed dwell fires the switch once and a short re-arm
+//! cooldown prevents machine-gunning. The poller runs on its own thread
+//! (blocking socket IO), forwarding positions to the edge manager task.
 //!
 //! The monitor layout comes from Hyprland's IPC (the only compositor
 //! supported in this phase); if it's unavailable the feature disables itself
 //! with a warning. The layout is re-queried periodically so monitor
-//! (un)plugs and resolution changes rebuild the strips.
+//! (un)plugs and resolution changes recompute the trigger zones.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -145,7 +143,7 @@ pub struct OutputRect {
 }
 
 /// A contiguous exposed piece of one output's boundary: no other output
-/// abuts it, so the cursor jams against it (and a strip there can see it).
+/// abuts it, so the cursor jams against it (and a trigger zone there sees it).
 /// `start`/`len` run along the edge axis in global layout coordinates.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EdgeSegment {
@@ -246,18 +244,24 @@ fn trim_corner_dead_zones(segment: EdgeSegment) -> Option<EdgeSegment> {
     })
 }
 
-/// Queries the monitor layout from Hyprland's IPC socket
+/// The Hyprland IPC socket
 /// ($XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket.sock), the
 /// same channel hyprctl uses. Errors when not running under Hyprland.
-pub fn hyprland_layout() -> Result<Vec<OutputRect>> {
+fn hyprland_socket_path() -> Result<PathBuf> {
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
         .context("XDG_RUNTIME_DIR is not set (no wayland session?)")?;
     let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
         .context("HYPRLAND_INSTANCE_SIGNATURE is not set (not running under Hyprland)")?;
-    let socket = PathBuf::from(runtime_dir)
+    Ok(PathBuf::from(runtime_dir)
         .join("hypr")
         .join(signature)
-        .join(".socket.sock");
+        .join(".socket.sock"))
+}
+
+/// Queries the monitor layout from Hyprland's IPC socket (see
+/// hyprland_socket_path). Errors when not running under Hyprland.
+pub fn hyprland_layout() -> Result<Vec<OutputRect>> {
+    let socket = hyprland_socket_path()?;
     let mut stream = UnixStream::connect(&socket)
         .with_context(|| format!("Failed to connect to Hyprland IPC at {}", socket.display()))?;
     stream
@@ -494,27 +498,120 @@ pub fn resolve_hostname(name: &str) -> Vec<IpAddr> {
     ips
 }
 
-/// Pointer Enter/Leave on an edge strip, sent from the strip's wayland
-/// dispatch thread to the edge manager task.
-enum StripEvent {
-    Enter(Direction),
-    Leave(Direction),
+/// How often the cursor position is polled from Hyprland's IPC.
+const POLL_INTERVAL: Duration = Duration::from_millis(40);
+
+/// How long the poller waits after a failed query before retrying.
+const POLL_FAILURE_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Queries the cursor position from Hyprland's IPC. One-shot, exactly like
+/// the layout query: the compositor closes the connection after each reply
+/// (verified empirically — hyprctl --batch's single connection works only
+/// because all its commands go out in ONE write), so each poll reconnects.
+fn cursor_position() -> Result<(i32, i32)> {
+    let socket = hyprland_socket_path()?;
+    let mut stream = UnixStream::connect(&socket)
+        .with_context(|| format!("Failed to connect to Hyprland IPC at {}", socket.display()))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .context("Failed to configure Hyprland IPC socket")?;
+    stream
+        .write_all(b"cursorpos")
+        .context("Failed to query the Hyprland cursor position")?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .context("Failed to finish the Hyprland cursor position query")?;
+    let mut reply = String::new();
+    stream
+        .read_to_string(&mut reply)
+        .context("Failed to read the Hyprland cursor position reply")?;
+    parse_cursorpos(&reply)
 }
 
-/// Placement of one strip: a 1px-wide band on `output`, starting `offset`
-/// px along the edge from the output's origin, `len` px long.
-struct StripSpec {
-    output: String,
+/// Parses Hyprland's cursorpos reply ("x, y"; coordinates can be negative
+/// when outputs sit left of/above the layout origin).
+fn parse_cursorpos(reply: &str) -> Result<(i32, i32)> {
+    let reply = reply.trim();
+    let (x, y) = reply
+        .split_once(',')
+        .with_context(|| format!("unexpected cursorpos reply '{}'", reply))?;
+    let x = x
+        .trim()
+        .parse::<i32>()
+        .with_context(|| format!("unexpected cursorpos reply '{}'", reply))?;
+    let y = y
+        .trim()
+        .parse::<i32>()
+        .with_context(|| format!("unexpected cursorpos reply '{}'", reply))?;
+    Ok((x, y))
+}
+
+/// Polls the cursor position every POLL_INTERVAL and forwards it to the edge
+/// manager; a failed query is logged at debug and retried after
+/// POLL_FAILURE_BACKOFF. Runs on its own thread (blocking socket IO) and
+/// ends when the edge manager is gone (server shutting down).
+fn run_cursor_poller(pos_tx: mpsc::UnboundedSender<(i32, i32)>) {
+    loop {
+        match cursor_position() {
+            Ok(pos) => {
+                if pos_tx.send(pos).is_err() {
+                    return;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(e) => {
+                debug!(
+                    "Screen-edge cursor poll failed ({:#}), retrying in {:?}",
+                    e, POLL_FAILURE_BACKOFF
+                );
+                std::thread::sleep(POLL_FAILURE_BACKOFF);
+            }
+        }
+    }
+}
+
+/// How far beyond an edge line the cursor still counts as "on the edge", in
+/// logical pixels. 0 = the cursor must reach the very edge: left x <= 0,
+/// right x >= the output's last column (and likewise for top/bottom rows).
+pub const EDGE_TRIGGER_PX: i32 = 0;
+
+/// A trigger zone: one exposed, corner-trimmed segment of one output's edge,
+/// in global layout coordinates. The cursor is on the zone's edge when its
+/// coordinate crosses the edge line while its along-axis coordinate lies
+/// within [start, start + len).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EdgeZone {
     direction: Direction,
-    offset: i32,
+    output: String,
+    /// The edge line: the output's first (left/top) or last (right/bottom)
+    /// pixel column/row on that side.
+    edge: i32,
+    /// Range start along the edge axis (y for left/right, x for top/bottom).
+    start: i32,
     len: i32,
 }
 
-/// Turns a layout into strip placements for the mapped directions: exposed
-/// segments only, corner dead zones applied, global coordinates translated
-/// to output-relative offsets.
-fn strip_specs(map: &EdgeMap, layout: &[OutputRect]) -> Vec<StripSpec> {
-    let mut specs = Vec::new();
+/// Whether the cursor at (x, y) is on this zone's edge.
+fn zone_contains(zone: &EdgeZone, x: i32, y: i32) -> bool {
+    let along = match zone.direction {
+        Direction::Left | Direction::Right => y,
+        Direction::Top | Direction::Bottom => x,
+    };
+    if along < zone.start || along >= zone.start + zone.len {
+        return false;
+    }
+    match zone.direction {
+        Direction::Left => x <= zone.edge + EDGE_TRIGGER_PX,
+        Direction::Right => x >= zone.edge - EDGE_TRIGGER_PX,
+        Direction::Top => y <= zone.edge + EDGE_TRIGGER_PX,
+        Direction::Bottom => y >= zone.edge - EDGE_TRIGGER_PX,
+    }
+}
+
+/// Turns a layout into trigger zones for the mapped directions: exposed
+/// segments only, corner dead zones applied.
+fn edge_zones(map: &EdgeMap, layout: &[OutputRect]) -> Vec<EdgeZone> {
+    let mut zones = Vec::new();
     for segment in exposed_segments(layout) {
         if !map.targets.contains_key(&segment.direction) {
             continue;
@@ -525,97 +622,103 @@ fn strip_specs(map: &EdgeMap, layout: &[OutputRect]) -> Vec<StripSpec> {
         let Some(output) = layout.iter().find(|o| o.name == segment.output) else {
             continue;
         };
-        let offset = match segment.direction {
-            Direction::Left | Direction::Right => segment.start - output.y,
-            Direction::Top | Direction::Bottom => segment.start - output.x,
+        let edge = match segment.direction {
+            Direction::Left => output.x,
+            Direction::Right => output.x + output.width - 1,
+            Direction::Top => output.y,
+            Direction::Bottom => output.y + output.height - 1,
         };
-        specs.push(StripSpec {
-            output: segment.output,
+        zones.push(EdgeZone {
             direction: segment.direction,
-            offset,
+            output: segment.output,
+            edge,
+            start: segment.start,
             len: segment.len,
         });
     }
-    specs
+    zones
 }
 
-/// How often the monitor layout is re-queried; a change rebuilds the strips.
+/// Logs the trigger zones, one per line — or the warning that --edge-map
+/// matches no exposed segment on the current layout.
+fn log_zones(zones: &[EdgeZone]) {
+    if zones.is_empty() {
+        warn!("Screen-edge switching: no exposed screen-edge segments match --edge-map on the current monitor layout");
+        return;
+    }
+    for zone in zones {
+        info!(
+            "Screen-edge switching: watching the {} edge of {} ({} {}..{})",
+            zone.direction.as_str(),
+            zone.output,
+            match zone.direction {
+                Direction::Left | Direction::Right => "y",
+                Direction::Top | Direction::Bottom => "x",
+            },
+            zone.start,
+            zone.start + zone.len
+        );
+    }
+}
+
+/// Consecutive equal poll outcomes required before a direction's on/off
+/// state transitions: single-poll jitter (the cursor grazing a zone
+/// boundary) never reaches the dwell timer.
+const STABLE_POLLS: u32 = 2;
+
+/// Per-direction edge-contact debouncer (see STABLE_POLLS): being on the
+/// edge is the Enter equivalent, leaving it the Leave equivalent. Pure over
+/// successive poll outcomes so the transition logic is testable.
+struct EdgeDebounce {
+    /// The committed state (true = cursor on the edge).
+    on: bool,
+    /// The candidate state and how many consecutive polls reported it.
+    candidate: Option<bool>,
+    streak: u32,
+}
+
+impl EdgeDebounce {
+    fn new() -> Self {
+        Self {
+            on: false,
+            candidate: None,
+            streak: 0,
+        }
+    }
+
+    /// Feeds one poll outcome; returns Some(state) when the committed state
+    /// transitioned.
+    fn poll(&mut self, on: bool) -> Option<bool> {
+        if on == self.on {
+            self.candidate = None;
+            self.streak = 0;
+            return None;
+        }
+        if self.candidate == Some(on) {
+            self.streak += 1;
+        } else {
+            self.candidate = Some(on);
+            self.streak = 1;
+        }
+        if self.streak >= STABLE_POLLS {
+            self.on = on;
+            self.candidate = None;
+            self.streak = 0;
+            Some(on)
+        } else {
+            None
+        }
+    }
+}
+
+/// How often the monitor layout is re-queried; a change recomputes the
+/// trigger zones.
 const LAYOUT_REQUERY_INTERVAL: Duration = Duration::from_secs(30);
 
-/// How long a strip's dispatch loop may block on the wayland socket before
-/// re-checking its shutdown flag (layout rebuilds stop the old strips).
-const STRIP_POLL_TIMEOUT_MS: i32 = 500;
-
-/// A running strip: its wayland dispatch thread plus its shutdown flag.
-struct StripHandle {
-    shutdown: Arc<AtomicBool>,
-    join: std::thread::JoinHandle<()>,
-}
-
-/// The strips of one layout generation.
-struct StripSet {
-    handles: Vec<StripHandle>,
-}
-
-impl StripSet {
-    /// Stops all strips: flags their dispatch loops and reaps the threads on
-    /// a detached thread (a loop can take up to STRIP_POLL_TIMEOUT_MS to
-    /// notice), so the caller isn't stalled on a layout rebuild.
-    fn shutdown(self) {
-        let mut joins = Vec::new();
-        for handle in self.handles {
-            handle.shutdown.store(true, Ordering::Relaxed);
-            joins.push(handle.join);
-        }
-        std::thread::spawn(move || {
-            for join in joins {
-                let _ = join.join();
-            }
-        });
-    }
-}
-
-/// Spawns one strip per exposed segment of a mapped direction.
-fn spawn_strips(
-    map: &EdgeMap,
-    layout: &[OutputRect],
-    strip_tx: &mpsc::UnboundedSender<StripEvent>,
-) -> StripSet {
-    let specs = strip_specs(map, layout);
-    if specs.is_empty() {
-        warn!("Screen-edge switching: no exposed screen-edge segments match --edge-map on the current monitor layout");
-    }
-    let mut handles = Vec::new();
-    for spec in specs {
-        info!(
-            "Screen-edge switching: creating strip on the {} edge of {} (offset {}, length {})",
-            spec.direction.as_str(),
-            spec.output,
-            spec.offset,
-            spec.len
-        );
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown2 = shutdown.clone();
-        let strip_tx = strip_tx.clone();
-        let join = std::thread::spawn(move || {
-            if let Err(e) = run_strip(&spec, strip_tx, shutdown2) {
-                warn!(
-                    "Screen-edge strip on the {} edge of {} died: {:?}",
-                    spec.direction.as_str(),
-                    spec.output,
-                    e
-                );
-            }
-        });
-        handles.push(StripHandle { shutdown, join });
-    }
-    StripSet { handles }
-}
-
-/// The edge manager task: owns the strips, the dwell state machines, target
-/// resolution, and the periodic layout re-query. Exits (disabling the
-/// feature) when Hyprland's IPC is unavailable; otherwise runs until the
-/// server shuts down.
+/// The edge manager task: spawns the cursor poller, owns the trigger zones,
+/// the dwell state machines, target resolution, and the periodic layout
+/// re-query. Exits (disabling the feature) when Hyprland's IPC is
+/// unavailable; otherwise runs until the server shuts down.
 pub async fn run(
     map: EdgeMap,
     dwell: Duration,
@@ -644,16 +747,17 @@ pub async fn run(
             .join(", ")
     );
     log_layout(&layout);
-    let (strip_tx, mut strip_rx) = mpsc::unbounded_channel::<StripEvent>();
-    let mut strips = spawn_strips(&map, &layout, &strip_tx);
+    let (pos_tx, mut pos_rx) = mpsc::unbounded_channel::<(i32, i32)>();
+    std::thread::spawn(move || run_cursor_poller(pos_tx));
+    let mut zones = edge_zones(&map, &layout);
+    log_zones(&zones);
     let mut current_layout = layout;
 
-    // Per-direction dwell state. `entered` counts strips of this direction
-    // the cursor is currently inside (multiple monitors can contribute
-    // several segments to one direction); the dwell timer runs while ≥1.
+    // Per-direction state: the debouncer turns polled edge contact into
+    // enter/leave equivalents that drive the dwell timer.
     struct DirState {
         timer: DwellTimer,
-        entered: u32,
+        debounce: EdgeDebounce,
         deadline: Option<Instant>,
     }
     let mut dirs: HashMap<Direction, DirState> = map
@@ -664,7 +768,7 @@ pub async fn run(
                 *dir,
                 DirState {
                     timer: DwellTimer::new(dwell, REARM_COOLDOWN),
-                    entered: 0,
+                    debounce: EdgeDebounce::new(),
                     deadline: None,
                 },
             )
@@ -678,29 +782,23 @@ pub async fn run(
     loop {
         let next_deadline = dirs.values().filter_map(|state| state.deadline).min();
         tokio::select! {
-            event = strip_rx.recv() => {
+            pos = pos_rx.recv() => {
+                let Some((x, y)) = pos else {
+                    warn!("Screen-edge switching disabled: the cursor poller is gone");
+                    return;
+                };
                 let now = Instant::now();
-                match event {
-                    Some(StripEvent::Enter(dir)) => {
-                        if let Some(state) = dirs.get_mut(&dir) {
-                            state.entered += 1;
-                            if state.entered == 1 {
-                                state.deadline = state.timer.enter(now);
-                            }
+                for (dir, state) in dirs.iter_mut() {
+                    let on = zones
+                        .iter()
+                        .any(|zone| zone.direction == *dir && zone_contains(zone, x, y));
+                    match state.debounce.poll(on) {
+                        Some(true) => state.deadline = state.timer.enter(now),
+                        Some(false) => {
+                            state.timer.leave();
+                            state.deadline = None;
                         }
-                    }
-                    Some(StripEvent::Leave(dir)) => {
-                        if let Some(state) = dirs.get_mut(&dir) {
-                            state.entered = state.entered.saturating_sub(1);
-                            if state.entered == 0 {
-                                state.timer.leave();
-                                state.deadline = None;
-                            }
-                        }
-                    }
-                    None => {
-                        warn!("Screen-edge switching disabled: all edge strips are gone");
-                        return;
+                        None => {}
                     }
                 }
             }
@@ -715,25 +813,25 @@ pub async fn run(
                 match hyprland_layout() {
                     Ok(new_layout) if !new_layout.is_empty() => {
                         if new_layout != current_layout {
-                            info!("Screen-edge switching: monitor layout changed, rebuilding edge strips");
+                            info!("Screen-edge switching: monitor layout changed, recomputing edge zones");
                             log_layout(&new_layout);
-                            strips.shutdown();
-                            strips = spawn_strips(&map, &new_layout, &strip_tx);
+                            zones = edge_zones(&map, &new_layout);
+                            log_zones(&zones);
                             current_layout = new_layout;
-                            // Enters recorded against the dead strips' generation
-                            // would never see their leave.
+                            // Contact states measured against the old layout's
+                            // zones are meaningless under the new one.
                             for state in dirs.values_mut() {
-                                state.entered = 0;
+                                state.debounce = EdgeDebounce::new();
                                 state.deadline = None;
                                 state.timer.leave();
                             }
                         }
                     }
                     Ok(_) => {
-                        warn!("Screen-edge switching: Hyprland layout re-query returned no outputs, keeping existing strips");
+                        warn!("Screen-edge switching: Hyprland layout re-query returned no outputs, keeping existing zones");
                     }
                     Err(e) => {
-                        warn!("Screen-edge switching: Hyprland layout re-query failed ({:#}), keeping existing strips", e);
+                        warn!("Screen-edge switching: Hyprland layout re-query failed ({:#}), keeping existing zones", e);
                     }
                 }
             }
@@ -752,7 +850,6 @@ pub async fn run(
                     }
                     // Fired: the timer reset and started its re-arm cooldown.
                     state.deadline = None;
-                    state.entered = 0;
                     let clients = clients_rx.borrow().clone();
                     let target = &map.targets[dir];
                     match resolve_edge_target(target, &clients, &resolve_hostname) {
@@ -805,308 +902,6 @@ fn log_edge_resolutions(map: &EdgeMap, clients: &[(SocketAddr, String)]) {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Wayland strip: a 1px-wide invisible layer-shell surface that reports
-// pointer Enter/Leave at the very screen edge.
-// ---------------------------------------------------------------------------
-
-use std::os::fd::{AsFd, AsRawFd};
-
-use wayland_client::globals::{registry_queue_init, GlobalListContents};
-use wayland_client::protocol::{
-    wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_output, wl_output::WlOutput, wl_pointer,
-    wl_pointer::WlPointer, wl_region::WlRegion, wl_registry, wl_seat::WlSeat, wl_shm,
-    wl_shm::WlShm, wl_shm_pool::WlShmPool, wl_surface::WlSurface,
-};
-use wayland_client::{delegate_noop, Connection, Dispatch, Proxy, QueueHandle};
-use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::{
-    Layer, ZwlrLayerShellV1,
-};
-use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{
-    Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1,
-};
-
-/// Per-strip wayland state, dispatched on the strip's own thread.
-struct StripState {
-    direction: Direction,
-    events_tx: mpsc::UnboundedSender<StripEvent>,
-    /// Bound wl_outputs with their names (filled by wl_output.name events).
-    outputs: Vec<(WlOutput, String)>,
-    /// One wl_pointer per seat (kept alive for Enter/Leave delivery).
-    pointers: Vec<WlPointer>,
-    surface: Option<WlSurface>,
-    buffer: Option<WlBuffer>,
-    /// Kept alive for the buffer's lifetime (protocol-wise the buffer keeps
-    /// referencing the pool's memory).
-    pool: Option<WlShmPool>,
-    configured: bool,
-}
-
-impl StripState {
-    fn new(direction: Direction, events_tx: mpsc::UnboundedSender<StripEvent>) -> Self {
-        Self {
-            direction,
-            events_tx,
-            outputs: Vec::new(),
-            pointers: Vec::new(),
-            surface: None,
-            buffer: None,
-            pool: None,
-            configured: false,
-        }
-    }
-}
-
-/// Runs one edge strip: connects to wayland, places a 1px transparent
-/// layer-shell surface per the spec, and dispatches until the shutdown flag
-/// is set or the connection breaks. The surface needs a buffer to be mapped
-/// (an unmapped surface receives no pointer focus), so a fully transparent
-/// 1x1 shm buffer is attached; the explicit input region (the strip rect)
-/// both enables Enter/Leave delivery and — crucially — keeps the default
-/// infinite input region from making the strip swallow input anywhere else.
-fn run_strip(
-    spec: &StripSpec,
-    events_tx: mpsc::UnboundedSender<StripEvent>,
-    shutdown: Arc<AtomicBool>,
-) -> Result<()> {
-    let conn = Connection::connect_to_env().context("Failed to connect to wayland")?;
-    let (globals, mut queue) = registry_queue_init::<StripState>(&conn)
-        .context("Failed to init Wayland registry queue")?;
-    let qh = queue.handle();
-    let compositor: WlCompositor = globals
-        .bind(&qh, 1..=4, ())
-        .context("compositor lacks wl_compositor")?;
-    let shm: WlShm = globals
-        .bind(&qh, 1..=1, ())
-        .context("compositor lacks wl_shm")?;
-    let layer_shell: ZwlrLayerShellV1 = globals
-        .bind(&qh, 1..=4, ())
-        .context("compositor lacks wlr-layer-shell")?;
-
-    let mut state = StripState::new(spec.direction, events_tx);
-    // Bind outputs (v4 for the name event) and a pointer per seat.
-    let registry = globals.registry();
-    globals.contents().with_list(|global_list| {
-        for global in global_list {
-            if global.interface == WlOutput::interface().name && global.version >= 4 {
-                let output: WlOutput = registry.bind(global.name, 4, &qh, ());
-                state.outputs.push((output, String::new()));
-            } else if global.interface == WlSeat::interface().name {
-                let seat: WlSeat = registry.bind(global.name, 1, &qh, ());
-                state.pointers.push(seat.get_pointer(&qh, ()));
-            }
-        }
-    });
-    queue
-        .roundtrip(&mut state)
-        .context("Failed to initialize Wayland state")?;
-    let output = state
-        .outputs
-        .iter()
-        .find(|(_, name)| *name == spec.output)
-        .map(|(output, _)| output.clone())
-        .with_context(|| {
-            format!(
-                "wayland output '{}' not found (have: {})",
-                spec.output,
-                state
-                    .outputs
-                    .iter()
-                    .map(|(_, name)| name.as_str())
-                    .collect::<Vec<&str>>()
-                    .join(", ")
-            )
-        })?;
-
-    // The 1x1 transparent buffer the compositor scales over the strip area.
-    let (buffer, pool) = transparent_buffer(&shm, &qh)?;
-
-    let (width, height) = match spec.direction {
-        Direction::Left | Direction::Right => (1, spec.len),
-        Direction::Top | Direction::Bottom => (spec.len, 1),
-    };
-    let surface = compositor.create_surface(&qh, ());
-    let region = compositor.create_region(&qh, ());
-    region.add(0, 0, width, height);
-    surface.set_input_region(Some(&region));
-    region.destroy();
-    let layer_surface = layer_shell.get_layer_surface(
-        &surface,
-        Some(&output),
-        Layer::Overlay,
-        "monux-edge".to_string(),
-        &qh,
-        (),
-    );
-    // Anchored to the mapped edge plus the perpendicular start edge, so the
-    // margin positions the strip along the edge. Exclusive zone -1: reserve
-    // no space AND ignore other surfaces' zones — bars/panels must neither
-    // move nor push the strip away from the very screen edge.
-    layer_surface.set_anchor(match spec.direction {
-        Direction::Left => Anchor::Left | Anchor::Top,
-        Direction::Right => Anchor::Right | Anchor::Top,
-        Direction::Top => Anchor::Top | Anchor::Left,
-        Direction::Bottom => Anchor::Bottom | Anchor::Left,
-    });
-    layer_surface.set_size(width as u32, height as u32);
-    layer_surface.set_exclusive_zone(-1);
-    match spec.direction {
-        Direction::Left | Direction::Right => layer_surface.set_margin(spec.offset, 0, 0, 0),
-        Direction::Top | Direction::Bottom => layer_surface.set_margin(0, 0, 0, spec.offset),
-    }
-    layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
-    state.surface = Some(surface.clone());
-    state.buffer = Some(buffer);
-    state.pool = Some(pool);
-    surface.commit();
-    queue
-        .roundtrip(&mut state)
-        .context("Failed to map the edge strip surface")?;
-    if !state.configured {
-        bail!("compositor never configured the edge strip surface");
-    }
-    debug!(
-        "edge strip mapped: {} edge of {} (offset {}, length {})",
-        spec.direction.as_str(),
-        spec.output,
-        spec.offset,
-        spec.len
-    );
-
-    // Dispatch loop, interruptible via the shutdown flag: poll the wayland
-    // socket with a timeout instead of blocking_dispatch so layout rebuilds
-    // can retire the strip (mirror of the clipboard type_watcher's pattern,
-    // plus the timeout).
-    while !shutdown.load(Ordering::Relaxed) {
-        queue
-            .dispatch_pending(&mut state)
-            .context("Wayland dispatch failed")?;
-        conn.flush().context("Wayland flush failed")?;
-        let Some(guard) = conn.prepare_read() else {
-            // Another thread holds the read — never the case here, but don't
-            // spin if it somehow happens.
-            std::thread::sleep(Duration::from_millis(STRIP_POLL_TIMEOUT_MS as u64));
-            continue;
-        };
-        let mut pollfd = libc::pollfd {
-            fd: conn.as_fd().as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let readable = unsafe { libc::poll(&mut pollfd, 1, STRIP_POLL_TIMEOUT_MS) } > 0
-            && pollfd.revents & libc::POLLIN != 0;
-        if readable {
-            guard.read().context("Wayland read failed")?;
-        }
-        // Dropping the guard without read() cancels the prepared read.
-    }
-    debug!(
-        "edge strip retired: {} edge of {}",
-        spec.direction.as_str(),
-        spec.output
-    );
-    Ok(())
-}
-
-/// Creates a fully transparent 1x1 ARGB8888 shm buffer (fresh memfd memory
-/// is zero-filled = transparent).
-fn transparent_buffer(shm: &WlShm, qh: &QueueHandle<StripState>) -> Result<(WlBuffer, WlShmPool)> {
-    let fd = rustix::fs::memfd_create("monux-edge", rustix::fs::MemfdFlags::CLOEXEC)
-        .context("Failed to allocate shm memory for the edge strip")?;
-    rustix::fs::ftruncate(&fd, 4).context("Failed to size the edge strip buffer")?;
-    let pool = shm.create_pool(fd.as_fd(), 4, qh, ());
-    let buffer = pool.create_buffer(0, 1, 1, 4, wl_shm::Format::Argb8888, qh, ());
-    Ok((buffer, pool))
-}
-
-impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for StripState {
-    fn event(
-        _state: &mut Self,
-        _proxy: &wl_registry::WlRegistry,
-        _event: <wl_registry::WlRegistry as Proxy>::Event,
-        _data: &GlobalListContents,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<WlOutput, ()> for StripState {
-    fn event(
-        state: &mut Self,
-        proxy: &WlOutput,
-        event: wl_output::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-        if let wl_output::Event::Name { name } = event {
-            if let Some(entry) = state.outputs.iter_mut().find(|(output, _)| output == proxy) {
-                entry.1 = name;
-            }
-        }
-    }
-}
-
-impl Dispatch<WlPointer, ()> for StripState {
-    fn event(
-        state: &mut Self,
-        _proxy: &WlPointer,
-        event: wl_pointer::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-        let event = match event {
-            wl_pointer::Event::Enter { .. } => StripEvent::Enter(state.direction),
-            wl_pointer::Event::Leave { .. } => StripEvent::Leave(state.direction),
-            _ => return,
-        };
-        // Unbounded sends can't block; a dead receiver means shutdown.
-        let _ = state.events_tx.send(event);
-    }
-}
-
-impl Dispatch<ZwlrLayerSurfaceV1, ()> for StripState {
-    fn event(
-        state: &mut Self,
-        proxy: &ZwlrLayerSurfaceV1,
-        event: wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-        use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Event;
-        match event {
-            Event::Configure { serial, .. } => {
-                proxy.ack_configure(serial);
-                if let (Some(surface), Some(buffer)) = (&state.surface, &state.buffer) {
-                    surface.attach(Some(buffer), 0, 0);
-                    surface.commit();
-                }
-                state.configured = true;
-            }
-            Event::Closed => {
-                debug!("edge strip surface closed by the compositor");
-            }
-            _ => {}
-        }
-    }
-}
-
-// NOTE: the `ignore` form is required for every interface that emits events
-// (wl_shm's format advertisement, wl_seat's capabilities, wl_surface's
-// enter/leave, wl_buffer's release): the plain form of delegate_noop panics
-// on the first event.
-delegate_noop!(StripState: ignore WlCompositor);
-delegate_noop!(StripState: ignore WlSurface);
-delegate_noop!(StripState: ignore WlRegion);
-delegate_noop!(StripState: ignore WlShm);
-delegate_noop!(StripState: ignore WlShmPool);
-delegate_noop!(StripState: ignore WlBuffer);
-delegate_noop!(StripState: ignore WlSeat);
-delegate_noop!(StripState: ignore ZwlrLayerShellV1);
 
 #[cfg(test)]
 mod tests {
@@ -1483,19 +1278,160 @@ mod tests {
     }
 
     #[test]
-    fn strip_specs_only_mapped_directions_with_corner_trim() {
+    fn zones_only_mapped_directions_with_corner_trim() {
         let mut map = EdgeMap::default();
         map.targets.insert(Direction::Right, EdgeTarget::Auto);
         let layout = vec![
             rect("DP-1", 0, 0, 1920, 1080),
             rect("HDMI-A-1", 1920, 0, 1920, 1080),
         ];
-        let specs = strip_specs(&map, &layout);
-        assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].output, "HDMI-A-1");
-        assert_eq!(specs[0].direction, Direction::Right);
-        // Global [86, 994) on an output at y=0 → offset 86, len 908.
-        assert_eq!(specs[0].offset, 86);
-        assert_eq!(specs[0].len, 908);
+        let zones = edge_zones(&map, &layout);
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].output, "HDMI-A-1");
+        assert_eq!(zones[0].direction, Direction::Right);
+        // The edge line is the output's last pixel column.
+        assert_eq!(zones[0].edge, 1920 + 1920 - 1);
+        // Global [86, 994): 8% of 1080 = 86 px trimmed off each end.
+        assert_eq!(zones[0].start, 86);
+        assert_eq!(zones[0].len, 908);
+        assert!(zone_contains(&zones[0], 3839, 500));
+        assert!(!zone_contains(&zones[0], 3838, 500));
+    }
+
+    /// The offset multi-monitor layout from the user's setup: HDMI-A-1
+    /// 3440x1440@(0,0) with eDP-1 2048x1280@(3440,160) to its lower right.
+    fn offset_layout() -> Vec<OutputRect> {
+        vec![
+            rect("HDMI-A-1", 0, 0, 3440, 1440),
+            rect("eDP-1", 3440, 160, 2048, 1280),
+        ]
+    }
+
+    fn all_mapped() -> EdgeMap {
+        let mut map = EdgeMap::default();
+        for dir in [
+            Direction::Left,
+            Direction::Right,
+            Direction::Top,
+            Direction::Bottom,
+        ] {
+            map.targets.insert(dir, EdgeTarget::Auto);
+        }
+        map
+    }
+
+    fn zone_of(zones: &[EdgeZone], direction: Direction, output: &str) -> EdgeZone {
+        zones
+            .iter()
+            .find(|zone| zone.direction == direction && zone.output == output)
+            .unwrap_or_else(|| panic!("no {:?} zone on {}", direction, output))
+            .clone()
+    }
+
+    #[test]
+    fn zones_offset_layout_left() {
+        let zones = edge_zones(&all_mapped(), &offset_layout());
+        // HDMI-A-1's left edge is fully exposed; 8% of 1440 = 115 trimmed
+        // per end → y in [115, 1325).
+        let zone = zone_of(&zones, Direction::Left, "HDMI-A-1");
+        assert_eq!((zone.edge, zone.start, zone.len), (0, 115, 1210));
+        assert!(zone_contains(&zone, 0, 115));
+        assert!(zone_contains(&zone, 0, 1324));
+        assert!(!zone_contains(&zone, 1, 500));
+        assert!(!zone_contains(&zone, 0, 114));
+        assert!(!zone_contains(&zone, 0, 1325));
+        // eDP-1's left edge is fully abutted by HDMI-A-1: no zone there.
+        assert!(zones
+            .iter()
+            .all(|zone| !(zone.direction == Direction::Left && zone.output == "eDP-1")));
+    }
+
+    #[test]
+    fn zones_offset_layout_right() {
+        let zones = edge_zones(&all_mapped(), &offset_layout());
+        // eDP-1's right edge is fully exposed; 8% of 1280 = 102 per end →
+        // y in [262, 1338), edge line at the output's last column.
+        let zone = zone_of(&zones, Direction::Right, "eDP-1");
+        assert_eq!((zone.edge, zone.start, zone.len), (5487, 262, 1076));
+        assert!(zone_contains(&zone, 5487, 262));
+        assert!(zone_contains(&zone, 5487, 1337));
+        assert!(!zone_contains(&zone, 5486, 500));
+        assert!(!zone_contains(&zone, 5487, 261));
+        assert!(!zone_contains(&zone, 5487, 1338));
+        // HDMI-A-1's right edge keeps only the exposed step above eDP-1:
+        // [0, 160) trimmed by 12 per end → y in [12, 148).
+        let step = zone_of(&zones, Direction::Right, "HDMI-A-1");
+        assert_eq!((step.edge, step.start, step.len), (3439, 12, 136));
+        assert!(zone_contains(&step, 3439, 12));
+        assert!(!zone_contains(&step, 3439, 148));
+    }
+
+    #[test]
+    fn zones_offset_layout_top_bottom() {
+        let zones = edge_zones(&all_mapped(), &offset_layout());
+        // Both tops are fully exposed (nothing above either output).
+        let top_hdmi = zone_of(&zones, Direction::Top, "HDMI-A-1");
+        assert_eq!((top_hdmi.edge, top_hdmi.start, top_hdmi.len), (0, 275, 2890));
+        assert!(zone_contains(&top_hdmi, 275, 0));
+        assert!(!zone_contains(&top_hdmi, 274, 0));
+        assert!(!zone_contains(&top_hdmi, 500, 1));
+        let top_edp = zone_of(&zones, Direction::Top, "eDP-1");
+        assert_eq!((top_edp.edge, top_edp.start, top_edp.len), (160, 3603, 1722));
+        assert!(zone_contains(&top_edp, 4000, 160));
+        assert!(!zone_contains(&top_edp, 4000, 161));
+        // Bottoms: both outputs end at y = 1439, trimmed the same way.
+        let bottom_hdmi = zone_of(&zones, Direction::Bottom, "HDMI-A-1");
+        assert_eq!((bottom_hdmi.edge, bottom_hdmi.start, bottom_hdmi.len), (1439, 275, 2890));
+        assert!(zone_contains(&bottom_hdmi, 500, 1439));
+        assert!(!zone_contains(&bottom_hdmi, 500, 1438));
+        let bottom_edp = zone_of(&zones, Direction::Bottom, "eDP-1");
+        assert_eq!((bottom_edp.edge, bottom_edp.start, bottom_edp.len), (1439, 3603, 1722));
+        assert!(zone_contains(&bottom_edp, 4000, 1439));
+    }
+
+    #[test]
+    fn debounce_ignores_single_poll_jitter() {
+        let mut debounce = EdgeDebounce::new();
+        // Alternating outcomes never hold for two consecutive polls.
+        for _ in 0..10 {
+            assert_eq!(debounce.poll(true), None);
+            assert_eq!(debounce.poll(false), None);
+        }
+    }
+
+    #[test]
+    fn debounce_transitions_after_two_stable_polls() {
+        let mut debounce = EdgeDebounce::new();
+        // Already off: offs are no-ops.
+        assert_eq!(debounce.poll(false), None);
+        // One on is only a candidate; the second consecutive one commits.
+        assert_eq!(debounce.poll(true), None);
+        assert_eq!(debounce.poll(true), Some(true));
+        // Back off again, same pattern.
+        assert_eq!(debounce.poll(false), None);
+        assert_eq!(debounce.poll(false), Some(false));
+        // A single stray poll between stable ones delays the transition
+        // instead of firing early.
+        assert_eq!(debounce.poll(true), None);
+        assert_eq!(debounce.poll(false), None);
+        assert_eq!(debounce.poll(true), None);
+        assert_eq!(debounce.poll(true), Some(true));
+    }
+
+    #[test]
+    fn cursorpos_parses_replies() {
+        assert_eq!(parse_cursorpos("3440, 160").unwrap(), (3440, 160));
+        assert_eq!(parse_cursorpos("0, 0").unwrap(), (0, 0));
+        // Outputs left of/above the layout origin report negatives.
+        assert_eq!(parse_cursorpos("-100, -200").unwrap(), (-100, -200));
+        assert_eq!(parse_cursorpos("3440,160\n").unwrap(), (3440, 160));
+    }
+
+    #[test]
+    fn cursorpos_rejects_garbage() {
+        assert!(parse_cursorpos("").is_err());
+        assert!(parse_cursorpos("3440").is_err());
+        assert!(parse_cursorpos("a, b").is_err());
+        assert!(parse_cursorpos("1, 2, 3").is_err());
     }
 }

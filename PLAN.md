@@ -248,9 +248,10 @@ STATUS: DONE — committed 83623f6 (v2.0.3); review checkpoint passed
 
 STATUS: Phase 9A (server-side) implemented 2026-07-22 (v3.1.0) — `--edge-map
 <direction>=<target>` switches input when the cursor dwells on an exposed
-screen edge. Hyprland-only (IPC monitor layout), 1px transparent
-wlr-layer-shell strips for event-driven detection (no cursor polling),
-multi-monitor exposed-edge computation with corner dead zones (~8%/end),
+screen edge. Hyprland-only (IPC monitor layout), cursorpos polling every
+40 ms for edge detection (layer-shell enter/leave at screen edges proved
+undeliverable on Hyprland), 2-poll debounce, multi-monitor exposed-edge
+computation with corner dead zones (~8%/end),
 250 ms dwell (`--edge-dwell-ms`) plus 1s re-arm cooldown, targets resolve to
 a fingerprint at switch time from the live client list (prefix / `auto` /
 hostname→IP). No protocol change: the switch reuses `set_client`. Later
