@@ -1,15 +1,15 @@
 [package]
 name = "monux"
-version = "5.0.1"
-authors = ["Nick Parker <nick@nickbp.com>"]
+version = "5.0.2"
+authors = ["Montazar <github.mdtk4@passmail.com>"]
 license = "AGPL-3.0-or-later"
 edition = "2021"
 readme = "README-CRATES.md"
-description = "Linux network KVM for Wayland/X11/Console"
-documentation = "https://nikau.nickbp.com"
-homepage = "https://nikau.nickbp.com"
+description = "Low-latency LAN KVM for Wayland/X11/Console: share keyboard, mouse, touchpad, and clipboard between machines over QUIC/TLS, with screen-edge switching (Hyprland)"
+documentation = "https://github.com/mntzrr/monux"
+homepage = "https://github.com/mntzrr/monux"
 repository = "https://github.com/mntzrr/monux"
-exclude = ["README.md", "Dockerfile", ".build.yml", "*.sh"]
+exclude = ["README.md", ".build.yml", "*.sh"]
 
 [dependencies]
 anyhow = "1.0"
