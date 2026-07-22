@@ -27,6 +27,7 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     mut rotation_rx: mpsc::Receiver<rotation::RotationEvent>,
     motion_flush_interval: Option<Duration>,
     bulk_throttle_mbps: Option<f64>,
+    mode: transport::NetworkMode,
     diagnostics: Arc<rotation::DiagnosticsMirror>,
 ) -> Result<()> {
     let local_clipboard = LocalClipboard::start(
@@ -37,7 +38,7 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     ).await;
 
     let mut rotation =
-        rotation::Rotation::new(grab_tx, output_handler, local_clipboard, &config_dir, rotation_tx, motion_flush_interval, bulk_throttle_mbps, diagnostics).await?;
+        rotation::Rotation::new(grab_tx, output_handler, local_clipboard, &config_dir, rotation_tx, motion_flush_interval, bulk_throttle_mbps, mode, diagnostics).await?;
     // Input-flow heartbeat: makes "user is typing but nothing arrives anywhere"
     // visible in the log, instead of silent (the dead-Enter investigations).
     let mut status_tick = time::interval(Duration::from_secs(10));
@@ -49,6 +50,10 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     let mut ping_tick = time::interval(rotation::PING_INTERVAL);
     // Skip the immediate first tick; the first ping lands one interval in.
     ping_tick.tick().await;
+    // Delay (not the default Burst): after the loop was blocked, don't fire
+    // catch-up pings back to back — ping_tick's own stall guard handles the
+    // late tick, and a burst would only multiply the load on a busy loop.
+    ping_tick.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     // Pointer-motion coalescing flush timer (office mode, see --motion-hz).
     // The branch guard keeps it inert until motion has accumulated; after a
     // long idle the first tick fires immediately, so the first delta goes out

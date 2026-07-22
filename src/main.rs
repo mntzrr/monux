@@ -945,6 +945,7 @@ async fn server(
             rotation_rx,
             motion_flush_interval,
             bulk_throttle_mbps,
+            mode,
             diagnostics,
         )
         .await
