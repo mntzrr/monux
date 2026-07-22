@@ -244,7 +244,13 @@ impl InputF64 {
             type_: e.event_type().0,
             code: e.code(),
             // For example: min=-10, max=10, vali=5 -> valf=0.75
-            value: ((e.value() - min) as f64) / ((max - min) as f64),
+            // A broken device advertising min==max would divide by zero;
+            // clamp to 0.0 instead of emitting NaN/inf onto the wire.
+            value: if max > min {
+                ((e.value() - min) as f64) / ((max - min) as f64)
+            } else {
+                0.0
+            },
         }
     }
 
@@ -426,5 +432,14 @@ mod tests {
             padded.types_vec(),
             vec!["text/plain".to_string(), "image/png".to_string()]
         );
+    }
+
+    #[test]
+    fn inputf64_degenerate_range_does_not_divide_by_zero() {
+        // A broken device advertising min==max must not emit NaN/inf.
+        let e = evdev::InputEvent::new(evdev::EventType::ABSOLUTE.0, 0, 5);
+        assert_eq!(InputF64::from_evdev(e, 3, 3).value, 0.0);
+        // And the normal case keeps its math.
+        assert_eq!(InputF64::from_evdev(e, -10, 10).value, 0.75);
     }
 }
