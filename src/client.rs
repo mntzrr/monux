@@ -116,6 +116,7 @@ pub async fn run<O: output::OutputHandler>(
     config_dir: &std::path::Path,
     mouse_scale: f64,
     scroll_scale: f64,
+    control_state: Arc<crate::control::ClientStateMirror>,
 ) -> Result<()> {
     let (mut client, connect_time) = Connection::new(
         server_addr,
@@ -125,8 +126,10 @@ pub async fn run<O: output::OutputHandler>(
         config_dir,
         mouse_scale,
         scroll_scale,
+        control_state,
     )
     .await?;
+    client.control_state.set_connected(client.conn().clone());
     notify::notify(
         "monux-connection",
         notify::Urgency::Low,
@@ -212,6 +215,9 @@ struct Connection {
     fresh_activation: bool,
     /// Pointer/scroll delta scaling applied on injection (see DeltaScaler).
     scaler: DeltaScaler,
+    /// Live-state mirror for the control socket (control.rs): Switch events
+    /// update `active`; the lifecycle in main.rs drives (dis)connected.
+    control_state: Arc<crate::control::ClientStateMirror>,
 }
 
 impl Connection {
@@ -224,6 +230,7 @@ impl Connection {
         config_dir: &std::path::Path,
         mouse_scale: f64,
         scroll_scale: f64,
+        control_state: Arc<crate::control::ClientStateMirror>,
     ) -> Result<(Self, Instant)> {
         let bind_addr: SocketAddr = match server_addr {
             SocketAddr::V4(_) => "0.0.0.0:0".parse().expect("Failed to parse 0.0.0.0:0"),
@@ -331,6 +338,7 @@ impl Connection {
                 output_write_failing: false,
                 fresh_activation: true,
                 scaler: DeltaScaler::new(mouse_scale, scroll_scale),
+                control_state,
             },
             connect_time,
         ))
@@ -536,6 +544,7 @@ impl Connection {
                         if e.enabled { "active" } else { "inactive" }
                     );
                     self.active = e.enabled;
+                    self.control_state.set_active(e.enabled);
                     // The local-clipboard announcement below fires on
                     // deactivation, and on the FIRST activation of each
                     // connection (fresh_activation); capture and clear the flag.

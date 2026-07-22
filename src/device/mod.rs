@@ -84,4 +84,8 @@ pub enum Event {
     /// Toggle pause mode: ungrab ALL input devices (keyboards included) so the
     /// local machine gets raw input, or re-grab per the rotation state.
     PauseToggle,
+    /// Set pause mode explicitly (the control socket's pause/resume commands).
+    /// Idempotent, unlike PauseToggle: setting the state already in effect is
+    /// a no-op, so a GUI can ask for the state it wants blindly.
+    SetPaused(bool),
 }

@@ -143,6 +143,24 @@ By default the server coalesces pointer motion to **250 updates per second**: hi
 
 When the server's mouse and the client's machine disagree on DPI/sensitivity, scale the deltas on the client: `--mouse-scale 0.5` halves pointer motion, `--scroll-scale 2` doubles scroll steps (including hi-res wheels). Both default to `1.0` and accept values from 0.05 to 20. Fractional remainders are carried between events per axis, so small scales lose no motion over time — 0.5x emits exactly one tick per two input ticks. The scaling applies only where the client injects into its own virtual devices; the server machine's local input always stays 1:1.
 
+### Control socket and `monux system status`
+
+Both daemons publish their live state and accept a small command set over a per-user unix socket: `$XDG_RUNTIME_DIR/monux/server.sock` and `$XDG_RUNTIME_DIR/monux/client.sock` (under `/tmp/monux-<uid>/` when XDG_RUNTIME_DIR is unset). The socket is same-user only — the directory is 0700, there is no further authentication — and the file is removed again on shutdown.
+
+The quickest way to use it is the built-in CLI, which pretty-prints the daemon's state (rotation target, connected clients with RTT, clipboard owner, update availability) or the raw JSON with `--json`:
+
+```bash
+monux system status            # server socket first, then the client's
+monux system status --client   # restrict to one role
+monux system status --json     # machine-readable response
+```
+
+The wire protocol is newline-delimited JSON, one request and one response per line, so any language can drive it (this is the backend for a future tray indicator). Requests: `{"cmd":"status"}`, `{"cmd":"switch","target":"next"|"prev"|"local"|<fingerprint-prefix>}`, `{"cmd":"pause"}` / `{"cmd":"resume"}` (idempotent: pausing a paused server is a no-op), `{"cmd":"update_now"}` (wakes the background update check), `{"cmd":"restart"}` (graceful shutdown + re-exec, like after an update), `{"cmd":"exit"}`. Responses: `{"ok":true,"state":{...}}` for status, `{"ok":true}` for accepted commands, `{"ok":false,"error":"..."}` on failure. The server socket serves the full set; the client socket only status/update_now/restart/exit — rotation and pause are server concepts. Example with socat:
+
+```bash
+echo '{"cmd":"pause"}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/monux/server.sock
+```
+
 ## Troubleshooting
 
 If input (e.g. the Enter key) stops registering on the server machine while `monux server` runs, the server log tells you what monux sees. The first log line records the exact build (`monux v1.0.0+<sha> starting`) — always include it when reporting.

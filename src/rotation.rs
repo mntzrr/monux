@@ -80,6 +80,9 @@ struct ClientInfo {
     /// then carries a stale token and is ignored instead of killing the
     /// healthy new entry.
     conn_token: u64,
+    /// When this client was added; published as connected_since_secs in the
+    /// control socket's status (control.rs).
+    connected_at: Instant,
 }
 
 /// Keeps track of the most recently disconnected client,
@@ -264,6 +267,10 @@ struct InputCounts {
 /// plus a pre-formatted state string behind a std Mutex that is only held for
 /// a swap/clone. The rotation loop refreshes it after every iteration (see
 /// Rotation::update_diagnostics).
+///
+/// The same mirror also carries the STRUCTURED snapshot served by the control
+/// socket (control.rs): updated in the same refresh, so a status request
+/// never waits on the rotation loop either.
 pub struct DiagnosticsMirror {
     /// Base for the liveness timestamp.
     started: Instant,
@@ -273,14 +280,22 @@ pub struct DiagnosticsMirror {
     last_iteration_ms: AtomicU64,
     /// The dumpable state, formatted by the loop after each iteration.
     state: Mutex<String>,
+    /// The server's QUIC listen address, published in the control state. The
+    /// rotation loop doesn't know it, so the mirror (built by main) holds it.
+    listen: SocketAddr,
+    /// Structured snapshot for the control socket; None until the rotation
+    /// loop's first refresh.
+    control_state: Mutex<Option<crate::control::ServerState>>,
 }
 
 impl DiagnosticsMirror {
-    pub fn new() -> Self {
+    pub fn new(listen: SocketAddr) -> Self {
         Self {
             started: Instant::now(),
             last_iteration_ms: AtomicU64::new(0),
             state: Mutex::new("<rotation loop has not completed an iteration yet>".to_string()),
+            listen,
+            control_state: Mutex::new(None),
         }
     }
 
@@ -294,6 +309,24 @@ impl DiagnosticsMirror {
         if let Ok(mut s) = self.state.lock() {
             *s = state;
         }
+    }
+
+    /// Swaps in the latest structured snapshot (control socket status).
+    /// Rotation-loop side only; called from update_diagnostics together with
+    /// the string refresh above.
+    fn update_control(&self, state: crate::control::ServerState) {
+        if let Ok(mut s) = self.control_state.lock() {
+            *s = Some(state);
+        }
+    }
+
+    /// The latest structured snapshot, with the listen address filled in (the
+    /// loop leaves it empty; it doesn't know it). Runs on the control socket
+    /// task, so it must never wait on the rotation loop: it only reads.
+    pub fn server_state(&self) -> Option<crate::control::ServerState> {
+        let mut state = self.control_state.lock().ok()?.clone()?;
+        state.listen = self.listen.to_string();
+        Some(state)
     }
 
     /// Logs the full state dump for SIGHUP. Runs on the signal thread, so it
@@ -528,6 +561,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             conn,
             datagrams_ok: true,
             conn_token,
+            connected_at: Instant::now(),
         };
         // Clients stay sorted by endpoint as an arbitrary consistent order across
         // sessions. An identical endpoint can already be present when a reconnect
@@ -912,6 +946,16 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             self.broadcast_grab_state();
             info!("Input paused: all devices ungrabbed, listening for the resume chord (clipboard sharing continues)");
             notify_switch("monux paused");
+        }
+    }
+
+    /// Sets pause mode explicitly (the control socket's pause/resume commands,
+    /// via Event::SetPaused). Idempotent, unlike the pause chord's toggle:
+    /// asking for the state already in effect is a no-op, so a GUI can send
+    /// the command matching the state it wants without reading status first.
+    pub async fn set_paused(&mut self, paused: bool) {
+        if self.paused != paused {
+            self.toggle_pause().await;
         }
     }
 
@@ -1573,6 +1617,46 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
     }
 
+    /// Builds the structured snapshot served by the control socket's status
+    /// (control.rs). The listen address is left empty here — the loop doesn't
+    /// know it; the mirror fills it in on read (DiagnosticsMirror::server_state).
+    fn server_state(&self) -> crate::control::ServerState {
+        crate::control::ServerState {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: crate::msgs::shared::PROTOCOL_VERSION,
+            listen: String::new(),
+            paused: self.paused,
+            current_target: match &self.current_client {
+                Some(endpoint) => endpoint.to_string(),
+                None => "local".to_string(),
+            },
+            clients: self
+                .clients
+                .iter()
+                .map(|c| crate::control::ServerClientState {
+                    addr: c.endpoint.to_string(),
+                    fingerprint: c.fingerprint.clone(),
+                    connected_since_secs: c.connected_at.elapsed().as_secs(),
+                    rtt_ms: Some(c.conn.stats().path.rtt.as_millis() as u64),
+                })
+                .collect(),
+            clipboard: match &self.clipboard_target {
+                Some(target) => crate::control::ServerClipboardState {
+                    owner: match &target.source {
+                        Some(source) => source.to_string(),
+                        None => "local".to_string(),
+                    },
+                    types: target.types.clone(),
+                },
+                None => crate::control::ServerClipboardState {
+                    owner: "none".to_string(),
+                    types: Vec::new(),
+                },
+            },
+            update_available: crate::autoupdate::update_available(),
+        }
+    }
+
     /// Refreshes the shared diagnostics mirror with the current state. Called
     /// once per rotation loop iteration, so the SIGHUP dump (which reads the
     /// mirror directly from the signal thread) keeps working when this loop
@@ -1607,6 +1691,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             ));
         }
         self.diagnostics.update(state);
+        self.diagnostics.update_control(self.server_state());
     }
 
     /// Adds a pure-motion batch to the coalescing accumulator (see --motion-hz).
@@ -2334,7 +2419,7 @@ mod tests {
             &dir,
             rotation_tx,
             None,
-            Arc::new(DiagnosticsMirror::new()),
+            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
         .await
         .unwrap();
@@ -2373,7 +2458,7 @@ mod tests {
             &dir,
             rotation_tx,
             Some(Duration::from_millis(8)),
-            Arc::new(DiagnosticsMirror::new()),
+            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
         .await
         .unwrap();
@@ -2422,7 +2507,7 @@ mod tests {
             &dir,
             rotation_tx,
             None,
-            Arc::new(DiagnosticsMirror::new()),
+            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
         .await
         .unwrap();
@@ -2449,7 +2534,7 @@ mod tests {
             &dir,
             rotation_tx,
             None,
-            Arc::new(DiagnosticsMirror::new()),
+            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
         .await
         .unwrap();
@@ -2481,7 +2566,7 @@ mod tests {
             &dir,
             rotation_tx,
             None,
-            Arc::new(DiagnosticsMirror::new()),
+            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
         .await
         .unwrap();
@@ -2517,7 +2602,7 @@ mod tests {
             &dir,
             rotation_tx,
             None,
-            Arc::new(DiagnosticsMirror::new()),
+            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
         .await
         .unwrap();
@@ -2553,7 +2638,7 @@ mod tests {
             &dir,
             rotation_tx,
             None,
-            Arc::new(DiagnosticsMirror::new()),
+            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
         .await
         .unwrap();
@@ -2627,7 +2712,7 @@ mod tests {
             &dir,
             rotation_tx,
             None,
-            Arc::new(DiagnosticsMirror::new()),
+            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
         .await
         .unwrap();
@@ -2648,6 +2733,76 @@ mod tests {
         assert!(!class_grabbed(DeviceClass::Toggled, &device::GrabState { client_active: false, paused: true }));
         assert!(!class_grabbed(DeviceClass::Keyboard, &device::GrabState { client_active: true, paused: true }));
         assert!(!class_grabbed(DeviceClass::Toggled, &device::GrabState { client_active: true, paused: true }));
+    }
+
+    #[tokio::test]
+    async fn control_state_reflects_rotation() {
+        let dir = temp_dir("control-state");
+        let (grab_tx, _grab_rx) = watch::channel(device::GrabState {
+            client_active: false,
+            paused: false,
+        });
+        let (rotation_tx, _rotation_rx) = mpsc::channel(8);
+        let diagnostics = Arc::new(DiagnosticsMirror::new("127.0.0.1:9999".parse().unwrap()));
+        let mut rotation = Rotation::new(
+            grab_tx,
+            StubOutput { written: 0, released: 0 },
+            None,
+            &dir,
+            rotation_tx,
+            None,
+            diagnostics.clone(),
+        )
+        .await
+        .unwrap();
+
+        // The refresh feeds the structured snapshot the control socket serves.
+        rotation.update_diagnostics();
+        let state = diagnostics.server_state().expect("seeded by update_diagnostics");
+        assert_eq!(state.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(state.protocol_version, crate::msgs::shared::PROTOCOL_VERSION);
+        // The listen address comes from the mirror, not the loop.
+        assert_eq!(state.listen, "127.0.0.1:9999");
+        assert!(!state.paused);
+        assert_eq!(state.current_target, "local");
+        assert!(state.clients.is_empty());
+        assert_eq!(state.clipboard.owner, "none");
+        assert!(state.clipboard.types.is_empty());
+        assert!(state.update_available.is_none());
+
+        // Rotation changes flow through: local clipboard, pause.
+        rotation
+            .clipboard_update_source(None, vec!["text/plain".to_string()], 1024)
+            .await
+            .unwrap();
+        rotation.toggle_pause().await;
+        rotation.update_diagnostics();
+        let state = diagnostics.server_state().unwrap();
+        assert!(state.paused);
+        assert_eq!(state.clipboard.owner, "local");
+        assert_eq!(state.clipboard.types, vec!["text/plain".to_string()]);
+
+        // set_paused (control socket) is idempotent, unlike the chord's toggle.
+        let released = rotation.output_handler.released;
+        rotation.set_paused(true).await;
+        assert!(rotation.paused);
+        assert_eq!(rotation.output_handler.released, released);
+        rotation.set_paused(false).await;
+        assert!(!rotation.paused);
+
+        // The wire JSON uses the documented, tray-stable field names (the
+        // "role" key comes from the State enum's tag).
+        let v = serde_json::to_value(crate::control::State::Server(
+            diagnostics.server_state().unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(v["role"], "server");
+        assert!(v.get("protocol_version").is_some());
+        assert!(v.get("current_target").is_some());
+        assert!(v.get("clients").is_some());
+        assert_eq!(v["clipboard"]["owner"], "local");
+        assert!(v.get("update_available").is_some());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

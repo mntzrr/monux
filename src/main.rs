@@ -68,11 +68,36 @@ enum SystemCommands {
     /// UDP socket buffers). Re-executes with sudo automatically.
     Setup(SetupArgs),
 
+    /// Prints the live state of the running monux daemon (server or client)
+    /// via its control socket in $XDG_RUNTIME_DIR/monux/: rotation target,
+    /// connected clients, clipboard owner, update availability.
+    Status(StatusArgs),
+
     /// Removes monux from this machine: stops any running server/client, then
     /// removes the binary (and stale copies), the /usr/local/bin link, and the
     /// system settings persisted by 'monux system setup'. Asks before also
     /// removing ~/.config/monux (identity keypair and peer approvals).
     Uninstall,
+}
+
+#[derive(Args)]
+struct StatusArgs {
+    /// Query the server daemon's socket only
+    #[arg(long, conflicts_with = "client")]
+    server: bool,
+
+    /// Query the client daemon's socket only
+    #[arg(long)]
+    client: bool,
+
+    /// Query this explicit control socket path instead of the default
+    /// $XDG_RUNTIME_DIR/monux/{server,client}.sock locations
+    #[arg(long, value_name = "path")]
+    socket: Option<PathBuf>,
+
+    /// Print the daemon's raw JSON response instead of a human-readable summary
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -355,6 +380,16 @@ fn main() -> Result<()> {
                 maybe_elevate("to persist system settings")?;
                 return monux::setup::run(args.autostart);
             }
+            SystemCommands::Status(args) => {
+                let out = monux::control::status_cli(
+                    args.server,
+                    args.client,
+                    args.socket.as_deref(),
+                    args.json,
+                )?;
+                println!("{}", out);
+                return Ok(());
+            }
             SystemCommands::Uninstall => {
                 return monux::uninstall::run();
             }
@@ -453,6 +488,7 @@ fn main() -> Result<()> {
                     max_clipboard_size_bytes,
                     mode,
                     motion_flush_interval,
+                    !args.no_auto_update,
                 )
                 .await
             })?;
@@ -540,6 +576,7 @@ fn main() -> Result<()> {
                     from_discovery,
                     args.mouse_scale,
                     args.scroll_scale,
+                    !args.no_auto_update,
                 )
                 .await
             })?;
@@ -674,6 +711,7 @@ async fn server(
     max_clipboard_size_bytes: u64,
     mode: NetworkMode,
     motion_flush_interval: Option<Duration>,
+    auto_update: bool,
 ) -> Result<()> {
     // Try to set up virtual devices up-front - exit early if we can't access uinput
     let mut output_handler = output::uinput::VirtualUInputDevices::new()
@@ -694,12 +732,28 @@ async fn server(
     let (event_tx, event_rx): (mpsc::Sender<Event>, mpsc::Receiver<Event>) = mpsc::channel(256);
 
     // Mirrored diagnostics state: the rotation loop refreshes it as it goes,
-    // and the SIGHUP handler dumps it without involving the loop.
-    let diagnostics = Arc::new(rotation::DiagnosticsMirror::new());
+    // and the SIGHUP handler dumps it without involving the loop. The same
+    // mirror carries the structured snapshot for the control socket.
+    let diagnostics = Arc::new(rotation::DiagnosticsMirror::new(listen_addr));
     let event_tx2 = event_tx.clone();
     let diagnostics2 = diagnostics.clone();
     let signals = Signals::new([signal::SIGUSR1, signal::SIGUSR2, signal::SIGHUP])?;
     std::thread::spawn(move || handle_signals(signals, event_tx2, diagnostics2));
+
+    // Local control IPC (status/switch/pause/update/restart/exit). Optional:
+    // an unbindable path (e.g. another live daemon owns it) just drops the
+    // feature, not the server.
+    match monux::control::Listener::bind(monux::control::Role::Server) {
+        Ok(listener) => {
+            let handler = monux::control::Handler::Server(monux::control::ServerHandler {
+                state: diagnostics.clone(),
+                event_tx: event_tx.clone(),
+                auto_update,
+            });
+            task::spawn(listener.run(handler));
+        }
+        Err(e) => warn!("Control socket unavailable: {:?}", e),
+    }
 
     let (grab_tx, _grab_rx) = watchchan::channel(monux::device::GrabState {
         client_active: false,
@@ -843,6 +897,7 @@ async fn client(
     from_discovery: bool,
     mouse_scale: f64,
     scroll_scale: f64,
+    auto_update: bool,
 ) -> Result<()> {
     // Try to set up virtual devices up-front - exit early if we can't access uinput
     let mut output_handler = output::uinput::VirtualUInputDevices::new()
@@ -862,12 +917,28 @@ async fn client(
     // is immediate, then the delay doubles per failure (1s, 2s, ...) up to
     // MAX_RECONNECT_BACKOFF. A lost healthy session resets it to immediate.
     let mut reconnect_backoff = Duration::ZERO;
+    // Live state for the control socket: the reconnect loop drives
+    // (dis)connected, the Switch handler in client.rs drives `active`.
+    let control_state = Arc::new(monux::control::ClientStateMirror::new(connect_addr));
+    // Local control IPC (status/update/restart/exit only — rotation and pause
+    // are server concepts). Optional, as on the server.
+    match monux::control::Listener::bind(monux::control::Role::Client) {
+        Ok(listener) => {
+            let handler = monux::control::Handler::Client(monux::control::ClientHandler {
+                state: control_state.clone(),
+                auto_update,
+            });
+            task::spawn(listener.run(handler));
+        }
+        Err(e) => warn!("Control socket unavailable: {:?}", e),
+    }
     // Keep one set of signal handlers registered across reconnect attempts.
     let shutdown = client_shutdown_signal();
     tokio::pin!(shutdown);
 
     loop {
         info!("Connecting to server: {}", connect_addr);
+        control_state.set_server(connect_addr);
         let connected_at = Instant::now();
         tokio::select! {
             run_result = client::run(
@@ -880,11 +951,13 @@ async fn client(
                 &config_dir,
                 mouse_scale,
                 scroll_scale,
+                control_state.clone(),
             ) => {
                 // client::run only returns on failure (its loop never exits otherwise).
                 if let Err(e) = run_result {
                     error!("Client error: {:?}", e);
                 }
+                control_state.set_disconnected();
                 // Clear any clipboard status that may have been accumulated while active
                 if let Some(lc) = &mut local_clipboard {
                     if let Err(e) = lc.clear_remote_clipboard() {

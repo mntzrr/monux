@@ -1,6 +1,7 @@
 pub mod autoupdate;
 pub mod client;
 pub mod clipboard;
+pub mod control;
 pub mod device;
 pub mod discovery;
 pub mod logging;

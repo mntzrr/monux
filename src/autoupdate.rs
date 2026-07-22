@@ -7,6 +7,7 @@
 //! automatically and the server re-activates whichever machine was active
 //! (session resumption in rotation.rs).
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -26,6 +27,24 @@ const RESTART_DELAY: Duration = Duration::from_secs(20);
 /// Set when an automatic restart is due after a background update; main
 /// re-execs the new binary once the graceful shutdown completes.
 static RESTART_AFTER_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// The last remote sha the check loop saw that's newer than this build,
+/// shared for the control socket's status (update_available). None means up
+/// to date — or never checked. A failed build attempt deliberately leaves it
+/// set: the update is still out there.
+static UPDATE_AVAILABLE: Mutex<Option<String>> = Mutex::new(None);
+
+/// The newer remote sha last seen by the check loop, if any (control IPC).
+pub fn update_available() -> Option<String> {
+    UPDATE_AVAILABLE.lock().ok()?.clone()
+}
+
+/// Records what the check loop just learned about the remote HEAD.
+fn set_update_available(sha: Option<String>) {
+    if let Ok(mut slot) = UPDATE_AVAILABLE.lock() {
+        *slot = sha;
+    }
+}
 
 /// Process-global hint that an update is probably available (e.g. the client
 /// saw a newer protocol version on the server). Wakes the check loop early
@@ -79,7 +98,8 @@ pub fn restart_scheduled() -> bool {
 /// Triggers the restart: flag it for main, then send ourselves SIGTERM so the
 /// process shuts down via the exact same graceful path as a manual stop
 /// (releasing grabs, held keys and clipboard state) before main re-execs.
-fn schedule_restart() {
+/// Also used by the control socket's restart command.
+pub fn schedule_restart() {
     RESTART_AFTER_EXIT.store(true, Ordering::SeqCst);
     unsafe {
         libc::kill(std::process::id() as i32, libc::SIGTERM);
@@ -118,6 +138,9 @@ pub async fn run(gate_config_dir: Option<std::path::PathBuf>) {
         match update::latest_remote_sha(&repo) {
             Ok(remote_sha) => {
                 let newer = update::is_newer_remote(&remote_sha, update::CURRENT_REVISION);
+                // Publish for the control socket's status before any attempt:
+                // the update is "available" whether or not we build it.
+                set_update_available(newer.then(|| remote_sha.clone()));
                 let attempted = last_attempted.as_deref() == Some(remote_sha.as_str());
                 if newer && !attempted {
                     info!(

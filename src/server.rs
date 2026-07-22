@@ -90,6 +90,9 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
                     Event::PauseToggle => {
                         rotation.toggle_pause().await;
                     }
+                    Event::SetPaused(paused) => {
+                        rotation.set_paused(paused).await;
+                    }
                 }
             },
             _ = status_tick.tick() => {
