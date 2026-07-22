@@ -44,6 +44,47 @@ pub struct VirtualUInputDevices {
     /// (a large batch of key events arriving right after a gap = stall flush,
     /// which presents to the user as repeated characters).
     last_key_event_at: Option<Instant>,
+    /// Per-key coalescing of auto-repeat delivery (see REPEAT_MIN_INTERVAL).
+    repeat_coalescer: RepeatCoalescer,
+}
+
+/// Minimum spacing between delivered auto-repeat events for the same key.
+/// Real-time repeats arrive at the keyboard's repeat rate (tens of ms apart);
+/// a faster run is a backlog flushing after a stall — collapsing it keeps a
+/// network blip from presenting as a burst of repeated characters. 20ms
+/// (50/s) leaves generous headroom over typical 25-30/s repeat rates.
+const REPEAT_MIN_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Per-key auto-repeat rate limiter. Real-time repeats pass through; a run
+/// arriving faster than the physical repeat rate (a stall backlog) is
+/// collapsed. The key is still physically held, so live repeats keep arriving
+/// at the natural rate afterwards — the user just doesn't see the stale burst.
+struct RepeatCoalescer {
+    last_delivered: HashMap<u16, Instant>,
+}
+
+impl RepeatCoalescer {
+    fn new() -> Self {
+        Self {
+            last_delivered: HashMap::new(),
+        }
+    }
+
+    /// Whether this repeat should be delivered now; updates the timestamp
+    /// when it should.
+    fn should_deliver(&mut self, code: u16) -> bool {
+        self.should_deliver_at(code, Instant::now())
+    }
+
+    fn should_deliver_at(&mut self, code: u16, now: Instant) -> bool {
+        if let Some(last) = self.last_delivered.get(&code) {
+            if now.duration_since(*last) < REPEAT_MIN_INTERVAL {
+                return false;
+            }
+        }
+        self.last_delivered.insert(code, now);
+        true
+    }
 }
 
 impl VirtualUInputDevices {
@@ -99,6 +140,7 @@ impl VirtualUInputDevices {
             touchpad_device,
             pressed_keys: HashMap::new(),
             last_key_event_at: None,
+            repeat_coalescer: RepeatCoalescer::new(),
         };
         info!("Created virtual uinput devices: keyboard, mouse, touchpad");
         Ok(ret)
@@ -361,6 +403,15 @@ impl OutputHandler for VirtualUInputDevices {
                                     e.code()
                                 );
                             }
+                            continue;
+                        }
+                        // Collapse auto-repeats arriving faster than the
+                        // physical repeat rate: a run like that is a stall
+                        // backlog flushing, and delivering it presents as a
+                        // burst of repeated characters. Real-time repeats at
+                        // the natural rate pass through untouched.
+                        if !self.repeat_coalescer.should_deliver(e.code()) {
+                            trace!("Coalescing backlog auto-repeat for key {}", e.code());
                             continue;
                         }
                     }
@@ -781,6 +832,27 @@ fn abs_axis(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeat_coalescer_collapses_backlog_bursts() {
+        let mut c = RepeatCoalescer::new();
+        let t0 = Instant::now();
+        // A backlog flush: many repeats of one key arriving at once — only
+        // the first is delivered.
+        assert!(c.should_deliver_at(28, t0));
+        for i in 1..10 {
+            assert!(
+                !c.should_deliver_at(28, t0 + Duration::from_millis(i)),
+                "repeat {}ms into the burst should be coalesced",
+                i
+            );
+        }
+        // A different key is independent.
+        assert!(c.should_deliver_at(42, t0 + Duration::from_millis(1)));
+        // Once the natural repeat interval has passed, delivery resumes.
+        assert!(c.should_deliver_at(28, t0 + REPEAT_MIN_INTERVAL));
+        assert!(!c.should_deliver_at(28, t0 + REPEAT_MIN_INTERVAL + Duration::from_millis(5)));
+    }
 
     /// Every axis classified Discrete must be advertised (with a raw range)
     /// on the virtual touchpad, and nothing else may be in the table: the
