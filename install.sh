@@ -43,7 +43,7 @@ echo "Installing monux..."
 rm -rf "$HOME"/.local/.monux-install-staging.* 2>/dev/null || true
 staging=$(mktemp -d "$HOME/.local/.monux-install-staging.XXXXXX")
 trap 'rm -rf "$staging"' EXIT
-cargo install --path . --root "$staging" --force
+cargo install --locked --path . --root "$staging" --force
 mkdir -p "$HOME/.local/bin"
 mv -f "$staging/bin/monux" "$HOME/.local/bin/monux"
 rm -rf "$staging"

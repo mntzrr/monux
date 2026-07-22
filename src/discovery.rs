@@ -164,17 +164,21 @@ pub async fn discover_server(timeout: Option<Duration>) -> Result<(SocketAddr, S
                         first_instance = Some(fullname);
                         grace_deadline = Some(Instant::now() + EXTRA_RESOLVE_GRACE);
                         instance_port = resolved.get_port();
-                        for ip in resolved.get_addresses().iter() {
-                            if !instance_addrs.contains(ip) {
-                                instance_addrs.push(*ip);
+                        for scoped_ip in resolved.get_addresses() {
+                            // ScopedIp carries the discovering interface(s);
+                            // reduce to a plain address, deduped.
+                            let ip = scoped_ip.to_ip_addr();
+                            if !instance_addrs.contains(&ip) {
+                                instance_addrs.push(ip);
                             }
                         }
                     }
                     Some(current) if *current == fullname => {
                         // More addresses for the same server arrived
-                        for ip in resolved.get_addresses().iter() {
-                            if !instance_addrs.contains(ip) {
-                                instance_addrs.push(*ip);
+                        for scoped_ip in resolved.get_addresses() {
+                            let ip = scoped_ip.to_ip_addr();
+                            if !instance_addrs.contains(&ip) {
+                                instance_addrs.push(ip);
                             }
                         }
                     }

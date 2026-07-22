@@ -428,6 +428,13 @@ fn main() -> Result<()> {
 
     let rt = Arc::new(
         runtime::Builder::new_multi_thread()
+            // Two workers, not one-per-CPU: the interactive certificate
+            // approval prompt blocks a worker on stdin, and with a single
+            // worker that would freeze all IO/timers until it times out.
+            // Heavier blocking work already runs off the executor (wayland
+            // reads via spawn_blocking, clipboard writes on dedicated
+            // threads), so two workers suffice.
+            .worker_threads(2)
             .enable_all()
             .build()
             .expect("Failed to create tokio runtime"),
@@ -645,8 +652,9 @@ fn settle_after_takeover(lock: &single_instance::InstanceLock) {
     // udevadm settle waits for udev's event queue to drain, so the old remove
     // events are emitted before our new add events (monitor order is preserved
     // for libinput/the compositor). Fall back to a plain sleep if unavailable.
+    // Note: --timeout is in SECONDS, not milliseconds.
     let settled = std::process::Command::new("udevadm")
-        .args(["settle", "--timeout=2000"])
+        .args(["settle", "--timeout=2"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

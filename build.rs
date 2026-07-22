@@ -18,6 +18,11 @@ fn main() {
         println!("cargo:rerun-if-changed=.git/{symref}");
     }
     println!("cargo:rerun-if-changed=.git/packed-refs");
+    // Emitting any rerun-if-changed switches cargo off its default
+    // rerun-on-any-change, so source edits alone would never re-run this
+    // script and the -dirty suffix above would go stale. Watch src/ too, so
+    // uncommitted edits are reflected in the embedded revision.
+    println!("cargo:rerun-if-changed=src");
 }
 
 fn git(args: &[&str]) -> Option<String> {

@@ -1,6 +1,6 @@
 [package]
 name = "monux"
-version = "2.0.1"
+version = "2.0.2"
 authors = ["Nick Parker <nick@nickbp.com>"]
 license = "AGPL-3.0-or-later"
 edition = "2021"
@@ -14,7 +14,6 @@ exclude = ["README.md", "Dockerfile", ".build.yml", "*.sh"]
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
-atty = "0.2"
 bit-vec = "0.9"
 bytes = "1.4"
 clap = { version = "4.4", features = ["derive", "string"] }
@@ -23,7 +22,7 @@ hex = "0.4"
 home = "0.5"
 ksni = { version = "0.3", features = ["blocking"] }
 libc = "0.2"
-mdns-sd = "0.11"
+mdns-sd = "0.20"
 nonblock = "0.2"
 notify = "8.2"
 pem = "3.0"
@@ -55,3 +54,10 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 [dev-dependencies]
 tempfile = "3.10"
+
+# Latency-sensitive daemon: favor runtime performance over compile time.
+# panic stays at the default "unwind" and symbols are kept (no strip) so
+# backtraces and crash reports stay useful.
+[profile.release]
+lto = "thin"
+codegen-units = 1

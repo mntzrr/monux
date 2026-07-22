@@ -1,4 +1,4 @@
-use std::io::{self, prelude::*};
+use std::io::{self, prelude::*, IsTerminal};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -374,7 +374,7 @@ fn prompt_unknown_cert(
     discovered_server_name: Option<&str>,
 ) -> bool {
     let their_cert_fingerprint = certs::fingerprint(their_cert);
-    if atty::isnt(atty::Stream::Stdin) {
+    if !io::stdin().is_terminal() {
         warn!("Stdin is not a TTY, skipping user certificate approval prompt. Approve this cert by running the {} with '--fingerprints {}'", if we_are_server { "server" } else { "client" }, their_cert_fingerprint);
         return false;
     }

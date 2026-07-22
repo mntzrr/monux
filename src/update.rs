@@ -23,7 +23,7 @@ pub fn repo_url() -> String {
 /// The commit currently published at the repo's HEAD (cheap update check; no
 /// clone needed).
 pub fn latest_remote_sha(repo: &str) -> Result<String> {
-    let out = Command::new("git")
+    let out = git_network_command()
         .args(["ls-remote", repo, "HEAD"])
         .output()
         .context("Failed to run git: is it installed?")?;
@@ -82,7 +82,7 @@ pub fn run(force: bool, low_priority: bool, protocol_constraint: Option<u64>) ->
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create {}", parent.display()))?;
         }
-        let status = Command::new("git")
+        let status = git_network_command()
             .args(["clone", "--depth", "1", &repo])
             .arg(&src_dir)
             .status()
@@ -153,6 +153,8 @@ pub fn run(force: bool, low_priority: bool, protocol_constraint: Option<u64>) ->
     };
     let status = cmd
         .arg("install")
+        // Build exactly the locked dependencies (Cargo.lock is committed).
+        .arg("--locked")
         .arg("--path")
         .arg(&src_dir)
         .arg("--root")
@@ -284,7 +286,7 @@ fn find_cargo() -> Result<PathBuf> {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<()> {
-    let status = Command::new("git")
+    let status = git_network_command()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -294,6 +296,17 @@ fn git(dir: &Path, args: &[&str]) -> Result<()> {
         bail!("git {:?} failed in {}", args, dir.display());
     }
     Ok(())
+}
+
+/// A git command for network operations (ls-remote/clone/pull), bounded so a
+/// dead route or hung connection fails in ~30s instead of blocking for
+/// minutes: git aborts when the transfer rate stays below
+/// GIT_HTTP_LOW_SPEED_LIMIT bytes/sec for GIT_HTTP_LOW_SPEED_TIME seconds.
+fn git_network_command() -> Command {
+    let mut cmd = Command::new("git");
+    cmd.env("GIT_HTTP_LOW_SPEED_LIMIT", "1000")
+        .env("GIT_HTTP_LOW_SPEED_TIME", "30");
+    cmd
 }
 
 fn git_output(dir: &Path, args: &[&str]) -> Result<String> {

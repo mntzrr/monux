@@ -135,7 +135,13 @@ pub async fn run(gate_config_dir: Option<std::path::PathBuf>) {
     let mut last_attempted: Option<String> = None;
     loop {
         let repo = update::repo_url();
-        match update::latest_remote_sha(&repo) {
+        // git ls-remote is blocking network IO: run it on the blocking pool
+        // so a dead route can't park an async worker for minutes (the call
+        // itself is bounded by git's low-speed limits in latest_remote_sha).
+        let check = tokio::task::spawn_blocking(move || update::latest_remote_sha(&repo))
+            .await
+            .unwrap_or_else(|e| Err(e.into()));
+        match check {
             Ok(remote_sha) => {
                 let newer = update::is_newer_remote(&remote_sha, update::CURRENT_REVISION);
                 // Publish for the control socket's status before any attempt:

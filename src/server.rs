@@ -363,18 +363,19 @@ async fn handle_event_messages(
         if !shared::has_complete_cobs_frame(&bytes[offset..]) {
             break;
         }
-        let bytes2 = bytes.clone();
-        let (msg, resp_remainder) = postcard::take_from_bytes_cobs::<event::ClientEvent>(
+        let (msg, resp_remainder) = match postcard::take_from_bytes_cobs::<event::ClientEvent>(
             &mut bytes[offset..],
-        )
-        .map_err(|e| {
-            anyhow!(
+        ) {
+            Ok(parsed) => parsed,
+            // The buffer is only copied (into this message) on the error
+            // path, not for every successfully parsed message.
+            Err(e) => bail!(
                 "Failed to deserialize client message: {:?} bytes(off={})={:X?}",
                 e,
                 offset,
-                bytes2
-            )
-        })?;
+                bytes
+            ),
+        };
         let consumed = bytes_len - resp_remainder.len() - offset;
         trace!(
             "Consumed event at offset={}: {} ({} bytes)",
