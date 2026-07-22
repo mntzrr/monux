@@ -14,7 +14,7 @@ pub const BULK_QUEUE_CAPACITY: usize = 4;
 
 /// A serialized bulk message sent from the server to the client.
 /// This is sent on a separate 'bulk' stream from the main 'events' stream, to avoid blocking events.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub enum ServerBulk<'a> {
     /// Request for clipboard content of the specified type from the client.
     #[serde(borrow)]
@@ -36,7 +36,7 @@ impl<'a> std::fmt::Display for ServerBulk<'a> {
 
 /// A serialized bulk message sent either from the client to the server.
 /// This is sent on a separate 'bulk' stream from the main 'events' stream, to avoid blocking events.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub enum ClientBulk<'a> {
     /// Request for clipboard content of the specified type from the server (may then route to a client).
     #[serde(borrow)]
@@ -59,7 +59,7 @@ impl<'a> std::fmt::Display for ClientBulk<'a> {
 // ServerClipboardRequest
 
 /// Request to retrieve a previously advertised clipboard, sent from the server to a client
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub struct ServerClipboardRequest<'a> {
     /// The desired type to be retrieved from the client,
     /// from a prior ClipboardTypes event advertised by the client
@@ -93,7 +93,7 @@ impl<'a> std::fmt::Display for ServerClipboardRequest<'a> {
 // ServerClipboardHeader
 
 /// Metadata about requested clipboard content which follows, sent from the server to a client
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub struct ServerClipboardHeader<'a> {
     /// The mime type that had originally been requested in the ClientClipboardRequest
     pub requested_type: &'a str,
@@ -126,7 +126,7 @@ impl<'a> std::fmt::Display for ServerClipboardHeader<'a> {
 // ClientClipboardRequest
 
 /// Request to retrieve a previously advertised clipboard, sent from a client to the server
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub struct ClientClipboardRequest<'a> {
     /// The desired type to be retrieved from the server,
     /// from a prior ClipboardTypes event adverstised by the server
@@ -156,7 +156,7 @@ impl<'a> std::fmt::Display for ClientClipboardRequest<'a> {
 // ClientClipboardHeader
 
 /// Metadata about requested clipboard content which follows, sent from a client to the server
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub struct ClientClipboardHeader<'a> {
     /// The mime type that had originally been requested in the ServerClipboardRequest
     pub requested_type: &'a str,
@@ -192,6 +192,119 @@ impl<'a> std::fmt::Display for ClientClipboardHeader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes then deserializes a bulk message exactly as the transport
+    /// does (postcard + COBS framing) and asserts it survives intact.
+    macro_rules! assert_cobs_roundtrip {
+        ($ty:ty, $msg:expr) => {{
+            let msg = $msg;
+            let mut bytes = postcard::to_stdvec_cobs(&msg).unwrap();
+            let (decoded, _) = postcard::take_from_bytes_cobs::<$ty>(&mut bytes).unwrap();
+            assert_eq!(decoded, msg);
+        }};
+    }
+
+    #[test]
+    fn client_clipboard_request_roundtrip() {
+        assert_cobs_roundtrip!(
+            ClientBulk,
+            ClientBulk::ClipboardRequest(ClientClipboardRequest {
+                requested_type: "text/plain",
+                max_size_bytes: 0,
+                request_id: 0,
+            })
+        );
+        // Empty requested type, max-size fields.
+        assert_cobs_roundtrip!(
+            ClientBulk,
+            ClientBulk::ClipboardRequest(ClientClipboardRequest {
+                requested_type: "",
+                max_size_bytes: u64::MAX,
+                request_id: u64::MAX,
+            })
+        );
+        // Unicode mime type.
+        assert_cobs_roundtrip!(
+            ClientBulk,
+            ClientBulk::ClipboardRequest(ClientClipboardRequest {
+                requested_type: "application/x-monux-üñíçødé",
+                max_size_bytes: 12345,
+                request_id: 42,
+            })
+        );
+    }
+
+    #[test]
+    fn client_clipboard_header_roundtrip() {
+        // No data_type override, no requesting client, zero-length content.
+        assert_cobs_roundtrip!(
+            ClientBulk,
+            ClientBulk::ClipboardHeader(ClientClipboardHeader {
+                requested_type: "text/plain",
+                data_type: None,
+                content_len_bytes: 0,
+                request_client: None,
+                request_id: u64::MAX,
+            })
+        );
+        // Compressed payload routed to an IPv6 requestor, max-size content.
+        assert_cobs_roundtrip!(
+            ClientBulk,
+            ClientBulk::ClipboardHeader(ClientClipboardHeader {
+                requested_type: "image/png",
+                data_type: Some("application/zstd"),
+                content_len_bytes: u64::MAX,
+                request_client: Some("[2001:db8::1]:8080".parse().unwrap()),
+                request_id: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn server_clipboard_request_roundtrip() {
+        // Server-originated (no requesting client).
+        assert_cobs_roundtrip!(
+            ServerBulk,
+            ServerBulk::ClipboardRequest(ServerClipboardRequest {
+                requested_type: "text/uri-list",
+                max_size_bytes: u64::MAX,
+                request_client: None,
+                request_id: 0,
+            })
+        );
+        // Routed on behalf of an IPv4 client, max request id.
+        assert_cobs_roundtrip!(
+            ServerBulk,
+            ServerBulk::ClipboardRequest(ServerClipboardRequest {
+                requested_type: "text/plain",
+                max_size_bytes: 1,
+                request_client: Some("192.0.2.1:1213".parse().unwrap()),
+                request_id: u64::MAX,
+            })
+        );
+    }
+
+    #[test]
+    fn server_clipboard_header_roundtrip() {
+        assert_cobs_roundtrip!(
+            ServerBulk,
+            ServerBulk::ClipboardHeader(ServerClipboardHeader {
+                requested_type: "x-special/gnome-copied-files",
+                data_type: Some("application/zip+clipboard-paths"),
+                content_len_bytes: 65536,
+                request_id: u64::MAX,
+            })
+        );
+        assert_cobs_roundtrip!(
+            ServerBulk,
+            ServerBulk::ClipboardHeader(ServerClipboardHeader {
+                requested_type: "",
+                data_type: None,
+                content_len_bytes: 0,
+                request_id: 0,
+            })
+        );
+    }
 
     /// Round-trips all four clipboard messages, checking that request_id survives.
     #[test]

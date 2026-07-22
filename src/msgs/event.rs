@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// A serialized event message sent from the server to a client.
 /// Changes to this signature likely require changing PROTOCOL_VERSION.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub enum ServerEvent<'a> {
     /// Notification to client that the input stream has started or ended.
     /// This allows the client to init or clear any local state, or to indicate being selected to the user.
@@ -27,7 +27,7 @@ impl<'a> std::fmt::Display for ServerEvent<'a> {
 }
 
 /// A serialized event message sent from a client to the server.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub enum ClientEvent<'a> {
     /// Broadcasts the types of a clipboard that can be retrieved from the client.
     #[serde(borrow)]
@@ -45,7 +45,7 @@ impl<'a> std::fmt::Display for ClientEvent<'a> {
 // SwitchEvent
 
 /// Notifies the client that it should enable or disable its virtual devices for input.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub struct SwitchEvent {
     pub enabled: bool,
 }
@@ -65,7 +65,7 @@ impl std::fmt::Display for SwitchEvent {
 /// the receiver heal losses without any retransmission backlog. Only pure
 /// REL_X/REL_Y deltas use this path; everything else (keys, buttons, wheel,
 /// absolute axes) stays on the ordered events stream.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub struct MotionDatagram {
     /// Per-connection sequence number of the newest frame in `history`.
     pub seq: u64,
@@ -151,7 +151,7 @@ pub fn motion_event(code: u16, value: i32) -> InputEvent {
 }
 
 /// An input event to be written to a virtual device indicated by the target.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct InputEvent {
     /// For discrete unscaled values: keys, relative axes, and discrete
     /// absolute axes (ABS_MT_SLOT, ABS_MT_TRACKING_ID, ... — the axes
@@ -179,7 +179,7 @@ impl std::fmt::Display for InputEvent {
 
 /// Equivalent to a uinput event for the client to emit locally.
 /// Omits the timestamp since it isn't required.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct InputI32 {
     pub type_: u16,
     pub code: u16,
@@ -219,7 +219,7 @@ impl InputI32 {
 /// Used for continuous absolute coordinates, with a scale of [0.0, 1.0] to
 /// be resized by the client. Discrete absolute axes travel raw via InputI32
 /// instead.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct InputF64 {
     pub type_: u16,
     pub code: u16,
@@ -266,7 +266,7 @@ impl InputF64 {
 
 // ClipboardTypes
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub struct ClipboardTypes<'a> {
     /// Space-separated list of types that are supported by the current clipboard owner
     /// (Couldn't figure out how to have a vec or slice)
@@ -312,6 +312,105 @@ mod tests {
         MotionDatagram {
             seq,
             history: history.to_vec(),
+        }
+    }
+
+    /// Serializes then deserializes a stream message exactly as the transport
+    /// does (postcard + COBS framing) and asserts it survives intact.
+    macro_rules! assert_cobs_roundtrip {
+        ($ty:ty, $msg:expr) => {{
+            let msg = $msg;
+            let mut bytes = postcard::to_stdvec_cobs(&msg).unwrap();
+            let (decoded, _) = postcard::take_from_bytes_cobs::<$ty>(&mut bytes).unwrap();
+            assert_eq!(decoded, msg);
+        }};
+    }
+
+    #[test]
+    fn switch_event_roundtrip() {
+        assert_cobs_roundtrip!(ServerEvent, ServerEvent::Switch(SwitchEvent { enabled: true }));
+        assert_cobs_roundtrip!(ServerEvent, ServerEvent::Switch(SwitchEvent { enabled: false }));
+    }
+
+    #[test]
+    fn server_event_input_roundtrip() {
+        // An empty batch is degenerate but must still round-trip.
+        assert_cobs_roundtrip!(ServerEvent, ServerEvent::Input(vec![]));
+        // Every InputEvent shape: discrete i32 (incl. negative), scaled f64 at
+        // both range extremes, and a both-fields-None event.
+        let events = vec![
+            InputEvent {
+                inputi32: Some(InputI32 { type_: 1, code: 30, value: 1 }),
+                inputf64: None,
+            },
+            InputEvent {
+                inputi32: Some(InputI32 { type_: 2, code: 0, value: -127 }),
+                inputf64: None,
+            },
+            InputEvent {
+                inputi32: None,
+                inputf64: Some(InputF64 { type_: 3, code: 53, value: 0.0 }),
+            },
+            InputEvent {
+                inputi32: None,
+                inputf64: Some(InputF64 { type_: 3, code: 53, value: 1.0 }),
+            },
+            InputEvent {
+                inputi32: None,
+                inputf64: None,
+            },
+        ];
+        assert_cobs_roundtrip!(ServerEvent, ServerEvent::Input(events));
+    }
+
+    #[test]
+    fn clipboard_types_roundtrip() {
+        // Empty types: a clipboard clear.
+        assert_cobs_roundtrip!(
+            ServerEvent,
+            ServerEvent::ClipboardTypes(ClipboardTypes { types: "", max_size_bytes: 0 })
+        );
+        // A max-size advertisement.
+        assert_cobs_roundtrip!(
+            ServerEvent,
+            ServerEvent::ClipboardTypes(ClipboardTypes {
+                types: "text/plain image/png application/zstd",
+                max_size_bytes: u64::MAX,
+            })
+        );
+        // Unicode in the types string, on the client-to-server direction.
+        assert_cobs_roundtrip!(
+            ClientEvent,
+            ClientEvent::ClipboardTypes(ClipboardTypes {
+                types: "text/plain;charset=utf-8 ✓ ünïcödé",
+                max_size_bytes: 1024,
+            })
+        );
+    }
+
+    #[test]
+    fn bare_input_structs_roundtrip() {
+        assert_cobs_roundtrip!(
+            InputI32,
+            InputI32 { type_: u16::MAX, code: u16::MAX, value: i32::MIN }
+        );
+        assert_cobs_roundtrip!(InputI32, InputI32 { type_: 0, code: 0, value: 0 });
+        assert_cobs_roundtrip!(InputF64, InputF64 { type_: 0, code: 0, value: 0.5 });
+    }
+
+    #[test]
+    fn motion_datagram_roundtrip() {
+        // Motion datagrams use plain postcard without COBS framing: QUIC
+        // datagrams are already message-framed (see rotation.rs/client.rs).
+        for msg in [
+            MotionDatagram { seq: 0, history: vec![] },
+            MotionDatagram { seq: 1, history: vec![(0, 0)] },
+            MotionDatagram { seq: 42, history: vec![(-5, 7), (0, -1), (300, -400)] },
+            MotionDatagram { seq: u64::MAX, history: vec![(i32::MIN, i32::MAX); 32] },
+        ] {
+            let bytes = postcard::to_stdvec(&msg).unwrap();
+            let decoded: MotionDatagram = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(decoded, msg);
         }
     }
 

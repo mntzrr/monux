@@ -366,3 +366,340 @@ fn zip_files(
     }
     Ok((uncompressed_len, cursor.into_inner()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Big enough that no test payload gets anywhere near the caps.
+    const GENEROUS_CAP: u64 = 100_000_000;
+
+    fn temp_file(dir: &Path, name: &str, contents: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn file_uri(path: &Path) -> String {
+        url::Url::from_file_path(path).unwrap().to_string()
+    }
+
+    /// Parses a write() gnome-paths result ("copy\nuri\nuri...") back into paths.
+    fn gnome_output_paths(buf: &[u8]) -> Vec<PathBuf> {
+        let text = String::from_utf8(buf.to_vec()).unwrap();
+        let mut lines = text.split('\n');
+        assert_eq!(lines.next(), Some("copy"));
+        lines
+            .map(|l| url::Url::parse(l).unwrap().to_file_path().unwrap())
+            .collect()
+    }
+
+    /// Parses a write() uri-list result ("uri\r\nuri\r\n") back into paths.
+    fn uri_list_output_paths(buf: &[u8]) -> Vec<PathBuf> {
+        let text = String::from_utf8(buf.to_vec()).unwrap();
+        // Every uri-list line is CRLF-terminated, including the last.
+        assert!(text.ends_with("\r\n"));
+        text.split("\r\n")
+            .filter(|l| !l.is_empty())
+            .map(|l| url::Url::parse(l).unwrap().to_file_path().unwrap())
+            .collect()
+    }
+
+    /// Builds a zip payload in-memory with the given entry names and contents,
+    /// bypassing the path canonicalization zip_files does (so traversal entries
+    /// can be tested).
+    fn build_test_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(vec![]);
+        {
+            let mut zipwriter = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::FileOptions::<()>::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, contents) in entries {
+                zipwriter.start_file(*name, options).unwrap();
+                zipwriter.write_all(contents).unwrap();
+            }
+            zipwriter.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    #[tokio::test]
+    async fn zstd_roundtrip_text_payload() {
+        let text = "monux clipboard text — unicode ✓ ünïcödé\n".repeat(100);
+        let original = text.into_bytes();
+        assert!(original.len() >= 100);
+
+        let (payload, data_type) = read(original.clone(), GENEROUS_CAP, "text/plain")
+            .await
+            .unwrap();
+        // The wrapper datatype marks the payload as zstd-compressed, and the
+        // repetitive text actually got smaller.
+        assert_eq!(data_type.as_deref(), Some(MONUX_ZSTD_TARGET_DATATYPE));
+        assert!(payload.len() < original.len());
+
+        let restored = write(
+            payload,
+            GENEROUS_CAP,
+            "text/plain",
+            &data_type.unwrap(),
+            &PathBuf::from("/nonexistent"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored, original);
+    }
+
+    #[tokio::test]
+    async fn zstd_roundtrip_binary_payload() {
+        let original: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
+        let (payload, data_type) = read(original.clone(), GENEROUS_CAP, "application/octet-stream")
+            .await
+            .unwrap();
+        assert_eq!(data_type.as_deref(), Some(MONUX_ZSTD_TARGET_DATATYPE));
+
+        let restored = write(
+            payload,
+            GENEROUS_CAP,
+            "application/octet-stream",
+            &data_type.unwrap(),
+            &PathBuf::from("/nonexistent"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored, original);
+    }
+
+    #[tokio::test]
+    async fn uncompressible_type_passes_through_uncompressed() {
+        // Compressing an already-compressed format is a waste of time.
+        let png: Vec<u8> = (0..=255u8).cycle().take(500).collect();
+        let (payload, data_type) = read(png.clone(), GENEROUS_CAP, "image/png").await.unwrap();
+        assert_eq!(data_type, None);
+        assert_eq!(payload, png);
+    }
+
+    #[tokio::test]
+    async fn small_payload_passes_through_uncompressed() {
+        // Under the 100-byte floor, compression doesn't pay for itself.
+        let tiny = b"a small clipboard".to_vec();
+        let (payload, data_type) = read(tiny.clone(), GENEROUS_CAP, "text/plain").await.unwrap();
+        assert_eq!(data_type, None);
+        assert_eq!(payload, tiny);
+    }
+
+    #[tokio::test]
+    async fn compressed_payload_over_cap_errors() {
+        // The LimitedCursor must error rather than write past the cap.
+        let payload = "some text that will be compressed".repeat(20).into_bytes();
+        assert!(read(payload, 4, "text/plain").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn decompressed_payload_over_cap_errors() {
+        let original = "some text that will be compressed".repeat(20).into_bytes();
+        let (compressed, data_type) = read(original.clone(), GENEROUS_CAP, "text/plain")
+            .await
+            .unwrap();
+        // Decompressing with a cap smaller than the original errors instead
+        // of producing a truncated clipboard.
+        assert!(
+            write(
+                compressed,
+                (original.len() - 1) as u64,
+                "text/plain",
+                &data_type.unwrap(),
+                &PathBuf::from("/nonexistent"),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    /// A full file-clipboard round trip through one of the paths formats:
+    /// source files -> zip payload -> unpack to a fresh dir -> paths output.
+    /// Covers spaces and percent signs in filenames (URL encoding), directory
+    /// recursion, and byte-exact content preservation.
+    async fn file_paths_roundtrip(paths_target: &str) {
+        let src = tempfile::tempdir().unwrap();
+        let hello = temp_file(src.path(), "hello.txt", b"hello world");
+        let spaced = temp_file(
+            src.path(),
+            "dir with space/100% certain.txt",
+            b"bytes \x00\x01\x02 here",
+        );
+        let nested = temp_file(src.path(), "subdir/nested/deep.txt", b"deep content");
+
+        let input = match paths_target {
+            PATHS_TARGET_GNOME => format!(
+                "copy\n{}\n{}\n{}",
+                file_uri(&hello),
+                file_uri(&spaced),
+                file_uri(src.path().join("subdir").as_path())
+            )
+            .into_bytes(),
+            PATHS_TARGET_URIS => format!(
+                "{}\r\n{}\r\n{}\r\n",
+                file_uri(&hello),
+                file_uri(&spaced),
+                file_uri(src.path().join("subdir").as_path())
+            )
+            .into_bytes(),
+            other => panic!("unexpected paths target: {}", other),
+        };
+
+        let (zip_payload, data_type) = read(input, GENEROUS_CAP, paths_target).await.unwrap();
+        assert_eq!(
+            data_type.as_deref(),
+            Some(MONUX_COPIED_FILES_DATATYPE)
+        );
+
+        let unpack_root = tempfile::tempdir().unwrap();
+        let output = write(
+            zip_payload,
+            GENEROUS_CAP,
+            paths_target,
+            &data_type.unwrap(),
+            &unpack_root.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+
+        let paths = match paths_target {
+            PATHS_TARGET_GNOME => gnome_output_paths(&output),
+            PATHS_TARGET_URIS => uri_list_output_paths(&output),
+            other => panic!("unexpected paths target: {}", other),
+        };
+
+        // Three files (the directory was scanned recursively), all unpacked
+        // under the target dir, with original filenames and exact contents.
+        assert_eq!(paths.len(), 3);
+        for path in &paths {
+            assert!(path.starts_with(unpack_root.path()));
+        }
+        let by_name: std::collections::HashMap<_, _> = paths
+            .iter()
+            .map(|p| (p.file_name().unwrap().to_str().unwrap().to_string(), p))
+            .collect();
+        assert_eq!(
+            std::fs::read(by_name["hello.txt"]).unwrap(),
+            b"hello world"
+        );
+        // The '%' and spaces survived the URL decode on both ends.
+        assert_eq!(
+            std::fs::read(by_name["100% certain.txt"]).unwrap(),
+            b"bytes \x00\x01\x02 here"
+        );
+        // The recursively scanned file matches its source byte-for-byte.
+        assert_eq!(
+            std::fs::read(by_name["deep.txt"]).unwrap(),
+            std::fs::read(&nested).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn gnome_copied_files_roundtrip() {
+        file_paths_roundtrip(PATHS_TARGET_GNOME).await;
+    }
+
+    #[tokio::test]
+    async fn uri_list_roundtrip() {
+        file_paths_roundtrip(PATHS_TARGET_URIS).await;
+    }
+
+    #[test]
+    fn gnome_parse_skips_cut_copy_line() {
+        // "cut" is handled the same as "copy" on the read side.
+        let src = tempfile::tempdir().unwrap();
+        let file = temp_file(src.path(), "a.txt", b"a");
+        let zip = read_gnome_file_paths(
+            format!("cut\n{}", file_uri(&file)).into_bytes(),
+            GENEROUS_CAP,
+        )
+        .unwrap();
+        let unpack_root = tempfile::tempdir().unwrap();
+        let paths = unpack_zip_payload(zip, GENEROUS_CAP, &unpack_root.path().to_path_buf())
+            .unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"a");
+    }
+
+    #[test]
+    fn unpack_sanitizes_traversal_and_absolute_entries() {
+        let unpack_root = tempfile::tempdir().unwrap();
+        let zip = build_test_zip(&[
+            ("../escape.txt", b"evil"),
+            ("/absolute/path.txt", b"absolute"),
+            ("ok.txt", b"fine"),
+        ]);
+        let paths = unpack_zip_payload(zip, GENEROUS_CAP, &unpack_root.path().to_path_buf())
+            .unwrap();
+
+        // Every entry was unpacked INSIDE the temp dir: the Normal-components
+        // guard drops ParentDir/RootDir components, so traversal attempts land
+        // harmlessly within the unpack dir instead of escaping it.
+        assert_eq!(paths.len(), 3);
+        for path in &paths {
+            assert!(path.starts_with(unpack_root.path()));
+        }
+        assert!(
+            !unpack_root
+                .path()
+                .parent()
+                .unwrap()
+                .join("escape.txt")
+                .exists()
+        );
+        let by_name: std::collections::HashMap<_, _> = paths
+            .iter()
+            .map(|p| (p.file_name().unwrap().to_str().unwrap().to_string(), p))
+            .collect();
+        assert_eq!(std::fs::read(by_name["escape.txt"]).unwrap(), b"evil");
+        assert_eq!(std::fs::read(by_name["path.txt"]).unwrap(), b"absolute");
+        assert_eq!(std::fs::read(by_name["ok.txt"]).unwrap(), b"fine");
+    }
+
+    #[test]
+    fn unpack_rejects_entry_with_no_normal_components() {
+        let unpack_root = tempfile::tempdir().unwrap();
+        // An entry whose path is pure traversal has no Normal components at
+        // all: it would unpack onto the unpack dir itself, so it is rejected.
+        let zip = build_test_zip(&[("..", b"evil"), ("ok.txt", b"fine")]);
+        assert!(
+            unpack_zip_payload(zip, GENEROUS_CAP, &unpack_root.path().to_path_buf()).is_err()
+        );
+    }
+
+    #[test]
+    fn unpack_enforces_size_cap() {
+        // One file over the cap: the LimitedWrite errors mid-extraction
+        // instead of writing the full payload.
+        let unpack_root = tempfile::tempdir().unwrap();
+        let big = vec![b'x'; 1000];
+        let zip = build_test_zip(&[("big.txt", &big)]);
+        assert!(unpack_zip_payload(zip, 100, &unpack_root.path().to_path_buf()).is_err());
+
+        // The cap is cumulative across entries.
+        let unpack_root = tempfile::tempdir().unwrap();
+        let zip = build_test_zip(&[("a.txt", &big[..100]), ("b.txt", &big[..100])]);
+        assert!(unpack_zip_payload(zip, 150, &unpack_root.path().to_path_buf()).is_err());
+    }
+
+    #[tokio::test]
+    async fn zip_build_over_cap_errors() {
+        // The LimitedCursor caps the COMPRESSED zip size during the build.
+        let src = tempfile::tempdir().unwrap();
+        let file = temp_file(src.path(), "a.txt", b"some content to zip up");
+        assert!(
+            read(
+                format!("copy\n{}", file_uri(&file)).into_bytes(),
+                8,
+                PATHS_TARGET_GNOME,
+            )
+            .await
+            .is_err()
+        );
+    }
+}

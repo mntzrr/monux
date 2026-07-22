@@ -8,7 +8,7 @@ pub const PROTOCOL_VERSION: u64 = 9;
 /// An initial handshake message exchanged between client and server on each stream.
 /// If the peer doesn't support the provided version value, it can cut off the connection early.
 /// The intent is for the structure of this message to never change.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub struct VersionBootstrapMessage {
     pub version: u64,
 }
@@ -30,5 +30,18 @@ mod tests {
         assert!(!has_complete_cobs_frame(&[1, 2, 3]));
         assert!(has_complete_cobs_frame(&[1, 2, 0]));
         assert!(has_complete_cobs_frame(&[1, 0, 5, 6, 0]));
+    }
+
+    #[test]
+    fn version_bootstrap_roundtrip() {
+        // The bootstrap message is exchanged as postcard + COBS on every
+        // stream (see network/transport.rs) and must never change shape.
+        for version in [0u64, PROTOCOL_VERSION, u64::MAX] {
+            let msg = VersionBootstrapMessage { version };
+            let mut bytes = postcard::to_stdvec_cobs(&msg).unwrap();
+            let (decoded, _) =
+                postcard::take_from_bytes_cobs::<VersionBootstrapMessage>(&mut bytes).unwrap();
+            assert_eq!(decoded, msg);
+        }
     }
 }

@@ -457,6 +457,83 @@ pub struct Rotation<O: device::output::OutputHandler> {
     diagnostics: Arc<DiagnosticsMirror>,
 }
 
+/// Computes the target of a previous-client switch (None = local machine).
+/// `clients` must be sorted by endpoint (the rotation keeps it so).
+///
+/// A free function over plain endpoints so the navigation logic is testable:
+/// ClientInfo embeds quinn handles and can't be fabricated in a unit test.
+fn prev_target_in(clients: &[SocketAddr], current: Option<SocketAddr>) -> Option<SocketAddr> {
+    if let Some(current_client) = current {
+        // Currently on remote machine, find its entry in the list and go to the prev one
+        let idx = match clients.binary_search(&current_client) {
+            Ok(idx) => idx,
+            Err(idx) => idx,
+        };
+        if idx == 0 {
+            // At start of vec or vec is empty - switch to local machine
+            None
+        } else {
+            // Go to prev entry in vec
+            clients.get(idx - 1).copied()
+        }
+    } else {
+        // Currently on local machine, go to last entry on vec (if any)
+        clients.last().copied()
+    }
+}
+
+/// Computes the target of a next-client switch (None = local machine).
+/// `clients` must be sorted by endpoint (see prev_target_in).
+fn next_target_in(clients: &[SocketAddr], current: Option<SocketAddr>) -> Option<SocketAddr> {
+    if let Some(current_client) = current {
+        // Currently on remote machine, find its entry in the list and go to the next one
+        let idx = match clients.binary_search(&current_client) {
+            Ok(idx) => idx,
+            Err(idx) => idx,
+        };
+        // Go to next entry in vec, or fall back to local machine if vec is empty or we're off the end
+        clients.get(idx + 1).copied()
+    } else {
+        // Currently on local machine, go to first entry on vec (if any)
+        clients.first().copied()
+    }
+}
+
+/// The resolution of a set_client goto fingerprint against the connected
+/// clients (see resolve_goto).
+#[derive(Debug, PartialEq)]
+enum GotoResolution {
+    /// Empty fingerprint means "go to the local machine".
+    Local,
+    /// Exactly one client's fingerprint starts with the requested prefix.
+    Client(SocketAddr),
+    /// No client's fingerprint starts with the requested prefix.
+    NoMatch,
+    /// Multiple clients match the prefix (their endpoints, for the warning).
+    Ambiguous(Vec<SocketAddr>),
+}
+
+/// Resolves a set_client goto fingerprint to a switch target. A free function
+/// so the prefix matching is testable (ClientInfo embeds quinn handles and
+/// can't be fabricated); `clients` are (endpoint, fingerprint) pairs.
+fn resolve_goto(clients: &[(SocketAddr, &str)], fingerprint: &str) -> GotoResolution {
+    if fingerprint.is_empty() {
+        // Empty fingerprint means "go to server"
+        return GotoResolution::Local;
+    }
+    // Find the matching clients, if any. Allow "abcd123" to match client with "abcd12345[...]"
+    let matching: Vec<SocketAddr> = clients
+        .iter()
+        .filter(|(_, fp)| fp.starts_with(fingerprint))
+        .map(|(endpoint, _)| *endpoint)
+        .collect();
+    match matching.len() {
+        0 => GotoResolution::NoMatch,
+        1 => GotoResolution::Client(matching[0]),
+        _ => GotoResolution::Ambiguous(matching),
+    }
+}
+
 impl<O: device::output::OutputHandler> Rotation<O> {
     pub async fn new(
         grab_tx: watch::Sender<device::GrabState>,
@@ -776,45 +853,14 @@ impl<O: device::output::OutputHandler> Rotation<O> {
 
     /// Computes the target of a previous-client switch (None = local machine).
     fn prev_target(&self) -> Option<SocketAddr> {
-        if let Some(current_client) = &self.current_client {
-            // Currently on remote machine, find its entry in the list and go to the prev one
-            let idx = match self
-                .clients
-                .binary_search_by(|c| c.endpoint.cmp(current_client))
-            {
-                Ok(idx) => idx,
-                Err(idx) => idx,
-            };
-            if idx == 0 {
-                // At start of vec or vec is empty - switch to local machine
-                None
-            } else {
-                // Go to prev entry in vec
-                self.clients.get(idx - 1).map(|c| c.endpoint)
-            }
-        } else {
-            // Currently on local machine, go to last entry on vec (if any)
-            self.clients.last().map(|c| c.endpoint)
-        }
+        let endpoints: Vec<SocketAddr> = self.clients.iter().map(|c| c.endpoint).collect();
+        prev_target_in(&endpoints, self.current_client)
     }
 
     /// Computes the target of a next-client switch (None = local machine).
     fn next_target(&self) -> Option<SocketAddr> {
-        if let Some(current_client) = &self.current_client {
-            // Currently on remote machine, find its entry in the list and go to the next one
-            let idx = match self
-                .clients
-                .binary_search_by(|c| c.endpoint.cmp(current_client))
-            {
-                Ok(idx) => idx,
-                Err(idx) => idx,
-            };
-            // Go to next entry in vec, or fall back to local machine if vec is empty or we're off the end
-            self.clients.get(idx + 1).map(|c| c.endpoint)
-        } else {
-            // Currently on local machine, go to first entry on vec (if any)
-            self.clients.first().map(|c| c.endpoint)
-        }
+        let endpoints: Vec<SocketAddr> = self.clients.iter().map(|c| c.endpoint).collect();
+        next_target_in(&endpoints, self.current_client)
     }
 
     /// Decides whether a next/prev switch to `target` may run now, recording
@@ -904,39 +950,30 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
         // Resolve the target: Ok(Some(target)) switches, Err(()) means no
         // unique match (already warn-logged).
-        let target: Result<Option<SocketAddr>, ()> = if fingerprint.is_empty() {
-            // Empty fingerprint means "go to server"
-            Ok(None)
-        } else {
-            // Find the matching client, if any. Allow "abcd123" to match client with "abcd12345[...]"
-            let matching_clients: Vec<&ClientInfo> = self
-                .clients
-                .iter()
-                .filter(|c| c.fingerprint.starts_with(&fingerprint))
-                .collect();
-            match matching_clients.len() {
-                0 => {
+        let client_entries: Vec<(SocketAddr, &str)> = self
+            .clients
+            .iter()
+            .map(|c| (c.endpoint, c.fingerprint.as_str()))
+            .collect();
+        let target: Result<Option<SocketAddr>, ()> =
+            match resolve_goto(&client_entries, &fingerprint) {
+                GotoResolution::Local => Ok(None),
+                GotoResolution::Client(endpoint) => Ok(Some(endpoint)),
+                GotoResolution::NoMatch => {
                     warn!(
                         "Missing client with fingerprint {}, doing nothing",
                         fingerprint
                     );
                     Err(())
                 }
-                1 => Ok(Some(
-                    matching_clients
-                        .first()
-                        .expect("matching_clients has len=1")
-                        .endpoint,
-                )),
-                _ => {
+                GotoResolution::Ambiguous(endpoints) => {
                     warn!(
                         "Multiple clients match fingerprint {}, doing nothing: {:?}",
-                        fingerprint, matching_clients
+                        fingerprint, endpoints
                     );
                     Err(())
                 }
-            }
-        };
+            };
         match target {
             Ok(target) if target != self.current_client => {
                 self.update_current_client(target).await;
@@ -2749,6 +2786,124 @@ mod tests {
         assert!(rotation.switch_allowed(None));
         assert!(!rotation.switch_allowed(Some(endpoint)));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn endpoints(specs: &[&str]) -> Vec<SocketAddr> {
+        specs.iter().map(|s| s.parse().unwrap()).collect()
+    }
+
+    fn goto_entries<'a>(specs: &[(&'a str, &'a str)]) -> Vec<(SocketAddr, &'a str)> {
+        specs
+            .iter()
+            .map(|(addr, fp)| (addr.parse().unwrap(), *fp))
+            .collect()
+    }
+
+    #[test]
+    fn next_prev_targets_empty_rotation() {
+        let clients = endpoints(&[]);
+        // No clients: both directions stay on the local machine...
+        assert_eq!(next_target_in(&clients, None), None);
+        assert_eq!(prev_target_in(&clients, None), None);
+        // ...even if the current client vanished without a removal landing.
+        let stale: SocketAddr = "10.0.0.9:9000".parse().unwrap();
+        assert_eq!(next_target_in(&clients, Some(stale)), None);
+        assert_eq!(prev_target_in(&clients, Some(stale)), None);
+    }
+
+    #[test]
+    fn next_prev_targets_single_client() {
+        let clients = endpoints(&["10.0.0.1:9000"]);
+        let only = clients[0];
+        // From the local machine both directions reach the only client.
+        assert_eq!(next_target_in(&clients, None), Some(only));
+        assert_eq!(prev_target_in(&clients, None), Some(only));
+        // From the client both directions wrap back to the local machine.
+        assert_eq!(next_target_in(&clients, Some(only)), None);
+        assert_eq!(prev_target_in(&clients, Some(only)), None);
+    }
+
+    #[test]
+    fn next_prev_targets_wrap_around_the_rotation() {
+        let clients = endpoints(&["10.0.0.1:9000", "10.0.0.2:9000", "10.0.0.3:9000"]);
+        let (a, b, c) = (clients[0], clients[1], clients[2]);
+        // From the local machine: next enters at the first client, prev wraps
+        // to the last.
+        assert_eq!(next_target_in(&clients, None), Some(a));
+        assert_eq!(prev_target_in(&clients, None), Some(c));
+        // From each end the rotation wraps back to the local machine.
+        assert_eq!(prev_target_in(&clients, Some(a)), None);
+        assert_eq!(next_target_in(&clients, Some(c)), None);
+        // In the middle it steps through the endpoint-sorted list.
+        assert_eq!(next_target_in(&clients, Some(a)), Some(b));
+        assert_eq!(prev_target_in(&clients, Some(b)), Some(a));
+        assert_eq!(next_target_in(&clients, Some(b)), Some(c));
+        assert_eq!(prev_target_in(&clients, Some(c)), Some(b));
+    }
+
+    #[test]
+    fn next_prev_targets_stale_current_uses_its_sort_position() {
+        // The current client disconnected without the rotation noticing
+        // (binary_search misses): prev steps to the would-be predecessor,
+        // while next starts one past the would-be successor — pinned as-is.
+        let clients = endpoints(&["10.0.0.1:9000", "10.0.0.3:9000"]);
+        let stale: SocketAddr = "10.0.0.2:9000".parse().unwrap();
+        assert_eq!(prev_target_in(&clients, Some(stale)), Some(clients[0]));
+        assert_eq!(next_target_in(&clients, Some(stale)), None);
+
+        // With more entries past the insertion point, next skips one.
+        let clients = endpoints(&["10.0.0.1:9000", "10.0.0.3:9000", "10.0.0.4:9000"]);
+        assert_eq!(prev_target_in(&clients, Some(stale)), Some(clients[0]));
+        assert_eq!(next_target_in(&clients, Some(stale)), Some(clients[2]));
+    }
+
+    #[test]
+    fn goto_empty_fingerprint_means_local() {
+        let clients = goto_entries(&[("10.0.0.1:9000", "aaaa1111")]);
+        assert_eq!(resolve_goto(&clients, ""), GotoResolution::Local);
+        assert_eq!(resolve_goto(&[], ""), GotoResolution::Local);
+    }
+
+    #[test]
+    fn goto_unique_prefix_match() {
+        let clients = goto_entries(&[
+            ("10.0.0.1:9000", "aaaa1111"),
+            ("10.0.0.2:9000", "bbbb2222"),
+        ]);
+        // Unique prefixes of any length resolve, up to the full fingerprint.
+        assert_eq!(
+            resolve_goto(&clients, "a"),
+            GotoResolution::Client(clients[0].0)
+        );
+        assert_eq!(
+            resolve_goto(&clients, "aaaa11"),
+            GotoResolution::Client(clients[0].0)
+        );
+        assert_eq!(
+            resolve_goto(&clients, "bbbb2222"),
+            GotoResolution::Client(clients[1].0)
+        );
+    }
+
+    #[test]
+    fn goto_no_match() {
+        let clients = goto_entries(&[("10.0.0.1:9000", "aaaa1111")]);
+        assert_eq!(resolve_goto(&clients, "cccc"), GotoResolution::NoMatch);
+        assert_eq!(resolve_goto(&[], "aaaa"), GotoResolution::NoMatch);
+    }
+
+    #[test]
+    fn goto_ambiguous_prefix_is_a_noop() {
+        // Clients may share certificates: one prefix can match several.
+        let clients = goto_entries(&[
+            ("10.0.0.1:9000", "aaaa1111"),
+            ("10.0.0.2:9000", "aaaa2222"),
+            ("10.0.0.3:9000", "bbbb3333"),
+        ]);
+        assert_eq!(
+            resolve_goto(&clients, "aaaa"),
+            GotoResolution::Ambiguous(vec![clients[0].0, clients[1].0])
+        );
     }
 
     #[tokio::test]
