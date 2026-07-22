@@ -1117,6 +1117,11 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         let Some(pending) = self.pending_local_clipboard.take() else {
             return;
         };
+        // Deliberate tradeoff: a held local update can be applied over a
+        // strictly newer remote announcement that landed inside the window
+        // (a cross-machine copy race within 300ms). We favor never losing the
+        // newest LOCAL user action; the remote state wins the next copy or
+        // switch, so any divergence self-heals.
         // The same ping-pong guard as a directly processed update: the target
         // may have converged on these types while the update was held.
         if let Some(current) = &self.clipboard_target {
@@ -1413,7 +1418,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// paste completes (with nothing) immediately instead of waiting out its
     /// fetch timeout. Sent whenever a fetch can't be served: the clipboard is
     /// gone, the requested type isn't offered, or the owning peer is gone.
-    /// Best-effort: an unconnected requester simply gets nothing, as before.
+    /// No-op when the requester is unknown; a requester whose bulk queue is
+    /// full or closed is dropped like a write failure (it isn't draining).
     async fn reply_empty_clipboard_fetch(
         &mut self,
         request_client: &SocketAddr,
@@ -2210,6 +2216,10 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
             Ok(idx) => {
                 self.clients.remove(idx);
+                // Drop the source's debounce entry too: reconnects arrive with
+                // a fresh ephemeral port, so keeping it would leak one map key
+                // per reconnect.
+                self.last_clipboard_update.remove(&Some(*endpoint));
                 notify_client_dropped(endpoint);
             }
             Err(_e) => {
