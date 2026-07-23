@@ -376,3 +376,19 @@ Recorded 2026-07-22; no plan order — take any when wanted.
    under random reorder/loss/duplication always converges to the newest
    cursor position. ~2-3 days incl. Arbitrary impls; dev-dependency only,
    runs in cargo test + CI.
+
+## Battery optimizations (laptop client, unscheduled)
+
+Ranked by real power cost:
+1. **Idle backoff for the edge poller.** 40ms cursorpos poll → ~200ms after
+   a few idle seconds with no cursor movement, ramp back on motion. Same
+   responsiveness when it matters, ~5x fewer wakeups when idle. (25 polls/s
+   is the main monux battery cost on both machines today.)
+2. **Keepalive relaxation on battery.** 2s QUIC keepalives wake the WiFi
+   radio (DTIM). 5-8s still sits far inside the 25s idle timeout; make it a
+   flag or a battery profile (server+client agree on the profile).
+3. **Pre-coalesce high-rate mice at capture.** An 8000Hz mouse costs the
+   server ~8000 evdev events/sec of context switches, serialization and
+   sends; the wire is already coalesced to 250Hz but capture is not.
+   Coalesce redundant REL motion in the evdev read path before it reaches
+   rotation.
