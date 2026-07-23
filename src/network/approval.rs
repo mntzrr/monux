@@ -387,7 +387,7 @@ The server has received a connection from a new unknown client.
 Only approve this if you are expecting a new client.
 You will also likely need to confirm this connection on the client as well.
 
-Comfirm that the client startup image has this fingerprint:
+Confirm that the client startup image has this fingerprint:
     {}
 
 Allow this new client and save its certificate for future connections? ({}s timeout) [y/N]

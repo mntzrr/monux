@@ -1,6 +1,6 @@
 //! Local control IPC: both daemons (server and client) publish their live
 //! state and accept a small command set over a per-user unix socket. This is
-//! the backend of `monux system status` and of the future tray indicator
+//! the backend of `monux system status` and of the tray indicator
 //! (`monux system indicator`), so the field names below are STABLE — the tray
 //! consumes them.
 //!
@@ -912,7 +912,7 @@ pub fn clients_cli(socket: Option<&Path>) -> Result<String> {
 /// Sends `request` to the first candidate socket that answers, returning the
 /// answering path and the raw response line. The first socket that answers
 /// wins; missing files and stale sockets (crash remnants) fall through to
-/// the next candidate. Shared by status_cli and tray_cli.
+/// the next candidate. Shared by status_cli, clients_cli and tray_cli.
 fn query_first(candidates: &[PathBuf], request: &str) -> Result<(PathBuf, String)> {
     let mut last_err = None;
     for path in candidates {

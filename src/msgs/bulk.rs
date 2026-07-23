@@ -129,7 +129,7 @@ impl<'a> std::fmt::Display for ServerClipboardHeader<'a> {
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub struct ClientClipboardRequest<'a> {
     /// The desired type to be retrieved from the server,
-    /// from a prior ClipboardTypes event adverstised by the server
+    /// from a prior ClipboardTypes event advertised by the server
     pub requested_type: &'a str,
 
     /// Request that any sent clipboards not exceed this size

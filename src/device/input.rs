@@ -432,7 +432,7 @@ fn handle_grab_event(
                     return true;
                 }
                 warn!(
-                    "Failed to ungrab device {:?}, : {}",
+                    "Failed to ungrab device {:?}: {}",
                     stream.device().name(),
                     e
                 );

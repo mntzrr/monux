@@ -3158,7 +3158,7 @@ fn notify_client_dropped(endpoint: &SocketAddr) {
 
 /// Path of the file recording the active client's fingerprint (see
 /// ACTIVE_CLIENT_STATE_FILE).
-pub fn active_client_state_path(config_dir: &Path) -> PathBuf {
+pub(crate) fn active_client_state_path(config_dir: &Path) -> PathBuf {
     config_dir.join(ACTIVE_CLIENT_STATE_FILE)
 }
 
@@ -3195,7 +3195,7 @@ fn load_pending_resume(path: &Path) -> Option<String> {
 /// Removes the active-client state file, if present. Called on switches back
 /// to the local machine. The file deliberately survives shutdown (graceful or
 /// not): the next server instance uses it to resume the session.
-pub fn clear_active_client(path: &Path) {
+pub(crate) fn clear_active_client(path: &Path) {
     if let Err(e) = fs::remove_file(path) {
         if e.kind() != std::io::ErrorKind::NotFound {
             warn!("Failed to clear active client state: {:?}", e);

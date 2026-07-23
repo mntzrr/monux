@@ -134,7 +134,7 @@ async fn handle_device_event<H: handles::DeviceHandler>(
 /// Opens a newly-appeared device node, tolerating the window between the
 /// kernel creating the node (root:root 0600) and udev applying group/mode
 /// permissions (root:input 0660). Without this, devices appearing while we
-/// run — hot-plugged keyboards, but also the virtual devices of any nikau
+/// run — hot-plugged keyboards, but also the virtual devices of any monux
 /// instance (including our own) — are skipped with a spurious Permission
 /// denied and, in the hot-plug case, never picked up at all.
 async fn open_device_with_retry(path: &Path) -> std::io::Result<Device> {

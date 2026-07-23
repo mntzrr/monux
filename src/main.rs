@@ -993,7 +993,7 @@ async fn server(
     let grab_tx2 = grab_tx.clone();
 
     // Screen-edge switching (opt-in via --edge-map): the edge manager owns the
-    // layer-shell strips and dwell timers, resolves targets against the live
+    // cursorpos poller and dwell timers, resolves targets against the live
     // client list that the rotation loop publishes through this watch channel,
     // and fires switches as Event::SwitchTo — the same entry point as goto
     // chords, so debounce/pause/no-op cleanup all apply. The rotation loop
