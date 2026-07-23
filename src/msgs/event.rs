@@ -30,6 +30,12 @@ pub enum ServerEvent<'a> {
     /// v12): mixed versions refuse at the handshake anyway, so a pre-v12
     /// client never sees it.
     EdgeInfo { direction: Direction },
+
+    /// Tells the client to stop watching the OPPOSITE edge that a prior
+    /// EdgeInfo({direction}) established — the target on the server's side
+    /// disconnected (or 'auto' became ambiguous), so the return trip no longer
+    /// applies. Appended variant (protocol v13).
+    EdgeInfoRevoke { direction: Direction },
 }
 
 impl<'a> std::fmt::Display for ServerEvent<'a> {
@@ -41,6 +47,9 @@ impl<'a> std::fmt::Display for ServerEvent<'a> {
             ServerEvent::Ping => f.write_str("Ping"),
             ServerEvent::EdgeInfo { direction } => {
                 f.write_str(format!("EdgeInfo(direction={})", direction.as_str()).as_str())
+            }
+            ServerEvent::EdgeInfoRevoke { direction } => {
+                f.write_str(format!("EdgeInfoRevoke(direction={})", direction.as_str()).as_str())
             }
         }
     }

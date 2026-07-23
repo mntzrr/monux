@@ -291,6 +291,19 @@ impl EdgeInference {
             .insert(direction.opposite(), crate::edge::EdgeTarget::Auto);
         Some(self.map.clone())
     }
+
+    /// Applies one ServerEvent::EdgeInfoRevoke: removes the watched (opposite)
+    /// direction established by a prior EdgeInfo. Returns Some(map) when the
+    /// detector should respawn with the trimmed map, Some(empty) to stop the
+    /// detector entirely (no inferred directions left), or None when an
+    /// explicit --edge-map wins.
+    fn revoke(&mut self, direction: event::Direction) -> Option<crate::edge::EdgeMap> {
+        if self.explicit {
+            return None;
+        }
+        self.map.targets.remove(&direction.opposite());
+        Some(self.map.clone())
+    }
 }
 
 impl Connection {
@@ -802,6 +815,35 @@ impl Connection {
                         None => debug!(
                             "Server says we're its {}-hand client, but --edge-map was given explicitly: keeping it",
                             direction.as_str()
+                        ),
+                    }
+                }
+                event::ServerEvent::EdgeInfoRevoke { direction } => {
+                    // The target on the server's side for `direction`
+                    // disconnected (or 'auto' became ambiguous). Stop
+                    // watching the opposite edge.
+                    match self.edge_inference.revoke(direction) {
+                        Some(map) => {
+                            if map.targets.is_empty() {
+                                info!(
+                                    "Server revoked our {}-hand edge: no inferred edges left, stopping detector",
+                                    direction.opposite().as_str()
+                                );
+                                self.switch_request_rx = None;
+                            } else {
+                                info!(
+                                    "Server revoked our {}-hand edge: respawning detector with {} remaining",
+                                    direction.opposite().as_str(),
+                                    map.targets.len()
+                                );
+                                let (request_tx, request_rx) = mpsc::unbounded_channel::<f64>();
+                                task::spawn(crate::edge::run_client(map, self.edge_dwell, request_tx));
+                                self.switch_request_rx = Some(request_rx);
+                            }
+                        }
+                        None => debug!(
+                            "Server revoked our {}-hand edge, but --edge-map was given explicitly: keeping it",
+                            direction.opposite().as_str()
                         ),
                     }
                 }

@@ -870,7 +870,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// Sends EdgeInfo for every edge-map direction resolving to this client,
     /// so it can infer its return edge (see ServerEvent::EdgeInfo). Used at
     /// add time and to re-advertise when the topology changes (a peer's
-    /// removal can make 'auto' resolve to a remaining client).
+    /// removal can make 'auto' resolve to a remaining client, or resolve it
+    /// away from one).
     async fn advertise_edge_info(&mut self, endpoint: &SocketAddr, fingerprint: &str) {
         let Some(map) = &self.edge_map else {
             return;
@@ -883,29 +884,33 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         )
         .into_iter()
         .collect();
-        // Dedup: skip if the resolved directions haven't changed since the
-        // last advertise. Each re-advertise respawns the client's edge
-        // detector, resetting any in-progress dwell.
-        if self.edge_info_sent.get(endpoint) == Some(&directions) {
+        let old = self.edge_info_sent.get(endpoint).cloned().unwrap_or_default();
+        // Dedup: skip if nothing changed. Each re-advertise respawns the
+        // client's edge detector, resetting any in-progress dwell.
+        if old == directions {
             return;
         }
         self.edge_info_sent.insert(*endpoint, directions.clone());
-        for direction in directions {
+        // Revoke directions that dropped out, then advertise new ones.
+        let to_revoke: BTreeSet<event::Direction> = old.difference(&directions).copied().collect();
+        let to_advertise: BTreeSet<event::Direction> = directions.difference(&old).copied().collect();
+        for direction in to_revoke.iter().copied().chain(to_advertise.iter().copied()) {
+            let is_revoke = to_revoke.contains(&direction);
+            let (msg_str, msg) = if is_revoke {
+                ("revoking", event::ServerEvent::EdgeInfoRevoke { direction })
+            } else {
+                ("telling", event::ServerEvent::EdgeInfo { direction })
+            };
             info!(
-                "Telling client {} it is our {}-hand neighbor",
+                "{} client {} about its {}-hand edge",
+                msg_str,
                 fingerprint,
                 direction.as_str()
             );
-            // Direct write rather than send_event: this advertisement is
-            // best-effort, and send_event's removal-on-failure path would
-            // recurse back into this fn on topology-change re-advertising.
-            // Dead clients are removed by their connection handler anyway.
-            let serialized = match postcard::to_stdvec_cobs(&event::ServerEvent::EdgeInfo {
-                direction,
-            }) {
+            let serialized = match postcard::to_stdvec_cobs(&msg) {
                 Ok(m) => m,
                 Err(e) => {
-                    error!("Failed to serialize EdgeInfo: {:?}", e);
+                    error!("Failed to serialize edge info message: {:?}", e);
                     return;
                 }
             };
@@ -921,7 +926,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 Err(_) => return,
             };
             if let Err(e) = result {
-                debug!("Failed to send EdgeInfo to {}: {:?}", endpoint, e);
+                debug!("Failed to send edge info to {}: {:?}", endpoint, e);
                 return;
             }
         }
@@ -1090,6 +1095,19 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         // the client's inferred detector is running before its first
         // activation. Unmapped clients get nothing.
         self.advertise_edge_info(&endpoint, &fingerprint).await;
+
+        // Topology changed: re-advertise surviving clients too — a new
+        // connection can make 'auto' ambiguous, revoking a direction that
+        // previously resolved to a single peer.
+        let survivors: Vec<(SocketAddr, String)> = self
+            .clients
+            .iter()
+            .filter(|c| c.endpoint != endpoint)
+            .map(|c| (c.endpoint, c.fingerprint.clone()))
+            .collect();
+        for (ep, fp) in survivors {
+            self.advertise_edge_info(&ep, &fp).await;
+        }
 
         // Announce clipboard to client, if its IP doesn't match the clipboard owner's IP.
         // Matching IP would indicate that the client is reconnecting but we haven't disconnected the old one yet.
