@@ -420,34 +420,51 @@ P1/P2 items not otherwise marked remain open.
    now Endpoint::close + bounded wait_idle (ENDPOINT_DRAIN_TIMEOUT) before
    aborting loop tasks.
 
-### P1 — correctness worth fixing
+### P1 — correctness worth fixing — DONE (42a062c..127c216), one sub-item open
+STATUS: All 19 non-MOOT P1 items fixed across four commits (device/ops, connection/lifecycle, edge correctness, clipboard/wayland). The EdgeInfo "revoke" sub-item is partially addressed (dedup landed in d08e92b; an explicit revoke message to a client whose edge target disconnected is not yet implemented). Build zero-warning, 271/271 tests pass.
 - PeerVersions keyed by addr:port: ephemeral-port churn breaks the refusal
   rate limit, the upgrade note, and grows unbounded. Key by IP. [S]
+  — DONE (fc59261): keyed by IpAddr; added ephemeral_port_reconnect test.
 - Silence -> drop -> reconnect loses auto-reactivation (no defunct window
   when removed while not current). Seed removed_current_client on
   silence-armed removal. [S-M]
+  — DONE (fc59261): seeds DefunctClientInfo on silence-armed removal of a
+  non-current client so its reconnect re-activates.
 - Rotated outputs: Hyprland `transform` never read; portrait monitors get
   wrong rects/zones. Swap w/h for odd transforms. [S]
+  — DONE (d08e92b): read the transform field; swap w/h for odd transforms.
 - Fractional scales: abutment equality off by 1px can manufacture mid-desktop
   trigger zones. Tolerate +/-1px (or match Hyprland's own rounding). [S-M]
+  — DONE (d08e92b): ±1px tolerance in the shares_boundary check.
 - Edge manager runs blocking syscalls (layout query, hostname DNS) on the
   async executor (2 workers; one already blockable by cert prompts). Move to
   spawn_blocking. [S]
+  — DONE (d08e92b): layout queries (startup + 30s re-query) and the hostname
+  DNS resolution at fire time run on spawn_blocking.
 - Duplicate device Created events leak the old reader task (double-forward +
   grab fight). Abort an existing handle for the path at insert. [trivial]
+  — DONE (42a062c): aborts the displaced reader task at insert.
 - live_holder trusts a stale pid file with substring cmdline matching (pid
   reuse; `monux client <host>` matches "client"). Verify with a flock probe.
   [S]
+  — DONE (42a062c): flock probe rejects stale pid files; exact argv-token
+  match (split_whitespace().any) replaces substring contains.
 - Takeover vs pending auto-update restart: old instance re-execs and kills
   the just-started manual instance (ping-pong). Loud log / skip re-exec when
   the lock is contended. [S]
+  — DONE (42a062c): a MONUX_RESTARTED instance that finds the lock held
+  yields instead of killing the contender.
 - Update staging cleanup deletes ALL staging dirs incl. a concurrent
   updater's. Skip dirs whose pid suffix is alive. [S]
+  — DONE (42a062c): skips staging dirs whose /proc/<pid> exists.
 - Wayland writer dispatcher deadlock on wedged compositor + unbounded ad
   queue. Roundtrip deadline + keep-latest queue semantics. [M]
+  — DONE (127c216): drains stale advertisements to latest; 10s timeout on
+  store_types so a wedged compositor can't deadlock the dispatcher.
 - Wayland type_watcher dies permanently on compositor error (no reconnect —
   the former X11 watcher had backoff, but that backend is gone). Add
   reconnect. [M-L]
+  — DONE (127c216): reconnect loop with exponential backoff (1s → 10s cap).
 - ~~X11 backend: requestors hang probing unadvertised targets (bail before
   SelectionNotify); watcher drops revocations (empty types); non-INCR
   transfers registered for chunking; PROPERTY_CHANGE mask never removed. [S]~~
@@ -455,23 +472,37 @@ P1/P2 items not otherwise marked remain open.
 - Supervisor spawn races (show vs respawn vs concurrent shows) leak an
   unreaped child -> permanent zombie indicator. Re-check the slot under the
   lock. [S]
+  — DONE (42a062c): takes the lock before spawning; reaps any displaced child.
 - pipe_into can block the tray thread forever on a >64K bundle written to a
   wedged wl-copy. Bound the stdin write. [S]
+  — DONE (42a062c): writes on a worker thread with a timeout; kills the child
+  on timeout to break the pipe.
 - Armed dwell can fire after the cursor already left (leave needs 2 stable
   polls; poller stall leaves deadlines firing blind). Require fresh contact
   at fire time. [M]
+  — DONE (d08e92b): re-checks zone contact at fire time using last_pos.
 - EdgeInfo has no revoke; each re-advertise resets the client's in-progress
   dwell (detector respawn). Send revoke on un-resolution; dedup unchanged
   maps. [M]
+  — PARTLY DONE (d08e92b): dedup cache skips re-advertising unchanged
+  directions. An explicit revoke message (telling the client to stop watching
+  an edge whose target disconnected) is still OPEN.
 - Silence recovery not tied to the silenced client: A silences, user picks B,
   A recovers first -> input jumps to A. Store the silenced endpoint. [S]
+  — DONE (fc59261): replaced the bool went_local_via_silence with an
+  Option<SocketAddr> silenced_endpoint; recovery only re-activates that peer.
 - No-op/debounced-chord Switch(false)+Switch(true) pair flaps clipboard
   ownership (client re-announces on fake deactivation). Dedicated
   release-keys signal or suppress announce on immediate re-activate. [S-M]
+  — DONE (fc59261): deferred-reannounce pattern — Switch(false) defers the
+  clipboard re-announce; an immediately-following Switch(true) suppresses it.
 - Unbounded partial-frame buffers from an authenticated peer (no COBS
   terminator -> memory growth). Cap retained bytes, reset connection. [S]
+  — DONE (fc59261): MAX_FRAME_BUFFER_BYTES (1MB) cap on both event and bulk
+  COBS buffers, server and client.
 - mDNS own-advertisement skip matches hostname only (cloned images). Also
   compare advertised IPs against local addresses. [S]
+  — DONE (42a062c): compares resolved service IPs against local_ipv4_addrs.
 
 ### P2 — hygiene and nits
 - Chord with a duplicated key ("shift,shift,p") never fires, silently: dedup
