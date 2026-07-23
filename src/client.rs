@@ -230,6 +230,14 @@ struct Connection {
     /// re-announcement on activation (see the Switch handler) only fires on the
     /// FIRST activation of each connection — i.e. on a fresh (re)connect.
     fresh_activation: bool,
+    /// True when a Switch(false) deferred its clipboard re-announce: the
+    /// server's release_current_target_keys sends Switch(false)+Switch(true)
+    /// in quick succession (a no-op key release, not a real deactivation).
+    /// The re-announce is deferred so that an immediate Switch(true) can
+    /// suppress it entirely (preventing clipboard-ownership flap). If a
+    /// non-Switch event arrives instead, the deactivation was real and the
+    /// re-announce is flushed.
+    pending_deactivate: bool,
     /// Pointer/scroll delta scaling applied on injection (see DeltaScaler).
     scaler: DeltaScaler,
     /// Live-state mirror for the control socket (control.rs): Switch events
@@ -404,6 +412,7 @@ impl Connection {
                 motion_applied_mask: 0,
                 output_write_failing: false,
                 fresh_activation: true,
+                pending_deactivate: false,
                 scaler: DeltaScaler::new(mouse_scale, scroll_scale),
                 control_state,
                 switch_request_rx: None,
@@ -535,6 +544,9 @@ impl Connection {
                 trace!("Received {} bytes from events stream: {:X?}", resp.bytes.len(), &*resp.bytes);
                 // Copy the immutable response data into a mutable buffer
                 self.event_bytes.extend_from_slice(&resp.bytes);
+                if self.event_bytes.len() > shared::MAX_FRAME_BUFFER_BYTES {
+                    bail!("Server sent an oversized events frame ({} bytes without a COBS terminator)", self.event_bytes.len());
+                }
                 self.handle_event_messages(local_clipboard.as_mut(), output_handler).await?;
             },
             datagram_result = self.quinn_conn.read_datagram() => {
@@ -615,6 +627,30 @@ impl Connection {
                 msg,
                 consumed
             );
+            // Flush a deferred clipboard re-announce (from a preceding
+            // Switch(false)) if this message isn't Switch(true): the
+            // deactivation was real, not a no-op key-release pair.
+            if self.pending_deactivate && !matches!(msg, event::ServerEvent::Switch(_)) {
+                self.pending_deactivate = false;
+                if let Some(local_clipboard) = &mut local_clipboard {
+                    if let Some(types) = local_clipboard.get_local_clipboard_types() {
+                        let types = types.join(" ");
+                        debug!("Sending clipboard types to server: {}", types);
+                        let msg =
+                            event::ClientEvent::ClipboardTypes(event::ClipboardTypes {
+                                types: &types,
+                                max_size_bytes: self.max_clipboard_size_bytes,
+                            });
+                        let serializedmsg = postcard::to_stdvec_cobs(&msg).map_err(|e| {
+                            anyhow!("Failed to serialize clipboard types message: {:?}", e)
+                        })?;
+                        self.events_send
+                            .write_all(&serializedmsg)
+                            .await
+                            .context("Failed to send clipboard types message")?;
+                    }
+                }
+            }
             match msg {
                 event::ServerEvent::Switch(e) => {
                     // Preserve ordering: apply queued input before handling this.
@@ -632,63 +668,67 @@ impl Connection {
                     );
                     self.active = e.enabled;
                     self.control_state.set_active(e.enabled);
-                    // The local-clipboard announcement below fires on
-                    // deactivation, and on the FIRST activation of each
-                    // connection (fresh_activation); capture and clear the flag.
                     let first_activation = e.enabled && self.fresh_activation;
                     if e.enabled {
                         self.fresh_activation = false;
                     }
                     if !e.enabled {
-                        // This client was deactivated: release any held keys so they
-                        // don't stay stuck on the virtual devices.
+                        // Deactivation: release held keys so they don't stay
+                        // stuck on the virtual devices.
                         Self::note_output_result(
                             &mut self.output_write_failing,
                             output_handler.release_all().await,
                         );
-                    }
-                    if let Some(local_clipboard) = &mut local_clipboard {
-                        if let Some(types) = &local_clipboard.get_local_clipboard_types() {
-                            if !e.enabled || first_activation {
-                                // We're being disabled and we have a clipboard from a local app.
-                                // It may be from when we were disabled, or from a prior enabled session. That's fine.
-                                // Keep announcing the local clipboard until/unless it gets overridden by a new one from the server.
-                                //
-                                // Empty types are announced too: the local selection was
-                                // revoked while we were active (the owning app exited), and
-                                // the server must hear about that as a clipboard clear or the
-                                // rotation's target stays stale. This can't ping-pong with the
-                                // server's own clear broadcast: a server-pushed announcement
-                                // goes to set_remote_clipboard (local_types = None), so it is
-                                // never re-announced here as a local clipboard.
-                                //
-                                // The first activation of a connection RE-announces it too:
-                                // when a drop makes the server clear the rotation's clipboard
-                                // state, a clipboard copied before the drop would otherwise
-                                // silently vanish. This cannot resurrect a stale clipboard
-                                // over a genuinely newer one: the server pushes the types of
-                                // any clipboard owned elsewhere BEFORE the Switch(true) that
-                                // activates us, on this ordered events stream (both when
-                                // adding the client and when switching to it), and that
-                                // announcement replaces our local types (set_remote_clipboard).
-                                // Still holding local types at the first activation therefore
-                                // means the rotation has nothing newer. Later activations on
-                                // the same connection don't re-announce: the
-                                // deactivate/activate handoff keeps the rotation current there.
+                        // Defer the clipboard re-announce: the server's
+                        // release_current_target_keys sends Switch(false)
+                        // immediately followed by Switch(true) (a no-op key
+                        // release, not a real deactivation). If Switch(true)
+                        // comes next, we suppress the re-announce entirely.
+                        self.pending_deactivate = true;
+                    } else if self.pending_deactivate {
+                        // Switch(true) right after Switch(false): no-op key
+                        // release pair. Clear the deferred flag and skip the
+                        // clipboard re-announce (it would flap ownership).
+                        self.pending_deactivate = false;
+                    } else if first_activation {
+                        // First activation of a connection: re-announce local
+                        // clipboard types so a pre-drop copy survives. See the
+                        // detailed comment below for why this is safe.
+                        //
+                        // The first activation of a connection RE-announces:
+                        // when a drop makes the server clear the rotation's
+                        // clipboard state, a clipboard copied before the drop
+                        // would otherwise silently vanish. This cannot
+                        // resurrect a stale clipboard over a genuinely newer
+                        // one: the server pushes the types of any clipboard
+                        // owned elsewhere BEFORE the Switch(true) that
+                        // activates us, on this ordered events stream (both
+                        // when adding the client and when switching to it),
+                        // and that announcement replaces our local types
+                        // (set_remote_clipboard). Still holding local types at
+                        // the first activation therefore means the rotation
+                        // has nothing newer. Later activations on the same
+                        // connection don't re-announce: the
+                        // deactivate/activate handoff keeps the rotation
+                        // current there.
+                        if let Some(local_clipboard) = &mut local_clipboard {
+                            if let Some(types) = local_clipboard.get_local_clipboard_types() {
                                 let types = types.join(" ");
                                 debug!("Sending clipboard types to server: {}", types);
-                                let msg =
-                                    event::ClientEvent::ClipboardTypes(event::ClipboardTypes {
+                                let msg = event::ClientEvent::ClipboardTypes(
+                                    event::ClipboardTypes {
                                         types: &types,
                                         max_size_bytes: self.max_clipboard_size_bytes,
-                                    });
-                                let serializedmsg =
-                                    postcard::to_stdvec_cobs(&msg).map_err(|e| {
+                                    },
+                                );
+                                let serializedmsg = postcard::to_stdvec_cobs(&msg).map_err(
+                                    |e| {
                                         anyhow!(
                                             "Failed to serialize clipboard types message: {:?}",
                                             e
                                         )
-                                    })?;
+                                    },
+                                )?;
                                 self.events_send
                                     .write_all(&serializedmsg)
                                     .await
@@ -872,6 +912,9 @@ impl Connection {
             // Not in the middle of a raw clipboard dump. Must be a postcard message.
             // Copy the immutable response data into a mutable buffer for parsing.
             self.bulk_recv_bytes.extend_from_slice(&resp_bytes);
+            if self.bulk_recv_bytes.len() > shared::MAX_FRAME_BUFFER_BYTES {
+                bail!("Server sent an oversized bulk frame ({} bytes without a COBS terminator)", self.bulk_recv_bytes.len());
+            }
             if let Some(updated_clipboard_data) = self.handle_bulk_messages(local_clipboard).await?
             {
                 self.incoming_clipboard_data.replace(updated_clipboard_data);

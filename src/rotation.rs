@@ -584,13 +584,12 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// skips silence evaluation instead (see ping_tick).
     last_ping_tick: Option<Instant>,
     /// Whether the current LOCAL target came from the silence detector (see
-    /// ping_tick). Automatic re-activation only fires while this is true:
-    /// any manual switch action (chord next/prev, socket switch, goto —
-    /// including a deliberate switch to local) clears it, so a manual choice
-    /// always wins over auto-recovery. Any switch TO a client clears it too
-    /// (via set_and_grab_current_client), keeping the flag meaningful only
-    /// while local.
-    went_local_via_silence: bool,
+    /// ping_tick), and WHICH endpoint's silence caused it. Automatic
+    /// re-activation only fires for the specific silenced endpoint (not just
+    /// any client that recovers): if A silences, the user picks B, and A
+    /// recovers first, input must NOT jump back to A. Any manual switch
+    /// action clears this; set_and_grab_current_client clears it too.
+    silenced_endpoint: Option<SocketAddr>,
     /// Loop-independent mirror of this rotation's diagnostic state, dumped by
     /// the SIGHUP handler without involving the loop (see DiagnosticsMirror).
     diagnostics: Arc<DiagnosticsMirror>,
@@ -821,7 +820,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 NetworkMode::Www => WWW_PONG_MISS_LIMIT,
             },
             last_ping_tick: None,
-            went_local_via_silence: false,
+            silenced_endpoint: None,
             diagnostics,
             edge_client_tx: None,
             edge_map: None,
@@ -1262,8 +1261,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
         // A manual switch action: any silence-driven local state is
         // superseded — the user's choice wins over automatic re-activation
-        // (see went_local_via_silence).
-        self.went_local_via_silence = false;
+        // (see silenced_endpoint).
+        self.silenced_endpoint = None;
         let target = self.prev_target();
         if target == self.current_client {
             // Already on the target: no switch happens, but the chord fired
@@ -1294,8 +1293,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             return;
         }
         // A manual switch action supersedes silence-driven local state (see
-        // prev_client and went_local_via_silence).
-        self.went_local_via_silence = false;
+        // prev_client and silenced_endpoint).
+        self.silenced_endpoint = None;
         let target = self.next_target();
         if target == self.current_client {
             // Already on the target: no switch happens, but the chord fired
@@ -1326,9 +1325,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             return;
         }
         // A manual switch action supersedes silence-driven local state (see
-        // prev_client and went_local_via_silence) — goto "" counts too: it is
+        // prev_client and silenced_endpoint) — goto "" counts too: it is
         // a deliberate choice of the LOCAL machine.
-        self.went_local_via_silence = false;
+        self.silenced_endpoint = None;
         // Resolve the target: Ok(Some(target)) switches, Err(()) means no
         // unique match (already warn-logged).
         let client_entries: Vec<(SocketAddr, &str)> = self
@@ -2159,7 +2158,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// i.e. at max(cooldown, enough heard-events), so a long freeze followed
     /// by a burst of buffered pongs recovers immediately on thaw. It only
     /// fires when the local target itself came from the silence
-    /// (went_local_via_silence): any manual switch action — chord, socket,
+    /// (silenced_endpoint): any manual switch action — chord, socket,
     /// goto, a deliberate LOCAL choice included — clears that flag, and a
     /// manual choice always wins (the client is then only marked healthy).
     async fn note_client_heard(&mut self, endpoint: SocketAddr) {
@@ -2184,7 +2183,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             .unwrap_or_default();
         state.silenced_since = None;
         state.recovery_pongs = 0;
-        if self.current_client.is_none() && self.went_local_via_silence {
+        if self.current_client.is_none() && self.silenced_endpoint == Some(endpoint) {
             info!(
                 "Client {} is answering again ({} consecutive pongs after {:?} silenced): re-activating it",
                 endpoint, pongs, silenced_for
@@ -2286,8 +2285,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                     self.update_current_client(None).await;
                     // The local target now came from the silence: automatic
                     // re-activation is armed until any manual switch action
-                    // (see went_local_via_silence).
-                    self.went_local_via_silence = true;
+                    // (see silenced_endpoint).
+                    self.silenced_endpoint = Some(current);
                 }
             }
             // A fresh miss while a silenced client was recovering resets its
@@ -2988,6 +2987,19 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             }
         }
 
+        // Non-current client. If its silence sent us local, seed a recovery
+        // window so its reconnect re-activates the session — otherwise the
+        // silence → drop → reconnect path loses auto-reactivation (a
+        // silenced client that then drops is no longer current_client, so
+        // the removal would skip the DefunctClientInfo above).
+        if self.silenced_endpoint == Some(*endpoint) {
+            self.removed_current_client = Some(DefunctClientInfo {
+                endpoint: *endpoint,
+                removed_at: Instant::now(),
+            });
+            self.silenced_endpoint = None;
+        }
+
         info!(
             "Removing client {} from client rotation: {}",
             endpoint,
@@ -3022,8 +3034,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             // what makes a manual switch to a silenced client safe.
             self.liveness.insert(endpoint, LivenessState::new());
             // Input is on a client now, so any silence-driven local state is
-            // over (see went_local_via_silence).
-            self.went_local_via_silence = false;
+            // over (see silenced_endpoint).
+            self.silenced_endpoint = None;
         }
         // Record which client is active (or none) so that an unexpected exit
         // mid-session can be recovered on the next server start. This is the
@@ -4747,7 +4759,7 @@ mod tests {
         );
         rotation.ping_tick().await;
         assert_eq!(rotation.current_client, None);
-        assert!(rotation.went_local_via_silence);
+        assert_eq!(rotation.silenced_endpoint, Some(endpoint));
 
         // While the flag is set, a completed recovery bar re-activates
         // automatically. (A fabricated endpoint can't receive Switch(true),
@@ -4759,7 +4771,7 @@ mod tests {
             silenced_state(Duration::from_secs(10), REACTIVATE_PONGS - 1),
         );
         rotation.note_client_heard(endpoint).await;
-        assert!(!rotation.went_local_via_silence);
+        assert_eq!(rotation.silenced_endpoint, None);
         assert_eq!(rotation.output_handler.released, 1);
 
         // Silence again...
@@ -4773,12 +4785,12 @@ mod tests {
             },
         );
         rotation.ping_tick().await;
-        assert!(rotation.went_local_via_silence);
+        assert_eq!(rotation.silenced_endpoint, Some(endpoint));
         // ...but this time the user DELIBERATELY chooses local (goto "" — a
         // no-op switch while already local, still a manual action): the flag
         // clears...
         rotation.set_client("".to_string()).await;
-        assert!(!rotation.went_local_via_silence);
+        assert_eq!(rotation.silenced_endpoint, None);
         let released = rotation.output_handler.released;
         // ...and a completed recovery bar no longer yanks input back: the
         // client is only marked healthy.

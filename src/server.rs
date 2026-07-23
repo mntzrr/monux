@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -40,10 +40,13 @@ const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// it catches up is visible too.
 #[derive(Default)]
 struct PeerVersions {
-    /// addr -> version from the last successful exchange (for the update note).
-    seen: HashMap<SocketAddr, u64>,
-    /// addr -> when we last logged a refusal for it (rate limit).
-    last_refusal_log: HashMap<SocketAddr, Instant>,
+    /// ip -> version from the last successful exchange (for the update note).
+    /// Keyed by IP, not addr:port — QUIC reconnects from a new ephemeral port,
+    /// so a full SocketAddr key would never match and the upgrade note +
+    /// refusal rate-limit would never fire.
+    seen: HashMap<IpAddr, u64>,
+    /// ip -> when we last logged a refusal for it (rate limit).
+    last_refusal_log: HashMap<IpAddr, Instant>,
 }
 
 impl PeerVersions {
@@ -52,9 +55,10 @@ impl PeerVersions {
     /// (a rate-limited, self-healing-framed warning on the first/log-worthy
     /// refusal, silence otherwise).
     fn check(&mut self, addr: SocketAddr, version: u64) -> Result<(), ()> {
+        let ip = addr.ip();
         let ours = shared::PROTOCOL_VERSION;
         if version == ours {
-            if let Some(old) = self.seen.insert(addr, version) {
+            if let Some(old) = self.seen.insert(ip, version) {
                 if old < version {
                     info!(
                         "Client {} updated protocol v{} -> v{} and reconnected",
@@ -65,13 +69,13 @@ impl PeerVersions {
             return Ok(());
         }
         // Refuse, but keep the last seen version for the eventual upgrade note.
-        self.seen.insert(addr, version);
+        self.seen.insert(ip, version);
         let should_log = self
             .last_refusal_log
-            .get(&addr)
+            .get(&ip)
             .is_none_or(|last| last.elapsed() >= REFUSAL_LOG_INTERVAL);
         if should_log {
-            self.last_refusal_log.insert(addr, Instant::now());
+            self.last_refusal_log.insert(ip, Instant::now());
             if version < ours {
                 warn!(
                     "Client {} speaks protocol v{} but we speak v{}: it's outdated and will auto-update and reconnect shortly (refusing until then)",
@@ -484,6 +488,9 @@ async fn handle_connection(
                     .await?;
                 // Copy the immutable response data into a mutable buffer
                 event_bytes.extend_from_slice(&resp.bytes);
+                if event_bytes.len() > shared::MAX_FRAME_BUFFER_BYTES {
+                    bail!("Client {} sent an oversized events frame ({} bytes without a COBS terminator)", conn.remote_address(), event_bytes.len());
+                }
                 handle_event_messages(conn.remote_address(), &rotation_tx, &mut event_bytes, max_clipboard_size_bytes).await?;
             },
             bulk_result = bulk_recv.read_chunk(65536, true) => {
@@ -534,6 +541,9 @@ async fn handle_connection(
                 } else {
                     // Copy the immutable response data into a mutable buffer
                     bulk_bytes.extend_from_slice(&resp.bytes);
+                    if bulk_bytes.len() > shared::MAX_FRAME_BUFFER_BYTES {
+                        bail!("Client {} sent an oversized bulk frame ({} bytes without a COBS terminator)", conn.remote_address(), bulk_bytes.len());
+                    }
                     incoming_clipboard_data = handle_bulk_messages(conn.remote_address(), &rotation_tx, &mut bulk_bytes, max_clipboard_size_bytes).await?;
                 }
             },
@@ -739,16 +749,16 @@ mod tests {
         let mut pv = PeerVersions::default();
         let old = shared::PROTOCOL_VERSION - 1;
         assert!(pv.check(addr(), old).is_err());
-        assert!(pv.last_refusal_log.contains_key(&addr()));
+        assert!(pv.last_refusal_log.contains_key(&addr().ip()));
         // A second refusal inside the window is not logged again.
-        let first = *pv.last_refusal_log.get(&addr()).unwrap();
+        let first = *pv.last_refusal_log.get(&addr().ip()).unwrap();
         assert!(pv.check(addr(), old).is_err());
-        assert_eq!(*pv.last_refusal_log.get(&addr()).unwrap(), first);
+        assert_eq!(*pv.last_refusal_log.get(&addr().ip()).unwrap(), first);
         // After the window passes, it logs again (new timestamp).
-        *pv.last_refusal_log.get_mut(&addr()).unwrap() =
+        *pv.last_refusal_log.get_mut(&addr().ip()).unwrap() =
             Instant::now() - REFUSAL_LOG_INTERVAL - Duration::from_secs(1);
         assert!(pv.check(addr(), old).is_err());
-        assert_ne!(*pv.last_refusal_log.get(&addr()).unwrap(), first);
+        assert_ne!(*pv.last_refusal_log.get(&addr().ip()).unwrap(), first);
     }
 
     #[test]
@@ -766,6 +776,20 @@ mod tests {
         assert!(pv.check(addr(), shared::PROTOCOL_VERSION).is_ok());
         // No note when nothing changed since the last seen version.
         assert!(pv.check(addr(), shared::PROTOCOL_VERSION).is_ok());
-        assert_eq!(pv.seen.get(&addr()), Some(&shared::PROTOCOL_VERSION));
+        assert_eq!(pv.seen.get(&addr().ip()), Some(&shared::PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn ephemeral_port_reconnect_matches_same_ip() {
+        let mut pv = PeerVersions::default();
+        let old = shared::PROTOCOL_VERSION - 1;
+        // Refuse from port A.
+        let port_a: SocketAddr = "10.0.0.1:50000".parse().unwrap();
+        assert!(pv.check(port_a, old).is_err());
+        // Reconnect from a different ephemeral port (same IP): the refusal
+        // rate-limit and the seen-version map must recognize the same peer.
+        let port_b: SocketAddr = "10.0.0.1:50001".parse().unwrap();
+        assert!(pv.check(port_b, old).is_err());
+        assert_eq!(pv.last_refusal_log.len(), 1); // keyed by IP, not addr:port
     }
 }

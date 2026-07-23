@@ -20,6 +20,13 @@ pub fn has_complete_cobs_frame(buf: &[u8]) -> bool {
     buf.contains(&0)
 }
 
+/// Maximum bytes retained in a COBS frame buffer without a terminator. A peer
+/// that streams bytes without ever emitting a 0x00 grows the buffer without
+/// bound; cap it and reject the connection. Events are small (key/mouse
+/// batches, type lists); bulk headers are slightly larger. The clipboard
+/// payload itself is length-prefixed (not COBS-framed) so it's not affected.
+pub const MAX_FRAME_BUFFER_BYTES: usize = 1024 * 1024;
+
 #[cfg(test)]
 mod tests {
     use super::*;
