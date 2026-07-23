@@ -184,8 +184,9 @@ struct ServerArgs {
     /// Keyboard shortcut for pausing/resuming input handling. While paused,
     /// ALL input devices (keyboards included) are ungrabbed so the local
     /// machine gets raw input with monux's re-emit out of the way (games,
-    /// raw-input apps); press the chord again to resume. Empty string disables.
-    #[arg(long, default_value = "leftshift,leftalt,p", value_name = "key1,key2,key3")]
+    /// raw-input apps); press the chord again to resume. Disabled unless set
+    /// (e.g. '--pause-shortcut leftshift,leftalt,p').
+    #[arg(long, default_value = "", value_name = "key1,key2,key3")]
     pause_shortcut: String,
 
     /// Substring or regular expression for selecting specific devices to monitor,
