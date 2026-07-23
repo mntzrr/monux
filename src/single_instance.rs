@@ -217,17 +217,15 @@ pub fn live_holder(kind: &str) -> Option<i32> {
     // crashed without flock-release being an issue — flock auto-releases on
     // process death — but the pid file survived). flock works on a read-only
     // fd, so this handles the cross-user case too.
-    let probe = match fs::OpenOptions::new().read(true).open(&path) {
+    match fs::OpenOptions::new().read(true).open(&path) {
         Ok(f) => {
             if try_lock(&f) {
                 let _ = rustix::fs::flock(&f, rustix::fs::FlockOperation::Unlock);
                 return None;
             }
-            true // locked by someone else
         }
         Err(_) => return None,
-    };
-    debug_assert!(probe);
+    }
     let pid = read_pid(&path)?;
     if pid == std::process::id() as i32 {
         return None;
