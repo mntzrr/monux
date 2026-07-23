@@ -1719,7 +1719,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             }
             Ok(())
         } else {
-            // The server has the clipboard: serve via X11 from local app
+            // The server has the clipboard: serve from the local clipboard app
             let request_client = if let ClipboardRequestSource::Remote(c) = &request_source {
                 c
             } else {
@@ -1946,7 +1946,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                       data_source, request_client, self.clients);
             }
         } else {
-            // Send to local X11 clipboard, completing the pending fetch that made the request.
+            // Send to the local clipboard, completing the pending fetch that made the request.
             match self.pending_clipboard_requests.remove(&request_id) {
                 Some(waiting_clipboard_tx) => {
                     if let Err(_d_again) = waiting_clipboard_tx.send(data) {

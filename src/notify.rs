@@ -37,7 +37,7 @@ impl Urgency {
 pub fn notify(id: &str, urgency: Urgency, timeout_ms: u32, summary: &str, body: &str) {
     let timeout = timeout_ms.to_string();
     let hint = format!("string:x-canonical-private-synchronous:{}", id);
-    let _ = Command::new("notify-send")
+    if let Ok(mut child) = Command::new("notify-send")
         .args([
             "-a",
             "monux",
@@ -53,7 +53,14 @@ pub fn notify(id: &str, urgency: Urgency, timeout_ms: u32, summary: &str, body: 
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
+        .spawn()
+    {
+        // Reap the child so notify-send doesn't linger as a zombie for the
+        // lifetime of long-lived daemons (tokio::process used to reap for us).
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 #[cfg(test)]

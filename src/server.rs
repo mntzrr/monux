@@ -461,6 +461,12 @@ async fn handle_connection(
             event_result = events_recv.read_chunk(16384, true) => {
                 let resp = match event_result {
                     Ok(chunk) => chunk.context("Client closed events connection")?,
+                    Err(quinn::ReadError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(_))) => {
+                        // A deliberate close (the client's, or our own
+                        // graceful shutdown), not an error worth logging.
+                        debug!("Client {} closed events connection", conn.remote_address());
+                        return Ok(());
+                    }
                     Err(e) => {
                         transport::log_conn_stats(&conn);
                         Err(e).context("Lost client events connection")?
@@ -483,6 +489,10 @@ async fn handle_connection(
             bulk_result = bulk_recv.read_chunk(65536, true) => {
                 let resp = match bulk_result {
                     Ok(chunk) => chunk.context("Client closed bulk connection")?,
+                    Err(quinn::ReadError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(_))) => {
+                        debug!("Client {} closed bulk connection", conn.remote_address());
+                        return Ok(());
+                    }
                     Err(e) => {
                         transport::log_conn_stats(&conn);
                         Err(e).context("Lost client bulk connection")?
