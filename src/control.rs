@@ -640,6 +640,16 @@ impl Handler {
                         // "resume"
                         _ => Event::SetPaused(false),
                     };
+                    // Origin evidence: a socket-driven switch/pause/resume is
+                    // distinguishable from a chord-driven one in the log.
+                    info!(
+                        "Control socket: {} requested{}",
+                        req.cmd,
+                        req.target
+                            .as_deref()
+                            .map(|t| format!(" (target: {})", t))
+                            .unwrap_or_default()
+                    );
                     // Non-blocking hand-off: a full queue means the events
                     // loop is stalled, which the caller should know about
                     // instead of waiting on it.

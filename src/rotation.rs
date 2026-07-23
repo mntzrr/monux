@@ -1290,7 +1290,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             // so those keystrokes also pass through to the local system, and
             // since nothing was forwarded anywhere there's no held-key cleanup
             // to run either.
-            debug!("Ignoring switch request: input is paused");
+            info!(
+                "Ignoring switch request: input is paused (resume via the pause chord, the tray, or 'monux daemon resume')"
+            );
             return;
         }
         // A manual switch action: any silence-driven local state is
@@ -1323,7 +1325,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             // Paused: switch chords are not acted on (see prev_client). This
             // also covers remote switches via SIGUSR1: while paused the
             // devices must stay ungrabbed regardless.
-            debug!("Ignoring switch request: input is paused");
+            info!(
+                "Ignoring switch request: input is paused (resume via the pause chord, the tray, or 'monux daemon resume')"
+            );
             return;
         }
         // A manual switch action supersedes silence-driven local state (see
@@ -1355,7 +1359,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     pub async fn set_client(&mut self, fingerprint: String) {
         if self.paused {
             // Paused: switch chords are not acted on (see prev_client).
-            debug!("Ignoring goto request: input is paused");
+            info!(
+                "Ignoring goto request: input is paused (resume via the pause chord, the tray, or 'monux daemon resume')"
+            );
             return;
         }
         // A manual switch action supersedes silence-driven local state (see
@@ -1438,7 +1444,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             self.motion_history.clear();
             self.paused = true;
             self.broadcast_grab_state();
-            info!("Input paused: all devices ungrabbed, listening for the resume chord (clipboard sharing continues)");
+            info!("Input paused: all devices ungrabbed (clipboard sharing continues); resume via the pause chord (if configured), the tray, or 'monux daemon resume'");
             notify_switch("monux paused");
         }
     }

@@ -837,6 +837,12 @@ async fn run_inner(
         timer: DwellTimer,
         debounce: EdgeDebounce,
         deadline: Option<Instant>,
+        /// Set after firing; cleared only by a committed leave. While a
+        /// switch doesn't take effect (paused, target offline) or the cursor
+        /// stays parked at the edge after a successful switch (it's frozen
+        /// there while input is forwarded), an unlatched timer would re-fire
+        /// on every contact flap.
+        latched: bool,
     }
     let mut dirs: HashMap<Direction, DirState> = map
         .targets
@@ -848,6 +854,7 @@ async fn run_inner(
                     timer: DwellTimer::new(dwell, REARM_COOLDOWN),
                     debounce: EdgeDebounce::new(),
                     deadline: None,
+                    latched: false,
                 },
             )
         })
@@ -877,8 +884,16 @@ async fn run_inner(
                         .iter()
                         .any(|zone| zone.direction == *dir && zone_contains(zone, x, y));
                     match state.debounce.poll(on) {
-                        Some(true) => state.deadline = state.timer.enter(now),
+                        Some(true) => {
+                            // A fire latches until a committed leave: don't
+                            // re-arm the dwell while the last switch is still
+                            // waiting for the cursor to actually leave.
+                            if !state.latched {
+                                state.deadline = state.timer.enter(now);
+                            }
+                        }
                         Some(false) => {
+                            state.latched = false;
                             state.timer.leave();
                             state.deadline = None;
                         }
@@ -928,6 +943,7 @@ async fn run_inner(
                             for state in dirs.values_mut() {
                                 state.debounce = EdgeDebounce::new();
                                 state.deadline = None;
+                                state.latched = false;
                                 state.timer.leave();
                             }
                         }
@@ -957,7 +973,12 @@ async fn run_inner(
                         continue;
                     }
                     // Fired: the timer reset and started its re-arm cooldown.
+                    // Latch until a committed leave so a switch that doesn't
+                    // take effect (paused, target offline) — or a cursor left
+                    // parked at the edge after a successful switch — doesn't
+                    // re-fire on every contact flap.
                     state.deadline = None;
+                    state.latched = true;
                     // Require fresh contact at fire time: the debounce needs
                     // STABLE_POLLS consecutive off-polls to commit a leave,
                     // so the dwell deadline can arrive before leave() is
@@ -983,7 +1004,10 @@ async fn run_inner(
                                 resolve_edge_target(&target, &clients, &resolve_hostname)
                             }).await {
                                 Ok(Ok(fingerprint)) => {
-                                    info!("Edge switch to client {} via {} edge", fingerprint, dir.as_str());
+                                    // The rotation logs the switch itself (or
+                                    // why it was ignored, e.g. paused) — this
+                                    // is only the request.
+                                    debug!("Edge switch to client {} requested via {} edge", fingerprint, dir.as_str());
                                     if let Err(e) = event_tx.send(Event::SwitchTo(fingerprint)).await {
                                         warn!("Failed to submit edge switch event: {:?}", e);
                                     }
