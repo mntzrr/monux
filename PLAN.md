@@ -484,9 +484,11 @@ STATUS: All 19 non-MOOT P1 items fixed across four commits (device/ops, connecti
 - EdgeInfo has no revoke; each re-advertise resets the client's in-progress
   dwell (detector respawn). Send revoke on un-resolution; dedup unchanged
   maps. [M]
-  — PARTLY DONE (d08e92b): dedup cache skips re-advertising unchanged
-  directions. An explicit revoke message (telling the client to stop watching
-  an edge whose target disconnected) is still OPEN.
+  — DONE (1841d30, protocol v13): dedup cache (d08e92b) + explicit
+  ServerEvent::EdgeInfoRevoke. advertise_edge_info diffs old vs new
+  resolved directions, revoking dropped ones; add_client also re-advertises
+  survivors (auto-ambiguous loss on connect). Client respawns/stops the
+  detector on revoke.
 - Silence recovery not tied to the silenced client: A silences, user picks B,
   A recovers first -> input jumps to A. Store the silenced endpoint. [S]
   — DONE (fc59261): replaced the bool went_local_via_silence with an
@@ -549,7 +551,7 @@ STATUS: All P2 items addressed across two commits (trivial fixes + documentation
   in 9a0ae4e, rotation helpers in 4eb6358, ClipboardType enum collapsed in
   2ff4bb8.
 
-### Optimizations (ordered by value) — 9 of 10 DONE (b724a7f..4eb6358)
+### Optimizations (ordered by value) — ALL DONE (b724a7f..b2a27ea)
 1. DONE (b724a7f): rustls ring-only features — drops aws-lc-rs + aws-lc-sys
    (heavy C build) and prefer-post-quantum; we only use the ring provider. [big]
 2. DONE (b724a7f): quinn feature trim — dropped default platform-verifier
@@ -559,9 +561,9 @@ STATUS: All P2 items addressed across two commits (trivial fixes + documentation
 4. DONE (1f059ff, with P0.2): update_diagnostics rate-limited to ~10Hz
    (DIAGNOSTICS_REFRESH_INTERVAL); ServerState/edge rebuild cached and
    invalidated on client-list/map change. [S]
-5. PARTLY DONE: shared runtime + per-type serve cache landed (1f059ff + 2ff4bb8);
-   the Arc<[u8]> payload-instead-of-clone sub-item is still open (writer still
-   clones Vec<u8> on cache insert). [S-M]
+5. DONE (55bed62): shared runtime + per-type serve cache (1f059ff + 2ff4bb8)
+   + Arc<[u8]> payload — cache value changed to Arc<[u8]>, eliminating
+   full-payload clones on both cache-hit reads and cache-miss inserts. [S-M]
 6. DONE (06e4f86): client.rs step() — the two select blocks merged via the
    Option-pending pattern. [M — biggest duplication]
 7. DONE (27358be): bulk-writer task shared between server and client
@@ -572,7 +574,7 @@ STATUS: All P2 items addressed across two commits (trivial fixes + documentation
 9. DONE (0da5e92): postcard scratch buffers reused on send paths (serialize +
    datagram scratch on Rotation); uinput write/route/release Vecs pre-sized.
    [S-M]
-10. OPEN: routine `cargo update` for semver-compatible bumps. [routine]
+10. DONE (b2a27ea): routine `cargo update` (rustls-pki-types 1.15.0 -> 1.15.1). [routine]
 
 ### Decisions to make
 - DECIDED (1f059ff): X11 clipboard backend dropped entirely (~1000 lines +
