@@ -334,18 +334,25 @@ pub async fn send_version(send: &mut SendStream) -> Result<()> {
 /// gate), then call ensure_compatible_version.
 pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<u64> {
     debug!("Waiting to receive version");
-    let resp = recv
-        .read_chunk(1024, true)
-        .await
-        .context("Failed reading protocol version (possible protocol version mismatch; run 'monux -V' on both ends to compare)")?
-        .context("Peer closed connection during version exchange (possible protocol version mismatch; run 'monux -V' on both ends to compare)")?;
-    trace!(
-        "Received {} byte version: {:X?}",
-        resp.bytes.len(),
-        &*resp.bytes
-    );
-    // Copy the immutable response data into a mutable buffer
-    buf.extend_from_slice(&resp.bytes);
+    // Loop until we have a complete COBS frame: the version message can be
+    // split across chunks, and a single read_chunk may return before the
+    // 0x00 terminator arrives.
+    loop {
+        if shared::has_complete_cobs_frame(buf) {
+            break;
+        }
+        let resp = recv
+            .read_chunk(1024, true)
+            .await
+            .context("Failed reading protocol version (possible protocol version mismatch; run 'monux -V' on both ends to compare)")?
+            .context("Peer closed connection during version exchange (possible protocol version mismatch; run 'monux -V' on both ends to compare)")?;
+        trace!(
+            "Received {} byte version chunk: {:X?}",
+            resp.bytes.len(),
+            &*resp.bytes
+        );
+        buf.extend_from_slice(&resp.bytes);
+    }
     let version: u64;
     {
         let (versionmsg, resp_remainder) =

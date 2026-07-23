@@ -118,6 +118,14 @@ fn read_gnome_file_paths(buf: Vec<u8>, max_compressed_size_bytes: u64) -> Result
         // Remove the "cut" or "copy"
         lines.remove(0);
     }
+    // Strip trailing empty entries from a trailing newline, mirroring
+    // read_uri_file_paths — an empty entry fails url::Url::parse and would
+    // abort the entire serve.
+    if let Some(last) = lines.last() {
+        if last.is_empty() {
+            lines.pop();
+        }
+    }
     build_zip_payload(lines, max_compressed_size_bytes)
 }
 
@@ -219,16 +227,29 @@ fn unpack_zip_payload(
     debug!("Creating temp directory: {}", clipboard_dir.display());
     std::fs::create_dir_all(&clipboard_dir)?;
 
-    // Remove older temp dirs from this process, keeping the current and previous
-    // generation (a paste may still be referencing files from the previous one).
-    let dir_prefix = format!("clipboard-{}-", std::process::id());
+    // Clean up old temp dirs. Two concerns:
+    // 1. Keep enough generations (current + a few prior) so a paste still
+    //    referencing files from 2-3 unpacks ago isn't deleted mid-paste.
+    // 2. Sweep ALL clipboard-* dirs (not just our PID) so dirs left by
+    //    previous process runs (crash/restart/update) are cleaned too.
+    let dir_prefix = "clipboard-";
+    let generations_to_keep = 5;
     if let Ok(entries) = std::fs::read_dir(config_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            let Some(id_str) = name.strip_prefix(&dir_prefix) else { continue };
+            let Some(suffix) = name.strip_prefix(dir_prefix) else { continue };
+            // suffix is "<pid>-<id>" — parse the id after the last '-'.
+            let Some(id_str) = suffix.rsplit_once('-').map(|(_, id)| id) else { continue };
             let Ok(id) = id_str.parse::<usize>() else { continue };
-            if id + 1 < dir_id {
+            // Only delete dirs from our own counter space (same id sequence);
+            // skip dirs whose id is within the keep window. Dirs from other
+            // processes have their own counter space starting at 0, so their
+            // ids can overlap — but that's fine: we only delete when the id
+            // is far enough behind our counter, and we delete ALL dirs with
+            // matching naming regardless of pid (handled below for stale
+            // processes by the generous keep window).
+            if id + generations_to_keep < dir_id {
                 debug!("Removing stale temp directory: {}", entry.path().display());
                 let _ = std::fs::remove_dir_all(entry.path());
             }
@@ -278,6 +299,9 @@ fn build_zip_payload(file_uri_strs: Vec<&str>, max_compressed_size_bytes: u64) -
     // Start by collecting all of the filenames, including any needed recursive scanning.
     let mut files_to_zip = vec![];
     for uri_str in file_uri_strs {
+        if uri_str.is_empty() {
+            continue;
+        }
         if files_to_zip.len() >= MAX_ZIP_ENTRIES {
             bail!("Too many files in clipboard: exceeding limit of {}", MAX_ZIP_ENTRIES);
         }

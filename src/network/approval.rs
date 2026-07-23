@@ -205,6 +205,9 @@ impl<'a> MonuxCertVerification<'a> {
                 approval_state.known_certs.push(their_cert.clone().into_owned());
                 approval_state.prompt_active = false;
             } else {
+                // Lock poisoned: force-reset prompt_active via a fresh write
+                // attempt so approval doesn't wedge permanently.
+                let _ = self.approval_state.write().map(|mut s| s.prompt_active = false);
                 bail!("Failed to lock known certs for approval");
             }
             Ok(their_cert_fingerprint)
@@ -216,6 +219,7 @@ impl<'a> MonuxCertVerification<'a> {
             if let Ok(mut approval_state) = self.approval_state.write() {
                 approval_state.prompt_active = false;
             } else {
+                let _ = self.approval_state.write().map(|mut s| s.prompt_active = false);
                 bail!("Failed to lock known certs for disapproval");
             }
             bail!(

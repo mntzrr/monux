@@ -1333,7 +1333,21 @@ async fn client(
                 }
                 // Back off before retrying (immediate on the first failure);
                 // the next delay doubles, capped at MAX_RECONNECT_BACKOFF.
-                time::sleep(reconnect_backoff).await;
+                tokio::select! {
+                    _ = time::sleep(reconnect_backoff) => {}
+                    _ = &mut shutdown => {
+                        if let Some(lc) = &mut local_clipboard {
+                            if let Err(e) = lc.clear_remote_clipboard() {
+                                warn!("Failed to clear remote clipboard: {}", e);
+                            }
+                        }
+                        if let Err(e) = output_handler.release_all().await {
+                            warn!("Failed to release held keys after connection loss: {:?}", e);
+                        }
+                        info!("Shutting down...");
+                        return Ok(());
+                    }
+                }
                 reconnect_backoff = if reconnect_backoff.is_zero() {
                     Duration::from_secs(1)
                 } else {

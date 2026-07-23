@@ -103,11 +103,22 @@ where
     let state = slot.take()?;
     let worker_slot = slot.clone();
     let join = task::spawn_blocking(move || {
-        let (state, result) = work(state);
-        // Restore unconditionally: this detached closure is the only place
-        // that can put the state back, whatever happened to the caller.
-        worker_slot.restore(state);
-        result
+        // Catch panics inside the worker so restore/mark_dead always runs,
+        // even if the caller was cancelled and never awaited our JoinHandle.
+        // Without this, a panic + caller-cancel leaves work_active stuck true.
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            work(state)
+        }));
+        match panic_result {
+            Ok((state, result)) => {
+                worker_slot.restore(state);
+                result
+            }
+            Err(payload) => {
+                worker_slot.mark_dead();
+                std::panic::resume_unwind(payload);
+            }
+        }
     });
     match join.await {
         Ok(result) => Ok(result),
