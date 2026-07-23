@@ -1,6 +1,6 @@
 use std::fs;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -510,55 +510,6 @@ async fn client_shutdown_signal() {
     }
 }
 
-/// The server protocol version to gate an update on: the minimum of the
-/// versions Monux servers currently advertise via mDNS (also recorded, healing
-/// a stale gate file), falling back to the version this client recorded at its
-/// last handshake when no server answers (offline, another subnet, or a build
-/// predating the advertisement). Never fails: discovery is best-effort.
-fn refresh_protocol_constraint(config_dir: Option<&Path>) -> Option<u64> {
-    let recorded = config_dir.and_then(monux::update::server_protocol_constraint);
-    let discovered = match monux::discovery::discover_server_protocol_versions() {
-        Ok(versions) => versions,
-        Err(e) => {
-            debug!(
-                "Server protocol version discovery failed ({}); using the recorded gate value",
-                e
-            );
-            return recorded;
-        }
-    };
-    let constraint = match monux::discovery::protocol_version_constraint(&discovered) {
-        Some(constraint) => constraint,
-        // No server answered: fall back to the last recorded version.
-        None => return recorded,
-    };
-    if discovered.len() > 1 {
-        info!(
-            "Monux servers advertise different protocol versions ({}); gating on the oldest, v{}",
-            discovered
-                .iter()
-                .map(u64::to_string)
-                .collect::<Vec<_>>()
-                .join(", "),
-            constraint
-        );
-    }
-    if recorded != Some(constraint) {
-        info!(
-            "Refreshed the server protocol version gate via mDNS: v{} -> v{}",
-            recorded
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "<none>".to_string()),
-            constraint
-        );
-    }
-    if let Some(dir) = config_dir {
-        let _ = fs::create_dir_all(dir);
-        monux::update::record_server_protocol_version(dir, constraint);
-    }
-    Some(constraint)
-}
-
 fn main() -> Result<()> {
     logging::init_logging();
     let cli = Cli::parse();
@@ -656,7 +607,7 @@ fn main() -> Result<()> {
                     None
                 } else {
                     let config_dir = home::home_dir().map(|h| h.join(".config").join("monux"));
-                    refresh_protocol_constraint(config_dir.as_deref())
+                    monux::update::refresh_protocol_constraint(config_dir.as_deref())
                 };
                 return monux::update::run(args.force, false, constraint).map(|_| ());
             }
@@ -1471,6 +1422,7 @@ async fn client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn tray_subcommand_parses_hide_show_and_socket() {

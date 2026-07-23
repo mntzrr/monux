@@ -7,9 +7,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use tracing::info;
+use tracing::{debug, info};
 
 const DEFAULT_REPO: &str = "https://github.com/mntzrr/monux.git";
 /// Commit this binary was built from, set by build.rs ("<sha>" or "<sha>-dirty").
@@ -209,6 +210,14 @@ fn source_protocol_version(src_dir: &Path) -> Result<u64> {
 /// the server this machine last talked to as a client.
 const SERVER_PROTOCOL_VERSION_FILE: &str = "server_protocol_version";
 
+/// How long a recorded server protocol version stays authoritative. Every
+/// handshake rewrites the file, so an older record means this machine has not
+/// acted as a client in days — typically a pure server, whose record can never
+/// heal otherwise (its own mDNS advertisement is ignored for the gate and it
+/// never handshakes as a client). Treating an expired record as absent lets
+/// such a machine update again instead of being vetoed by history forever.
+const SERVER_PROTOCOL_VERSION_MAX_AGE: Duration = Duration::from_secs(48 * 60 * 60);
+
 /// Records the server's protocol version for the update gate (best-effort).
 /// Called by the client on every handshake, including refused ones — that is
 /// what re-opens the gate after the server upgrades ahead of us.
@@ -222,14 +231,74 @@ pub fn record_server_protocol_version(config_dir: &Path, version: u64) {
 }
 
 /// The protocol version of the server this machine acts as a client to, if it
-/// has ever connected to one. Used to gate updates so a client never installs
-/// a build its server couldn't talk to.
+/// has connected to one recently. Used to gate updates so a client never
+/// installs a build its server couldn't talk to. Records older than
+/// SERVER_PROTOCOL_VERSION_MAX_AGE are ignored (see there).
 pub fn server_protocol_constraint(config_dir: &Path) -> Option<u64> {
-    std::fs::read_to_string(config_dir.join(SERVER_PROTOCOL_VERSION_FILE))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+    server_protocol_constraint_fresh(config_dir, SERVER_PROTOCOL_VERSION_MAX_AGE)
+}
+
+/// The max age is a parameter so tests can force expiry without touching
+/// file mtimes.
+fn server_protocol_constraint_fresh(config_dir: &Path, max_age: Duration) -> Option<u64> {
+    let path = config_dir.join(SERVER_PROTOCOL_VERSION_FILE);
+    let version: u64 = std::fs::read_to_string(&path).ok()?.trim().parse().ok()?;
+    let age = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+        // A future mtime (clock skew) counts as fresh.
+        Ok(mtime) => mtime.elapsed().unwrap_or(Duration::ZERO),
+        Err(_) => return None,
+    };
+    (age <= max_age).then_some(version)
+}
+
+/// The server protocol version to gate an update on: the minimum of the
+/// versions Monux servers currently advertise via mDNS (also recorded, healing
+/// a stale gate file), falling back to the version this client recorded at its
+/// last handshake when no server answers (offline, another subnet, or a build
+/// predating the advertisement). Never fails: discovery is best-effort. Blocks
+/// for up to the mDNS discovery timeout: call it from a blocking context.
+pub fn refresh_protocol_constraint(config_dir: Option<&Path>) -> Option<u64> {
+    let recorded = config_dir.and_then(server_protocol_constraint);
+    let discovered = match crate::discovery::discover_server_protocol_versions() {
+        Ok(versions) => versions,
+        Err(e) => {
+            debug!(
+                "Server protocol version discovery failed ({}); using the recorded gate value",
+                e
+            );
+            return recorded;
+        }
+    };
+    let constraint = match crate::discovery::protocol_version_constraint(&discovered) {
+        Some(constraint) => constraint,
+        // No server answered: fall back to the last recorded version.
+        None => return recorded,
+    };
+    if discovered.len() > 1 {
+        info!(
+            "Monux servers advertise different protocol versions ({}); gating on the oldest, v{}",
+            discovered
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            constraint
+        );
+    }
+    if recorded != Some(constraint) {
+        info!(
+            "Refreshed the server protocol version gate via mDNS: v{} -> v{}",
+            recorded
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            constraint
+        );
+    }
+    if let Some(dir) = config_dir {
+        let _ = std::fs::create_dir_all(dir);
+        record_server_protocol_version(dir, constraint);
+    }
+    Some(constraint)
 }
 
 /// Install next to the currently running binary (<root>/bin/monux -> <root>),
@@ -383,6 +452,23 @@ mod tests {
         // A later handshake overwrites (e.g. the server upgraded).
         record_server_protocol_version(&dir, 8);
         assert_eq!(server_protocol_constraint(&dir), Some(8));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn server_protocol_constraint_expires() {
+        let dir =
+            std::env::temp_dir().join(format!("monux-test-constraint-exp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        record_server_protocol_version(&dir, 9);
+        // Fresh record: honored.
+        assert_eq!(
+            server_protocol_constraint_fresh(&dir, Duration::from_secs(60)),
+            Some(9)
+        );
+        // A record not refreshed within the max age is ignored: this is what
+        // lets a pure server (nothing rewrites its file) update again.
+        assert_eq!(server_protocol_constraint_fresh(&dir, Duration::ZERO), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

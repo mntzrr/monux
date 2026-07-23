@@ -108,8 +108,9 @@ pub fn schedule_restart() {
 
 /// Runs the auto-update loop; spawn it on the tokio runtime.
 /// `gate_config_dir`: for clients, the config dir holding the server's
-/// recorded protocol version — updates that would break compatibility with
-/// the server are skipped. Servers pass None: they lead protocol upgrades.
+/// protocol version record — refreshed via mDNS on every check, so updates
+/// that would break compatibility with the server are skipped. Servers pass
+/// None: they lead protocol upgrades.
 pub async fn run(gate_config_dir: Option<std::path::PathBuf>) {
     tokio::select! {
         _ = tokio::time::sleep(initial_delay()) => {}
@@ -153,12 +154,17 @@ pub async fn run(gate_config_dir: Option<std::path::PathBuf>) {
                         "monux update available ({}), rebuilding in the background...",
                         short(&remote_sha)
                     );
-                    let constraint = gate_config_dir
-                        .as_deref()
-                        .and_then(update::server_protocol_constraint);
-                    let result =
-                        tokio::task::spawn_blocking(move || update::run(false, true, constraint))
-                            .await;
+                    // Refresh the gate via mDNS on every check (healing a
+                    // stale record) inside the blocking task: discovery is
+                    // synchronous IO with a timeout.
+                    let gate_dir = gate_config_dir.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        let constraint = gate_dir
+                            .as_deref()
+                            .and_then(|dir| update::refresh_protocol_constraint(Some(dir)));
+                        update::run(false, true, constraint)
+                    })
+                    .await;
                     match result {
                         Ok(Ok(update::UpdateStatus::Installed)) => {
                             last_attempted = Some(remote_sha.clone());
