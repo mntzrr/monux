@@ -553,6 +553,14 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// lost on the wire (see MotionDatagram.history). Cleared on every switch:
     /// deltas flushed to one client are moot for another.
     motion_history: VecDeque<(i32, i32)>,
+    /// Reusable serialization scratch for forwarded event batches (send_event):
+    /// at input rates a fresh Vec per message is pure allocator churn. Only
+    /// ever grows, to the largest frame seen — a separate buffer from
+    /// datagram_scratch so the datagram path's clear() doesn't shrink it back.
+    serialize_scratch: Vec<u8>,
+    /// Reusable serialization scratch for motion datagrams
+    /// (try_send_motion_datagram); cleared before each datagram.
+    datagram_scratch: Vec<u8>,
     /// Flush interval for motion coalescing; None = forward every batch
     /// immediately (e.g. --motion-hz 0 for gaming).
     motion_flush_interval: Option<Duration>,
@@ -802,6 +810,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             pending_motion: (0, 0, 0),
             motion_dirty: false,
             motion_history: VecDeque::new(),
+            serialize_scratch: Vec::new(),
+            datagram_scratch: Vec::new(),
             motion_flush_interval,
             bulk_throttle_mbps,
             last_switch_at: None,
@@ -2612,15 +2622,17 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
         let seq = self.motion_seq.wrapping_add(1);
         let msg = event::MotionDatagram { seq, history };
-        let serialized = match postcard::to_stdvec(&msg) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Failed to serialize motion datagram: {:?}", e);
-                return MotionSend::Fallback;
-            }
-        };
+        // Serialize into the reusable scratch; quinn consumes the bytes it
+        // queues, so it gets a (tiny) copy and the scratch capacity survives
+        // for the next datagram.
+        self.datagram_scratch.clear();
+        if let Err(e) = postcard::to_io(&msg, &mut self.datagram_scratch) {
+            error!("Failed to serialize motion datagram: {:?}", e);
+            return MotionSend::Fallback;
+        }
+        let serialized = Bytes::copy_from_slice(&self.datagram_scratch);
         let history_len = msg.history.len();
-        match self.clients[idx].conn.send_datagram(Bytes::from(serialized)) {
+        match self.clients[idx].conn.send_datagram(serialized) {
             Ok(()) => {
                 self.motion_seq = seq;
                 if !self.motion_datagram_announced {
@@ -2794,11 +2806,22 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     ) -> Result<bool> {
         // Serialize up front: a serialization failure is a problem with the message,
         // not with the client's connection, so it shouldn't kick the client out.
-        let serializedmsg = match postcard::to_stdvec_cobs(&msg) {
-            Ok(m) => m,
-            Err(e) => {
-                error!("Failed to serialize event message: {:?}", e);
-                return Err(anyhow!("Failed to serialize event message: {:?}", e));
+        // postcard's cobs flavor backpatches the overhead byte, so it needs a
+        // sized slice rather than an Extend target: serialize into the reusable
+        // scratch, growing it (once per size class, then it stays put) whenever
+        // a frame doesn't fit.
+        let serializedmsg: &[u8] = loop {
+            let attempt = postcard::to_slice_cobs(&msg, &mut self.serialize_scratch).map(|s| s.len());
+            match attempt {
+                Ok(len) => break &self.serialize_scratch[..len],
+                Err(postcard::Error::SerializeBufferFull) => {
+                    let grown = (self.serialize_scratch.len() * 2).max(1024);
+                    self.serialize_scratch.resize(grown, 0);
+                }
+                Err(e) => {
+                    error!("Failed to serialize event message: {:?}", e);
+                    return Err(anyhow!("Failed to serialize event message: {:?}", e));
+                }
             }
         };
         match self.clients.binary_search_by(|c| c.endpoint.cmp(endpoint)) {

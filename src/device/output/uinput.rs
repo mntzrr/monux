@@ -295,18 +295,17 @@ impl OutputHandler for VirtualUInputDevices {
             "Releasing {} held keys/buttons on virtual devices",
             self.pressed_keys.len()
         );
-        let mut releases: Vec<event::InputEvent> = self
-            .pressed_keys
-            .keys()
-            .map(|code| event::InputEvent {
-                inputi32: Some(event::InputI32 {
-                    type_: evdev::EventType::KEY.0,
-                    code: *code,
-                    value: 0,
-                }),
-                inputf64: None,
-            })
-            .collect();
+        // Pre-size to pressed-keys plus the trailing SYN event: an exact-fit
+        // collect would just reallocate on the push below.
+        let mut releases: Vec<event::InputEvent> = Vec::with_capacity(self.pressed_keys.len() + 1);
+        releases.extend(self.pressed_keys.keys().map(|code| event::InputEvent {
+            inputi32: Some(event::InputI32 {
+                type_: evdev::EventType::KEY.0,
+                code: *code,
+                value: 0,
+            }),
+            inputf64: None,
+        }));
         releases.push(event::InputEvent {
             inputi32: Some(event::InputI32 {
                 type_: evdev::EventType::SYNCHRONIZATION.0,
@@ -322,30 +321,31 @@ impl OutputHandler for VirtualUInputDevices {
     }
 
     async fn write(&mut self, events: Vec<event::InputEvent>) -> Result<()> {
-        let events = events
-            .iter()
-            .filter_map(|event| {
-                if let Some(e) = &event.inputf64 {
-                    let evdev_event = e.to_evdev(SCALED_DIM_MIN, SCALED_DIM_MAX);
-                    if let Some(dest) = self.route_event(evdev_event) {
-                        Some((evdev_event, dest))
-                    } else {
-                        None
-                    }
-                } else if let Some(e) = &event.inputi32 {
-                    let evdev_event = e.to_evdev();
-                    check_discrete_axis_range(&evdev_event);
-                    if let Some(dest) = self.route_event(evdev_event) {
-                        Some((evdev_event, dest))
-                    } else {
-                        None
-                    }
+        // Pre-size to the incoming batch: batches arrive at up to 8kHz, so a
+        // collect-grown Vec (doublings from empty) is per-call churn.
+        let mut routed: Vec<(evdev::InputEvent, EventDest)> = Vec::with_capacity(events.len());
+        routed.extend(events.iter().filter_map(|event| {
+            if let Some(e) = &event.inputf64 {
+                let evdev_event = e.to_evdev(SCALED_DIM_MIN, SCALED_DIM_MAX);
+                if let Some(dest) = self.route_event(evdev_event) {
+                    Some((evdev_event, dest))
                 } else {
-                    warn!("Event missing either an i32 or an f64 value: {}", event);
                     None
                 }
-            })
-            .collect::<Vec<(evdev::InputEvent, EventDest)>>();
+            } else if let Some(e) = &event.inputi32 {
+                let evdev_event = e.to_evdev();
+                check_discrete_axis_range(&evdev_event);
+                if let Some(dest) = self.route_event(evdev_event) {
+                    Some((evdev_event, dest))
+                } else {
+                    None
+                }
+            } else {
+                warn!("Event missing either an i32 or an f64 value: {}", event);
+                None
+            }
+        }));
+        let events = routed;
         if events.is_empty() {
             return Ok(());
         }
@@ -534,9 +534,9 @@ impl VirtualUInputDevices {
             emit_events(&mut self.touchpad_device, &events)?;
         } else {
             // Events don't all 'fit' in one device, group by device
-            let mut keyboard_events = vec![];
-            let mut mouse_events = vec![];
-            let mut touchpad_events = vec![];
+            let mut keyboard_events = Vec::with_capacity(keyboard_count);
+            let mut mouse_events = Vec::with_capacity(mouse_count);
+            let mut touchpad_events = Vec::with_capacity(touchpad_count);
             for event in events {
                 match event.1 {
                     EventDest::Keyboard => {
