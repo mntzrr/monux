@@ -318,12 +318,28 @@ fn instance_name_of(fullname: &str) -> &str {
         .unwrap_or(fullname)
 }
 
-/// Picks an address to connect to. A server may advertise several addresses
-/// (LAN, docker bridges, VPN, ...), so prefer the one sharing the longest bit
-/// prefix with one of our own interface addresses (i.e. most likely on our
-/// subnet), falling back to any IPv4 address, then any address.
+/// Picks an address to connect to. A link-local pair (169.254.0.0/16 on both
+/// sides — almost certainly a direct, routerless link like a plugged-in
+/// cable) is preferred over any routed path. Otherwise a server may advertise
+/// several addresses (LAN, docker bridges, VPN, ...), so prefer the one
+/// sharing the longest bit prefix with one of our own interface addresses
+/// (i.e. most likely on our subnet), falling back to any IPv4 address, then
+/// any address.
 fn pick_addr(addrs: &[IpAddr], port: u16) -> Option<SocketAddr> {
-    let local_ips = local_ipv4_addrs().unwrap_or_default();
+    pick_addr_with_locals(addrs, &local_ipv4_addrs().unwrap_or_default(), port)
+}
+
+/// pick_addr with the local interface addresses passed in, so the preference
+/// logic is testable without real interfaces.
+fn pick_addr_with_locals(addrs: &[IpAddr], local_ips: &[IpAddr], port: u16) -> Option<SocketAddr> {
+    let link_local = |ip: &IpAddr| matches!(ip, IpAddr::V4(v4) if v4.is_link_local());
+    // Without our own link-local address a link-local peer is unreachable, so
+    // the preference only fires when the direct segment exists on both sides.
+    if local_ips.iter().any(&link_local) {
+        if let Some(ip) = addrs.iter().find(|ip| link_local(ip)) {
+            return Some(SocketAddr::new(*ip, port));
+        }
+    }
     addrs
         .iter()
         .filter(|ip| ip.is_ipv4())
@@ -387,8 +403,11 @@ fn is_virtual_iface(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
-/// Enumerates this host's non-loopback, non-link-local IPv4 addresses,
-/// preferring physical/primary interfaces over virtual overlay ones.
+/// Enumerates this host's non-loopback IPv4 addresses, preferring
+/// physical/primary interfaces over virtual overlay ones. Link-local
+/// (169.254.0.0/16) addresses are included: a direct, routerless link between
+/// the machines (e.g. a plugged-in cable) lives there, and both the
+/// advertisement and the path preference (pick_addr) need to see them.
 fn local_ipv4_addrs() -> Result<Vec<IpAddr>> {
     let mut ips: Vec<(String, IpAddr)> = Vec::new();
     unsafe {
@@ -414,10 +433,7 @@ fn local_ipv4_addrs() -> Result<Vec<IpAddr>> {
                 // the in-memory octet order on any host endianness.
                 let ip = std::net::Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
                 let ip = IpAddr::V4(ip);
-                if !ip.is_loopback()
-                    && !ip.is_unspecified()
-                    && !matches!(ip, IpAddr::V4(v4) if v4.is_link_local())
-                    && !ips.iter().any(|(_, existing)| *existing == ip)
+                if !ip.is_loopback() && !ip.is_unspecified() && !ips.iter().any(|(_, existing)| *existing == ip)
                 {
                     ips.push((name, ip));
                 }
@@ -499,6 +515,32 @@ mod tests {
         // Cross-family is always 0
         let v6: IpAddr = "fe80::1".parse().unwrap();
         assert_eq!(common_prefix_len(&server, &v6), 0);
+    }
+
+    #[test]
+    fn link_local_pair_is_preferred_over_routed_path() {
+        let lan: IpAddr = "192.168.1.187".parse().unwrap();
+        let direct: IpAddr = "169.254.10.1".parse().unwrap();
+        let our_lan: IpAddr = "192.168.1.102".parse().unwrap();
+        let our_direct: IpAddr = "169.254.10.2".parse().unwrap();
+        let addrs = [lan, direct];
+        // Both sides have a link-local address (a cable plugged straight in):
+        // the direct path wins over the better-prefix LAN path.
+        assert_eq!(
+            pick_addr_with_locals(&addrs, &[our_lan, our_direct], 1213),
+            Some(SocketAddr::new(direct, 1213))
+        );
+        // Without our own link-local address the link-local peer is
+        // unreachable: the routed LAN path wins instead.
+        assert_eq!(
+            pick_addr_with_locals(&addrs, &[our_lan], 1213),
+            Some(SocketAddr::new(lan, 1213))
+        );
+        // No link-local advertised either: the prefix match picks the LAN path.
+        assert_eq!(
+            pick_addr_with_locals(&[lan], &[our_lan, our_direct], 1213),
+            Some(SocketAddr::new(lan, 1213))
+        );
     }
 
     #[test]

@@ -14,7 +14,8 @@ use tracing::{debug, error, info, trace, warn};
 use crate::clipboard::{CLIPBOARD_SERVE_TIMEOUT_SECS, client, data};
 use crate::device::output;
 use crate::msgs::{bulk, event, shared};
-use crate::network::{approval, throttle, transport};
+use crate::network::{approval, link_quality::LinkQuality, link_quality::Tier, throttle, transport};
+use crate::rotation::ThrottleMode;
 use crate::notify;
 
 /// Client-side scaling for relative pointer/scroll deltas (--mouse-scale,
@@ -117,7 +118,7 @@ pub async fn run<O: output::OutputHandler>(
     mouse_scale: f64,
     scroll_scale: f64,
     control_state: Arc<crate::control::ClientStateMirror>,
-    bulk_throttle_mbps: Option<f64>,
+    throttle_mode: ThrottleMode,
     edge_map: Option<crate::edge::EdgeMap>,
     edge_dwell: Duration,
 ) -> Result<()> {
@@ -130,7 +131,7 @@ pub async fn run<O: output::OutputHandler>(
         mouse_scale,
         scroll_scale,
         control_state,
-        bulk_throttle_mbps,
+        throttle_mode,
         edge_map.is_some(),
         edge_dwell,
     )
@@ -146,7 +147,11 @@ pub async fn run<O: output::OutputHandler>(
     // The link monitor's thresholds assume a LAN; a --www connection
     // legitimately exceeds them, so it only runs in Local mode.
     if mode == transport::NetworkMode::Local {
-        task::spawn(monitor_link(client.conn().clone()));
+        task::spawn(monitor_link(
+            client.conn().clone(),
+            client.throttle_cell.clone(),
+            throttle_mode,
+        ));
     }
     // Screen-edge switching back to the server: either an explicit --edge-map
     // (spawned here per connection), or inferred from the server's EdgeInfo
@@ -195,6 +200,9 @@ struct Connection {
     /// payload when transfers overlap.
     bulk_tx: mpsc::Sender<Vec<u8>>,
     bulk_recv: RecvStream,
+    /// Live pacing-rate cell shared with the bulk writer task (adaptive
+    /// fidelity: monitor_link rewrites it as the measured link tier changes).
+    throttle_cell: throttle::SharedThrottle,
     max_clipboard_size_bytes: u64,
 
     active: bool,
@@ -317,7 +325,7 @@ impl Connection {
         mouse_scale: f64,
         scroll_scale: f64,
         control_state: Arc<crate::control::ClientStateMirror>,
-        bulk_throttle_mbps: Option<f64>,
+        throttle_mode: ThrottleMode,
         edge_map_explicit: bool,
         edge_dwell: Duration,
     ) -> Result<(Self, Instant)> {
@@ -395,10 +403,16 @@ impl Connection {
         // (bulk::BULK_QUEUE_CAPACITY): senders fail fast instead of queueing
         // clipboard payloads without limit behind a server that can't drain.
         let (bulk_tx, bulk_rx) = mpsc::channel::<Vec<u8>>(bulk::BULK_QUEUE_CAPACITY);
+        // The pacing cell starts at the Normal-tier rate; monitor_link
+        // rewrites it as the measured link tier changes (adaptive fidelity).
+        let throttle_cell = throttle::shared_throttle(crate::rotation::effective_throttle_mbps(
+            &throttle_mode,
+            Tier::Normal,
+        ));
         throttle::spawn_bulk_writer(
             bulk_send,
             bulk_rx,
-            bulk_throttle_mbps,
+            throttle_cell.clone(),
             conn.remote_address(),
             |len, e| async move {
                 // A broken stream also fails the step loop's read side, which
@@ -413,6 +427,7 @@ impl Connection {
                 events_recv,
                 bulk_tx,
                 bulk_recv,
+                throttle_cell,
                 max_clipboard_size_bytes,
                 active: false,
                 event_bytes,
@@ -1249,8 +1264,13 @@ impl DegradationEpisode {
 /// once per LINK_NOTIFY_COOLDOWN — when the link degrades past LAN
 /// expectations, plus once when it recovers. The message points at the
 /// WiFi/link, not monux. Exits when the connection closes.
-async fn monitor_link(conn: quinn::Connection) {
+async fn monitor_link(
+    conn: quinn::Connection,
+    throttle: throttle::SharedThrottle,
+    throttle_mode: ThrottleMode,
+) {
     let mut monitor = LinkMonitor::new();
+    let mut quality = LinkQuality::new();
     let mut episode: Option<DegradationEpisode> = None;
     let mut interval = tokio::time::interval(LINK_SAMPLE_INTERVAL);
     // The first interval tick is immediate: consume it and take the loss
@@ -1296,6 +1316,24 @@ async fn monitor_link(conn: quinn::Connection) {
                 rtt_ms,
                 loss_rate * 100.0,
                 LINK_SAMPLE_INTERVAL
+            );
+        }
+        // Adaptive fidelity: the same sample feeds the tier tracker, which
+        // rewrites the bulk pacing cell on transitions (see
+        // network::link_quality).
+        if let Some(tier) = quality.sample(path.rtt, loss_rate) {
+            let rate = crate::rotation::effective_throttle_mbps(&throttle_mode, tier);
+            throttle::set_throttle(&throttle, rate);
+            info!(
+                "Adaptive fidelity: {} (bulk {})",
+                match tier {
+                    Tier::Proximity => "link measured close and clean, raising bulk throughput",
+                    Tier::Normal => "link no longer close, back to the default bulk pacing",
+                },
+                match rate {
+                    Some(mbps) => format!("{} Mbps", mbps),
+                    None => "unthrottled".to_string(),
+                }
             );
         }
         match monitor.check(path.rtt, loss_rate, Instant::now()) {

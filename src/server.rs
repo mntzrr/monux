@@ -101,8 +101,8 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     max_uncompressed_size_bytes: u64,
     rotation_tx: mpsc::Sender<rotation::RotationEvent>,
     mut rotation_rx: mpsc::Receiver<rotation::RotationEvent>,
-    motion_flush_interval: Option<Duration>,
-    bulk_throttle_mbps: Option<f64>,
+    motion_mode: rotation::MotionMode,
+    throttle_mode: rotation::ThrottleMode,
     mode: transport::NetworkMode,
     diagnostics: Arc<rotation::DiagnosticsMirror>,
     edge_client_tx: Option<watch::Sender<Vec<(SocketAddr, String)>>>,
@@ -116,7 +116,7 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     ).await;
 
     let mut rotation =
-        rotation::Rotation::new(grab_tx, output_handler, local_clipboard, &config_dir, rotation_tx, motion_flush_interval, bulk_throttle_mbps, mode, diagnostics).await?;
+        rotation::Rotation::new(grab_tx, output_handler, local_clipboard, &config_dir, rotation_tx, motion_mode, throttle_mode, mode, diagnostics).await?;
     if let Some(tx) = edge_client_tx {
         rotation.set_edge_client_publisher(tx);
     }
@@ -141,15 +141,26 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     // Pointer-motion coalescing flush timer (office mode, see --motion-hz).
     // The branch guard keeps it inert until motion has accumulated; after a
     // long idle the first tick fires immediately, so the first delta goes out
-    // without added delay and only sustained streams are coalesced.
-    let mut motion_tick =
-        time::interval(motion_flush_interval.unwrap_or(Duration::from_secs(3600)));
+    // without added delay and only sustained streams are coalesced. In
+    // Adaptive mode the interval is rebuilt whenever the current client's
+    // measured link tier changes (see the quality tick below).
+    let mut motion_tick = time::interval(
+        rotation
+            .motion_flush_interval()
+            .unwrap_or(Duration::from_secs(3600)),
+    );
     // The tick is only polled while motion is pending, so after an idle stretch
     // many periods count as "missed". Delay (not the default Burst) skips the
     // catch-up: one immediate flush after idle, then one per interval. With
     // Burst, the backlog of catch-up ticks would fire on every frame and
     // silently defeat the coalescing.
     motion_tick.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    // Adaptive-fidelity sampler (see network::link_quality): re-tunes the
+    // per-client bulk pacing cells and, through the motion-tick rebuild in its
+    // select arm, the coalescing rate for the current client's measured tier.
+    let mut quality_tick = time::interval(crate::network::link_quality::SAMPLE_INTERVAL);
+    // Skip the immediate first tick; let connections settle first.
+    quality_tick.tick().await;
     // Seed the diagnostics mirror so a SIGHUP before the first event still dumps.
     rotation.update_diagnostics();
     loop {
@@ -203,6 +214,20 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
             },
             _ = ping_tick.tick() => {
                 rotation.ping_tick().await;
+            },
+            _ = quality_tick.tick() => {
+                if rotation.sample_link_quality() {
+                    // The current client's tier changed: rebuild the motion
+                    // flush tick at the new rate (Adaptive mode; pinned
+                    // --motion-hz reports the same interval back, so the
+                    // rebuild is a no-op there).
+                    motion_tick = time::interval(
+                        rotation
+                            .motion_flush_interval()
+                            .unwrap_or(Duration::from_secs(3600)),
+                    );
+                    motion_tick.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+                }
             },
             _ = motion_tick.tick(), if rotation.motion_dirty() => {
                 rotation.flush_pending_motion().await;

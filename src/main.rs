@@ -272,22 +272,23 @@ struct ServerArgs {
     /// Target rate for forwarding pointer motion, in updates per second. Motion
     /// deltas are coalesced (summed losslessly) between updates and sent as
     /// unreliable datagrams with recent deltas repeated, so WiFi loss neither
-    /// stalls nor misplaces the cursor. The default of 250 is plenty for
-    /// office work; set 0 to forward every event as it comes (e.g. for gaming
-    /// with a high-polling-rate mouse).
-    #[arg(long, default_value_t = 250, value_name = "hz")]
-    motion_hz: u32,
+    /// stalls nor misplaces the cursor. Unset (the default): adaptive — 250
+    /// normally, raised to 500 while the link is measured close and clean.
+    /// Set a number to pin the rate, or 0 to forward every event as it comes
+    /// (e.g. for gaming with a high-polling-rate mouse).
+    #[arg(long, value_name = "hz")]
+    motion_hz: Option<u32>,
 
-    /// Pace clipboard/bulk transfers to this many megabits per second
-    /// (0 disables). QUIC stream priorities only order data inside the
-    /// connection; the kernel/WiFi driver queue below is FIFO, so an
-    /// unthrottled multi-MB clipboard transfer fills it and input packets
-    /// behind it wait for the whole backlog to drain (bufferbloat: RTT
-    /// spikes for the duration of the transfer). Pacing keeps that queue
-    /// short so input stays responsive, at the cost of slower large
-    /// clipboard transfers (5MB takes ~1s at 40Mbps).
-    #[arg(long, default_value_t = 40.0, value_name = "mbps", value_parser = parse_bulk_throttle)]
-    bulk_throttle_mbps: f64,
+    /// Pace clipboard/bulk transfers to this many megabits per second. QUIC
+    /// stream priorities only order data inside the connection; the
+    /// kernel/WiFi driver queue below is FIFO, so an unthrottled multi-MB
+    /// clipboard transfer fills it and input packets behind it wait for the
+    /// whole backlog to drain (bufferbloat: RTT spikes for the duration of
+    /// the transfer). Unset (the default): adaptive — 40 normally, raised to
+    /// 160 while the link is measured close and clean. Set a number to pin
+    /// the rate (5MB takes ~1s at 40Mbps), or 0 to disable pacing.
+    #[arg(long, value_name = "mbps", value_parser = parse_bulk_throttle)]
+    bulk_throttle_mbps: Option<f64>,
 
     /// Screen-edge switching (Hyprland only for now): switch input to a client
     /// when the cursor is pushed against this screen edge and dwells there.
@@ -355,16 +356,16 @@ struct ClientArgs {
     #[arg(long, default_value = "1.0", value_name = "scale", value_parser = parse_input_scale)]
     scroll_scale: f64,
 
-    /// Pace clipboard/bulk transfers to this many megabits per second
-    /// (0 disables). QUIC stream priorities only order data inside the
-    /// connection; the kernel/WiFi driver queue below is FIFO, so an
-    /// unthrottled multi-MB clipboard transfer fills it and input packets
-    /// behind it wait for the whole backlog to drain (bufferbloat: RTT
-    /// spikes for the duration of the transfer). Pacing keeps that queue
-    /// short so input stays responsive, at the cost of slower large
-    /// clipboard transfers (5MB takes ~1s at 40Mbps).
-    #[arg(long, default_value_t = 40.0, value_name = "mbps", value_parser = parse_bulk_throttle)]
-    bulk_throttle_mbps: f64,
+    /// Pace clipboard/bulk transfers to this many megabits per second. QUIC
+    /// stream priorities only order data inside the connection; the
+    /// kernel/WiFi driver queue below is FIFO, so an unthrottled multi-MB
+    /// clipboard transfer fills it and input packets behind it wait for the
+    /// whole backlog to drain (bufferbloat: RTT spikes for the duration of
+    /// the transfer). Unset (the default): adaptive — 40 normally, raised to
+    /// 160 while the link is measured close and clean. Set a number to pin
+    /// the rate (5MB takes ~1s at 40Mbps), or 0 to disable pacing.
+    #[arg(long, value_name = "mbps", value_parser = parse_bulk_throttle)]
+    bulk_throttle_mbps: Option<f64>,
 
     /// Switching BACK to the server by screen edge (Hyprland only for now):
     /// while this client has input, pushing the cursor against this screen
@@ -693,22 +694,38 @@ fn main() -> Result<()> {
                 .max_clipboard_size_kb
                 .checked_mul(1024)
                 .context("--max-clipboard-size-kb is too large")?;
-            let motion_flush_interval =
-                (args.motion_hz > 0).then(|| Duration::from_secs_f64(1.0 / args.motion_hz as f64));
-            if motion_flush_interval.is_some() {
-                info!(
-                    "Coalescing pointer motion to {} updates/s (--motion-hz 0 to disable)",
-                    args.motion_hz
-                );
-            }
-            let bulk_throttle_mbps =
-                (args.bulk_throttle_mbps > 0.0).then_some(args.bulk_throttle_mbps);
-            if let Some(mbps) = bulk_throttle_mbps {
-                info!(
-                    "Pacing bulk transfers to {} Mbps (--bulk-throttle-mbps 0 to disable)",
-                    mbps
-                );
-            }
+            let motion_mode = match args.motion_hz {
+                None => {
+                    info!(
+                        "Coalescing pointer motion adaptively: {} updates/s, raised to {} on a sustained close link (pin with --motion-hz; 0 disables)",
+                        monux::rotation::ADAPTIVE_MOTION_NORMAL_HZ,
+                        monux::rotation::ADAPTIVE_MOTION_PROXIMITY_HZ,
+                    );
+                    monux::rotation::MotionMode::Adaptive
+                }
+                Some(0) => monux::rotation::MotionMode::Pinned(None),
+                Some(hz) => {
+                    info!("Coalescing pointer motion to {} updates/s (pinned)", hz);
+                    monux::rotation::MotionMode::Pinned(Some(Duration::from_secs_f64(
+                        1.0 / hz as f64,
+                    )))
+                }
+            };
+            let throttle_mode = match args.bulk_throttle_mbps {
+                None => {
+                    info!(
+                        "Pacing bulk transfers adaptively: {} Mbps, raised to {} on a sustained close link (pin with --bulk-throttle-mbps; 0 disables)",
+                        monux::rotation::ADAPTIVE_THROTTLE_NORMAL_MBPS,
+                        monux::rotation::ADAPTIVE_THROTTLE_PROXIMITY_MBPS,
+                    );
+                    monux::rotation::ThrottleMode::Adaptive
+                }
+                Some(mbps) if mbps <= 0.0 => monux::rotation::ThrottleMode::Pinned(None),
+                Some(mbps) => {
+                    info!("Pacing bulk transfers to {} Mbps (pinned)", mbps);
+                    monux::rotation::ThrottleMode::Pinned(Some(mbps))
+                }
+            };
             // Screen-edge switching is opt-in: no --edge-map, no edge manager.
             let edge_map = match &args.edge_map {
                 Some(specs) => Some(monux::edge::parse_edge_map(specs)?),
@@ -733,8 +750,8 @@ fn main() -> Result<()> {
                     fingerprint,
                     max_clipboard_size_bytes,
                     mode,
-                    motion_flush_interval,
-                    bulk_throttle_mbps,
+                    motion_mode,
+                    throttle_mode,
                     edge_map,
                     Duration::from_millis(args.edge_dwell_ms),
                     !args.no_auto_update,
@@ -816,14 +833,21 @@ fn main() -> Result<()> {
                     args.mouse_scale, args.scroll_scale
                 );
             }
-            let bulk_throttle_mbps =
-                (args.bulk_throttle_mbps > 0.0).then_some(args.bulk_throttle_mbps);
-            if let Some(mbps) = bulk_throttle_mbps {
-                info!(
-                    "Pacing bulk transfers to {} Mbps (--bulk-throttle-mbps 0 to disable)",
-                    mbps
-                );
-            }
+            let throttle_mode = match args.bulk_throttle_mbps {
+                None => {
+                    info!(
+                        "Pacing bulk transfers adaptively: {} Mbps, raised to {} on a sustained close link (pin with --bulk-throttle-mbps; 0 disables)",
+                        monux::rotation::ADAPTIVE_THROTTLE_NORMAL_MBPS,
+                        monux::rotation::ADAPTIVE_THROTTLE_PROXIMITY_MBPS,
+                    );
+                    monux::rotation::ThrottleMode::Adaptive
+                }
+                Some(mbps) if mbps <= 0.0 => monux::rotation::ThrottleMode::Pinned(None),
+                Some(mbps) => {
+                    info!("Pacing bulk transfers to {} Mbps (pinned)", mbps);
+                    monux::rotation::ThrottleMode::Pinned(Some(mbps))
+                }
+            };
             // Screen-edge switching back to the server is opt-in: no
             // --edge-map, no edge detection. Client targets are validated at
             // startup ('auto' only), not at fire time.
@@ -841,7 +865,7 @@ fn main() -> Result<()> {
                     from_discovery,
                     args.mouse_scale,
                     args.scroll_scale,
-                    bulk_throttle_mbps,
+                    throttle_mode,
                     edge_map,
                     Duration::from_millis(args.edge_dwell_ms),
                     !args.no_auto_update,
@@ -980,8 +1004,8 @@ async fn server(
     fingerprint: Arc<Mutex<Option<String>>>,
     max_clipboard_size_bytes: u64,
     mode: NetworkMode,
-    motion_flush_interval: Option<Duration>,
-    bulk_throttle_mbps: Option<f64>,
+    motion_mode: monux::rotation::MotionMode,
+    throttle_mode: monux::rotation::ThrottleMode,
     edge_map: Option<monux::edge::EdgeMap>,
     edge_dwell: Duration,
     auto_update: bool,
@@ -1088,8 +1112,8 @@ async fn server(
             10 * max_clipboard_size_bytes,
             rotation_tx,
             rotation_rx,
-            motion_flush_interval,
-            bulk_throttle_mbps,
+            motion_mode,
+            throttle_mode,
             mode,
             diagnostics,
             edge_client_tx,
@@ -1257,7 +1281,7 @@ async fn client(
     from_discovery: bool,
     mouse_scale: f64,
     scroll_scale: f64,
-    bulk_throttle_mbps: Option<f64>,
+    throttle_mode: monux::rotation::ThrottleMode,
     edge_map: Option<monux::edge::EdgeMap>,
     edge_dwell: Duration,
     auto_update: bool,
@@ -1324,7 +1348,7 @@ async fn client(
                 mouse_scale,
                 scroll_scale,
                 control_state.clone(),
-                bulk_throttle_mbps,
+                throttle_mode,
                 edge_map.clone(),
                 edge_dwell,
             ) => {

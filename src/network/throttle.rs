@@ -1,5 +1,7 @@
 //! Token-bucket pacing for bulk (clipboard) transfers (--bulk-throttle-mbps).
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -9,6 +11,21 @@ use tracing::trace;
 /// scheduler jitter without meaningfully draining the driver queue. The
 /// carried debt is amortized into the next frame's pause instead.
 const MIN_SLEEP: Duration = Duration::from_millis(1);
+
+/// Live-adjustable pacing rate for a bulk writer (adaptive fidelity): the f64
+/// mbps as raw bits; 0.0 means unthrottled. The link-quality tracker rewrites
+/// it as the measured tier changes; the writer reads it per frame.
+pub type SharedThrottle = Arc<AtomicU64>;
+
+/// A shared rate cell initialized from an mbps setting (None = unthrottled).
+pub fn shared_throttle(mbps: Option<f64>) -> SharedThrottle {
+    Arc::new(AtomicU64::new(mbps.unwrap_or(0.0).to_bits()))
+}
+
+/// Updates a shared rate cell (None = unthrottled).
+pub fn set_throttle(cell: &SharedThrottle, mbps: Option<f64>) {
+    cell.store(mbps.unwrap_or(0.0).to_bits(), Ordering::Relaxed);
+}
 
 /// Token-bucket pacer for a bulk writer task.
 ///
@@ -26,10 +43,11 @@ const MIN_SLEEP: Duration = Duration::from_millis(1);
 /// always goes out whole and immediately (frames are never split, and a lone
 /// frame — a header or another small message — is never delayed); pacing
 /// only inserts quiet time BETWEEN frames, so the FIFO drains before the
-/// next payload arrives.
+/// next payload arrives. The rate is read from the shared cell on every
+/// frame, so a tier change takes effect mid-transfer.
 pub struct BulkThrottle {
-    /// Send-time cost of one byte at the configured rate.
-    secs_per_byte: f64,
+    /// Shared mbps (f64 bits; 0.0 = unthrottled); see SharedThrottle.
+    rate: SharedThrottle,
     /// Unpaid send-time: the writer is this far ahead of the configured rate
     /// and owes the link this much quiet time before the next frame.
     debt_secs: f64,
@@ -38,10 +56,10 @@ pub struct BulkThrottle {
 }
 
 impl BulkThrottle {
-    /// A pacer for `mbps` megabits (1e6 bits) per second.
-    pub fn new(mbps: f64) -> Self {
+    /// A pacer reading its rate from the shared cell.
+    pub fn new(rate: SharedThrottle) -> Self {
         BulkThrottle {
-            secs_per_byte: 8.0 / (mbps * 1_000_000.0),
+            rate,
             debt_secs: 0.0,
             last: Instant::now(),
         }
@@ -49,12 +67,22 @@ impl BulkThrottle {
 
     /// Charges a just-written frame of `len` bytes and returns how long to
     /// sleep before writing the next one (ZERO while the carried debt is
-    /// below MIN_SLEEP). Idle time since the last charge repays debt first;
-    /// it never builds credit, so an idle link doesn't bank a full-speed blast.
+    /// below MIN_SLEEP, or while the cell says unthrottled). Idle time since
+    /// the last charge repays debt first; it never builds credit, so an idle
+    /// link doesn't bank a full-speed blast.
     pub fn charge(&mut self, len: usize, now: Instant) -> Duration {
+        let mbps = f64::from_bits(self.rate.load(Ordering::Relaxed));
+        if mbps <= 0.0 {
+            // Unthrottled: no debt accrues, and the reprieve fully repays any
+            // debt from a previously paced rate.
+            self.debt_secs = 0.0;
+            self.last = now;
+            return Duration::ZERO;
+        }
+        let secs_per_byte = 8.0 / (mbps * 1_000_000.0);
         self.debt_secs = (self.debt_secs - now.duration_since(self.last).as_secs_f64()).max(0.0);
         self.last = now;
-        self.debt_secs += len as f64 * self.secs_per_byte;
+        self.debt_secs += len as f64 * secs_per_byte;
         if self.debt_secs < MIN_SLEEP.as_secs_f64() {
             Duration::ZERO
         } else {
@@ -83,14 +111,14 @@ impl BulkThrottle {
 pub fn spawn_bulk_writer<F, Fut>(
     mut send_stream: quinn::SendStream,
     mut rx: mpsc::Receiver<Vec<u8>>,
-    throttle_mbps: Option<f64>,
+    throttle: SharedThrottle,
     peer: std::net::SocketAddr,
     on_failure: F,
 ) where
     F: FnOnce(usize, quinn::WriteError) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    let mut throttle = throttle_mbps.map(BulkThrottle::new);
+    let mut throttle = BulkThrottle::new(throttle);
     tokio::task::spawn(async move {
         while let Some(bytes) = rx.recv().await {
             trace!("Sending {} byte bulk message to {}", bytes.len(), peer);
@@ -98,11 +126,9 @@ pub fn spawn_bulk_writer<F, Fut>(
                 on_failure(bytes.len(), e).await;
                 return;
             }
-            if let Some(throttle) = &mut throttle {
-                let wait = throttle.charge(bytes.len(), Instant::now());
-                if !wait.is_zero() {
-                    tokio::time::sleep(wait).await;
-                }
+            let wait = throttle.charge(bytes.len(), Instant::now());
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
             }
         }
     });
@@ -115,7 +141,7 @@ mod tests {
     #[test]
     fn rate_conversion_paces_a_large_frame() {
         // 40 Mbps = 5,000,000 bytes/s: a 5 MB frame costs just over 1 s.
-        let mut t = BulkThrottle::new(40.0);
+        let mut t = BulkThrottle::new(shared_throttle(Some(40.0)));
         let t0 = Instant::now();
         let sleep = t.charge(5 * 1024 * 1024, t0);
         let expected = 5.0 * 1024.0 * 1024.0 / 5_000_000.0;
@@ -129,7 +155,7 @@ mod tests {
     #[test]
     fn small_frames_pass_immediately() {
         // A 100-byte header at 40 Mbps costs 20µs: below MIN_SLEEP, carried.
-        let mut t = BulkThrottle::new(40.0);
+        let mut t = BulkThrottle::new(shared_throttle(Some(40.0)));
         let t0 = Instant::now();
         assert_eq!(t.charge(100, t0), Duration::ZERO);
     }
@@ -138,7 +164,7 @@ mod tests {
     fn deficit_carries_until_one_real_sleep() {
         // Back-to-back small frames accumulate their sub-millisecond costs;
         // once the debt reaches MIN_SLEEP it is paid with a single sleep.
-        let mut t = BulkThrottle::new(40.0);
+        let mut t = BulkThrottle::new(shared_throttle(Some(40.0)));
         let t0 = Instant::now();
         let mut slept = Duration::ZERO;
         for i in 0..50 {
@@ -157,7 +183,7 @@ mod tests {
 
     #[test]
     fn idle_time_repays_debt_without_banking_credit() {
-        let mut t = BulkThrottle::new(40.0);
+        let mut t = BulkThrottle::new(shared_throttle(Some(40.0)));
         let t0 = Instant::now();
         // 1 ms of debt, slept off.
         assert_eq!(t.charge(5000, t0), Duration::from_millis(1));
@@ -174,7 +200,7 @@ mod tests {
         // Each frame paces by exactly its own cost; real write time between
         // frames only makes the wall-clock rate slightly UNDER the configured
         // one — the right side to err on.
-        let mut t = BulkThrottle::new(40.0);
+        let mut t = BulkThrottle::new(shared_throttle(Some(40.0)));
         let t0 = Instant::now();
         let frame = 1024 * 1024;
         let mut now = t0;
@@ -192,5 +218,23 @@ mod tests {
             "4 MB at 40 Mbps should pace to {expected}s, got {:?}",
             total_sleep
         );
+    }
+
+    #[test]
+    fn rate_changes_take_effect_mid_stream() {
+        let cell = shared_throttle(Some(40.0));
+        let mut t = BulkThrottle::new(cell.clone());
+        let t0 = Instant::now();
+        // 1 MB at 40 Mbps costs ~0.21s...
+        let paced = t.charge(1024 * 1024, t0);
+        assert!(paced > Duration::from_millis(100));
+        // ...but after the cell is raised to 400 Mbps the same frame costs
+        // ~0.02s (below nothing meaningful), and unthrottling costs nothing.
+        set_throttle(&cell, Some(400.0));
+        let t1 = t0 + paced + Duration::from_millis(1);
+        let fast = t.charge(1024 * 1024, t1);
+        assert!(fast < paced / 5, "400 Mbps should be much cheaper: {:?}", fast);
+        set_throttle(&cell, None);
+        assert_eq!(t.charge(1024 * 1024, t1 + Duration::from_millis(1)), Duration::ZERO);
     }
 }

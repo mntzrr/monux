@@ -18,7 +18,8 @@ use crate::clipboard::{CLIPBOARD_SERVE_TIMEOUT_SECS, data, server};
 use crate::device;
 use crate::edge;
 use crate::msgs::{bulk, event};
-use crate::network::throttle;
+use crate::network::link_quality::{LinkQuality, Tier};
+use crate::network::throttle::{self, SharedThrottle};
 use crate::network::transport::NetworkMode;
 
 /// If the selected client reconnects within this long after being removed, then reselect it
@@ -27,6 +28,46 @@ use crate::network::transport::NetworkMode;
 /// drop via the 25s idle timeout needs ~25s to detect it plus an immediate first reconnect
 /// attempt; 45s leaves margin for a couple of backoff steps on top of that worst case.
 const REMOVED_CLIENT_RECOVERY_DEADLINE: Duration = Duration::from_secs(45);
+
+/// How the pointer-motion flush rate is chosen (see --motion-hz).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MotionMode {
+    /// 250 Hz normally, raised to 500 Hz while the current client's link
+    /// measures in the proximity tier (adaptive fidelity, the default).
+    Adaptive,
+    /// Pinned by an explicit --motion-hz: Some(interval), or None for
+    /// --motion-hz 0 (forward every event as it comes, e.g. gaming).
+    Pinned(Option<Duration>),
+}
+
+/// How the per-connection bulk pacing rate is chosen (see --bulk-throttle-mbps).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ThrottleMode {
+    /// 40 Mbps normally, raised to 160 Mbps while the connection's link
+    /// measures in the proximity tier (adaptive fidelity, the default).
+    Adaptive,
+    /// Pinned by an explicit --bulk-throttle-mbps: Some(mbps), or None for 0
+    /// (unthrottled).
+    Pinned(Option<f64>),
+}
+
+/// Adaptive-fidelity rates (see MotionMode/ThrottleMode and
+/// network::link_quality for the tier state machine).
+pub const ADAPTIVE_MOTION_NORMAL_HZ: u32 = 250;
+pub const ADAPTIVE_MOTION_PROXIMITY_HZ: u32 = 500;
+pub const ADAPTIVE_THROTTLE_NORMAL_MBPS: f64 = 40.0;
+pub const ADAPTIVE_THROTTLE_PROXIMITY_MBPS: f64 = 160.0;
+
+/// The effective bulk pacing rate for a link tier under a throttle mode.
+pub fn effective_throttle_mbps(mode: &ThrottleMode, tier: Tier) -> Option<f64> {
+    match mode {
+        ThrottleMode::Pinned(mbps) => *mbps,
+        ThrottleMode::Adaptive => Some(match tier {
+            Tier::Normal => ADAPTIVE_THROTTLE_NORMAL_MBPS,
+            Tier::Proximity => ADAPTIVE_THROTTLE_PROXIMITY_MBPS,
+        }),
+    }
+}
 
 /// Name of the file (inside the config dir) recording the fingerprint of the
 /// client currently switched active. Written on every switch to a client and
@@ -197,6 +238,21 @@ impl LivenessState {
             recovery_pongs: 0,
         }
     }
+}
+
+/// Per-client adaptive-fidelity state (see network::link_quality), keyed by
+/// endpoint in lockstep with `clients` (inserted on add, removed on removal).
+/// A separate map from ClientInfo so the state machine is testable —
+/// ClientInfo embeds quinn handles and can't be fabricated in a unit test.
+struct ClientLinkState {
+    /// The tier tracker fed by connection-stat samples.
+    quality: LinkQuality,
+    /// Counters the windowed loss rate is diffed against (last sample).
+    last_sent: u64,
+    last_lost: u64,
+    /// The live pacing-rate cell shared with this client's bulk writer task;
+    /// rewritten on every tier transition.
+    throttle: SharedThrottle,
 }
 
 /// Whether the client has missed enough pings to be declared silent
@@ -563,12 +619,16 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// Reusable serialization scratch for motion datagrams
     /// (try_send_motion_datagram); cleared before each datagram.
     datagram_scratch: Vec<u8>,
-    /// Flush interval for motion coalescing; None = forward every batch
-    /// immediately (e.g. --motion-hz 0 for gaming).
-    motion_flush_interval: Option<Duration>,
-    /// Pacing rate for the per-client bulk writers (--bulk-throttle-mbps);
-    /// None = unthrottled. Each writer task gets its own token bucket.
-    bulk_throttle_mbps: Option<f64>,
+    /// How the motion flush rate is chosen (see MotionMode); the interval
+    /// itself is derived on demand by motion_flush_interval().
+    motion_mode: MotionMode,
+    /// How the per-client bulk pacing rates are chosen (see ThrottleMode).
+    throttle_mode: ThrottleMode,
+    /// Per-client adaptive-fidelity state, keyed by endpoint in lockstep with
+    /// `clients` (like `liveness`): a separate map so the state machine is
+    /// testable — ClientInfo embeds quinn handles and can't be fabricated in
+    /// a unit test.
+    link_quality: HashMap<SocketAddr, ClientLinkState>,
     /// When the last next/prev switch was processed (see SWITCH_DEBOUNCE).
     last_switch_at: Option<Instant>,
     /// Per-client liveness tracking for the Ping/Pong check (see
@@ -779,8 +839,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         local_clipboard: Option<server::LocalClipboard>,
         config_dir: &Path,
         rotation_tx: mpsc::Sender<RotationEvent>,
-        motion_flush_interval: Option<Duration>,
-        bulk_throttle_mbps: Option<f64>,
+        motion_mode: MotionMode,
+        throttle_mode: ThrottleMode,
         mode: NetworkMode,
         diagnostics: Arc<DiagnosticsMirror>,
     ) -> Result<Self> {
@@ -817,8 +877,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             motion_history: VecDeque::new(),
             serialize_scratch: Vec::new(),
             datagram_scratch: Vec::new(),
-            motion_flush_interval,
-            bulk_throttle_mbps,
+            motion_mode,
+            throttle_mode,
+            link_quality: HashMap::new(),
             last_switch_at: None,
             liveness: HashMap::new(),
             pong_miss_limit: match mode {
@@ -1027,13 +1088,28 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         // payload by writing queued byte blobs sequentially. The queue is
         // bounded (bulk::BULK_QUEUE_CAPACITY): senders fail fast when the
         // client can't drain, and the client is dropped like a write failure.
+        // Fresh adaptive-fidelity state for the (re)connection, kept in
+        // lockstep with the clients entry (see handle_client_removal): the
+        // bulk pacing cell starts at the Normal-tier rate and is rewritten by
+        // the link sampler on every measured tier transition.
+        let throttle_cell =
+            throttle::shared_throttle(effective_throttle_mbps(&self.throttle_mode, Tier::Normal));
+        self.link_quality.insert(
+            endpoint,
+            ClientLinkState {
+                quality: LinkQuality::new(),
+                last_sent: 0,
+                last_lost: 0,
+                throttle: throttle_cell.clone(),
+            },
+        );
         let (bulk_tx, bulk_rx) = mpsc::channel::<Vec<u8>>(bulk::BULK_QUEUE_CAPACITY);
         {
             let rotation_tx = self.rotation_tx.clone();
             throttle::spawn_bulk_writer(
                 bulk_send,
                 bulk_rx,
-                self.bulk_throttle_mbps,
+                throttle_cell,
                 endpoint,
                 move |_len, e| async move {
                     warn!("Bulk stream to {} failed, removing client: {:?}", endpoint, e);
@@ -2618,6 +2694,89 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         self.motion_dirty
     }
 
+    /// The motion flush interval currently in effect: pinned by --motion-hz,
+    /// or derived from the current client's measured link tier in Adaptive
+    /// mode (None = forward every event as it comes). Read on demand: in
+    /// Adaptive mode the server events loop rebuilds its flush tick whenever
+    /// the current client's tier changes (see sample_link_quality).
+    pub fn motion_flush_interval(&self) -> Option<Duration> {
+        match self.motion_mode {
+            MotionMode::Pinned(interval) => interval,
+            MotionMode::Adaptive => Some(Duration::from_secs_f64(
+                1.0 / match self.current_client_tier() {
+                    Tier::Normal => ADAPTIVE_MOTION_NORMAL_HZ,
+                    Tier::Proximity => ADAPTIVE_MOTION_PROXIMITY_HZ,
+                } as f64,
+            )),
+        }
+    }
+
+    /// The measured tier of the current client's link, Normal when local (or
+    /// its state hasn't been sampled yet).
+    fn current_client_tier(&self) -> Tier {
+        self.current_client
+            .and_then(|endpoint| self.link_quality.get(&endpoint))
+            .map(|state| state.quality.tier())
+            .unwrap_or(Tier::Normal)
+    }
+
+    /// Samples every client's connection stats for the adaptive-fidelity
+    /// tiers (see network::link_quality): feeds the per-client tracker,
+    /// rewrites the bulk pacing cell on tier transitions, and returns true
+    /// when the CURRENT client's tier changed — the caller then rebuilds the
+    /// motion flush tick at the new rate. Called on a timer from the server
+    /// events loop.
+    pub fn sample_link_quality(&mut self) -> bool {
+        let mut current_tier_changed = false;
+        for client in &self.clients {
+            let Some(state) = self.link_quality.get_mut(&client.endpoint) else {
+                continue;
+            };
+            let path = client.conn.stats().path;
+            let sent = path.sent_packets;
+            let lost = path.lost_packets;
+            let delta_sent = sent.saturating_sub(state.last_sent);
+            let delta_lost = lost.saturating_sub(state.last_lost);
+            state.last_sent = sent;
+            state.last_lost = lost;
+            // An idle window carries too few packets for its loss rate to
+            // mean anything (one lost keepalive would read as >10% loss):
+            // judge those windows on RTT alone.
+            let loss_rate = if delta_sent >= 20 {
+                delta_lost as f64 / delta_sent as f64
+            } else {
+                0.0
+            };
+            let Some(tier) = state.quality.sample(path.rtt, loss_rate) else {
+                continue;
+            };
+            throttle::set_throttle(
+                &state.throttle,
+                effective_throttle_mbps(&self.throttle_mode, tier),
+            );
+            if self.current_client == Some(client.endpoint) {
+                current_tier_changed = true;
+            }
+            info!(
+                "Adaptive fidelity for {}: {} (motion {} Hz, bulk {})",
+                client.endpoint,
+                match tier {
+                    Tier::Proximity => "link measured close and clean, raising fidelity",
+                    Tier::Normal => "link no longer close, back to defaults",
+                },
+                match tier {
+                    Tier::Proximity => ADAPTIVE_MOTION_PROXIMITY_HZ,
+                    Tier::Normal => ADAPTIVE_MOTION_NORMAL_HZ,
+                },
+                match effective_throttle_mbps(&self.throttle_mode, tier) {
+                    Some(mbps) => format!("{} Mbps", mbps),
+                    None => "unthrottled".to_string(),
+                }
+            );
+        }
+        current_tier_changed
+    }
+
     /// Sends any coalesced pointer motion to the active client as a single
     /// batch (see --motion-hz). No-op when nothing is pending.
     pub async fn flush_pending_motion(&mut self) {
@@ -2808,7 +2967,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             let events = batch.events;
             keytrace_route(&events, "forward to client");
             if is_pure_pointer_motion(&events) {
-                if self.motion_flush_interval.is_some() {
+                if self.motion_flush_interval().is_some() {
                     // Office-mode coalescing (--motion-hz): sum the deltas into
                     // the accumulator; the flush timer forwards them at the
                     // configured rate as datagrams. Lossless for the
@@ -2993,6 +3152,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         // with the clients list (a removal for a never-added endpoint just
         // finds no entry).
         self.liveness.remove(endpoint);
+        self.link_quality.remove(endpoint);
         self.edge_info_sent.remove(endpoint);
         // Always refetch the idx to avoid issues if there was an await in which the client was
         // removed behind our back.
@@ -3428,8 +3588,8 @@ mod tests {
             None,
             &dir,
             rotation_tx,
-            None,
-            None,
+            MotionMode::Pinned(None),
+            ThrottleMode::Pinned(None),
             NetworkMode::Local,
             Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
@@ -3481,8 +3641,8 @@ mod tests {
             None,
             &dir,
             rotation_tx,
-            Some(Duration::from_millis(8)),
-            None,
+            MotionMode::Pinned(Some(Duration::from_millis(8))),
+            ThrottleMode::Pinned(None),
             NetworkMode::Local,
             Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
@@ -3534,8 +3694,8 @@ mod tests {
             None,
             &dir,
             rotation_tx,
-            None,
-            None,
+            MotionMode::Pinned(None),
+            ThrottleMode::Pinned(None),
             NetworkMode::Local,
             Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
@@ -3590,8 +3750,8 @@ mod tests {
             None,
             &dir,
             rotation_tx,
-            None,
-            None,
+            MotionMode::Pinned(None),
+            ThrottleMode::Pinned(None),
             NetworkMode::Local,
             Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
@@ -3619,8 +3779,8 @@ mod tests {
             None,
             &dir,
             rotation_tx,
-            None,
-            None,
+            MotionMode::Pinned(None),
+            ThrottleMode::Pinned(None),
             NetworkMode::Local,
             Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
@@ -3902,8 +4062,8 @@ mod tests {
             None,
             &dir,
             rotation_tx,
-            None,
-            None,
+            MotionMode::Pinned(None),
+            ThrottleMode::Pinned(None),
             NetworkMode::Local,
             Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
@@ -3940,8 +4100,8 @@ mod tests {
             None,
             &dir,
             rotation_tx,
-            None,
-            None,
+            MotionMode::Pinned(None),
+            ThrottleMode::Pinned(None),
             NetworkMode::Local,
             Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
@@ -3978,8 +4138,8 @@ mod tests {
             None,
             &dir,
             rotation_tx,
-            None,
-            None,
+            MotionMode::Pinned(None),
+            ThrottleMode::Pinned(None),
             NetworkMode::Local,
             Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
@@ -4026,14 +4186,132 @@ mod tests {
             None,
             &dir,
             rotation_tx,
-            None,
-            None,
+            MotionMode::Pinned(None),
+            ThrottleMode::Pinned(None),
             NetworkMode::Local,
             Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
         .await
         .unwrap();
         (dir, rotation)
+    }
+
+    /// Builds a rotation with adaptive motion/throttle for link-tier tests.
+    async fn adaptive_rotation(name: &str) -> (PathBuf, Rotation<StubOutput>) {
+        let dir = temp_dir(name);
+        let (grab_tx, _grab_rx) = watch::channel(device::GrabState {
+            client_active: false,
+            paused: false,
+        });
+        let (rotation_tx, _rotation_rx) = mpsc::channel(8);
+        let rotation = Rotation::new(
+            grab_tx,
+            StubOutput { written: 0, released: 0 },
+            None,
+            &dir,
+            rotation_tx,
+            MotionMode::Adaptive,
+            ThrottleMode::Adaptive,
+            NetworkMode::Local,
+            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
+        )
+        .await
+        .unwrap();
+        (dir, rotation)
+    }
+
+    #[test]
+    fn adaptive_throttle_rates_by_tier() {
+        assert_eq!(
+            effective_throttle_mbps(&ThrottleMode::Adaptive, Tier::Normal),
+            Some(ADAPTIVE_THROTTLE_NORMAL_MBPS)
+        );
+        assert_eq!(
+            effective_throttle_mbps(&ThrottleMode::Adaptive, Tier::Proximity),
+            Some(ADAPTIVE_THROTTLE_PROXIMITY_MBPS)
+        );
+        // Pinned modes ignore the tier entirely.
+        assert_eq!(
+            effective_throttle_mbps(&ThrottleMode::Pinned(Some(12.0)), Tier::Proximity),
+            Some(12.0)
+        );
+        assert_eq!(
+            effective_throttle_mbps(&ThrottleMode::Pinned(None), Tier::Proximity),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn adaptive_motion_interval_tracks_the_current_client_tier() {
+        let (dir, mut rotation) = adaptive_rotation("adaptive-motion").await;
+        // Local (no current client): the Normal rate.
+        let normal = 1.0 / ADAPTIVE_MOTION_NORMAL_HZ as f64;
+        assert_eq!(
+            rotation.motion_flush_interval(),
+            Some(Duration::from_secs_f64(normal))
+        );
+        // Register a client link-state and make it the current client: the
+        // interval follows its measured tier.
+        let endpoint: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let cell = throttle::shared_throttle(Some(ADAPTIVE_THROTTLE_NORMAL_MBPS));
+        rotation.link_quality.insert(
+            endpoint,
+            ClientLinkState {
+                quality: LinkQuality::new(),
+                last_sent: 0,
+                last_lost: 0,
+                throttle: cell.clone(),
+            },
+        );
+        rotation.current_client = Some(endpoint);
+        assert_eq!(
+            rotation.motion_flush_interval(),
+            Some(Duration::from_secs_f64(normal))
+        );
+        // Three consecutive good samples promote the link; the interval drops
+        // to the Proximity rate and the bulk cell is rewritten.
+        let good_rtt = crate::network::link_quality::GOOD_RTT;
+        for _ in 0..crate::network::link_quality::PROMOTE_SAMPLES {
+            rotation
+                .link_quality
+                .get_mut(&endpoint)
+                .unwrap()
+                .quality
+                .sample(good_rtt, 0.0);
+        }
+        assert_eq!(
+            rotation.motion_flush_interval(),
+            Some(Duration::from_secs_f64(
+                1.0 / ADAPTIVE_MOTION_PROXIMITY_HZ as f64
+            ))
+        );
+        // A bad sample demotes immediately.
+        rotation
+            .link_quality
+            .get_mut(&endpoint)
+            .unwrap()
+            .quality
+            .sample(crate::network::link_quality::BAD_RTT + Duration::from_millis(1), 0.0);
+        assert_eq!(
+            rotation.motion_flush_interval(),
+            Some(Duration::from_secs_f64(normal))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn pinned_motion_ignores_the_tier() {
+        let (dir, rotation) = clipboard_rotation("pinned-motion").await;
+        // Pinned(None) = --motion-hz 0: every event, never an interval.
+        assert_eq!(rotation.motion_flush_interval(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sample_link_quality_without_clients_is_quiet() {
+        let (dir, mut rotation) = adaptive_rotation("adaptive-sample-empty").await;
+        assert!(!rotation.sample_link_quality());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -4292,8 +4570,8 @@ mod tests {
             None,
             &dir,
             rotation_tx,
-            None,
-            None,
+            MotionMode::Pinned(None),
+            ThrottleMode::Pinned(None),
             NetworkMode::Local,
             Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
@@ -4333,8 +4611,8 @@ mod tests {
             None,
             &dir,
             rotation_tx,
-            None,
-            None,
+            MotionMode::Pinned(None),
+            ThrottleMode::Pinned(None),
             NetworkMode::Local,
             diagnostics.clone(),
         )
@@ -4409,8 +4687,8 @@ mod tests {
             None,
             &dir,
             rotation_tx,
-            None,
-            None,
+            MotionMode::Pinned(None),
+            ThrottleMode::Pinned(None),
             NetworkMode::Local,
             diagnostics.clone(),
         )
@@ -4561,8 +4839,8 @@ mod tests {
             None,
             &dir,
             rotation_tx,
-            None,
-            None,
+            MotionMode::Pinned(None),
+            ThrottleMode::Pinned(None),
             mode,
             Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
         )
