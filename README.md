@@ -260,7 +260,12 @@ Latency-sensitive input shares the link with bulk clipboard traffic, and QUIC's 
 
 When the machines sit next to each other, the link should feel like it. Both endpoints sample their connection's RTT and loss (server: every 5s per client; client: every 15s): a link that stays at or under 15ms RTT and 1% loss for three consecutive samples is promoted to the **proximity tier** — pointer motion rises 250→500 Hz, bulk pacing rises 40→160 Mbps — and one bad sample (over 50ms or 2% loss) snaps straight back. Explicit `--motion-hz` / `--bulk-throttle-mbps` flags pin the rate and opt out of adaptation.
 
-The other half of proximity is the *path*: everything normally goes via the router even when the machines are arm's-length apart. monux advertises and prefers **direct, routerless links** — plug an Ethernet cable between the machines (both ends auto-assign link-local addresses, no DHCP or config needed) and mDNS discovery will steer the connection over it automatically. A server-hosted WiFi hotspot (`nmcli device wifi hotspot`) works the same way. Connecting by hand with `monux client <ip>` always overrides the preference.
+The other half of proximity is the *path*: everything normally goes via the router even when the machines are arm's-length apart. monux can steer the connection onto a **direct, routerless link** instead, in two ways:
+
+- **A hosted hotspot (no cable)**: `sudo monux system setup --hotspot` on the server creates a 'monux-direct' WiFi hotspot (checked against the card's AP support) and prints the join command; run the printed `sudo monux system setup --hotspot-join '<ssid>' '<psk>'` on the client. The client re-associates to the hotspot — its old WiFi profile returns automatically when the hotspot is off — and its internet keeps working, NATed through the server. Discovery then prefers the direct link automatically. `monux system uninstall` removes the profile on either machine. Note the hotspot shares the router's channel on a single-radio card: it removes the router's buffering and other clients from the path, not the band's airtime contention.
+- **A plain Ethernet cable**: plug it between the machines (both ends auto-assign link-local addresses, no DHCP or config needed) and mDNS discovery steers the connection over it automatically.
+
+Connecting by hand with `monux client <ip>` always overrides the preference.
 
 When the link is degraded, monux says so in several places: a desktop notification (at most once per 5 minutes, plus once on recovery), the client's `Link stats:` / `Link degraded:` log lines (every 15s sample), and the server's 10-second input-status heartbeat (`Link to <client> is degraded: rtt=...`, only while above the threshold). If you see sporadic RTT spikes on WiFi, the checklist:
 

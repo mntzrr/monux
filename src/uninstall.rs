@@ -145,6 +145,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 fn execute(plan: &Plan) {
     remove_root_owned(&plan.root_owned);
     remove_qos_marking();
+    remove_hotspot_profile();
 
     for path in &plan.user_binaries {
         match fs::remove_file(path) {
@@ -250,6 +251,30 @@ fn remove_qos_marking() {
             .status();
     }
     println!("Removed DSCP QoS marking rules (if any were installed).");
+}
+
+/// Removes the 'monux-direct' NetworkManager hotspot profile 'monux system
+/// setup --hotspot/--hotspot-join' installs. Self-describing and idempotent
+/// (deleting a missing profile just errors, ignored). Same non-interactive
+/// rule as the QoS cleanup: only attempted when sudo won't prompt.
+fn remove_hotspot_profile() {
+    let sudo_ready = Command::new("sudo")
+        .args(["-n", "true"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !sudo_ready {
+        println!(
+            "note: the '{}' NetworkManager profile (if installed) was left in place; remove it with:",
+            setup::HOTSPOT_CON_NAME
+        );
+        println!("  sudo nmcli connection delete {}", setup::HOTSPOT_CON_NAME);
+        return;
+    }
+    let _ = Command::new("sudo")
+        .args(["nmcli", "connection", "delete", setup::HOTSPOT_CON_NAME])
+        .status();
+    println!("Removed the '{}' NetworkManager profile (if it was installed).", setup::HOTSPOT_CON_NAME);
 }
 
 /// Asks any running monux server and client to shut down gracefully, waiting

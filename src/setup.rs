@@ -16,6 +16,10 @@
 //! - DSCP CS6 netfilter marking of monux's UDP traffic (the AP/router hop
 //!   picks its downlink queue from each packet's DSCP; quinn overwrites the
 //!   TOS byte per packet, so only netfilter can set it)
+//! - with `--hotspot`, a 'monux-direct' WiFi hotspot hosted by this machine
+//!   (the KVM link then bypasses the router; the peer is NATed through this
+//!   machine so its internet keeps working); with `--hotspot-join`, this
+//!   machine joins the other machine's hotspot
 //! - with `--autostart`, a per-user systemd service starting monux with the
 //!   graphical session (the only step that is NOT machine tuning; off by
 //!   default)
@@ -30,6 +34,11 @@ pub(crate) const NM_POWERSAVE_CONF_PATH: &str =
 pub(crate) const UDEV_RULE_PATH: &str = "/etc/udev/rules.d/99-monux-uinput.rules";
 pub(crate) const MODULES_LOAD_PATH: &str = "/etc/modules-load.d/monux-uinput.conf";
 pub(crate) const SYSCTL_BUF_CONF_PATH: &str = "/etc/sysctl.d/90-monux-udp-buffers.conf";
+
+/// Name of the NetworkManager connection profile for the direct, routerless
+/// KVM link (see setup_hotspot / setup_hotspot_join). One name for both roles
+/// keeps uninstall trivial: delete the profile.
+pub(crate) const HOTSPOT_CON_NAME: &str = "monux-direct";
 
 /// Where per-user systemd units live, relative to the target user's home.
 const SYSTEMD_USER_UNIT_DIR: &str = ".config/systemd/user";
@@ -459,7 +468,7 @@ fn sysctl_buf_conf_content() -> String {
     )
 }
 
-pub fn run(autostart: Option<Autostart>) -> Result<()> {
+pub fn run(autostart: Option<Autostart>, hotspot: bool, hotspot_join: Option<(String, String)>) -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         // Reaching here non-root means auto-elevation was opted out of
         // (MONUX_NO_ELEVATE). sudo resets PATH, so 'sudo monux system setup' often
@@ -476,6 +485,15 @@ pub fn run(autostart: Option<Autostart>) -> Result<()> {
     setup_wifi_powersave(&mut failures);
     setup_socket_buffers(&mut failures);
     setup_qos_marking(&mut failures);
+    match (hotspot, hotspot_join) {
+        (true, Some(_)) => {
+            failures += 1;
+            println!("[fail] hotspot: --hotspot and --hotspot-join are opposite roles; pass only one");
+        }
+        (true, None) => setup_hotspot(&mut failures),
+        (false, Some((ssid, psk))) => setup_hotspot_join(&ssid, &psk, &mut failures),
+        (false, None) => {}
+    }
     setup_autostart(autostart, &mut failures);
 
     println!();
@@ -746,6 +764,158 @@ fn read_proc_sysctl(path: &str) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+/// Whether `iw list` reports AP mode in the card's valid interface
+/// combinations (the group is spelled exactly '#{ AP }' to avoid matching
+/// '#{ AP/VLAN }' — every card with AP also lists plain AP).
+fn iw_supports_ap(iw_list: &str) -> bool {
+    iw_list.contains("#{ AP }")
+}
+
+/// Whether a NetworkManager connection profile with this name exists.
+fn nmcli_con_exists(name: &str) -> bool {
+    run_cmd("nmcli", &["-t", "-f", "NAME", "connection", "show"])
+        .map(|out| out.lines().any(|line| line == name))
+        .unwrap_or(false)
+}
+
+/// Alphabet for the generated hotspot passphrase: no easily-confused
+/// characters (0/O, 1/l) since it's typed once on the other machine.
+const PSK_ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
+
+/// Maps bytes onto the PSK alphabet (pure, so the generator is testable).
+fn psk_from_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(16)
+        .map(|b| PSK_ALPHABET[(*b % PSK_ALPHABET.len() as u8) as usize] as char)
+        .collect()
+}
+
+/// A random 16-character WPA passphrase for the hotspot.
+fn gen_psk() -> String {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .expect("/dev/urandom is always available on Linux");
+    psk_from_bytes(&bytes)
+}
+
+/// Hosts the 'monux-direct' WiFi hotspot (--hotspot, server side): the KVM
+/// link then bypasses the router entirely. NetworkManager's shared IPv4 mode
+/// NATs the peer through this machine, so its internet keeps working over the
+/// single radio it has; the KVM connection prefers the direct link via the
+/// ordinary same-subnet match in mDNS discovery (no path code needed).
+/// Idempotent; the profile is removed by 'monux system uninstall'.
+fn setup_hotspot(failures: &mut u32) {
+    if run_cmd("nmcli", &["--version"]).is_err() {
+        println!("[skip] hotspot: NetworkManager (nmcli) not found; host a hotspot via your network stack instead");
+        return;
+    }
+    let iw_list = match run_cmd("iw", &["list"]) {
+        Ok(out) => out,
+        Err(e) => {
+            println!("[skip] hotspot: 'iw list' unavailable ({}); cannot check for AP support", e);
+            return;
+        }
+    };
+    if !iw_supports_ap(&iw_list) {
+        println!("[skip] hotspot: the WiFi card does not support AP mode (no '#{{ AP }}' in its valid interface combinations)");
+        return;
+    }
+    if nmcli_con_exists(HOTSPOT_CON_NAME) {
+        println!("[ok]   hotspot: profile '{}' already exists", HOTSPOT_CON_NAME);
+        return;
+    }
+    let ifname = match run_cmd("iw", &["dev"]) {
+        Ok(out) => match parse_iw_interfaces(&out).into_iter().next() {
+            Some(ifname) => ifname,
+            None => {
+                println!("[skip] hotspot: no wireless interface found");
+                return;
+            }
+        },
+        Err(e) => {
+            println!("[skip] hotspot: 'iw dev' unavailable ({}); no wireless interface", e);
+            return;
+        }
+    };
+    let hostname = run_cmd("hostname", &[])
+        .map(|h| h.trim().to_string())
+        .unwrap_or_else(|_| "server".to_string());
+    let ssid = format!("monux-direct-{}", hostname);
+    let psk = gen_psk();
+    if let Err(e) = run_cmd(
+        "nmcli",
+        &[
+            "connection", "add", "type", "wifi", "ifname", &ifname, "con-name", HOTSPOT_CON_NAME,
+            "autoconnect", "yes", "ssid", &ssid,
+        ],
+    )
+    .and_then(|_| {
+        run_cmd(
+            "nmcli",
+            &[
+                "connection", "modify", HOTSPOT_CON_NAME, "wifi.mode", "ap",
+                "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", &psk, "ipv4.method", "shared",
+            ],
+        )
+    })
+    .and_then(|_| run_cmd("nmcli", &["connection", "up", HOTSPOT_CON_NAME]))
+    {
+        *failures += 1;
+        println!("[fail] hotspot: {}", e);
+        // Don't leave a half-configured profile behind.
+        let _ = run_cmd("nmcli", &["connection", "delete", HOTSPOT_CON_NAME]);
+        return;
+    }
+    println!("[done] hotspot: hosting '{}' (WPA2) on {} — the KVM link now bypasses the router", ssid, ifname);
+    println!("       Join the other machine with: sudo monux system setup --hotspot-join '{}' '{}'", ssid, psk);
+    println!("       Its internet keeps working through this machine (NAT); the WiFi may hiccup for a second while the AP starts. Revert with: sudo nmcli connection delete {}", HOTSPOT_CON_NAME);
+}
+
+/// Joins this machine to the other machine's 'monux-direct' hotspot
+/// (--hotspot-join, client side). NOTE the topology change: this machine's
+/// WiFi association moves to the hotspot (its previous profile reconnects
+/// automatically when the hotspot is off), and its internet then flows
+/// through the hosting machine.
+fn setup_hotspot_join(ssid: &str, psk: &str, failures: &mut u32) {
+    if run_cmd("nmcli", &["--version"]).is_err() {
+        println!("[skip] hotspot: NetworkManager (nmcli) not found; join the hotspot via your network stack instead");
+        return;
+    }
+    if nmcli_con_exists(HOTSPOT_CON_NAME) {
+        println!("[ok]   hotspot: profile '{}' already exists", HOTSPOT_CON_NAME);
+        return;
+    }
+    if let Err(e) = run_cmd(
+        "nmcli",
+        &[
+            "connection", "add", "type", "wifi", "con-name", HOTSPOT_CON_NAME, "autoconnect",
+            "yes", "connection.autoconnect-priority", "10", "ssid", ssid,
+        ],
+    )
+    .and_then(|_| {
+        run_cmd(
+            "nmcli",
+            &[
+                "connection", "modify", HOTSPOT_CON_NAME, "wifi-sec.key-mgmt", "wpa-psk",
+                "wifi-sec.psk", psk,
+            ],
+        )
+    })
+    .and_then(|_| run_cmd("nmcli", &["connection", "up", HOTSPOT_CON_NAME]))
+    {
+        *failures += 1;
+        println!("[fail] hotspot: {}", e);
+        let _ = run_cmd("nmcli", &["connection", "delete", HOTSPOT_CON_NAME]);
+        return;
+    }
+    println!("[done] hotspot: joined '{}' — this machine's WiFi association moved to the hotspot", ssid);
+    println!("       Its internet now flows through the hosting machine (NAT), and the KVM link is direct.");
+    println!("       The previous WiFi profile reconnects automatically when the hotspot is off. Revert with: sudo nmcli connection delete {}", HOTSPOT_CON_NAME);
+}
+
 fn setup_socket_buffers(failures: &mut u32) {
     const RMEM_PROC: &str = "/proc/sys/net/core/rmem_max";
     const WMEM_PROC: &str = "/proc/sys/net/core/wmem_max";
@@ -797,6 +967,28 @@ mod tests {
     #[test]
     fn powersave_conf_disables() {
         assert!(powersave_conf_content().contains("wifi.powersave = 2"));
+    }
+
+    #[test]
+    fn ap_support_detection_matches_only_plain_ap() {
+        // A real combo dump from an Intel card that supports managed+AP.
+        let capable = "valid interface combinations:\n\t\t * #{ managed, P2P-client } <= 2, #{ P2P-GO } <= 1, #{ P2P-device } <= 1,\n\t\t   total <= 3, #channels <= 2,\n\t\t * #{ managed, P2P-client } <= 2, #{ AP } <= 1, #{ P2P-device } <= 1,\n\t\t   total <= 3, #channels <= 1";
+        assert!(iw_supports_ap(capable));
+        // AP/VLAN alone must not count as AP support.
+        let vlan_only = " * #{ managed } <= 1, #{ AP/VLAN } <= 1, total <= 2";
+        assert!(!iw_supports_ap(vlan_only));
+        let incapable = " * #{ managed } <= 1, #{ P2P-device } <= 1, total <= 2";
+        assert!(!iw_supports_ap(incapable));
+    }
+
+    #[test]
+    fn psk_is_sixteen_safe_chars() {
+        let psk = psk_from_bytes(&[0, 1, 61, 255, 42, 7, 99, 128, 3, 250, 17, 200, 30, 90, 111, 64]);
+        assert_eq!(psk.len(), 16);
+        assert!(psk.chars().all(|c| PSK_ALPHABET.contains(&(c as u8))));
+        // No easily-confused characters ever appear.
+        assert!(!psk.contains('0') && !psk.contains('1') && !psk.contains('l') && !psk.contains('o'));
+        assert_eq!(psk_from_bytes(&[9; 16]), psk_from_bytes(&[9; 16]));
     }
 
     #[test]

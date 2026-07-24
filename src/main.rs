@@ -209,6 +209,23 @@ struct SetupArgs {
     /// autostart changes are made.
     #[arg(long, value_enum, value_name = "server|client|off")]
     autostart: Option<monux::setup::Autostart>,
+
+    /// Host a dedicated 'monux-direct' WiFi hotspot on this machine (server
+    /// side): the KVM link then bypasses the router entirely. The peer's
+    /// internet keeps working — NATed through this machine — and mDNS
+    /// discovery steers the KVM connection onto the direct link
+    /// automatically. Requires AP support in the WiFi card (checked).
+    /// Prints the join command for the other machine.
+    #[arg(long)]
+    hotspot: bool,
+
+    /// Join this machine to a 'monux-direct' hotspot hosted by the other
+    /// machine (client side): '--hotspot-join <ssid> <psk>' as printed by
+    /// 'monux system setup --hotspot' there. NOTE: this moves the machine's
+    /// WiFi association to the hotspot; its internet then flows through the
+    /// hosting machine.
+    #[arg(long, num_args = 2, value_names = ["ssid", "psk"])]
+    hotspot_join: Option<Vec<String>>,
 }
 
 #[derive(Args)]
@@ -570,7 +587,11 @@ fn main() -> Result<()> {
         Commands::System(args) => match &args.command {
             SystemCommands::Setup(args) => {
                 maybe_elevate("to persist system settings")?;
-                return monux::setup::run(args.autostart);
+                return monux::setup::run(
+                    args.autostart,
+                    args.hotspot,
+                    args.hotspot_join.as_ref().map(|v| (v[0].clone(), v[1].clone())),
+                );
             }
             SystemCommands::Status(args) => {
                 let out = monux::control::status_cli(
