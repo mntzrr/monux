@@ -16,10 +16,13 @@
 //! - DSCP CS6 netfilter marking of monux's UDP traffic (the AP/router hop
 //!   picks its downlink queue from each packet's DSCP; quinn overwrites the
 //!   TOS byte per packet, so only netfilter can set it)
-//! - with `--hotspot`, a 'monux-direct' WiFi hotspot hosted by this machine
-//!   (the KVM link then bypasses the router; the peer is NATed through this
-//!   machine so its internet keeps working); with `--hotspot-join`, this
-//!   machine joins the other machine's hotspot
+//! - with `--hotspot`, a 'monux-direct' WiFi hotspot hosted by this machine:
+//!   hostapd drives a dedicated AP interface (NetworkManager is left managing
+//!   only the host's own WiFi — the NM AP path is a dead end on iwlwifi,
+//!   which only beacons on '__ap' vifs NM can't activate), dnsmasq serves
+//!   DHCP/DNS, and the peer is NATed through this machine so its internet
+//!   keeps working while the KVM link bypasses the router; with
+//!   `--hotspot-join`, this machine joins the other machine's hotspot
 //! - with `--autostart`, a per-user systemd service starting monux with the
 //!   graphical session (the only step that is NOT machine tuning; off by
 //!   default)
@@ -41,8 +44,10 @@ pub(crate) const SYSCTL_BUF_CONF_PATH: &str = "/etc/sysctl.d/90-monux-udp-buffer
 pub(crate) const IP_FORWARD_SYSCTL_PATH: &str = "/etc/sysctl.d/90-monux-ip-forward.conf";
 
 /// Name of the NetworkManager connection profile for the direct, routerless
-/// KVM link (see setup_hotspot / setup_hotspot_join). One name for both roles
-/// keeps uninstall trivial: delete the profile.
+/// KVM link. On the CLIENT this is the join profile (see setup_hotspot_join);
+/// on the host the AP is driven by hostapd (see AP_IFACE_NAME), so a host-side
+/// profile with this name is a leftover from the abandoned NM-AP design and
+/// gets deleted as a migration.
 pub(crate) const HOTSPOT_CON_NAME: &str = "monux-direct";
 
 /// Priority of the policy rule that routes the hotspot subnet around a VPN
@@ -53,20 +58,32 @@ pub(crate) const VPN_WORKAROUND_RULE_PRIORITY: u32 = 32763;
 /// teardown finds it even after Mullvad regenerates everything around it.
 pub(crate) const VPN_WORKAROUND_COMMENT: &str = "monux-hotspot";
 
-/// Name of the dedicated AP interface the hotspot runs on. Binding the AP
-/// profile to wlan0 itself makes NetworkManager REPLACE the managed
-/// connection with the AP (one profile per netdev), killing the host's own
-/// internet — the managed+AP combo the card supports only happens with a
-/// second virtual interface. Kernel vifs don't persist across reboots;
-/// re-running setup recreates this one.
+/// Name of the dedicated AP interface the hotspot runs on, driven by hostapd
+/// — NOT NetworkManager: iwlwifi only beacons on '__ap'-type vifs (which
+/// NM's wifi factory can't activate on), and station-type vifs can't beacon,
+/// so the NM AP path is a dead end on this driver class. Binding an AP
+/// profile to wlan0 itself is worse: it replaces the host's own WiFi. The
+/// vif is a kernel object and doesn't persist; the systemd unit recreates it.
 pub(crate) const AP_IFACE_NAME: &str = "monux-ap";
 
+/// Directory holding the hotspot's hostapd/dnsmasq configuration.
+pub(crate) const HOTSPOT_CONF_DIR: &str = "/etc/monux";
+/// hostapd config for the hotspot AP (ssid + WPA2 psk live here; the server
+/// advertises them to approved clients from this file).
+pub(crate) const HOSTAPD_CONF_PATH: &str = "/etc/monux/hostapd.conf";
+/// dnsmasq config (DHCP + DNS for hotspot clients).
+pub(crate) const DNSMASQ_CONF_PATH: &str = "/etc/monux/dnsmasq.conf";
+/// systemd unit bringing up the AP interface, hostapd, dnsmasq and the NAT.
+pub(crate) const HOTSPOT_UNIT_PATH: &str = "/etc/systemd/system/monux-hotspot.service";
+/// nftables table for the hotspot's NAT masquerade (removed on unit stop).
+pub(crate) const HOTSPOT_NAT_TABLE: &str = "monux-hotspot-nat";
+
 /// Creates the dedicated AP interface for the hotspot (idempotent). The vif
-/// is created as a STATION ('managed'): NM's wifi device factory ignores
-/// '__ap'-type vifs (the one it never sees, it also can't activate on —
-/// and such a vif vanishes from the phy shortly after creation), while a
-/// managed vif is picked up as a normal wifi device that NM itself switches
-/// to AP mode when the profile activates. The card's combinations allow
+/// is '__ap'-type: iwlwifi only beacons on that type (a 'managed' vif comes
+/// up but wpa_supplicant/hostapd then fail with 'Failed to set beacon
+/// parameters'). NetworkManager ignores '__ap' vifs entirely — which is
+/// exactly what we want: NM keeps managing only the host's own WiFi, and
+/// hostapd drives this interface. The card's combinations allow
 /// 2 managed + 1 AP on one channel.
 fn ensure_ap_interface(wifi_ifname: &str, failures: &mut u32) -> bool {
     if run_cmd("ip", &["link", "show", AP_IFACE_NAME]).is_ok() {
@@ -75,7 +92,7 @@ fn ensure_ap_interface(wifi_ifname: &str, failures: &mut u32) -> bool {
     }
     match run_cmd(
         "iw",
-        &["dev", wifi_ifname, "interface", "add", AP_IFACE_NAME, "type", "managed"],
+        &["dev", wifi_ifname, "interface", "add", AP_IFACE_NAME, "type", "__ap"],
     ) {
         Ok(_) => {
             println!(
@@ -134,16 +151,9 @@ pub(crate) fn monux_rule_handles(nft_list_output: &str) -> Vec<u64> {
         .collect()
 }
 
-/// Whether the hotspot profile exists AND its AP is currently up.
-fn hotspot_profile_active() -> bool {
-    run_cmd("nmcli", &["-t", "-f", "NAME", "connection", "show", "--active"])
-        .map(|out| out.lines().any(|line| line == HOTSPOT_CON_NAME))
-        .unwrap_or(false)
-}
-
-/// The hotspot's live subnet: NetworkManager's shared mode assigns a 10.42.x
-/// address to the AP interface on activation. Polled briefly — the address
-/// can lag 'connection up' by a moment.
+/// The hotspot's live subnet: the AP interface carries the static address
+/// 10.42.0.1/24 once the hotspot unit is up. Polled briefly — the address
+/// can lag the unit start by a moment.
 fn hotspot_live_subnet() -> Option<String> {
     for attempt in 0..4 {
         if attempt > 0 {
@@ -1077,18 +1087,147 @@ pub(crate) fn remove_vpn_workaround() {
         let _ = run_cmd("ip", &["rule", "del", "priority", &priority]);
     }
 }
-/// NATs the peer through this machine, so its internet keeps working over the
-/// Hosts the 'monux-direct' WiFi hotspot (--hotspot, server side): the KVM
-/// link then bypasses the router entirely. NetworkManager's shared IPv4 mode
-/// NATs the peer through this machine, so its internet keeps working over the
-/// single radio it has; the KVM connection prefers the direct link via the
-/// ordinary same-subnet match in mDNS discovery (no path code needed).
-/// Idempotent; the profile is removed by 'monux system uninstall'.
-fn setup_hotspot(failures: &mut u32) {
-    if run_cmd("nmcli", &["--version"]).is_err() {
-        println!("[skip] hotspot: NetworkManager (nmcli) not found; host a hotspot via your network stack instead");
+/// Reads the live channel (and the band-derived hostapd hw_mode) off
+/// `iw dev <if> info` output: the single-radio card requires the AP to sit on
+/// the SAME channel the managed connection is using. hw_mode is 'g' for
+/// 2.4 GHz, 'a' for 5 GHz (hostapd's naming).
+fn current_channel(iw_info: &str) -> Option<(u32, &'static str)> {
+    for line in iw_info.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("channel ") else {
+            continue;
+        };
+        let channel: u32 = rest.split_whitespace().next()?.parse().ok()?;
+        // The frequency follows in parentheses: "channel 9 (2452 MHz), ...".
+        let mhz: u32 = rest.split('(').nth(1)?.split_whitespace().next()?.parse().ok()?;
+        return Some((channel, if mhz >= 5000 { "a" } else { "g" }));
+    }
+    None
+}
+
+/// hostapd configuration for the hotspot AP. WPA2-PSK/CCMP only; the channel
+/// must match the managed connection's (single-radio card, see
+/// current_channel).
+fn hostapd_conf_content(ssid: &str, psk: &str, channel: u32, hw_mode: &str) -> String {
+    format!(
+        "interface={}\ndriver=nl80211\nssid={}\nhw_mode={}\nchannel={}\nwmm_enabled=1\nauth_algs=1\nwpa=2\nwpa_passphrase={}\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\n",
+        AP_IFACE_NAME, ssid, hw_mode, channel, psk
+    )
+}
+
+/// dnsmasq configuration: DHCP (+ DNS forwarding) for hotspot clients on the
+/// 10.42.0.0/24 subnet, this machine being the gateway at 10.42.0.1. The pid
+/// file lets the unit stop dnsmasq cleanly (it daemonizes, so systemd doesn't
+/// track it as the unit's main process).
+fn dnsmasq_conf_content() -> String {
+    format!(
+        "interface={}\nbind-interfaces\ndhcp-range=10.42.0.10,10.42.0.254,255.255.255.0,24h\ndhcp-option=3,10.42.0.1\ndhcp-option=6,10.42.0.1\npid-file=/run/dnsmasq-monux.pid\n",
+        AP_IFACE_NAME
+    )
+}
+
+/// The systemd unit that brings the whole hotspot up: the AP vif, its static
+/// address, the NAT masquerade, hostapd and dnsmasq. nft takes each full
+/// command as one quoted argument (systemd splits on whitespace but honors
+/// quotes; nft parses a single-string command fine). '-' prefixes make the
+/// idempotent steps failure-tolerant; ExecStopPost undoes dnsmasq, the NAT
+/// and the vif, so a stopped unit leaves nothing behind.
+fn hotspot_unit_content(ifname: &str) -> String {
+    format!(
+        "[Unit]\nDescription=monux direct KVM hotspot (hostapd on {ap})\nAfter=network.target\n\n[Service]\nType=simple\nExecStartPre=-/usr/bin/iw dev {ifname} interface add {ap} type __ap\nExecStartPre=/usr/bin/ip link set {ap} up\nExecStartPre=/usr/bin/ip addr replace 10.42.0.1/24 dev {ap}\nExecStartPre=-/usr/bin/nft add table ip {nat}\nExecStartPre=-/usr/bin/nft \"add chain ip {nat} postrouting {{ type nat hook postrouting priority 100 ; }}\"\nExecStartPre=-/usr/bin/nft \"add rule ip {nat} postrouting ip saddr 10.42.0.0/24 masquerade\"\nExecStart=/usr/bin/hostapd {hostapd}\nExecStartPost=-/usr/bin/dnsmasq --conf-file={dnsmasq}\nExecStopPost=-/usr/bin/pkill -F /run/dnsmasq-monux.pid\nExecStopPost=-/usr/bin/nft delete table ip {nat}\nExecStopPost=-/usr/bin/iw dev {ap} del\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=multi-user.target\n",
+        ap = AP_IFACE_NAME,
+        ifname = ifname,
+        nat = HOTSPOT_NAT_TABLE,
+        hostapd = HOSTAPD_CONF_PATH,
+        dnsmasq = DNSMASQ_CONF_PATH,
+    )
+}
+
+/// Parses ssid and wpa_passphrase out of a hostapd.conf; None when either is
+/// missing or empty (comment lines are ignored).
+fn parse_hostapd_conf(text: &str) -> Option<(String, String)> {
+    let mut ssid = None;
+    let mut psk = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("ssid=") {
+            ssid = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("wpa_passphrase=") {
+            psk = Some(value.trim().to_string());
+        }
+    }
+    match (ssid, psk) {
+        (Some(ssid), Some(psk)) if !ssid.is_empty() && !psk.is_empty() => Some((ssid, psk)),
+        _ => None,
+    }
+}
+
+/// Whether the hotspot systemd unit is currently active. Bounded: systemctl
+/// on a busy system must not stall the caller (the advertisement probe runs
+/// this off the rotation loop, but still).
+fn hotspot_unit_active() -> bool {
+    run_cmd_timeout("systemctl", &["is-active", "--quiet", "monux-hotspot"], 5).is_ok()
+}
+
+/// Server-startup hook: the hotspot exists for the KVM, so a configured but
+/// down hotspot is started when the monux server starts — but ONLY when the
+/// server runs as root (euid 0), so no sudo/polkit prompt (FIDO touch) can
+/// ever fire from a daemon. Best-effort and bounded. The unit file's
+/// existence is the signal for "user wants the hotspot": '--hotspot off'
+/// deletes it, so a deliberate teardown is never resurrected.
+pub fn start_hotspot_if_configured() {
+    if !Path::new(HOTSPOT_UNIT_PATH).exists() {
         return;
     }
+    if unsafe { libc::geteuid() } != 0 {
+        tracing::debug!(
+            "hotspot unit present but the server runs unprivileged; leaving the hotspot as-is"
+        );
+        return;
+    }
+    if hotspot_unit_active() {
+        return;
+    }
+    tracing::info!("Starting monux-hotspot (installed by 'monux system setup --hotspot')");
+    if let Err(e) = run_cmd_timeout("systemctl", &["start", "monux-hotspot"], 10) {
+        tracing::warn!("could not start monux-hotspot: {}", e);
+    }
+}
+
+/// Server-shutdown hook: stops the hotspot when the monux server goes down
+/// gracefully (a lingering AP with no KVM behind it only confuses clients
+/// into joining a dead-end link). Same root-only, best-effort, bounded rules
+/// as start_hotspot_if_configured. A hard kill can't run this; the next
+/// server start or setup run reconciles.
+pub fn stop_hotspot_if_active() {
+    if !Path::new(HOTSPOT_UNIT_PATH).exists() {
+        return;
+    }
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    if !hotspot_unit_active() {
+        return;
+    }
+    tracing::info!("Stopping monux-hotspot (the monux server is going down)");
+    if let Err(e) = run_cmd_timeout("systemctl", &["stop", "monux-hotspot"], 10) {
+        tracing::warn!("could not stop monux-hotspot: {}", e);
+    }
+}
+
+/// Hosts the 'monux-direct' WiFi hotspot (--hotspot, server side): the KVM
+/// link then bypasses the router entirely. hostapd drives a dedicated AP
+/// interface (NetworkManager is NOT involved on the host — see AP_IFACE_NAME
+/// for why the NM AP path is a dead end), dnsmasq gives the peer an address,
+/// and an nftables masquerade NATs it through this machine so its internet
+/// keeps working; the KVM connection prefers the direct link via the ordinary
+/// same-subnet match in mDNS discovery (no path code needed). Idempotent —
+/// re-running reuses the existing credentials; removed by '--hotspot off' or
+/// 'monux system uninstall'.
+fn setup_hotspot(failures: &mut u32) {
     let iw_list = match run_cmd("iw", &["list"]) {
         Ok(out) => out,
         Err(e) => {
@@ -1106,21 +1245,31 @@ fn setup_hotspot(failures: &mut u32) {
     // A VPN tunnel on this machine (Mullvad/WireGuard/OpenVPN) hijacks
     // routing and drops forwarded packets: the KVM link would work, but the
     // NAT that gives hotspot clients internet would not. Mullvad's layout is
-    // auto-fixed after the profile is up (install_vpn_workaround); anything
-    // else gets a loud warning.
+    // auto-fixed after the unit is up (install_vpn_workaround); anything else
+    // gets a loud warning.
     let tunnels = run_cmd("ip", &["-o", "link", "show", "up"])
         .map(|out| tunnel_iface_names(&out))
         .unwrap_or_default();
+    // Migration: a host-side 'monux-direct' NM profile belongs to the
+    // abandoned NM-AP design; left in place, its autoconnect can still seize
+    // wlan0. Delete it on sight.
     if nmcli_con_exists(HOTSPOT_CON_NAME) {
-        println!("[ok]   hotspot: profile '{}' already exists", HOTSPOT_CON_NAME);
-        if hotspot_profile_active() {
-            verify_ip_forward_still_on(failures);
+        match run_cmd("nmcli", &["connection", "delete", HOTSPOT_CON_NAME]) {
+            Ok(_) => println!(
+                "[done] hotspot: deleted the obsolete '{}' NetworkManager profile (superseded by the hostapd unit)",
+                HOTSPOT_CON_NAME
+            ),
+            Err(e) => println!(
+                "[warn] hotspot: could not delete the obsolete '{}' NetworkManager profile: {}",
+                HOTSPOT_CON_NAME, e
+            ),
         }
-        handle_vpn_after_up(&tunnels, failures);
-        return;
     }
     let ifname = match run_cmd("iw", &["dev"]) {
-        Ok(out) => match parse_iw_interfaces(&out).into_iter().next() {
+        Ok(out) => match parse_iw_interfaces(&out)
+            .into_iter()
+            .find(|name| name != AP_IFACE_NAME)
+        {
             Some(ifname) => ifname,
             None => {
                 println!("[skip] hotspot: no wireless interface found");
@@ -1132,60 +1281,131 @@ fn setup_hotspot(failures: &mut u32) {
             return;
         }
     };
-    let hostname = run_cmd("hostname", &[])
-        .map(|h| h.trim().to_string())
-        .unwrap_or_else(|_| "server".to_string());
-    let ssid = format!("monux-direct-{}", hostname);
-    let psk = gen_psk();
-    // The AP runs on its own virtual interface: binding it to the managed
-    // interface itself would replace the host's WiFi connection (see
-    // AP_IFACE_NAME).
+    // Reuse existing credentials so re-runs don't strand already-joined
+    // clients; generate fresh ones on first setup.
+    let old_conf = std::fs::read_to_string(HOSTAPD_CONF_PATH).ok();
+    let (ssid, psk) = match old_conf.as_deref().and_then(parse_hostapd_conf) {
+        Some(creds) => {
+            println!(
+                "[ok]   hotspot: reusing the existing ssid/passphrase from {}",
+                HOSTAPD_CONF_PATH
+            );
+            creds
+        }
+        None => {
+            let hostname = run_cmd("hostname", &[])
+                .map(|h| h.trim().to_string())
+                .unwrap_or_else(|_| "server".to_string());
+            (format!("monux-direct-{}", hostname), gen_psk())
+        }
+    };
+    // hostapd + dnsmasq are the only packages the unit needs; install them
+    // when missing (pacman on Arch derivatives; anything else gets a manual
+    // hint).
+    let missing: Vec<&str> = [("hostapd", "-v"), ("dnsmasq", "--version")]
+        .into_iter()
+        .filter(|(prog, flag)| run_cmd(prog, &[flag]).is_err())
+        .map(|(prog, _)| prog)
+        .collect();
+    if !missing.is_empty() {
+        let mut args = vec!["-S", "--noconfirm", "--needed"];
+        args.extend_from_slice(&missing);
+        match run_cmd("pacman", &args) {
+            Ok(_) => println!("[done] hotspot: installed {}", missing.join(" ")),
+            Err(e) => {
+                *failures += 1;
+                println!(
+                    "[fail] hotspot: {} not installed and the automatic install failed ({}); install manually (e.g. 'sudo pacman -S {}')",
+                    missing.join(", "), e, missing.join(" ")
+                );
+                return;
+            }
+        }
+    }
+    // The AP runs on its own virtual interface; the unit recreates it on
+    // every start, but creating it now keeps the failure modes visible here.
     if !ensure_ap_interface(&ifname, failures) {
         return;
     }
-    // NM must list the vif as a device to activate a profile on it; if it
-    // doesn't (driver/NM quirk), say so plainly instead of surfacing nmcli's
-    // interface-name mismatch.
-    let nm_sees = run_cmd("nmcli", &["-t", "-f", "DEVICE", "device", "status"])
-        .map(|out| out.lines().any(|line| line == AP_IFACE_NAME))
-        .unwrap_or(false);
-    if !nm_sees {
+    // The single-radio card forces the AP onto the managed connection's
+    // channel; read it live. (Router channel hop later? The note below says
+    // how to re-sync.)
+    let (channel, hw_mode) = run_cmd("iw", &["dev", &ifname, "info"])
+        .ok()
+        .and_then(|info| current_channel(&info))
+        .unwrap_or_else(|| {
+            println!(
+                "[warn] hotspot: couldn't read {}'s channel; falling back to channel 6 (re-run setup if the AP doesn't come up)",
+                ifname
+            );
+            (6, "g")
+        });
+    let hostapd_conf = hostapd_conf_content(&ssid, &psk, channel, hw_mode);
+    let conf_changed = old_conf.as_deref() != Some(hostapd_conf.as_str());
+    if let Err(e) = std::fs::create_dir_all(HOTSPOT_CONF_DIR) {
         *failures += 1;
-        println!(
-            "[fail] hotspot: {} exists but NetworkManager doesn't list it as a device (driver/NM quirk) — the AP can't be activated this way",
-            AP_IFACE_NAME
-        );
+        println!("[fail] hotspot: could not create {}: {}", HOTSPOT_CONF_DIR, e);
         return;
     }
-    if let Err(e) = run_cmd(
-        "nmcli",
-        &[
-            "connection", "add", "type", "wifi", "ifname", AP_IFACE_NAME, "con-name", HOTSPOT_CON_NAME,
-            "autoconnect", "yes", "ssid", &ssid,
-        ],
-    )
-    .and_then(|_| {
-        run_cmd(
-            "nmcli",
-            &[
-                "connection", "modify", HOTSPOT_CON_NAME, "wifi.mode", "ap",
-                "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", &psk, "ipv4.method", "shared",
-            ],
-        )
-    })
-    .and_then(|_| run_cmd("nmcli", &["connection", "up", HOTSPOT_CON_NAME]))
+    // The psk is a secret: 0600 (the server reads it as root to advertise it).
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::write(HOSTAPD_CONF_PATH, &hostapd_conf).and_then(|_| {
+        std::fs::set_permissions(HOSTAPD_CONF_PATH, std::fs::Permissions::from_mode(0o600))
+    }) {
+        *failures += 1;
+        println!("[fail] hotspot: could not write {}: {}", HOSTAPD_CONF_PATH, e);
+        return;
+    }
+    if let Err(e) = std::fs::write(DNSMASQ_CONF_PATH, dnsmasq_conf_content())
+        .and_then(|_| std::fs::write(HOTSPOT_UNIT_PATH, hotspot_unit_content(&ifname)))
     {
         *failures += 1;
-        println!("[fail] hotspot: {}", e);
-        // Don't leave a half-configured profile behind.
-        let _ = run_cmd("nmcli", &["connection", "delete", HOTSPOT_CON_NAME]);
+        println!("[fail] hotspot: could not write the config/unit files: {}", e);
+        return;
+    }
+    println!(
+        "[done] hotspot: wrote {}, {} and {}",
+        HOSTAPD_CONF_PATH, DNSMASQ_CONF_PATH, HOTSPOT_UNIT_PATH
+    );
+    let was_active = hotspot_unit_active();
+    let start = if was_active && !conf_changed {
+        println!("[ok]   hotspot: monux-hotspot already running with this configuration");
+        Ok(String::new())
+    } else if was_active {
+        // The channel (or credentials) changed under a running unit.
+        run_cmd("systemctl", &["restart", "monux-hotspot"])
+    } else {
+        run_cmd("systemctl", &["daemon-reload"])
+            .and_then(|_| run_cmd("systemctl", &["enable", "--now", "monux-hotspot"]))
+    };
+    if let Err(e) = start {
+        *failures += 1;
+        println!("[fail] hotspot: could not enable/start monux-hotspot: {}", e);
+        return;
+    }
+    // Verify the unit actually came up (a wrong channel or a driver hiccup
+    // surfaces as 'activating' then 'failed').
+    let mut up = false;
+    for _ in 0..5 {
+        if hotspot_unit_active() {
+            up = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    if !up {
+        *failures += 1;
+        println!("[fail] hotspot: monux-hotspot did not come up; see: journalctl -u monux-hotspot -e");
         return;
     }
     println!("[done] hotspot: hosting '{}' (WPA2) on {} — the KVM link now bypasses the router ({} keeps its normal WiFi)", ssid, AP_IFACE_NAME, ifname);
     verify_ip_forward_still_on(failures);
     handle_vpn_after_up(&tunnels, failures);
     println!("       Join the other machine with: sudo monux system setup --hotspot-join '{}' '{}'", ssid, psk);
-    println!("       Its internet keeps working through this machine (NAT); the WiFi may hiccup for a second while the AP starts. Revert with: sudo nmcli connection delete {}", HOTSPOT_CON_NAME);
+    println!("       Its internet keeps working through this machine (NAT); the WiFi may hiccup for a second while the AP starts.");
+    println!("       The hotspot persists across reboots (systemd unit) and, when the monux server runs as root, starts/stops with it.");
+    println!("       If the router hops channels, re-run this setup or: sudo systemctl restart monux-hotspot");
+    println!("       Revert with: sudo monux system setup --hotspot off");
 }
 
 /// After the AP is up: install the Mullvad workaround when its table is
@@ -1247,20 +1467,48 @@ fn setup_hotspot_join(ssid: &str, psk: &str, failures: &mut u32) {
     println!("       The previous WiFi profile reconnects automatically when the hotspot is off. Revert with: sudo nmcli connection delete {}", HOTSPOT_CON_NAME);
 }
 
-/// Removes the hotspot profile (either role) without touching anything else
+/// Removes the hotspot (either role) without touching anything else
 /// (`--hotspot off`): the targeted undo for the hotspot steps, as opposed to
-/// 'monux system uninstall', which removes the whole installation. Also
-/// removes the VPN workaround rules, which linger independently of the
-/// profile.
+/// 'monux system uninstall', which removes the whole installation. Stopping
+/// the unit tears down the AP interface and the NAT by itself (ExecStopPost);
+/// the rest is files, the leftover NM profile (the client's join profile, or
+/// a migration leftover on the host), and the independently-lingering VPN
+/// workaround rules + ip_forward drop-in.
 fn remove_hotspot(failures: &mut u32) {
     remove_vpn_workaround();
-    // The dedicated AP interface (a kernel vif) goes too; absent is fine.
+    let unit_present = Path::new(HOTSPOT_UNIT_PATH).exists();
+    let unit_active = hotspot_unit_active();
+    if unit_present || unit_active {
+        let _ = run_cmd("systemctl", &["stop", "monux-hotspot"]);
+        let _ = run_cmd("systemctl", &["disable", "monux-hotspot"]);
+        println!("[done] hotspot: stopped and disabled monux-hotspot (AP interface and NAT torn down)");
+    } else {
+        println!("[ok]   hotspot: no monux-hotspot unit installed");
+    }
+    for path in [HOTSPOT_UNIT_PATH, HOSTAPD_CONF_PATH, DNSMASQ_CONF_PATH] {
+        match std::fs::remove_file(path) {
+            Ok(()) => println!("[done] hotspot: removed {}", path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                *failures += 1;
+                println!("[fail] hotspot: could not remove {}: {}", path, e);
+            }
+        }
+    }
+    // The conf dir itself, only when nothing else lives in it.
+    let _ = std::fs::remove_dir(HOTSPOT_CONF_DIR);
+    if unit_present || unit_active {
+        let _ = run_cmd("systemctl", &["daemon-reload"]);
+    }
+    // Belt-and-suspenders: the unit's ExecStopPost deletes the vif and the
+    // NAT table, but a crashed or hand-built state can linger.
     if run_cmd("ip", &["link", "show", AP_IFACE_NAME]).is_ok() {
         match run_cmd("iw", &["dev", AP_IFACE_NAME, "del"]) {
             Ok(_) => println!("[done] hotspot: removed AP interface {}", AP_IFACE_NAME),
             Err(e) => println!("[warn] hotspot: could not remove AP interface {}: {}", AP_IFACE_NAME, e),
         }
     }
+    let _ = run_cmd("nft", &["delete", "table", "ip", HOTSPOT_NAT_TABLE]);
     match std::fs::remove_file(IP_FORWARD_SYSCTL_PATH) {
         Ok(()) => println!(
             "[done] ip forward: removed {} (the live sysctl is left alone — other tools like docker or a VPN may need it on)",
@@ -1272,63 +1520,32 @@ fn remove_hotspot(failures: &mut u32) {
             println!("[fail] ip forward: could not remove {}: {}", IP_FORWARD_SYSCTL_PATH, e);
         }
     }
+    // The NM profile: the client's join profile — or, on the host, a leftover
+    // from the abandoned NM-AP design. Either way it goes.
     if !nmcli_con_exists(HOTSPOT_CON_NAME) {
-        println!("[ok]   hotspot: no '{}' profile installed", HOTSPOT_CON_NAME);
+        println!("[ok]   hotspot: no '{}' NetworkManager profile installed", HOTSPOT_CON_NAME);
         return;
     }
     match run_cmd("nmcli", &["connection", "delete", HOTSPOT_CON_NAME]) {
-        Ok(_) => println!("[done] hotspot: removed the '{}' profile", HOTSPOT_CON_NAME),
+        Ok(_) => println!("[done] hotspot: removed the '{}' NetworkManager profile", HOTSPOT_CON_NAME),
         Err(e) => {
             *failures += 1;
-            println!("[fail] hotspot: could not remove the profile: {}", e);
+            println!("[fail] hotspot: could not remove the '{}' NetworkManager profile: {}", HOTSPOT_CON_NAME, e);
         }
     }
 }
 
 /// The active hotspot's (ssid, psk), for the server to advertise to approved
-/// clients (ServerEvent::HotspotInfo). Some only when the profile exists AND
-/// the AP is currently up: advertising a down hotspot would flap clients
-/// between profiles. Reading the passphrase needs root (the server has it).
+/// clients (ServerEvent::HotspotInfo). Some only when the hotspot unit is
+/// active: advertising a down hotspot would flap clients between profiles.
+/// Reading the passphrase needs root (the file is 0600; the server has it
+/// when run via sudo).
 pub fn active_hotspot_credentials() -> Option<(String, String)> {
-    let active = run_cmd_timeout("nmcli", &["-t", "-f", "NAME", "connection", "show", "--active"], 5)
-        .map(|out| out.lines().any(|line| line == HOTSPOT_CON_NAME))
-        .unwrap_or(false);
-    if !active {
+    if !hotspot_unit_active() {
         return None;
     }
-    let out = run_cmd_timeout(
-        "nmcli",
-        &[
-            "--show-secrets",
-            "-t",
-            "-f",
-            "802-11-wireless.ssid,802-11-wireless-security.psk",
-            "connection",
-            "show",
-            HOTSPOT_CON_NAME,
-        ],
-        5,
-    )
-    .ok()?;
-    parse_hotspot_credentials(&out)
-}
-
-/// Parses nmcli -t property output into (ssid, psk); None when either is
-/// missing or empty (e.g. an open/unconfigured profile).
-fn parse_hotspot_credentials(output: &str) -> Option<(String, String)> {
-    let mut ssid = None;
-    let mut psk = None;
-    for line in output.lines() {
-        if let Some(value) = line.strip_prefix("802-11-wireless.ssid:") {
-            ssid = Some(value.to_string());
-        } else if let Some(value) = line.strip_prefix("802-11-wireless-security.psk:") {
-            psk = Some(value.to_string());
-        }
-    }
-    match (ssid, psk) {
-        (Some(ssid), Some(psk)) if !ssid.is_empty() && !psk.is_empty() => Some((ssid, psk)),
-        _ => None,
-    }
+    let text = std::fs::read_to_string(HOSTAPD_CONF_PATH).ok()?;
+    parse_hostapd_conf(&text)
 }
 
 fn setup_socket_buffers(failures: &mut u32) {
@@ -1451,19 +1668,87 @@ mod tests {
     }
 
     #[test]
-    fn hotspot_credentials_parsing() {
-        let out = "802-11-wireless.ssid:monux-direct-box\n802-11-wireless-security.psk:abc123xyz4567890\n";
+    fn hostapd_conf_parsing() {
+        let conf = hostapd_conf_content("monux-direct-box", "abc123xyz4567890", 9, "g");
         assert_eq!(
-            parse_hotspot_credentials(out),
+            parse_hostapd_conf(&conf),
             Some(("monux-direct-box".to_string(), "abc123xyz4567890".to_string()))
         );
-        // A missing or empty psk (open/unconfigured profile) advertises nothing.
-        assert_eq!(parse_hotspot_credentials("802-11-wireless.ssid:monux-direct-box\n"), None);
+        // Comments and unrelated keys are ignored.
+        let commented = format!("# a comment\n{}\ncountry_code=SE\n", conf);
         assert_eq!(
-            parse_hotspot_credentials("802-11-wireless.ssid:monux-direct-box\n802-11-wireless-security.psk:\n"),
+            parse_hostapd_conf(&commented),
+            Some(("monux-direct-box".to_string(), "abc123xyz4567890".to_string()))
+        );
+        // A missing or empty psk (open AP) advertises nothing.
+        assert_eq!(parse_hostapd_conf("ssid=monux-direct-box\n"), None);
+        assert_eq!(
+            parse_hostapd_conf("ssid=monux-direct-box\nwpa_passphrase=\n"),
             None
         );
-        assert_eq!(parse_hotspot_credentials(""), None);
+        assert_eq!(parse_hostapd_conf(""), None);
+        // '#'-prefixed keys don't count.
+        assert_eq!(
+            parse_hostapd_conf("#ssid=monux-direct-box\n#wpa_passphrase=x\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn channel_parsing_from_iw_info() {
+        // Real 'iw dev wlan0 info' output (2.4 GHz).
+        let info = "Interface wlan0\n\tifindex 3\n\twdev 0x1\n\taddr aa:bb:cc:dd:ee:ff\n\ttype managed\n\twiphy 0\n\tchannel 9 (2452 MHz), width: 20 MHz, center1: 2452 MHz\n\ttxpower 22.00 dBm\n";
+        assert_eq!(current_channel(info), Some((9, "g")));
+        // 5 GHz maps to hw_mode 'a'.
+        let five_g = "Interface wlan0\n\tchannel 36 (5180 MHz), width: 80 MHz, center1: 5210 MHz\n";
+        assert_eq!(current_channel(five_g), Some((36, "a")));
+        // No channel line (interface down): no fallback invented.
+        assert_eq!(current_channel("Interface wlan0\n\ttype managed\n"), None);
+    }
+
+    #[test]
+    fn hostapd_conf_contains_ap_basics() {
+        let conf = hostapd_conf_content("monux-direct-box", "abc123xyz4567890", 36, "a");
+        assert!(conf.contains(&format!("interface={}", AP_IFACE_NAME)));
+        assert!(conf.contains("ssid=monux-direct-box\n"));
+        assert!(conf.contains("wpa_passphrase=abc123xyz4567890\n"));
+        assert!(conf.contains("hw_mode=a\n"));
+        assert!(conf.contains("channel=36\n"));
+        assert!(conf.contains("wpa=2\n"));
+        assert!(conf.contains("rsn_pairwise=CCMP\n"));
+    }
+
+    #[test]
+    fn dnsmasq_conf_serves_hotspot_subnet() {
+        let conf = dnsmasq_conf_content();
+        assert!(conf.contains(&format!("interface={}", AP_IFACE_NAME)));
+        assert!(conf.contains("dhcp-range=10.42.0.10,10.42.0.254"));
+        // Gateway (3) and DNS (6) both point at the host.
+        assert!(conf.contains("dhcp-option=3,10.42.0.1\n"));
+        assert!(conf.contains("dhcp-option=6,10.42.0.1\n"));
+        // The pid file is how the unit stops dnsmasq (it daemonizes).
+        assert!(conf.contains("pid-file=/run/dnsmasq-monux.pid\n"));
+    }
+
+    #[test]
+    fn hotspot_unit_wires_vif_nat_hostapd_dnsmasq() {
+        let unit = hotspot_unit_content("wlan0");
+        // The vif is created from the managed interface, as '__ap' (the only
+        // type iwlwifi beacons on).
+        assert!(unit.contains(&format!("iw dev wlan0 interface add {} type __ap", AP_IFACE_NAME)));
+        assert!(unit.contains(&format!("ip addr replace 10.42.0.1/24 dev {}", AP_IFACE_NAME)));
+        // NAT masquerade for the hotspot subnet in its own table.
+        assert!(unit.contains(&format!("nft add table ip {}", HOTSPOT_NAT_TABLE)));
+        assert!(unit.contains("ip saddr 10.42.0.0/24 masquerade"));
+        // hostapd runs in the foreground as the main process; dnsmasq after.
+        assert!(unit.contains(&format!("ExecStart=/usr/bin/hostapd {}", HOSTAPD_CONF_PATH)));
+        assert!(unit.contains(&format!("ExecStartPost=-/usr/bin/dnsmasq --conf-file={}", DNSMASQ_CONF_PATH)));
+        // Teardown on stop: dnsmasq, the NAT table and the vif.
+        assert!(unit.contains("pkill -F /run/dnsmasq-monux.pid"));
+        assert!(unit.contains(&format!("nft delete table ip {}", HOTSPOT_NAT_TABLE)));
+        assert!(unit.contains(&format!("iw dev {} del", AP_IFACE_NAME)));
+        // Real persistence across reboots.
+        assert!(unit.contains("WantedBy=multi-user.target\n"));
     }
 
     #[test]

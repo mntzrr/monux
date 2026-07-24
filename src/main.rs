@@ -1201,6 +1201,9 @@ async fn server(
     // The daemon is up (listening, rotation running): start the tray
     // indicator alongside it.
     indicator.launch();
+    // The hotspot lives for the KVM: if the user set one up, bring it up with
+    // the server (root only — a daemon must never trigger a sudo prompt).
+    monux::setup::start_hotspot_if_configured();
     if let Some(exit_secs) = exit_secs {
         info!("Exiting in {} seconds...", exit_secs);
         tokio::select! {
@@ -1223,6 +1226,7 @@ async fn server(
                 // a restart (e.g. after 'monux update') resumes the session
                 // automatically when the client reconnects (bounded by
                 // ACTIVE_CLIENT_MAX_AGE).
+                monux::setup::stop_hotspot_if_active();
                 info!("Shutting down...");
                 return Ok(());
             },
@@ -1245,6 +1249,7 @@ async fn server(
                 // a restart (e.g. after 'monux update') resumes the session
                 // automatically when the client reconnects (bounded by
                 // ACTIVE_CLIENT_MAX_AGE).
+                monux::setup::stop_hotspot_if_active();
                 info!("Shutting down...");
                 return Ok(());
             },

@@ -70,6 +70,9 @@ fn plan(home: &Path, current_exe: &Path) -> Plan {
         PathBuf::from(setup::NM_POWERSAVE_CONF_PATH),
         PathBuf::from(setup::SYSCTL_BUF_CONF_PATH),
         PathBuf::from(setup::IP_FORWARD_SYSCTL_PATH),
+        PathBuf::from(setup::HOTSPOT_UNIT_PATH),
+        PathBuf::from(setup::HOSTAPD_CONF_PATH),
+        PathBuf::from(setup::DNSMASQ_CONF_PATH),
     ];
     plan_impl(
         home,
@@ -254,10 +257,13 @@ fn remove_qos_marking() {
     println!("Removed DSCP QoS marking rules (if any were installed).");
 }
 
-/// Removes the 'monux-direct' NetworkManager hotspot profile 'monux system
-/// setup --hotspot/--hotspot-join' installs. Self-describing and idempotent
-/// (deleting a missing profile just errors, ignored). Same non-interactive
-/// rule as the QoS cleanup: only attempted when sudo won't prompt.
+/// Removes the hotspot pieces 'monux system setup --hotspot/--hotspot-join'
+/// installs: the monux-hotspot systemd unit (stop+disable first, so the AP
+/// interface, NAT and dnsmasq come down cleanly), /etc/monux, the NAT table
+/// and the vif if they linger, and the 'monux-direct' NetworkManager profile
+/// (the client's join profile, or a migration leftover on the host). All
+/// self-describing and idempotent. Same non-interactive rule as the QoS
+/// cleanup: only attempted when sudo won't prompt.
 fn remove_hotspot_profile() {
     let sudo_ready = Command::new("sudo")
         .args(["-n", "true"])
@@ -266,20 +272,43 @@ fn remove_hotspot_profile() {
         .unwrap_or(false);
     if !sudo_ready {
         println!(
-            "note: the '{}' NetworkManager profile (if installed) was left in place; remove it with:",
+            "note: the hotspot (monux-hotspot unit / '{}' profile, if installed) was left in place; remove it with:",
             setup::HOTSPOT_CON_NAME
+        );
+        println!("  sudo systemctl disable --now monux-hotspot");
+        println!(
+            "  sudo rm -rf {} {}",
+            setup::HOTSPOT_CONF_DIR, setup::HOTSPOT_UNIT_PATH
         );
         println!("  sudo nmcli connection delete {}", setup::HOTSPOT_CON_NAME);
         return;
     }
+    // Stop+disable first: stopping runs the unit's ExecStopPost teardown
+    // (dnsmasq, NAT table, vif). Works even when the unit file was already
+    // removed above — systemd still has the unit in memory until the reload.
     let _ = Command::new("sudo")
-        .args(["nmcli", "connection", "delete", setup::HOTSPOT_CON_NAME])
+        .args(["systemctl", "stop", "monux-hotspot"])
         .status();
-    println!("Removed the '{}' NetworkManager profile (if it was installed).", setup::HOTSPOT_CON_NAME);
-    // The dedicated AP interface (a kernel vif) goes too; absent is fine.
+    let _ = Command::new("sudo")
+        .args(["systemctl", "disable", "monux-hotspot"])
+        .status();
+    let _ = Command::new("sudo")
+        .args(["systemctl", "daemon-reload"])
+        .status();
+    let _ = Command::new("sudo")
+        .args(["rm", "-rf", setup::HOTSPOT_CONF_DIR])
+        .status();
+    // Belt-and-suspenders for a crashed or hand-built state.
+    let _ = Command::new("sudo")
+        .args(["nft", "delete", "table", "ip", setup::HOTSPOT_NAT_TABLE])
+        .status();
     let _ = Command::new("sudo")
         .args(["iw", "dev", setup::AP_IFACE_NAME, "del"])
         .status();
+    let _ = Command::new("sudo")
+        .args(["nmcli", "connection", "delete", setup::HOTSPOT_CON_NAME])
+        .status();
+    println!("Removed the monux hotspot (unit, configs, NAT, AP interface) and the '{}' profile (if installed).", setup::HOTSPOT_CON_NAME);
     // The VPN workaround rules setup may have installed: the tagged rule in
     // Mullvad's table, and the policy rule by its priority. Best-effort —
     // anything already gone is skipped silently.
