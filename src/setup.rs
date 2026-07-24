@@ -1056,8 +1056,7 @@ fn install_vpn_workaround(failures: &mut u32) {
         println!("[ok]   hotspot: hotspot subnet already routed around the VPN");
     } else {
         let priority = VPN_WORKAROUND_RULE_PRIORITY.to_string();
-        let from = format!("from {}", subnet);
-        match run_cmd("ip", &["rule", "add", &from, "lookup", "main", "priority", &priority]) {
+        match run_cmd("ip", &["rule", "add", "from", &subnet, "lookup", "main", "priority", &priority]) {
             Ok(_) => println!(
                 "[done] hotspot: hotspot subnet routed around the VPN (ip rule priority {})",
                 priority
@@ -1328,19 +1327,45 @@ fn setup_hotspot(failures: &mut u32) {
         return;
     }
     // The single-radio card forces the AP onto the managed connection's
-    // channel; read it live. (Router channel hop later? The note below says
-    // how to re-sync.)
-    let (channel, hw_mode) = run_cmd("iw", &["dev", &ifname, "info"])
-        .ok()
-        .and_then(|info| current_channel(&info))
-        .unwrap_or_else(|| {
+    // channel; read it live. A disconnected wlan0 shows no channel (it may be
+    // mid-reconnect), so retry briefly before giving up.
+    let mut channel_info = None;
+    for _ in 0..4 {
+        channel_info = run_cmd("iw", &["dev", &ifname, "info"])
+            .ok()
+            .and_then(|info| current_channel(&info));
+        if channel_info.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let hostapd_conf = match channel_info {
+        Some((channel, hw_mode)) => hostapd_conf_content(&ssid, &psk, channel, hw_mode),
+        None => {
+            // An AP started on a GUESSED channel can lock the single-channel
+            // radio away from wlan0's — breaking the host's own WiFi (seen in
+            // the wild: fallback channel 6 vs the router's 9). Never guess;
+            // only a healthy running unit with an existing config is left as
+            // it is.
+            if old_conf.is_some() && hotspot_unit_active() {
+                println!(
+                    "[warn] hotspot: {} shows no channel (disconnected?); keeping the running hotspot's existing configuration",
+                    ifname
+                );
+                verify_ip_forward_still_on(failures);
+                handle_vpn_after_up(&tunnels, failures);
+                println!("       Join the other machine with: sudo monux system setup --hotspot-join '{}' '{}'", ssid, psk);
+                println!("       If the router hops channels, re-run this setup or: sudo systemctl restart monux-hotspot");
+                return;
+            }
+            *failures += 1;
             println!(
-                "[warn] hotspot: couldn't read {}'s channel; falling back to channel 6 (re-run setup if the AP doesn't come up)",
+                "[fail] hotspot: {} shows no channel — it must be connected to WiFi so the AP can share its channel (this single-radio card allows only one). Connect, then re-run setup.",
                 ifname
             );
-            (6, "g")
-        });
-    let hostapd_conf = hostapd_conf_content(&ssid, &psk, channel, hw_mode);
+            return;
+        }
+    };
     let conf_changed = old_conf.as_deref() != Some(hostapd_conf.as_str());
     if let Err(e) = std::fs::create_dir_all(HOTSPOT_CONF_DIR) {
         *failures += 1;
