@@ -125,7 +125,7 @@ pub async fn run<O: output::OutputHandler>(
 ) -> Result<()> {
     let (mut client, connect_time) = Connection::new(
         server_addr,
-        cert_verifier,
+        cert_verifier.clone(),
         max_clipboard_size_bytes,
         mode,
         config_dir,
@@ -139,6 +139,26 @@ pub async fn run<O: output::OutputHandler>(
     )
     .await?;
     client.control_state.set_connected(client.conn().clone());
+    // Remember this server for next time: mDNS (link-local multicast) can't
+    // cross routers, so a working address is worth trying before discovery
+    // on later runs (see known_servers.rs).
+    if let Some(fingerprint) = cert_verifier.peer_fingerprint() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Err(e) = crate::known_servers::record(
+            config_dir,
+            *server_addr,
+            &fingerprint,
+            client.server_hostname.as_deref(),
+            now,
+        ) {
+            warn!("Failed to record the server in the remembered store: {:?}", e);
+        }
+    } else {
+        debug!("No server fingerprint learned during the handshake; not remembering the server");
+    }
     notify::notify(
         "monux-connection",
         notify::Urgency::Low,
@@ -267,6 +287,10 @@ struct Connection {
     /// --no-auto-hotspot: don't join the server's advertised hotspot
     /// automatically (ServerEvent::HotspotInfo).
     no_auto_hotspot: bool,
+    /// The server's hostname, learned from the v15+ handshake (None from an
+    /// older server): feeds the approval prompt and the remembered-servers
+    /// store (known_servers.rs).
+    server_hostname: Option<String>,
 }
 
 /// Per-connection state of server-driven edge inference (see
@@ -339,11 +363,31 @@ impl Connection {
             SocketAddr::V4(_) => "0.0.0.0:0".parse().expect("Failed to parse 0.0.0.0:0"),
             SocketAddr::V6(_) => "[::]:0".parse().expect("Failed to parse [::]:0"),
         };
-        let client_endpoint = transport::build_client(&bind_addr, cert_verifier, mode)?;
+        let client_endpoint = transport::build_client(&bind_addr, cert_verifier.clone(), mode)?;
+        // Bound the connect (QUIC+TLS handshake): the reconnect loop cycles
+        // remembered server addresses (known_servers.rs), and a dead one must
+        // fail fast — a silent address otherwise rides the full QUIC idle
+        // timeout. Www gets longer so slow internet handshakes still pass.
+        // Note an interactive cert-approval prompt runs INSIDE this future:
+        // a timeout drops that attempt, but the answer is still honored (the
+        // cert is written to disk) and a later retry connects.
+        let connect_timeout = match mode {
+            transport::NetworkMode::Local => Duration::from_secs(3),
+            transport::NetworkMode::Www => Duration::from_secs(10),
+        };
         // Connect to server, our custom cert verifiers result in server_name being ignored
-        let conn = client_endpoint
-            .connect(*server_addr, "__ignored__")?
-            .await?;
+        let conn = tokio::time::timeout(
+            connect_timeout,
+            client_endpoint.connect(*server_addr, "__ignored__")?,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "Connecting to {} timed out after {}s",
+                server_addr,
+                connect_timeout.as_secs()
+            )
+        })??;
         info!(
             "Connected to server: {} (from local endpoint {})",
             conn.remote_address(),
@@ -384,6 +428,23 @@ impl Connection {
             }
         }
         transport::ensure_compatible_version(server_version)?;
+
+        // Protocol v15: the server follows the events-stream version with
+        // its hostname (length-prefixed). Learned for the approval prompt
+        // (a direct-IP connect has no mDNS name) and for the remembered-
+        // servers store (known_servers.rs). An older server sends nothing,
+        // so there is nothing to wait for then.
+        let server_hostname = if shared::expects_hostname(server_version) {
+            let hostname = transport::recv_hostname(&mut events_recv, &mut event_bytes).await?;
+            if hostname.is_empty() {
+                None
+            } else {
+                cert_verifier.set_handshake_server_name(hostname.clone());
+                Some(hostname)
+            }
+        } else {
+            None
+        };
 
         let (mut bulk_send, mut bulk_recv) = conn
             .open_bi()
@@ -453,6 +514,7 @@ impl Connection {
                 edge_inference: EdgeInference::new(edge_map_explicit),
                 edge_dwell,
                 no_auto_hotspot,
+                server_hostname,
             },
             connect_time,
         ))

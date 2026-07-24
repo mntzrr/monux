@@ -73,10 +73,16 @@ pub struct MonuxCertVerification<'a> {
     /// Disabled for the server in --www mode, where internet-facing peers must
     /// be pre-approved instead of prompting on the console.
     allow_interactive_prompts: bool,
-    /// Server instance name discovered via mDNS (client side only), shown in
-    /// the approval prompt so the user can sanity-check which machine they are
-    /// connecting to. mDNS is unauthenticated, so this is a hint, not proof.
+    /// Server name (client side only), shown in the approval prompt so the
+    /// user can sanity-check which machine they are connecting to. Learned
+    /// via mDNS discovery or the v15+ handshake; both are unauthenticated,
+    /// so this is a hint, not proof.
     discovered_server_name: Mutex<Option<String>>,
+    /// The server certificate's fingerprint as learned during the client-side
+    /// handshake, read after a successful connect for the remembered-servers
+    /// store (known_servers.rs). Server side, the client's fingerprint
+    /// travels via the `fingerprint` slot instead (see verify_client_cert).
+    peer_fingerprint: Mutex<Option<String>>,
     /// For rustls verify calls
     crypto_provider: Arc<rustls::crypto::CryptoProvider>,
 }
@@ -94,6 +100,26 @@ impl<'a> MonuxCertVerification<'a> {
         if let Ok(mut slot) = self.discovered_server_name.lock() {
             *slot = Some(name);
         }
+    }
+
+    /// Records the server's hostname learned from the v15+ handshake, for the
+    /// approval prompt — but only when no mDNS-discovered name exists (mDNS
+    /// was there first and says the same thing).
+    pub fn set_handshake_server_name(&self, name: String) {
+        if let Ok(mut slot) = self.discovered_server_name.lock() {
+            if slot.is_none() {
+                *slot = Some(name);
+            }
+        }
+    }
+
+    /// The server certificate's fingerprint as learned during the client-side
+    /// handshake; None before the first successful verification.
+    pub fn peer_fingerprint(&self) -> Option<String> {
+        self.peer_fingerprint
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
     }
 
     pub fn new(
@@ -130,6 +156,7 @@ impl<'a> MonuxCertVerification<'a> {
             fingerprint,
             allow_interactive_prompts,
             discovered_server_name: Mutex::new(None),
+            peer_fingerprint: Mutex::new(None),
             crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
         }))
     }
@@ -241,10 +268,16 @@ impl rustls::client::danger::ServerCertVerifier for MonuxCertVerification<'_> {
         _ocsp_response: &[u8],
         _now: rustls_pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        if let Err(e) = self.verify_cert(server_cert, "Server", false) {
-            Err(rustls::Error::General(e.to_string()))
-        } else {
-            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        match self.verify_cert(server_cert, "Server", false) {
+            Err(e) => Err(rustls::Error::General(e.to_string())),
+            Ok(their_cert_fingerprint) => {
+                // Learn the server's fingerprint for the remembered-servers
+                // store (known_servers.rs), read after a successful connect.
+                if let Ok(mut slot) = self.peer_fingerprint.lock() {
+                    *slot = Some(their_cert_fingerprint);
+                }
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
         }
     }
 
@@ -400,7 +433,7 @@ Allow this new client and save its certificate for future connections? ({}s time
         )
     } else {
         let discovered_line = discovered_server_name
-            .map(|name| format!("The server was discovered via mDNS as: {}\n", name))
+            .map(|name| format!("The server calls itself: {} (learned via mDNS or the handshake — unauthenticated)\n", name))
             .unwrap_or_default();
         format!(
             "APPROVAL NEEDED: New unknown server connection

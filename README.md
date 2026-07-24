@@ -108,6 +108,8 @@ On a local network you can omit the host and let the client discover the server 
 monux client
 ```
 
+The server advertises its hostname, protocol version, and certificate fingerprint in its mDNS TXT record; `monux servers` lists everything answering on the LAN plus the servers this client remembers — without connecting to anything. mDNS is link-local multicast and cannot cross routers, so when the machines sit on different subnets (same modem, different router) discovery never sees the server, while a direct connection works fine: connect once with `monux client <ip>` and the address is remembered (`~/.config/monux/known_servers`, the 5 most recent) and tried before mDNS from then on. The remembered store also widens the host argument: `monux client` takes an IP, a remembered server name, or a fingerprint prefix — every field printed by `monux servers` is a valid connect target.
+
 The first time a client connects, verify the fingerprint shown on both sides matches, then approve it. Approved certificates are stored in `~/.config/monux/known_certs/`.
 
 ### Server: sudo vs non-sudo

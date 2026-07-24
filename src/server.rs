@@ -475,6 +475,19 @@ async fn handle_connection(
         return Err(VersionMismatch.into());
     }
 
+    // Protocol v15: tell the client our hostname right after the version
+    // exchange (length-prefixed; the client reads it only when we spoke
+    // v15+, so mixed pairs behave exactly as before). Direct-IP connects get
+    // the same display name as mDNS-discovered ones (approval prompt), and
+    // the client can remember us by name (known_servers.rs).
+    if shared::sends_hostname(client_version) {
+        let hostname = crate::discovery::get_hostname().unwrap_or_default();
+        events_send
+            .write_all(&shared::encode_hostname(&hostname))
+            .await
+            .context("Failed to send our hostname")?;
+    }
+
     // Start second stream for bulk messages
     let (mut bulk_send, mut bulk_recv) = conn
         .accept_bi()

@@ -377,6 +377,36 @@ pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<u6
     Ok(version)
 }
 
+/// Reads the server-hostname frame (protocol v15: u16 big-endian length
+/// prefix + UTF-8, see shared::encode_hostname) from the events stream.
+/// Bytes already in `buf` (past the version frame) are consumed first; the
+/// frame is at most 2 + MAX_HOSTNAME_BYTES, so anything longer without a
+/// complete frame means a misbehaving peer.
+pub async fn recv_hostname(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<String> {
+    loop {
+        if let Some(decoded) = shared::decode_hostname(buf) {
+            let (hostname, consumed) = decoded
+                .map_err(|e| anyhow!("Failed to decode the server hostname: {}", e))?;
+            buf.drain(..consumed);
+            return Ok(hostname);
+        }
+        if buf.len() > 2 + shared::MAX_HOSTNAME_BYTES {
+            bail!("Peer sent an oversized hostname frame ({} bytes)", buf.len());
+        }
+        let resp = recv
+            .read_chunk(1024, true)
+            .await
+            .context("Failed reading the server hostname")?
+            .context("Peer closed the connection while sending its hostname")?;
+        trace!(
+            "Received {} byte hostname chunk: {:X?}",
+            resp.bytes.len(),
+            &*resp.bytes
+        );
+        buf.extend_from_slice(&resp.bytes);
+    }
+}
+
 /// Errors when the peer's protocol version doesn't match ours.
 pub fn ensure_compatible_version(their_version: u64) -> Result<()> {
     if their_version != shared::PROTOCOL_VERSION {

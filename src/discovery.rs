@@ -14,6 +14,10 @@ const SERVICE_TYPE: &str = "_monux._udp.local.";
 /// of waiting for a handshake.
 const PROTOCOL_VERSION_PROPERTY: &str = "pv";
 
+/// TXT property under which a server advertises its certificate fingerprint,
+/// so `monux servers` can display it (and pre-approve with --fingerprints).
+const FINGERPRINT_PROPERTY: &str = "fp";
+
 /// How long `monux update` browses for advertised server protocol versions
 /// before falling back to the recorded gate value: long enough for a running
 /// server to answer, short enough that the command doesn't appear to hang.
@@ -27,7 +31,7 @@ const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const EXTRA_RESOLVE_GRACE: Duration = Duration::from_millis(500);
 
 /// Error message when no server is discovered within the timeout.
-const DISCOVERY_TIMEOUT_HINT: &str = "Discovery timeout: no Monux server found on the local network. Check that: the server is running, both machines are on the same subnet, and no firewall is blocking UDP port 5353 (mDNS). Alternatively, connect directly with 'monux client <ip>'";
+const DISCOVERY_TIMEOUT_HINT: &str = "Discovery timeout: no Monux server found on the local network. Check that: the server is running, both machines are on the same subnet, and no firewall is blocking UDP port 5353 (mDNS). Note that mDNS is link-local multicast and cannot cross routers/subnets: on a different subnet, connect once with 'monux client <ip>' — the address is remembered thereafter";
 
 /// Registers a Monux server on the local network via mDNS.
 pub struct DiscoveryRegistration {
@@ -36,8 +40,9 @@ pub struct DiscoveryRegistration {
 }
 
 impl DiscoveryRegistration {
-    /// Advertises a Monux server listening on the given address.
-    pub fn register(listen_addr: SocketAddr) -> Result<Self> {
+    /// Advertises a Monux server listening on the given address, with its
+    /// certificate fingerprint in the TXT record.
+    pub fn register(listen_addr: SocketAddr, fingerprint: &str) -> Result<Self> {
         let hostname = get_hostname().context("Failed to get hostname")?;
         let instance_name = if hostname.is_empty() {
             "monux".to_string()
@@ -49,13 +54,19 @@ impl DiscoveryRegistration {
         let ips = advertise_ips(listen_addr.ip())?;
 
         // Advertise the wire protocol version so clients can refresh their
-        // update gate from the LAN (see update.rs). Like all mDNS data this
-        // is unauthenticated — acceptable because the gate is only a
-        // convenience; real compatibility is enforced at the handshake.
-        let properties = HashMap::from([(
-            PROTOCOL_VERSION_PROPERTY.to_string(),
-            crate::msgs::shared::PROTOCOL_VERSION.to_string(),
-        )]);
+        // update gate from the LAN (see update.rs), and the certificate
+        // fingerprint so 'monux servers' can display it. Both are
+        // informational only: like all mDNS data the TXT record is
+        // unauthenticated — acceptable because the gate is only a
+        // convenience and real trust is the cert approval flow. Old clients
+        // ignore unknown TXT properties; there is no protocol dependency.
+        let properties = HashMap::from([
+            (
+                PROTOCOL_VERSION_PROPERTY.to_string(),
+                crate::msgs::shared::PROTOCOL_VERSION.to_string(),
+            ),
+            (FINGERPRINT_PROPERTY.to_string(), fingerprint.to_string()),
+        ]);
 
         let service_info = ServiceInfo::new(
             SERVICE_TYPE,
@@ -105,10 +116,41 @@ impl Drop for DiscoveryRegistration {
     }
 }
 
-/// Discovers a Monux server on the local network via mDNS.
-/// Returns the first server found, along with its advertised instance name
-/// (normally the server's hostname) for display in e.g. approval prompts.
-pub async fn discover_server(timeout: Option<Duration>) -> Result<(SocketAddr, String)> {
+/// One Monux server instance discovered via mDNS.
+#[derive(Clone, Debug)]
+pub struct DiscoveredServer {
+    /// Instance name (normally the server's hostname), stripped of the
+    /// service-type suffix.
+    pub name: String,
+    /// All advertised addresses, merged across resolve events (mDNS delivers
+    /// a service's addresses incrementally) and deduped.
+    pub addrs: Vec<IpAddr>,
+    /// The advertised port.
+    pub port: u16,
+    /// The advertised wire protocol version (TXT `pv`); None when the server
+    /// predates the advertisement.
+    pub protocol_version: Option<u64>,
+    /// The advertised certificate fingerprint (TXT `fp`); None when the
+    /// server predates the advertisement.
+    pub fingerprint: Option<String>,
+}
+
+/// Discovers ALL Monux servers advertised on the local network via mDNS, in
+/// resolve order. The mDNS browse is synchronous (mdns_sd is a channel API);
+/// it runs off the async workers so a long timeout can't park one.
+pub async fn discover_servers(timeout: Option<Duration>) -> Result<Vec<DiscoveredServer>> {
+    tokio::task::spawn_blocking(move || discover_servers_blocking(timeout))
+        .await
+        .context("mDNS discovery task failed")?
+}
+
+/// Synchronous core of `discover_servers` (also used by `monux servers`,
+/// which runs before the tokio runtime exists). Browses until the timeout,
+/// but ends a grace period (EXTRA_RESOLVE_GRACE) after the first resolve:
+/// mDNS answers are near-instant on a LAN, and waiting out the full timeout
+/// would make a listing feel hung. Errors only when NOTHING resolved within
+/// the timeout (DISCOVERY_TIMEOUT_HINT) or the browse itself failed.
+pub fn discover_servers_blocking(timeout: Option<Duration>) -> Result<Vec<DiscoveredServer>> {
     let timeout = timeout.unwrap_or(DEFAULT_DISCOVERY_TIMEOUT);
     let daemon = ServiceDaemon::new().context("Failed to create mDNS daemon")?;
     let receiver = daemon
@@ -116,21 +158,18 @@ pub async fn discover_server(timeout: Option<Duration>) -> Result<(SocketAddr, S
         .context("Failed to browse for Monux servers")?;
 
     let deadline = Instant::now() + timeout;
-    // Addresses of the first-discovered server instance, merged across resolve
-    // events: mDNS delivers a service's addresses incrementally, so the first
-    // event rarely carries them all. Only after a grace period do we pick one.
-    let mut first_instance: Option<String> = None;
+    // Once the first instance has resolved, only wait out the grace period
+    // for the rest of its addresses (and other servers) to arrive.
     let mut grace_deadline: Option<Instant> = None;
-    let mut instance_port = 0u16;
-    let mut instance_addrs: Vec<IpAddr> = Vec::new();
-    let mut other_servers: Vec<String> = Vec::new();
+    let mut instances: Vec<DiscoveredServer> = Vec::new();
+    // Parallel to `instances`: the service fullname, for merging the
+    // incremental resolve events of one instance.
+    let mut fullnames: Vec<String> = Vec::new();
 
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or_else(|| anyhow!("{}", DISCOVERY_TIMEOUT_HINT))?;
-        // Once the first instance has resolved, only wait out the grace period
-        // for the rest of its addresses (and other servers) to arrive.
         let wait = match grace_deadline {
             Some(grace) => match grace.checked_duration_since(Instant::now()) {
                 Some(grace_remaining) => grace_remaining,
@@ -139,12 +178,10 @@ pub async fn discover_server(timeout: Option<Duration>) -> Result<(SocketAddr, S
             None => remaining,
         };
 
-        let event = match tokio::time::timeout(wait, receiver.recv_async()).await {
-            Ok(Ok(event)) => event,
-            Ok(Err(e)) => {
-                let _ = daemon.shutdown();
-                bail!("mDNS browse error: {}", e);
-            }
+        let event = match receiver.recv_timeout(wait) {
+            Ok(event) => event,
+            // Timeout (normal: no more answers within the window) or the
+            // daemon's channel closing: either way the browse is over.
             Err(_) => {
                 if grace_deadline.is_some() {
                     // Grace period expired with no more events
@@ -158,33 +195,37 @@ pub async fn discover_server(timeout: Option<Duration>) -> Result<(SocketAddr, S
         match event {
             ServiceEvent::ServiceResolved(resolved) => {
                 let fullname = resolved.get_fullname().to_string();
-                match &first_instance {
+                match fullnames.iter().position(|known| *known == fullname) {
+                    Some(idx) => {
+                        // More addresses for the same server arrived.
+                        for scoped_ip in resolved.get_addresses() {
+                            let ip = scoped_ip.to_ip_addr();
+                            if !instances[idx].addrs.contains(&ip) {
+                                instances[idx].addrs.push(ip);
+                            }
+                        }
+                    }
                     None => {
                         info!("Discovered Monux server: {}", fullname);
-                        first_instance = Some(fullname);
-                        grace_deadline = Some(Instant::now() + EXTRA_RESOLVE_GRACE);
-                        instance_port = resolved.get_port();
+                        let mut addrs: Vec<IpAddr> = Vec::new();
                         for scoped_ip in resolved.get_addresses() {
                             // ScopedIp carries the discovering interface(s);
                             // reduce to a plain address, deduped.
                             let ip = scoped_ip.to_ip_addr();
-                            if !instance_addrs.contains(&ip) {
-                                instance_addrs.push(ip);
+                            if !addrs.contains(&ip) {
+                                addrs.push(ip);
                             }
                         }
-                    }
-                    Some(current) if *current == fullname => {
-                        // More addresses for the same server arrived
-                        for scoped_ip in resolved.get_addresses() {
-                            let ip = scoped_ip.to_ip_addr();
-                            if !instance_addrs.contains(&ip) {
-                                instance_addrs.push(ip);
-                            }
-                        }
-                    }
-                    Some(_) => {
-                        if !other_servers.contains(&fullname) {
-                            other_servers.push(fullname);
+                        fullnames.push(fullname.clone());
+                        instances.push(DiscoveredServer {
+                            name: instance_name_of(&fullname).to_string(),
+                            addrs,
+                            port: resolved.get_port(),
+                            protocol_version: protocol_version_of(resolved.get_properties()),
+                            fingerprint: fingerprint_of(resolved.get_properties()),
+                        });
+                        if grace_deadline.is_none() {
+                            grace_deadline = Some(Instant::now() + EXTRA_RESOLVE_GRACE);
                         }
                     }
                 }
@@ -195,28 +236,56 @@ pub async fn discover_server(timeout: Option<Duration>) -> Result<(SocketAddr, S
         }
     }
 
-    if !other_servers.is_empty() {
+    let _ = daemon.shutdown();
+    Ok(instances)
+}
+
+/// Discovers a Monux server on the local network via mDNS.
+/// Returns the first server found — unless a later instance's address is in
+/// the remembered store (a server we connected to before beats a stranger) —
+/// along with its advertised instance name (normally the server's hostname)
+/// for display in e.g. approval prompts.
+pub async fn discover_server(
+    timeout: Option<Duration>,
+    remembered: &[crate::known_servers::RememberedServer],
+) -> Result<(SocketAddr, String)> {
+    let instances = discover_servers(timeout).await?;
+    let remembered_hit = instances.iter().position(|instance| {
+        instance.addrs.iter().any(|ip| {
+            remembered
+                .iter()
+                .any(|server| server.addr == SocketAddr::new(*ip, instance.port))
+        })
+    });
+    let chosen_idx = remembered_hit.unwrap_or(0);
+    let chosen = &instances[chosen_idx];
+    if instances.len() > 1 {
+        let others: Vec<&str> = instances
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx != chosen_idx)
+            .map(|(_, instance)| instance.name.as_str())
+            .collect();
         info!(
-            "Multiple Monux servers discovered: {}; connecting to: {}",
-            other_servers.join(", "),
-            first_instance.as_deref().unwrap_or("<unknown>")
+            "Multiple Monux servers discovered: {}; connecting to: {}{}",
+            others.join(", "),
+            chosen.name,
+            if remembered_hit.is_some() {
+                " (remembered from a previous connection)"
+            } else {
+                ""
+            }
         );
+        info!("Run 'monux servers' to list them, 'monux client <ip|name|fp-prefix>' to choose another");
     }
-    let fullname = first_instance.ok_or_else(|| anyhow!("Discovered server has no addresses"))?;
-    let addr = pick_addr(&instance_addrs, instance_port)
+    let addr = pick_addr(&chosen.addrs, chosen.port)
         .ok_or_else(|| anyhow!("Discovered server has no addresses"))?;
     info!(
         "Discovered {} address(es) for server, connecting to: {}",
-        instance_addrs.len(),
+        chosen.addrs.len(),
         addr
     );
-    let _ = daemon.shutdown();
-    // Strip the service-type suffix, leaving the bare instance (host) name.
-    let instance_name = fullname
-        .strip_suffix(&format!(".{}", SERVICE_TYPE))
-        .unwrap_or(&fullname)
-        .to_string();
-    Ok((addr, instance_name))
+    Ok((addr, chosen.name.clone()))
 }
 
 /// Extracts a server's advertised protocol version from its mDNS TXT
@@ -227,6 +296,15 @@ fn protocol_version_of(properties: &TxtProperties) -> Option<u64> {
         .get_property_val_str(PROTOCOL_VERSION_PROPERTY)?
         .parse()
         .ok()
+}
+
+/// Extracts a server's advertised certificate fingerprint from its mDNS TXT
+/// properties: `None` when the property is absent (servers predate the
+/// advertisement) — "no information", never an error.
+fn fingerprint_of(properties: &TxtProperties) -> Option<String> {
+    properties
+        .get_property_val_str(FINGERPRINT_PROPERTY)
+        .map(|fp| fp.to_string())
 }
 
 /// Picks the update-gate constraint from the protocol versions discovered on
@@ -456,7 +534,7 @@ fn local_ipv4_addrs() -> Result<Vec<IpAddr>> {
 }
 
 /// Returns the machine hostname.
-fn get_hostname() -> Result<String> {
+pub fn get_hostname() -> Result<String> {
     let mut buf = [0i8; 256];
     let ret = unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) };
     if ret != 0 {
@@ -489,6 +567,17 @@ mod tests {
         assert_eq!(protocol_version_of(&empty), None);
         let junk = HashMap::from([("pv".to_string(), "eight".to_string())]).into_txt_properties();
         assert_eq!(protocol_version_of(&junk), None);
+    }
+
+    #[test]
+    fn extracts_advertised_fingerprint() {
+        use mdns_sd::IntoTxtProperties;
+        let props =
+            HashMap::from([("fp".to_string(), "aabbccdd".to_string())]).into_txt_properties();
+        assert_eq!(fingerprint_of(&props), Some("aabbccdd".to_string()));
+        // No property (a pre-advertisement server): no information.
+        let empty = HashMap::<String, String>::new().into_txt_properties();
+        assert_eq!(fingerprint_of(&empty), None);
     }
 
     #[test]

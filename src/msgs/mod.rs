@@ -22,14 +22,14 @@ mod golden_tests {
     /// The update gate keys on the protocol version: bumping it must be a
     /// conscious red test (and per AGENTS.md a MAJOR crate version bump).
     #[test]
-    fn protocol_version_is_14() {
-        assert_eq!(shared::PROTOCOL_VERSION, 14);
+    fn protocol_version_is_15() {
+        assert_eq!(shared::PROTOCOL_VERSION, 15);
     }
 
     #[test]
     fn golden_version_bootstrap() {
-        let msg = shared::VersionBootstrapMessage { version: 14 };
-        assert_eq!(cobs_hex(&msg), "020e00");
+        let msg = shared::VersionBootstrapMessage { version: 15 };
+        assert_eq!(cobs_hex(&msg), "020f00");
     }
 
     #[test]

@@ -106,6 +106,23 @@ EXAMPLES:
     monux status --server     # restrict to one role (or --client)")]
     Status(StatusArgs),
 
+    /// Lists the servers visible on the LAN and remembered from past connects
+    ///
+    /// The union of live mDNS advertisements and the remembered-servers
+    /// store (~/.config/monux/known_servers, written on every successful
+    /// connect). Display only: nothing is probed or connected to. One line
+    /// per server address: name, ip:port, fingerprint prefix, protocol
+    /// version, source ('mdns', or 'remembered' with the last connect); an
+    /// address visible via both shows once, as mdns. Every printed field is
+    /// a valid connect target for 'monux client'.
+    #[command(after_long_help = "\
+EXAMPLES:
+    monux servers                  # what's out there, what do I remember
+    monux client 192.168.1.187     # connect by address
+    monux client myhost            # connect by remembered/mDNS name
+    monux client aabbccdd          # connect by fingerprint prefix")]
+    Servers,
+
     /// Desktop GUI integration: the tray indicator and its visibility
     #[command(after_long_help = "\
 EXAMPLES:
@@ -745,7 +762,7 @@ fn main() -> Result<()> {
     // Record the exact build in the log: invaluable when diagnosing bug reports.
     info!("monux v{} starting", VERSION);
 
-    // Setup/update/status/config/gui/system/daemon commands don't need the
+    // Setup/update/status/servers/config/gui/system/daemon commands don't need the
     // devices or the async runtime.
     match &cli.command {
         Commands::Daemon(args) => match &args.command {
@@ -837,6 +854,12 @@ fn main() -> Result<()> {
             println!("{}", out);
             return Ok(());
         }
+        Commands::Servers => {
+            // Display-only: reads mDNS advertisements and the remembered
+            // store; never connects to anything (no probes, no handshake).
+            println!("{}", monux::servers::listing(&init_config_dir()?));
+            return Ok(());
+        }
         Commands::Config(args) => {
             let action = match &args.command {
                 None | Some(ConfigCommands::Show) => monux::config::Action::Show,
@@ -910,11 +933,12 @@ fn main() -> Result<()> {
         Commands::Setup(_)
         | Commands::Update(_)
         | Commands::Status(_)
+        | Commands::Servers
         | Commands::Config(_)
         | Commands::Gui(_)
         | Commands::System(_)
         | Commands::Daemon(_) => {
-            unreachable!("setup/update/status/config/gui/system/daemon commands are handled before runtime initialization")
+            unreachable!("setup/update/status/servers/config/gui/system/daemon commands are handled before runtime initialization")
         }
         Commands::Server(mut args) => {
             // The config file fills whatever the command line left unset.
@@ -1063,39 +1087,28 @@ fn main() -> Result<()> {
             if auto_update {
                 rt.spawn(monux::autoupdate::run(Some(config_dir.clone())));
             }
-            // When no host is given, the server address comes from mDNS discovery,
-            // which allows re-discovering it after repeated connection failures.
-            let from_discovery = args.host.is_none();
+            // When no host is given, the client cycles its server candidates:
+            // the remembered servers (most recent first — a one-time
+            // 'monux client <ip>' is remembered, see known_servers.rs) and
+            // one mDNS discovery attempt, over and over.
             let port = args.port.unwrap_or(monux::config::DEFAULT_PORT);
-            // Server instance name from mDNS discovery, for the approval prompt.
-            let mut discovered_server_name: Option<String> = None;
-            let connect_addr: SocketAddr = match &args.host {
-                Some(host) => {
-                    if let Ok(host_ip) = host.parse::<IpAddr>() {
-                        // It's an IP.
-                        SocketAddr::new(host_ip, port)
-                    } else {
-                        // Its a hostname? Try resolving it.
-                        let mut socket_addrs = format!("{}:{}", host, port)
+            let initial_addr: Option<SocketAddr> = match &args.host {
+                Some(host) => Some(monux::known_servers::resolve_host(
+                    host,
+                    port,
+                    &monux::known_servers::load(&config_dir),
+                    |host| {
+                        format!("{}:{}", host, port)
                             .to_socket_addrs()
-                            .map_err(|e| anyhow!("Failed to resolve --host={}: {:?}", host, e))?;
-                        if let Some(first) = socket_addrs.next() {
-                            first
-                        } else {
-                            bail!("Provided --host={} didn't resolve to an IP", host);
-                        }
-                    }
-                }
+                            .map(|mut addrs| addrs.next())
+                            .map_err(anyhow::Error::from)
+                    },
+                )?),
                 None => {
                     if args.port.is_some() {
-                        warn!("a configured port (--port or config file) is ignored when the server is auto-discovered via mDNS");
+                        warn!("a configured port (--port or config file) is ignored when the server is auto-discovered via mDNS or tried from the remembered servers");
                     }
-                    // Discover the server on the local network via mDNS.
-                    info!("No server host provided, discovering via mDNS...");
-                    let (addr, name) =
-                        rt.block_on(async { discovery::discover_server(None).await })?;
-                    discovered_server_name = Some(name);
-                    addr
+                    None
                 }
             };
             let verifier = approval::MonuxCertVerification::new(
@@ -1107,9 +1120,6 @@ fn main() -> Result<()> {
                 // approval prompts stay enabled even in --www mode (unlike the server).
                 true,
             )?;
-            if let Some(name) = discovered_server_name {
-                verifier.set_discovered_server_name(name);
-            }
             info!(
                 "Our certificate fingerprint: {} (pre-approve this client on the server with '--fingerprints {}')",
                 verifier.our_fingerprint(),
@@ -1156,11 +1166,10 @@ fn main() -> Result<()> {
             rt.block_on(async {
                 client(
                     config_dir,
-                    connect_addr,
+                    initial_addr,
                     verifier,
                     max_clipboard_size_bytes,
                     mode,
-                    from_discovery,
                     mouse_scale,
                     scroll_scale,
                     throttle_mode,
@@ -1428,6 +1437,9 @@ async fn server(
     // close_loops).
     let server_endpoint = server::SharedEndpoint::default();
     let server_endpoint2 = server_endpoint.clone();
+    // Advertised in the mDNS TXT record ('monux servers' displays it);
+    // read before the verifier moves into the connections loop.
+    let our_fingerprint = verifier.our_fingerprint();
     let mut server_connections_handle = task::spawn(async move {
         server::run_server_connections_loop(
             &listen_addr,
@@ -1442,7 +1454,7 @@ async fn server(
     });
 
     // Advertise the server on the local network so that clients can discover it.
-    let _mdns_registration = match discovery::DiscoveryRegistration::register(listen_addr) {
+    let _mdns_registration = match discovery::DiscoveryRegistration::register(listen_addr, &our_fingerprint) {
         Ok(r) => Some(r),
         Err(e) => {
             warn!("Failed to register mDNS service for LAN discovery: {}", e);
@@ -1572,20 +1584,75 @@ async fn close_loops(
 
 /// A failed connection that had survived beyond this was a healthy session: its
 /// loss is a fresh network event, not a persistent failure — it neither counts
-/// toward mDNS re-discovery nor keeps the reconnect backoff elevated.
+/// toward candidate cycling nor keeps the reconnect backoff elevated.
 const HEALTHY_SESSION: Duration = Duration::from_secs(60);
 
 /// Cap for the reconnect backoff: the first retry after a failure is immediate,
 /// then the delay doubles (1s, 2s, ...) up to this.
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 
+/// One candidate in the reconnect cycle of a discovery-mode client (no
+/// --host).
+enum Candidate {
+    /// A remembered server address (known_servers.rs), most recent first.
+    Remembered(SocketAddr),
+    /// One mDNS discovery attempt.
+    Discover,
+}
+
+/// Builds one pass of the reconnect candidate cycle: the remembered servers,
+/// most recent first, then a single mDNS discovery attempt. The cycle is
+/// rebuilt from a fresh store read every pass, so a server just recorded by
+/// a successful connect leads the next one.
+fn candidate_cycle(
+    remembered: &[monux::known_servers::RememberedServer],
+) -> std::collections::VecDeque<Candidate> {
+    remembered
+        .iter()
+        .map(|server| Candidate::Remembered(server.addr))
+        .chain(std::iter::once(Candidate::Discover))
+        .collect()
+}
+
+/// Draws the next reconnect candidate for a discovery-mode client, rebuilding
+/// the cycle from a fresh read of the remembered store when the current pass
+/// is exhausted. Returns None when the pass's mDNS attempt found no server;
+/// the caller then retries the current address.
+async fn draw_candidate(
+    cycle: &mut std::collections::VecDeque<Candidate>,
+    config_dir: &std::path::Path,
+    verifier: &approval::MonuxCertVerification<'static>,
+) -> Option<SocketAddr> {
+    if cycle.is_empty() {
+        *cycle = candidate_cycle(&monux::known_servers::load(config_dir));
+    }
+    match cycle
+        .pop_front()
+        .expect("a candidate pass always holds at least the mDNS attempt")
+    {
+        Candidate::Remembered(addr) => Some(addr),
+        Candidate::Discover => {
+            info!("Discovering the server via mDNS...");
+            match discovery::discover_server(None, &monux::known_servers::load(config_dir)).await {
+                Ok((addr, name)) => {
+                    verifier.set_discovered_server_name(name);
+                    Some(addr)
+                }
+                Err(e) => {
+                    warn!("mDNS discovery found no server: {:?}", e);
+                    None
+                }
+            }
+        }
+    }
+}
+
 async fn client(
     config_dir: PathBuf,
-    connect_addr: SocketAddr,
+    initial_addr: Option<SocketAddr>,
     verifier: Arc<approval::MonuxCertVerification<'static>>,
     max_clipboard_size_bytes: u64,
     mode: NetworkMode,
-    from_discovery: bool,
     mouse_scale: f64,
     scroll_scale: f64,
     throttle_mode: monux::rotation::ThrottleMode,
@@ -1607,7 +1674,22 @@ async fn client(
         max_uncompressed_size_bytes,
     ).await;
 
-    let mut connect_addr = connect_addr;
+    // An explicit --host keeps retrying its own address; without one
+    // (discovery mode) the reconnect loop cycles: the remembered servers
+    // (most recent first), one mDNS attempt, then a fresh pass. The first
+    // draw is the startup connection attempt; when nothing is remembered it
+    // IS the mDNS discovery — fatal when it finds nothing, as before.
+    let discovery_mode = initial_addr.is_none();
+    let mut cycle: std::collections::VecDeque<Candidate> = std::collections::VecDeque::new();
+    let mut connect_addr = match initial_addr {
+        Some(addr) => addr,
+        None => match draw_candidate(&mut cycle, &config_dir, &verifier).await {
+            Some(addr) => addr,
+            None => bail!(
+                "No server found: nothing is remembered yet and mDNS discovery found no server on this network. Connect once with 'monux client <ip>' (remembered thereafter)"
+            ),
+        },
+    };
     let mut consecutive_failures = 0u32;
     // Delay before the next reconnect attempt: the first retry after a failure
     // is immediate, then the delay doubles per failure (1s, 2s, ...) up to
@@ -1679,38 +1761,29 @@ async fn client(
                 }
                 if connected_at.elapsed() > HEALTHY_SESSION {
                     // The lost connection was a healthy session: start over with
-                    // a clean failure count and an immediate retry.
+                    // a clean failure count and an immediate retry of the same
+                    // address.
                     consecutive_failures = 0;
                     reconnect_backoff = Duration::ZERO;
                 } else {
                     consecutive_failures += 1;
-                }
-                if from_discovery && consecutive_failures >= 3 {
-                    // The discovered address may be stale (server restarted elsewhere,
-                    // DHCP lease change, ...): try discovering the server again.
-                    warn!(
-                        "{} consecutive connection failures, re-running mDNS discovery",
-                        consecutive_failures
-                    );
-                    match discovery::discover_server(None).await {
-                        Ok((new_addr, new_name)) => {
-                            if new_addr != connect_addr {
+                    if discovery_mode {
+                        // A fast failure means this candidate is probably
+                        // stale: advance to the next one (the remembered
+                        // servers, most recent first, then one mDNS attempt,
+                        // then a fresh pass — see draw_candidate). A failed
+                        // mDNS attempt keeps the current address.
+                        if let Some(next) = draw_candidate(&mut cycle, &config_dir, &verifier).await
+                        {
+                            if next != connect_addr {
                                 info!(
-                                    "Discovered server at new address: {} (was {})",
-                                    new_addr, connect_addr
+                                    "Connection failure #{}: trying the next server candidate: {} (was {})",
+                                    consecutive_failures, next, connect_addr
                                 );
                             }
-                            connect_addr = new_addr;
-                            verifier.set_discovered_server_name(new_name);
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Re-discovery failed, keeping previous address {}: {:?}",
-                                connect_addr, e
-                            );
+                            connect_addr = next;
                         }
                     }
-                    consecutive_failures = 0;
                 }
                 // Back off before retrying (immediate on the first failure);
                 // the next delay doubles, capped at MAX_RECONNECT_BACKOFF.
@@ -1761,6 +1834,41 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn servers_command_parses() {
+        let cli = Cli::try_parse_from(["monux", "servers"]).unwrap();
+        assert!(matches!(cli.command, Commands::Servers));
+    }
+
+    #[test]
+    fn candidate_cycle_is_remembered_first_then_one_mdns_attempt() {
+        // Empty store: a pass is exactly one mDNS attempt.
+        let cycle = candidate_cycle(&[]);
+        assert_eq!(cycle.len(), 1);
+        assert!(matches!(cycle[0], Candidate::Discover));
+
+        // The remembered servers lead, most recent first, then the mDNS attempt.
+        let remembered = vec![
+            monux::known_servers::RememberedServer {
+                addr: "10.0.0.1:1213".parse().unwrap(),
+                fingerprint: "aa".to_string(),
+                hostname: Some("one".to_string()),
+                last_connected: 200,
+            },
+            monux::known_servers::RememberedServer {
+                addr: "10.0.0.2:1213".parse().unwrap(),
+                fingerprint: "bb".to_string(),
+                hostname: None,
+                last_connected: 100,
+            },
+        ];
+        let cycle = candidate_cycle(&remembered);
+        assert_eq!(cycle.len(), 3);
+        assert!(matches!(&cycle[0], Candidate::Remembered(addr) if *addr == "10.0.0.1:1213".parse().unwrap()));
+        assert!(matches!(&cycle[1], Candidate::Remembered(addr) if *addr == "10.0.0.2:1213".parse().unwrap()));
+        assert!(matches!(cycle[2], Candidate::Discover));
     }
 
     #[test]
