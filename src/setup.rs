@@ -61,7 +61,13 @@ pub(crate) const VPN_WORKAROUND_COMMENT: &str = "monux-hotspot";
 /// re-running setup recreates this one.
 pub(crate) const AP_IFACE_NAME: &str = "monux-ap";
 
-/// Creates the dedicated AP interface for the hotspot (idempotent).
+/// Creates the dedicated AP interface for the hotspot (idempotent). The vif
+/// is created as a STATION ('managed'): NM's wifi device factory ignores
+/// '__ap'-type vifs (the one it never sees, it also can't activate on —
+/// and such a vif vanishes from the phy shortly after creation), while a
+/// managed vif is picked up as a normal wifi device that NM itself switches
+/// to AP mode when the profile activates. The card's combinations allow
+/// 2 managed + 1 AP on one channel.
 fn ensure_ap_interface(wifi_ifname: &str, failures: &mut u32) -> bool {
     if run_cmd("ip", &["link", "show", AP_IFACE_NAME]).is_ok() {
         println!("[ok]   hotspot: AP interface {} already exists", AP_IFACE_NAME);
@@ -69,7 +75,7 @@ fn ensure_ap_interface(wifi_ifname: &str, failures: &mut u32) -> bool {
     }
     match run_cmd(
         "iw",
-        &["dev", wifi_ifname, "interface", "add", AP_IFACE_NAME, "type", "__ap"],
+        &["dev", wifi_ifname, "interface", "add", AP_IFACE_NAME, "type", "managed"],
     ) {
         Ok(_) => {
             println!(
@@ -1135,6 +1141,20 @@ fn setup_hotspot(failures: &mut u32) {
     // interface itself would replace the host's WiFi connection (see
     // AP_IFACE_NAME).
     if !ensure_ap_interface(&ifname, failures) {
+        return;
+    }
+    // NM must list the vif as a device to activate a profile on it; if it
+    // doesn't (driver/NM quirk), say so plainly instead of surfacing nmcli's
+    // interface-name mismatch.
+    let nm_sees = run_cmd("nmcli", &["-t", "-f", "DEVICE", "device", "status"])
+        .map(|out| out.lines().any(|line| line == AP_IFACE_NAME))
+        .unwrap_or(false);
+    if !nm_sees {
+        *failures += 1;
+        println!(
+            "[fail] hotspot: {} exists but NetworkManager doesn't list it as a device (driver/NM quirk) — the AP can't be activated this way",
+            AP_IFACE_NAME
+        );
         return;
     }
     if let Err(e) = run_cmd(
