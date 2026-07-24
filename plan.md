@@ -95,12 +95,12 @@ works because the modem routes.
 
 The config file is persistent flag storage; `mx config` is its CLI.
 
-- [ ] `~/.config/monux/config.toml`, sections `[server]` / `[client]`, keys = flag
+- [x] `~/.config/monux/config.toml`, sections `[server]` / `[client]`, keys = flag
       long-names. Add toml/serde deps only if not already present (check Cargo.toml).
-- [ ] Config-capable flags (all server/client runtime args) become `Option<T>`
+- [x] Config-capable flags (all server/client runtime args) become `Option<T>`
       without clap defaults; resolution in one place:
       explicit flag > config file > built-in default.
-- [ ] First-level `config` subcommand:
+- [x] First-level `config` subcommand:
       `show` (effective values + source annotation (default|config file) + file path),
       `keys` (reference: each key with one-line help, expected-value syntax, default;
       `set <key>` with no value prints the same per-key card),
@@ -111,21 +111,21 @@ The config file is persistent flag storage; `mx config` is its CLI.
       `validate` (parse + value-check the file, report errors with line numbers,
       change nothing — guards files edited outside `mx config` and scripts);
       unknown key errors list valid keys.
-- [ ] Single key registry {key, section, expects, default, help, parser} drives
+- [x] Single key registry {key, section, expects, default, help, parser} drives
       show/keys/set/unset; a test maps every registry entry to a real clap flag
       so the registry can't drift from the CLI.
-- [ ] Staleness policy: daemon startup warns-and-ignores unknown keys (never
+- [x] Staleness policy: daemon startup warns-and-ignores unknown keys (never
       fails to start); `validate` lists stale keys with did-you-mean + the exact
       `unset` cleanup lines; renames get an alias map honored for a deprecation
       window (startup warning names the replacement, next edit/set rewrites it).
-- [ ] New-key visibility: registry entries carry a `since` version; the daemon
+- [x] New-key visibility: registry entries carry a `since` version; the daemon
       keeps ~/.config/monux/last-version and, on the first start of a new
       version, logs one line per key introduced since (then updates the file);
       `mx config keys` annotates entries with (new in vX.Y).
-- [ ] Daemons read their section at startup only; `set` prints
+- [x] Daemons read their section at startup only; `set` prints
       "restart to apply: mx daemon restart" when a daemon is running. No live-reload.
-- [ ] `setup`-persisted system settings are NOT config — they stay machine state.
-- [ ] Tests: parse/serialize roundtrip, set/unset validation, precedence,
+- [x] `setup`-persisted system settings are NOT config — they stay machine state.
+- [x] Tests: parse/serialize roundtrip, set/unset validation, precedence,
       unknown-key errors, show output.
 
 ## Phase C — `mx` alias (item 2)

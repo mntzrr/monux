@@ -17,6 +17,18 @@ pub struct KeyCombo {
     pub action: Event,
 }
 
+/// Validates a "key1,key2,..." (or "key1+key2+...") chord string without
+/// building a combo — the config file's counterpart of the flag parsing
+/// (parse_action does the real work at daemon startup).
+pub fn validate_chord(keys: &str) -> Result<()> {
+    parse_action(keys, Event::SwitchNext).map(|_| ())
+}
+
+/// Validates a "key1,key2,key3=[fingerprint-prefix]" goto spec.
+pub fn validate_goto(spec: &str) -> Result<()> {
+    parse_goto(spec).map(|_| ())
+}
+
 /// Parses user-provided key shortcuts into a list of combinations paired with actions to be performed
 pub fn parse_key_combos(
     keys_next: &str,

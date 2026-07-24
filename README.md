@@ -226,6 +226,34 @@ You can hide the icon without stopping the daemon — the menu's **Hide tray ico
 
 Headless sessions are detected and skipped silently by the daemon; a manually started indicator there exits with a "no D-Bus session / no tray host" error. The systemd units installed by `monux setup --autostart` get the indicator for free, since the daemon spawns it — with the same caveat as clipboard sharing: the service needs `DBUS_SESSION_BUS_ADDRESS` in the systemd user manager's environment (see the autostart caveat above), otherwise the auto-spawn is skipped.
 
+## Configuration
+
+Every `monux server` / `monux client` flag (except the client's positional host) can be persisted in `~/.config/monux/config.toml`, sectioned `[server]` / `[client]` with the flag long-names as keys; repeatable flags are TOML arrays:
+
+```toml
+[server]
+port = 1213
+edge-map = ["right=auto", "left=aa11bb"]
+motion-hz = 250
+
+[client]
+mouse-scale = 0.5
+no-auto-hotspot = true
+```
+
+Precedence: an explicit CLI flag always beats the config file, which beats the built-in default. Daemons read the file once at startup — restart to apply changes (`mx daemon restart`).
+
+Manage the file with `monux config` (or by hand):
+
+```bash
+monux config                                   # effective values and their source
+monux config keys edge                         # the key reference, optionally filtered
+monux config set server.edge-map right=auto left=aa11bb
+monux config edit                              # $EDITOR, validated on save
+```
+
+`set` validates values with the same parsers as the flags before writing (atomic, 0600). A daemon never refuses to start over the config file: a malformed file is logged and ignored, and unknown keys (e.g. written by a newer version, or left behind by a rename) are warned about and skipped — `monux config validate` reports them with did-you-mean suggestions, line numbers, and the exact `mx config unset` lines that clean them up. When an update introduces new config keys, the first daemon start of the new version logs them once (`mx config keys` has the reference).
+
 ## Troubleshooting
 
 If input (e.g. the Enter key) stops registering on the server machine while `monux server` runs, the server log tells you what monux sees. The first log line records the exact build (`monux v1.0.0+<sha> starting`) — always include it when reporting.

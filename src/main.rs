@@ -114,6 +114,22 @@ EXAMPLES:
     monux gui tray show    # bring it back")]
     Gui(GuiArgs),
 
+    /// Manages the persistent configuration (~/.config/monux/config.toml)
+    ///
+    /// The config file stores flag values for the server and client daemons,
+    /// keyed by the flag long-names under [server] / [client] sections. An
+    /// explicit CLI flag always beats the config file, which beats the
+    /// built-in default. Daemons read the file once at startup.
+    #[command(after_long_help = "\
+EXAMPLES:
+    monux config                             # effective values and their source
+    monux config keys edge                   # the key reference, filtered
+    monux config set server.port 4321        # persist a value (validated like --port)
+    monux config set server.edge-map right=auto left=aa11bb
+    monux config unset client.mouse-scale    # revert to the built-in default
+    monux config edit                        # edit in $EDITOR, validated on save")]
+    Config(ConfigArgs),
+
     /// Manages a running monux daemon through its control socket
     ///
     /// Switching input between machines, pausing, restarting, and more.
@@ -150,6 +166,55 @@ struct GuiArgs {
 struct DaemonArgs {
     #[command(subcommand)]
     command: DaemonCommands,
+}
+
+#[derive(Args)]
+struct ConfigArgs {
+    /// show / keys / set / unset / edit / validate; bare 'monux config' shows
+    /// the effective values
+    #[command(subcommand)]
+    command: Option<ConfigCommands>,
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Shows the effective configuration: every key with its value and whether
+    /// it came from the config file or the built-in default (the default when
+    /// no action is given)
+    Show,
+
+    /// Lists all config keys with a one-line description, the expected value
+    /// syntax, and the built-in default; keys introduced after the baseline
+    /// are annotated (new in vX.Y)
+    Keys {
+        /// Only list keys whose name or description contains this substring
+        filter: Option<String>,
+    },
+
+    /// Sets a config key, or prints the key's reference card when no value is
+    /// given. Values are validated with the same parsers as the flags before
+    /// anything is written; repeatable (array) keys take multiple values
+    Set {
+        /// The full key name: server.<flag> or client.<flag>
+        key: String,
+        /// The value(s) to store
+        values: Vec<String>,
+    },
+
+    /// Removes a config key, reverting it to the built-in default
+    Unset {
+        /// The full key name: server.<flag> or client.<flag>
+        key: String,
+    },
+
+    /// Opens the config file in $EDITOR (fallback: vi) and installs the result
+    /// only when it validates, crontab-style
+    Edit,
+
+    /// Checks the config file without changing it: unknown keys (with
+    /// did-you-mean suggestions and the exact 'unset' cleanup lines) and
+    /// invalid values, with line numbers
+    Validate,
 }
 
 #[derive(Subcommand)]
@@ -303,16 +368,13 @@ struct SetupArgs {
 #[derive(Args)]
 struct ServerArgs {
     /// Keyboard shortcut for switching to the next client in the rotation
-    #[arg(
-        long,
-        alias = "shortcut-next",
-        default_value = "leftshift,leftalt,r",
-        value_name = "key1,key2,key3"
-    )]
-    shortcut: String,
+    /// (default: leftshift,leftalt,r)
+    #[arg(long, alias = "shortcut-next", value_name = "key1,key2,key3")]
+    shortcut: Option<String>,
 
     /// Keyboard shortcut for switching to the previous client in the rotation
-    #[arg(long, default_value = "leftalt,p", value_name = "key1,key2,key3")]
+    /// (default: leftalt,p)
+    #[arg(long, value_name = "key1,key2,key3")]
     shortcut_prev: Option<String>,
 
     /// Keyboard shortcut for switching directly to a client by its fingerprint prefix,
@@ -325,21 +387,21 @@ struct ServerArgs {
     /// machine gets raw input with monux's re-emit out of the way (games,
     /// raw-input apps); press the chord again to resume. Disabled unless set
     /// (e.g. '--pause-shortcut leftshift,leftalt,p').
-    #[arg(long, default_value = "", value_name = "key1,key2,key3")]
-    pause_shortcut: String,
+    #[arg(long, value_name = "key1,key2,key3")]
+    pause_shortcut: Option<String>,
 
     /// Substring or regular expression for selecting specific devices to monitor,
     /// argument can be repeated for multiple filters
     #[arg(long, value_name = "device-name-pattern")]
     device: Option<Vec<Regex>>,
 
-    /// Server listen IP
-    #[arg(short = 'l', long, default_value = "0.0.0.0", value_name = "ip")]
-    listen: IpAddr,
+    /// Server listen IP (default: 0.0.0.0)
+    #[arg(short = 'l', long, value_name = "ip")]
+    listen: Option<IpAddr>,
 
-    /// Server port
-    #[arg(short = 'p', long, default_value_t = 1213, value_name = "port")]
-    port: u16,
+    /// Server port (default: 1213)
+    #[arg(short = 'p', long, value_name = "port")]
+    port: Option<u16>,
 
     /// Client certificate fingerprint to automatically accept without prompting (repeat for multiple fingerprints)
     #[arg(long, alias = "fingerprints", value_name = "fingerprint")]
@@ -350,13 +412,13 @@ struct ServerArgs {
     exit_secs: Option<u32>,
 
     /// Maximum size in KB for transferring clipboard data (default: 5MB)
-    #[arg(long, default_value_t = 5120, value_name = "kb")]
-    max_clipboard_size_kb: u64,
+    #[arg(long, value_name = "kb")]
+    max_clipboard_size_kb: Option<u64>,
 
     /// Use conservative tuning suitable for traversing the public internet (WWW).
     /// The default is low-latency tuning for local networks.
-    #[arg(long)]
-    www: bool,
+    #[arg(long, num_args = 0, default_missing_value = "true")]
+    www: Option<bool>,
 
     /// Target rate for forwarding pointer motion, in updates per second. Motion
     /// deltas are coalesced (summed losslessly) between updates and sent as
@@ -376,7 +438,7 @@ struct ServerArgs {
     /// the transfer). Unset (the default): adaptive — 40 normally, raised to
     /// 160 while the link is measured close and clean. Set a number to pin
     /// the rate (5MB takes ~1s at 40Mbps), or 0 to disable pacing.
-    #[arg(long, value_name = "mbps", value_parser = parse_bulk_throttle)]
+    #[arg(long, value_name = "mbps", value_parser = monux::config::parse_bulk_throttle)]
     bulk_throttle_mbps: Option<f64>,
 
     /// Screen-edge switching (Hyprland only for now): switch input to a client
@@ -393,22 +455,74 @@ struct ServerArgs {
     edge_map: Option<Vec<String>>,
 
     /// How long the cursor must dwell on a mapped screen edge before the
-    /// switch fires, in milliseconds (see --edge-map)
-    #[arg(long, default_value_t = 250, value_name = "ms")]
-    edge_dwell_ms: u64,
+    /// switch fires, in milliseconds (see --edge-map; default: 250)
+    #[arg(long, value_name = "ms")]
+    edge_dwell_ms: Option<u64>,
 
     /// Disable the automatic background update (on by default): a daily check
     /// at low CPU priority, then an automatic restart into the new binary.
     /// The session resumes automatically on reconnect.
-    #[arg(long)]
-    no_auto_update: bool,
+    #[arg(long, num_args = 0, default_missing_value = "true")]
+    no_auto_update: Option<bool>,
 
     /// Do not auto-spawn the tray indicator (monux gui indicator) with the
     /// daemon. By default the indicator starts once the daemon is up whenever
     /// a desktop session bus is available, and stops with the daemon. Can
     /// also be disabled with MONUX_NO_INDICATOR=1.
-    #[arg(long)]
-    no_indicator: bool,
+    #[arg(long, num_args = 0, default_missing_value = "true")]
+    no_indicator: Option<bool>,
+}
+
+impl ServerArgs {
+    /// Fills config-capable fields left unset on the command line from the
+    /// config file's [server] section: explicit flag > config file > built-in
+    /// default (the default is applied at the use sites).
+    fn resolve(&mut self, cfg: &monux::config::File) {
+        self.shortcut = self.shortcut.take().or_else(|| cfg.get_str("server.shortcut"));
+        self.shortcut_prev = self
+            .shortcut_prev
+            .take()
+            .or_else(|| cfg.get_str("server.shortcut-prev"));
+        self.shortcut_goto = self
+            .shortcut_goto
+            .take()
+            .or_else(|| cfg.get_str_vec("server.shortcut-goto"));
+        self.pause_shortcut = self
+            .pause_shortcut
+            .take()
+            .or_else(|| cfg.get_str("server.pause-shortcut"));
+        self.device = self.device.take().or_else(|| cfg.get_regex_vec("server.device"));
+        self.listen = self.listen.take().or_else(|| cfg.get_ip("server.listen"));
+        self.port = self.port.take().or_else(|| cfg.get_int("server.port"));
+        self.fingerprint = self
+            .fingerprint
+            .take()
+            .or_else(|| cfg.get_str_vec("server.fingerprint"));
+        self.exit_secs = self.exit_secs.take().or_else(|| cfg.get_int("server.exit-secs"));
+        self.max_clipboard_size_kb = self
+            .max_clipboard_size_kb
+            .take()
+            .or_else(|| cfg.get_int("server.max-clipboard-size-kb"));
+        self.www = self.www.take().or_else(|| cfg.get_bool("server.www"));
+        self.motion_hz = self.motion_hz.take().or_else(|| cfg.get_int("server.motion-hz"));
+        self.bulk_throttle_mbps = self
+            .bulk_throttle_mbps
+            .take()
+            .or_else(|| cfg.get_f64("server.bulk-throttle-mbps"));
+        self.edge_map = self.edge_map.take().or_else(|| cfg.get_str_vec("server.edge-map"));
+        self.edge_dwell_ms = self
+            .edge_dwell_ms
+            .take()
+            .or_else(|| cfg.get_int("server.edge-dwell-ms"));
+        self.no_auto_update = self
+            .no_auto_update
+            .take()
+            .or_else(|| cfg.get_bool("server.no-auto-update"));
+        self.no_indicator = self
+            .no_indicator
+            .take()
+            .or_else(|| cfg.get_bool("server.no-indicator"));
+    }
 }
 
 #[derive(Args)]
@@ -416,7 +530,7 @@ struct ClientArgs {
     /// Server hostname or IP. If omitted, the server is discovered on the local network via mDNS.
     host: Option<String>,
 
-    /// Server port
+    /// Server port (default: 1213)
     #[arg(short = 'p', long, value_name = "port")]
     port: Option<u16>,
 
@@ -425,25 +539,25 @@ struct ClientArgs {
     fingerprint: Option<Vec<String>>,
 
     /// Maximum size in KB for transferring clipboard data (default: 5MB)
-    #[arg(long, default_value_t = 5120, value_name = "kb")]
-    max_clipboard_size_kb: u64,
+    #[arg(long, value_name = "kb")]
+    max_clipboard_size_kb: Option<u64>,
 
     /// Use conservative tuning suitable for traversing the public internet (WWW).
     /// The default is low-latency tuning for local networks.
-    #[arg(long)]
-    www: bool,
+    #[arg(long, num_args = 0, default_missing_value = "true")]
+    www: Option<bool>,
 
     /// Multiplier applied to pointer motion deltas before injecting them on
     /// this machine, for compensating DPI/sensitivity differences with the
     /// server's mouse. Sub-tick fractions are carried between events, so small
-    /// scales lose no motion over time.
-    #[arg(long, default_value = "1.0", value_name = "scale", value_parser = parse_input_scale)]
-    mouse_scale: f64,
+    /// scales lose no motion over time. (default: 1.0)
+    #[arg(long, value_name = "scale", value_parser = monux::config::parse_input_scale)]
+    mouse_scale: Option<f64>,
 
     /// Multiplier applied to scroll wheel deltas (including the hi-res wheel
-    /// axes) before injecting them on this machine.
-    #[arg(long, default_value = "1.0", value_name = "scale", value_parser = parse_input_scale)]
-    scroll_scale: f64,
+    /// axes) before injecting them on this machine. (default: 1.0)
+    #[arg(long, value_name = "scale", value_parser = monux::config::parse_input_scale)]
+    scroll_scale: Option<f64>,
 
     /// Pace clipboard/bulk transfers to this many megabits per second. QUIC
     /// stream priorities only order data inside the connection; the
@@ -453,7 +567,7 @@ struct ClientArgs {
     /// the transfer). Unset (the default): adaptive — 40 normally, raised to
     /// 160 while the link is measured close and clean. Set a number to pin
     /// the rate (5MB takes ~1s at 40Mbps), or 0 to disable pacing.
-    #[arg(long, value_name = "mbps", value_parser = parse_bulk_throttle)]
+    #[arg(long, value_name = "mbps", value_parser = monux::config::parse_bulk_throttle)]
     bulk_throttle_mbps: Option<f64>,
 
     /// Don't join the server's advertised 'monux-direct' hotspot automatically
@@ -461,8 +575,8 @@ struct ClientArgs {
     /// credentials over the encrypted connection, and the client provisions
     /// and joins it by default). Manual join remains available with
     /// 'monux setup --hotspot-join'.
-    #[arg(long)]
-    no_auto_hotspot: bool,
+    #[arg(long, num_args = 0, default_missing_value = "true")]
+    no_auto_hotspot: Option<bool>,
 
     /// Switching BACK to the server by screen edge (Hyprland only for now):
     /// while this client has input, pushing the cursor against this screen
@@ -477,22 +591,70 @@ struct ClientArgs {
     edge_map: Option<Vec<String>>,
 
     /// How long the cursor must dwell on a mapped screen edge before the
-    /// return request fires, in milliseconds (see --edge-map)
-    #[arg(long, default_value_t = 250, value_name = "ms")]
-    edge_dwell_ms: u64,
+    /// return request fires, in milliseconds (see --edge-map; default: 250)
+    #[arg(long, value_name = "ms")]
+    edge_dwell_ms: Option<u64>,
 
     /// Disable the automatic background update (on by default): a daily check
     /// at low CPU priority, then an automatic restart into the new binary.
     /// The session resumes automatically on reconnect.
-    #[arg(long)]
-    no_auto_update: bool,
+    #[arg(long, num_args = 0, default_missing_value = "true")]
+    no_auto_update: Option<bool>,
 
     /// Do not auto-spawn the tray indicator (monux gui indicator) with the
     /// daemon. By default the indicator starts once the daemon is up whenever
     /// a desktop session bus is available, and stops with the daemon. Can
     /// also be disabled with MONUX_NO_INDICATOR=1.
-    #[arg(long)]
-    no_indicator: bool,
+    #[arg(long, num_args = 0, default_missing_value = "true")]
+    no_indicator: Option<bool>,
+}
+
+impl ClientArgs {
+    /// Fills config-capable fields left unset on the command line from the
+    /// config file's [client] section: explicit flag > config file > built-in
+    /// default (the default is applied at the use sites). The positional host
+    /// is deliberately not configurable.
+    fn resolve(&mut self, cfg: &monux::config::File) {
+        self.port = self.port.take().or_else(|| cfg.get_int("client.port"));
+        self.fingerprint = self
+            .fingerprint
+            .take()
+            .or_else(|| cfg.get_str_vec("client.fingerprint"));
+        self.max_clipboard_size_kb = self
+            .max_clipboard_size_kb
+            .take()
+            .or_else(|| cfg.get_int("client.max-clipboard-size-kb"));
+        self.www = self.www.take().or_else(|| cfg.get_bool("client.www"));
+        self.mouse_scale = self
+            .mouse_scale
+            .take()
+            .or_else(|| cfg.get_f64("client.mouse-scale"));
+        self.scroll_scale = self
+            .scroll_scale
+            .take()
+            .or_else(|| cfg.get_f64("client.scroll-scale"));
+        self.bulk_throttle_mbps = self
+            .bulk_throttle_mbps
+            .take()
+            .or_else(|| cfg.get_f64("client.bulk-throttle-mbps"));
+        self.no_auto_hotspot = self
+            .no_auto_hotspot
+            .take()
+            .or_else(|| cfg.get_bool("client.no-auto-hotspot"));
+        self.edge_map = self.edge_map.take().or_else(|| cfg.get_str_vec("client.edge-map"));
+        self.edge_dwell_ms = self
+            .edge_dwell_ms
+            .take()
+            .or_else(|| cfg.get_int("client.edge-dwell-ms"));
+        self.no_auto_update = self
+            .no_auto_update
+            .take()
+            .or_else(|| cfg.get_bool("client.no-auto-update"));
+        self.no_indicator = self
+            .no_indicator
+            .take()
+            .or_else(|| cfg.get_bool("client.no-indicator"));
+    }
 }
 
 #[derive(Args)]
@@ -501,43 +663,6 @@ struct UpdateArgs {
     /// server protocol-compatibility gate
     #[arg(long)]
     force: bool,
-}
-
-/// Accepted range for --mouse-scale/--scroll-scale: wide enough for genuine
-/// DPI/sensitivity mismatches, narrow enough to catch typos.
-const MIN_INPUT_SCALE: f64 = 0.05;
-const MAX_INPUT_SCALE: f64 = 20.0;
-
-/// clap value parser for the client's --mouse-scale/--scroll-scale flags.
-fn parse_input_scale(s: &str) -> std::result::Result<f64, String> {
-    match s.parse::<f64>() {
-        Ok(v) if v.is_finite() && (MIN_INPUT_SCALE..=MAX_INPUT_SCALE).contains(&v) => Ok(v),
-        _ => Err(format!(
-            "scale must be a number between {} and {}",
-            MIN_INPUT_SCALE, MAX_INPUT_SCALE
-        )),
-    }
-}
-
-/// Accepted range for --bulk-throttle-mbps when enabled (0 disables): wide
-/// enough for any WiFi/LAN link, narrow enough to catch typos.
-const MIN_BULK_THROTTLE_MBPS: f64 = 0.1;
-const MAX_BULK_THROTTLE_MBPS: f64 = 10_000.0;
-
-/// clap value parser for --bulk-throttle-mbps on server and client.
-fn parse_bulk_throttle(s: &str) -> std::result::Result<f64, String> {
-    match s.parse::<f64>() {
-        Ok(v) if v == 0.0 => Ok(v),
-        Ok(v)
-            if v.is_finite() && (MIN_BULK_THROTTLE_MBPS..=MAX_BULK_THROTTLE_MBPS).contains(&v) =>
-        {
-            Ok(v)
-        }
-        _ => Err(format!(
-            "throttle must be 0 (disabled) or a number between {} and {}",
-            MIN_BULK_THROTTLE_MBPS, MAX_BULK_THROTTLE_MBPS
-        )),
-    }
 }
 
 /// Listens for SIGUSR1 and SIGUSR2, treating them as "switch to next client" and "switch to prev client" respectively.
@@ -609,13 +734,19 @@ async fn client_shutdown_signal() {
 }
 
 fn main() -> Result<()> {
+    // Die silently on SIGPIPE like a normal Unix tool ('monux config show |
+    // head', '... | less' quit early) instead of panicking on a failed
+    // println!: Rust ignores SIGPIPE by default, which turns a closed pipe
+    // into a write error. Restoring the default disposition makes the kernel
+    // kill us, matching every other CLI.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     logging::init_logging();
     let cli = Cli::parse();
     // Record the exact build in the log: invaluable when diagnosing bug reports.
     info!("monux v{} starting", VERSION);
 
-    // Setup/update/status/gui/system/daemon commands don't need the config
-    // dir, devices, or the async runtime.
+    // Setup/update/status/config/gui/system/daemon commands don't need the
+    // devices or the async runtime.
     match &cli.command {
         Commands::Daemon(args) => match &args.command {
             DaemonCommands::Switch(args) => {
@@ -706,6 +837,28 @@ fn main() -> Result<()> {
             println!("{}", out);
             return Ok(());
         }
+        Commands::Config(args) => {
+            let action = match &args.command {
+                None | Some(ConfigCommands::Show) => monux::config::Action::Show,
+                Some(ConfigCommands::Keys { filter }) => {
+                    monux::config::Action::Keys(filter.clone())
+                }
+                Some(ConfigCommands::Set { key, values }) => monux::config::Action::Set {
+                    key: key.clone(),
+                    values: values.clone(),
+                },
+                Some(ConfigCommands::Unset { key }) => monux::config::Action::Unset {
+                    key: key.clone(),
+                },
+                Some(ConfigCommands::Edit) => monux::config::Action::Edit,
+                Some(ConfigCommands::Validate) => monux::config::Action::Validate,
+            };
+            // False only for a failed 'validate' or an aborted 'edit'.
+            if !monux::config::cli(&init_config_dir()?, &action)? {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         Commands::Gui(args) => match &args.command {
             GuiCommands::Tray(args) => {
                 let hide = matches!(args.action, TrayAction::Hide);
@@ -757,15 +910,23 @@ fn main() -> Result<()> {
         Commands::Setup(_)
         | Commands::Update(_)
         | Commands::Status(_)
+        | Commands::Config(_)
         | Commands::Gui(_)
         | Commands::System(_)
         | Commands::Daemon(_) => {
-            unreachable!("setup/update/status/gui/system/daemon commands are handled before runtime initialization")
+            unreachable!("setup/update/status/config/gui/system/daemon commands are handled before runtime initialization")
         }
-        Commands::Server(args) => {
-            if args.port == 0 {
+        Commands::Server(mut args) => {
+            // The config file fills whatever the command line left unset.
+            args.resolve(&monux::config::load_for_daemon(&config_dir));
+            let listen = args.listen.unwrap_or(monux::config::DEFAULT_LISTEN);
+            let port = args.port.unwrap_or(monux::config::DEFAULT_PORT);
+            if port == 0 {
                 bail!("--port 0 (ephemeral port) is not supported: the mDNS advertisement must match the actual listen port");
             }
+            let auto_update = !args.no_auto_update.unwrap_or(false);
+            let auto_indicator = !args.no_indicator.unwrap_or(false);
+            let www = args.www.unwrap_or(false);
             let server_lock = single_instance::acquire("server")?;
             settle_after_takeover(&server_lock);
             // A machine running only a server has no use for the client-side
@@ -777,32 +938,33 @@ fn main() -> Result<()> {
             if single_instance::live_holder("client").is_none() {
                 monux::update::clear_protocol_constraint(&config_dir);
             }
-            if !args.no_auto_update {
+            if auto_update {
                 // The server leads protocol upgrades: no compatibility gate.
                 rt.spawn(monux::autoupdate::run(None));
             }
             let fingerprint = Arc::new(Mutex::new(None));
             let verifier = approval::MonuxCertVerification::new(
                 "server",
-                args.fingerprint.unwrap_or(vec![]),
+                args.fingerprint.take().unwrap_or(vec![]),
                 &config_dir,
                 fingerprint.clone(),
                 // No interactive approval prompts when facing the public internet:
                 // unknown peers must be pre-approved via --fingerprints instead.
-                !args.www,
+                !www,
             )?;
             info!(
                 "Our certificate fingerprint: {} (pre-approve this server on clients with '--fingerprints {}')",
                 verifier.our_fingerprint(),
                 verifier.our_fingerprint()
             );
-            let mode = if args.www {
+            let mode = if www {
                 NetworkMode::Www
             } else {
                 NetworkMode::Local
             };
             let max_clipboard_size_bytes = args
                 .max_clipboard_size_kb
+                .unwrap_or(monux::config::DEFAULT_MAX_CLIPBOARD_SIZE_KB)
                 .checked_mul(1024)
                 .context("--max-clipboard-size-kb is too large")?;
             let motion_mode = match args.motion_hz {
@@ -842,20 +1004,31 @@ fn main() -> Result<()> {
                 Some(specs) => Some(monux::edge::parse_edge_map(specs)?),
                 None => None,
             };
+            // An empty --pause-shortcut disables pause/resume.
+            let pause_shortcut = args
+                .pause_shortcut
+                .as_deref()
+                .unwrap_or(monux::config::DEFAULT_PAUSE_SHORTCUT);
+            let pause_shortcut = if pause_shortcut.trim().is_empty() {
+                None
+            } else {
+                Some(pause_shortcut)
+            };
             rt.block_on(async {
                 server(
                     config_dir,
-                    SocketAddr::new(args.listen, args.port),
-                    &args.shortcut,
-                    args.shortcut_prev.as_deref(),
-                    args.shortcut_goto.unwrap_or(vec![]),
-                    // An empty --pause-shortcut disables pause/resume.
-                    if args.pause_shortcut.trim().is_empty() {
-                        None
-                    } else {
-                        Some(args.pause_shortcut.as_str())
-                    },
-                    args.device.unwrap_or(vec![]),
+                    SocketAddr::new(listen, port),
+                    args.shortcut
+                        .as_deref()
+                        .unwrap_or(monux::config::DEFAULT_SHORTCUT),
+                    Some(
+                        args.shortcut_prev
+                            .as_deref()
+                            .unwrap_or(monux::config::DEFAULT_SHORTCUT_PREV),
+                    ),
+                    args.shortcut_goto.take().unwrap_or(vec![]),
+                    pause_shortcut,
+                    args.device.take().unwrap_or(vec![]),
                     args.exit_secs,
                     verifier,
                     fingerprint,
@@ -864,23 +1037,36 @@ fn main() -> Result<()> {
                     motion_mode,
                     throttle_mode,
                     edge_map,
-                    Duration::from_millis(args.edge_dwell_ms),
-                    !args.no_auto_update,
-                    !args.no_indicator,
+                    Duration::from_millis(
+                        args.edge_dwell_ms
+                            .unwrap_or(monux::config::DEFAULT_EDGE_DWELL_MS),
+                    ),
+                    auto_update,
+                    auto_indicator,
                 )
                 .await
             })?;
         }
-        Commands::Client(args) => {
+        Commands::Client(mut args) => {
+            // The config file fills whatever the command line left unset.
+            args.resolve(&monux::config::load_for_daemon(&config_dir));
+            let auto_update = !args.no_auto_update.unwrap_or(false);
+            let auto_indicator = !args.no_indicator.unwrap_or(false);
+            let www = args.www.unwrap_or(false);
+            let no_auto_hotspot = args.no_auto_hotspot.unwrap_or(false);
+            let mouse_scale = args.mouse_scale.unwrap_or(monux::config::DEFAULT_INPUT_SCALE);
+            let scroll_scale = args
+                .scroll_scale
+                .unwrap_or(monux::config::DEFAULT_INPUT_SCALE);
             let client_lock = single_instance::acquire("client")?;
             settle_after_takeover(&client_lock);
-            if !args.no_auto_update {
+            if auto_update {
                 rt.spawn(monux::autoupdate::run(Some(config_dir.clone())));
             }
             // When no host is given, the server address comes from mDNS discovery,
             // which allows re-discovering it after repeated connection failures.
             let from_discovery = args.host.is_none();
-            let port = args.port.unwrap_or(1213);
+            let port = args.port.unwrap_or(monux::config::DEFAULT_PORT);
             // Server instance name from mDNS discovery, for the approval prompt.
             let mut discovered_server_name: Option<String> = None;
             let connect_addr: SocketAddr = match &args.host {
@@ -902,7 +1088,7 @@ fn main() -> Result<()> {
                 }
                 None => {
                     if args.port.is_some() {
-                        warn!("--port is ignored when the server is auto-discovered via mDNS");
+                        warn!("a configured port (--port or config file) is ignored when the server is auto-discovered via mDNS");
                     }
                     // Discover the server on the local network via mDNS.
                     info!("No server host provided, discovering via mDNS...");
@@ -914,7 +1100,7 @@ fn main() -> Result<()> {
             };
             let verifier = approval::MonuxCertVerification::new(
                 "client",
-                args.fingerprint.unwrap_or(vec![]),
+                args.fingerprint.take().unwrap_or(vec![]),
                 &config_dir,
                 Arc::new(Mutex::new(None)),
                 // The client connects outbound to a server it chose, so interactive
@@ -929,19 +1115,20 @@ fn main() -> Result<()> {
                 verifier.our_fingerprint(),
                 verifier.our_fingerprint()
             );
-            let mode = if args.www {
+            let mode = if www {
                 NetworkMode::Www
             } else {
                 NetworkMode::Local
             };
             let max_clipboard_size_bytes = args
                 .max_clipboard_size_kb
+                .unwrap_or(monux::config::DEFAULT_MAX_CLIPBOARD_SIZE_KB)
                 .checked_mul(1024)
                 .context("--max-clipboard-size-kb is too large")?;
-            if args.mouse_scale != 1.0 || args.scroll_scale != 1.0 {
+            if mouse_scale != 1.0 || scroll_scale != 1.0 {
                 info!(
                     "Scaling injected input: pointer motion x{}, scroll x{}",
-                    args.mouse_scale, args.scroll_scale
+                    mouse_scale, scroll_scale
                 );
             }
             let throttle_mode = match args.bulk_throttle_mbps {
@@ -974,14 +1161,17 @@ fn main() -> Result<()> {
                     max_clipboard_size_bytes,
                     mode,
                     from_discovery,
-                    args.mouse_scale,
-                    args.scroll_scale,
+                    mouse_scale,
+                    scroll_scale,
                     throttle_mode,
                     edge_map,
-                    Duration::from_millis(args.edge_dwell_ms),
-                    args.no_auto_hotspot,
-                    !args.no_auto_update,
-                    !args.no_indicator,
+                    Duration::from_millis(
+                        args.edge_dwell_ms
+                            .unwrap_or(monux::config::DEFAULT_EDGE_DWELL_MS),
+                    ),
+                    no_auto_hotspot,
+                    auto_update,
+                    auto_indicator,
                 )
                 .await
             })?;
@@ -1673,16 +1863,16 @@ mod tests {
         };
         let specs = args.edge_map.expect("edge map should be set");
         assert_eq!(specs, vec!["right=auto", "left=aa11bb,top=laptop"]);
-        assert_eq!(args.edge_dwell_ms, 400);
+        assert_eq!(args.edge_dwell_ms, Some(400));
         assert!(monux::edge::parse_edge_map(&specs).is_ok());
 
-        // Defaults: no edge map, 250ms dwell.
+        // Defaults: no edge map, no dwell override (250ms built-in).
         let cli = Cli::try_parse_from(["monux", "server"]).unwrap();
         let Commands::Server(args) = cli.command else {
             panic!("expected the server subcommand")
         };
         assert!(args.edge_map.is_none());
-        assert_eq!(args.edge_dwell_ms, 250);
+        assert_eq!(args.edge_dwell_ms, None);
     }
 
     #[test]
@@ -1704,15 +1894,177 @@ mod tests {
         };
         let specs = args.edge_map.expect("edge map should be set");
         assert_eq!(specs, vec!["left=auto", "top=auto"]);
-        assert_eq!(args.edge_dwell_ms, 400);
+        assert_eq!(args.edge_dwell_ms, Some(400));
         assert!(monux::edge::parse_client_edge_map(&specs).is_ok());
 
-        // Defaults: no edge map, 250ms dwell.
+        // Defaults: no edge map, no dwell override (250ms built-in).
         let cli = Cli::try_parse_from(["monux", "client", "10.0.0.1"]).unwrap();
         let Commands::Client(args) = cli.command else {
             panic!("expected the client subcommand")
         };
         assert!(args.edge_map.is_none());
-        assert_eq!(args.edge_dwell_ms, 250);
+        assert_eq!(args.edge_dwell_ms, None);
+    }
+
+    #[test]
+    fn bool_flags_are_optional_set_true() {
+        // SetTrue on an Option<bool>: present = Some(true), absent = None
+        // (so the config file can tell "not given" from "given").
+        let cli = Cli::try_parse_from(["monux", "server", "--www", "--no-indicator"]).unwrap();
+        let Commands::Server(args) = cli.command else {
+            panic!("expected the server subcommand")
+        };
+        assert_eq!(args.www, Some(true));
+        assert_eq!(args.no_indicator, Some(true));
+        assert_eq!(args.no_auto_update, None);
+        // ...and they take no value.
+        assert!(Cli::try_parse_from(["monux", "server", "--www", "true"]).is_err());
+    }
+
+    #[test]
+    fn config_subcommand_parses_actions() {
+        let cli = Cli::try_parse_from(["monux", "config"]).unwrap();
+        let Commands::Config(args) = cli.command else {
+            panic!("expected the config subcommand")
+        };
+        assert!(args.command.is_none());
+
+        let cli = Cli::try_parse_from(["monux", "config", "set", "server.port", "4321"]).unwrap();
+        let Commands::Config(args) = cli.command else {
+            panic!("expected the config subcommand")
+        };
+        let Some(ConfigCommands::Set { key, values }) = args.command else {
+            panic!("expected config set")
+        };
+        assert_eq!(key, "server.port");
+        assert_eq!(values, vec!["4321".to_string()]);
+
+        // Repeatable keys take several values.
+        let cli = Cli::try_parse_from([
+            "monux",
+            "config",
+            "set",
+            "server.edge-map",
+            "right=auto",
+            "left=aa11bb",
+        ])
+        .unwrap();
+        let Commands::Config(args) = cli.command else {
+            panic!("expected the config subcommand")
+        };
+        let Some(ConfigCommands::Set { values, .. }) = args.command else {
+            panic!("expected config set")
+        };
+        assert_eq!(values, vec!["right=auto".to_string(), "left=aa11bb".to_string()]);
+
+        // 'set <key>' with no value (the reference card) parses too.
+        assert!(Cli::try_parse_from(["monux", "config", "set", "server.port"]).is_ok());
+        assert!(Cli::try_parse_from(["monux", "config", "unset", "client.www"]).is_ok());
+        assert!(Cli::try_parse_from(["monux", "config", "keys", "edge"]).is_ok());
+        assert!(Cli::try_parse_from(["monux", "config", "edit"]).is_ok());
+        assert!(Cli::try_parse_from(["monux", "config", "validate"]).is_ok());
+        assert!(Cli::try_parse_from(["monux", "config", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn config_registry_matches_server_and_client_flags() {
+        // The registry (config.rs) must not drift from the clap definitions:
+        // every registered key names a real flag of its subcommand.
+        let cmd = Cli::command();
+        for spec in monux::config::REGISTRY {
+            let sub = cmd
+                .get_subcommands()
+                .find(|s| s.get_name() == spec.section.as_str())
+                .unwrap_or_else(|| panic!("no '{}' subcommand", spec.section.as_str()));
+            assert!(
+                sub.get_arguments().any(|a| a.get_long() == Some(spec.flag)),
+                "registry key '{}' has no matching --{} flag",
+                spec.key,
+                spec.flag
+            );
+        }
+    }
+
+    #[test]
+    fn server_args_resolve_flag_beats_config_beats_default() {
+        let cfg = monux::config::File::parse(
+            "[server]\nport = 4321\nedge-dwell-ms = 400\nwww = true\nno-indicator = true\nedge-map = [\"right=auto\"]\n",
+        )
+        .unwrap();
+
+        // Explicit flags win over the config file.
+        let cli =
+            Cli::try_parse_from(["monux", "server", "--port", "5555", "--edge-dwell-ms", "100"])
+                .unwrap();
+        let Commands::Server(mut args) = cli.command else {
+            panic!("expected the server subcommand")
+        };
+        args.resolve(&cfg);
+        assert_eq!(args.port, Some(5555));
+        assert_eq!(args.edge_dwell_ms, Some(100));
+        // ...while the config fills the flags that were not given.
+        assert_eq!(args.www, Some(true));
+        assert_eq!(args.no_indicator, Some(true));
+        assert_eq!(args.edge_map, Some(vec!["right=auto".to_string()]));
+
+        // The config file alone fills everything it sets.
+        let cli = Cli::try_parse_from(["monux", "server"]).unwrap();
+        let Commands::Server(mut args) = cli.command else {
+            panic!("expected the server subcommand")
+        };
+        args.resolve(&cfg);
+        assert_eq!(args.port, Some(4321));
+        assert_eq!(args.edge_dwell_ms, Some(400));
+
+        // Without a config file the use sites fall back to the built-ins.
+        let cli = Cli::try_parse_from(["monux", "server"]).unwrap();
+        let Commands::Server(mut args) = cli.command else {
+            panic!("expected the server subcommand")
+        };
+        args.resolve(&monux::config::File::default());
+        assert_eq!(args.port, None);
+        assert_eq!(args.port.unwrap_or(monux::config::DEFAULT_PORT), 1213);
+        assert_eq!(
+            args.edge_dwell_ms.unwrap_or(monux::config::DEFAULT_EDGE_DWELL_MS),
+            250
+        );
+        assert!(!args.www.unwrap_or(false));
+        assert_eq!(
+            args.shortcut.as_deref().unwrap_or(monux::config::DEFAULT_SHORTCUT),
+            "leftshift,leftalt,r"
+        );
+        // Semantic-None flags stay None: the adaptive modes.
+        assert!(args.motion_hz.is_none());
+        assert!(args.bulk_throttle_mbps.is_none());
+    }
+
+    #[test]
+    fn client_args_resolve_flag_beats_config_beats_default() {
+        let cfg =
+            monux::config::File::parse("[client]\nmouse-scale = 0.5\nno-auto-hotspot = true\n")
+                .unwrap();
+
+        // Explicit flag wins; config fills the rest.
+        let cli = Cli::try_parse_from(["monux", "client", "--mouse-scale", "2"]).unwrap();
+        let Commands::Client(mut args) = cli.command else {
+            panic!("expected the client subcommand")
+        };
+        args.resolve(&cfg);
+        assert_eq!(args.mouse_scale, Some(2.0));
+        assert_eq!(args.no_auto_hotspot, Some(true));
+
+        // Without a config file the use sites fall back to the built-ins.
+        let cli = Cli::try_parse_from(["monux", "client"]).unwrap();
+        let Commands::Client(mut args) = cli.command else {
+            panic!("expected the client subcommand")
+        };
+        args.resolve(&monux::config::File::default());
+        assert_eq!(args.mouse_scale, None);
+        assert_eq!(
+            args.mouse_scale.unwrap_or(monux::config::DEFAULT_INPUT_SCALE),
+            1.0
+        );
+        assert!(!args.no_auto_hotspot.unwrap_or(false));
+        assert!(args.host.is_none(), "the positional host is not configurable");
     }
 }
