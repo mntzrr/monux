@@ -825,6 +825,22 @@ fn gen_psk() -> String {
     psk_from_bytes(&bytes)
 }
 
+/// Detects active VPN tunnel interfaces from `ip -o link show up` output: a
+/// VPN's policy routing and forward-dropping firewall typically break the
+/// NAT that gives hotspot clients internet (the KVM link itself is fine).
+fn tunnel_iface_names(ip_link_output: &str) -> Vec<String> {
+    ip_link_output
+        .lines()
+        .filter_map(|line| line.split(':').nth(1).map(str::trim))
+        .filter(|name| {
+            ["wg", "tun", "tap", "zt", "tailscale", "mullvad"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 /// Hosts the 'monux-direct' WiFi hotspot (--hotspot, server side): the KVM
 /// link then bypasses the router entirely. NetworkManager's shared IPv4 mode
 /// NATs the peer through this machine, so its internet keeps working over the
@@ -846,6 +862,19 @@ fn setup_hotspot(failures: &mut u32) {
     if !iw_supports_ap(&iw_list) {
         println!("[skip] hotspot: the WiFi card does not support AP mode (no '#{{ AP }}' in its valid interface combinations)");
         return;
+    }
+    // A VPN tunnel on this machine (Mullvad/WireGuard/OpenVPN) hijacks
+    // routing and drops forwarded packets: the KVM link would work, but the
+    // NAT that gives hotspot clients internet would not. Warn loudly now
+    // rather than letting the client lose internet mysteriously.
+    if let Ok(out) = run_cmd("ip", &["-o", "link", "show", "up"]) {
+        let tunnels = tunnel_iface_names(&out);
+        if !tunnels.is_empty() {
+            println!(
+                "[warn] hotspot: VPN tunnel(s) up ({}): a VPN's policy routing and forward-dropping firewall typically break the NAT that gives hotspot clients internet — the KVM link will work, the client's internet may not. Disconnect the VPN while using the hotspot (see README).",
+                tunnels.join(", ")
+            );
+        }
     }
     if nmcli_con_exists(HOTSPOT_CON_NAME) {
         println!("[ok]   hotspot: profile '{}' already exists", HOTSPOT_CON_NAME);
@@ -1066,6 +1095,19 @@ mod tests {
         assert!(!iw_supports_ap(vlan_only));
         let incapable = " * #{ managed } <= 1, #{ P2P-device } <= 1, total <= 2";
         assert!(!iw_supports_ap(incapable));
+    }
+
+    #[test]
+    fn tunnel_iface_detection() {
+        let out = "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536\n3: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n4: wg0-mullvad: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1380\n5: tun0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1500\n";
+        assert_eq!(
+            tunnel_iface_names(out),
+            vec!["wg0-mullvad".to_string(), "tun0".to_string()]
+        );
+        let plain = "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536\n3: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n";
+        assert!(tunnel_iface_names(plain).is_empty());
+        // 'wgp0' starts with 'wg' too (prefix match, like VIRTUAL_IFACE_PREFIXES).
+        assert_eq!(tunnel_iface_names("2: wgpia0: <POINTOPOINT,UP>\n"), vec!["wgpia0".to_string()]);
     }
 
     #[test]
