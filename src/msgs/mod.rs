@@ -22,14 +22,14 @@ mod golden_tests {
     /// The update gate keys on the protocol version: bumping it must be a
     /// conscious red test (and per AGENTS.md a MAJOR crate version bump).
     #[test]
-    fn protocol_version_is_13() {
-        assert_eq!(shared::PROTOCOL_VERSION, 13);
+    fn protocol_version_is_14() {
+        assert_eq!(shared::PROTOCOL_VERSION, 14);
     }
 
     #[test]
     fn golden_version_bootstrap() {
-        let msg = shared::VersionBootstrapMessage { version: 13 };
-        assert_eq!(cobs_hex(&msg), "020d00");
+        let msg = shared::VersionBootstrapMessage { version: 14 };
+        assert_eq!(cobs_hex(&msg), "020e00");
     }
 
     #[test]
@@ -98,6 +98,17 @@ mod golden_tests {
             direction: event::Direction::Right,
         };
         assert_eq!(cobs_hex(&msg), "03050100");
+    }
+
+    #[test]
+    fn golden_server_event_hotspot_info() {
+        // Appended variant (protocol v14): variant index 6 followed by the
+        // two length-prefixed strings (ssid, psk).
+        let msg = event::ServerEvent::HotspotInfo {
+            ssid: "ap".to_string(),
+            psk: "pw".to_string(),
+        };
+        assert_eq!(cobs_hex(&msg), "080602617002707700");
     }
 
     #[test]

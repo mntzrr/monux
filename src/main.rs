@@ -210,14 +210,15 @@ struct SetupArgs {
     #[arg(long, value_enum, value_name = "server|client|off")]
     autostart: Option<monux::setup::Autostart>,
 
-    /// Host a dedicated 'monux-direct' WiFi hotspot on this machine (server
-    /// side): the KVM link then bypasses the router entirely. The peer's
-    /// internet keeps working — NATed through this machine — and mDNS
-    /// discovery steers the KVM connection onto the direct link
-    /// automatically. Requires AP support in the WiFi card (checked).
-    /// Prints the join command for the other machine.
-    #[arg(long)]
-    hotspot: bool,
+    /// Host ('on', the default when the flag is given bare) or remove ('off')
+    /// a dedicated 'monux-direct' WiFi hotspot on this machine (server side):
+    /// the KVM link then bypasses the router entirely. The peer's internet
+    /// keeps working — NATed through this machine — and approved clients
+    /// receive the credentials automatically over the encrypted connection
+    /// (protocol v14), or you can join manually with --hotspot-join. 'off'
+    /// deletes the profile without uninstalling anything else.
+    #[arg(long, value_enum, default_missing_value = "on", num_args = 0..=1, value_name = "on|off")]
+    hotspot: Option<monux::setup::Hotspot>,
 
     /// Join this machine to a 'monux-direct' hotspot hosted by the other
     /// machine (client side): '--hotspot-join <ssid> <psk>' as printed by
@@ -383,6 +384,14 @@ struct ClientArgs {
     /// the rate (5MB takes ~1s at 40Mbps), or 0 to disable pacing.
     #[arg(long, value_name = "mbps", value_parser = parse_bulk_throttle)]
     bulk_throttle_mbps: Option<f64>,
+
+    /// Don't join the server's advertised 'monux-direct' hotspot automatically
+    /// (protocol v14: a hosting server hands approved clients the hotspot
+    /// credentials over the encrypted connection, and the client provisions
+    /// and joins it by default). Manual join remains available with
+    /// 'monux system setup --hotspot-join'.
+    #[arg(long)]
+    no_auto_hotspot: bool,
 
     /// Switching BACK to the server by screen edge (Hyprland only for now):
     /// while this client has input, pushing the cursor against this screen
@@ -889,6 +898,7 @@ fn main() -> Result<()> {
                     throttle_mode,
                     edge_map,
                     Duration::from_millis(args.edge_dwell_ms),
+                    args.no_auto_hotspot,
                     !args.no_auto_update,
                     !args.no_indicator,
                 )
@@ -1305,6 +1315,7 @@ async fn client(
     throttle_mode: monux::rotation::ThrottleMode,
     edge_map: Option<monux::edge::EdgeMap>,
     edge_dwell: Duration,
+    no_auto_hotspot: bool,
     auto_update: bool,
     auto_indicator: bool,
 ) -> Result<()> {
@@ -1372,6 +1383,7 @@ async fn client(
                 throttle_mode,
                 edge_map.clone(),
                 edge_dwell,
+                no_auto_hotspot,
             ) => {
                 // client::run only returns on failure (its loop never exits otherwise).
                 if let Err(e) = run_result {

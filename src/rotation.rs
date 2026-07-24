@@ -629,6 +629,11 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// testable — ClientInfo embeds quinn handles and can't be fabricated in
     /// a unit test.
     link_quality: HashMap<SocketAddr, ClientLinkState>,
+    /// The 'monux-direct' hotspot credentials, probed lazily on the first
+    /// client connect (None = not probed yet, Some(None) = no active
+    /// hotspot). Advertised to every approved client so it can join the
+    /// direct link without the user copying anything (ServerEvent::HotspotInfo).
+    hotspot_credentials: Option<Option<(String, String)>>,
     /// When the last next/prev switch was processed (see SWITCH_DEBOUNCE).
     last_switch_at: Option<Instant>,
     /// Per-client liveness tracking for the Ping/Pong check (see
@@ -880,6 +885,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             motion_mode,
             throttle_mode,
             link_quality: HashMap::new(),
+            hotspot_credentials: None,
             last_switch_at: None,
             liveness: HashMap::new(),
             pong_miss_limit: match mode {
@@ -990,6 +996,48 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 debug!("Failed to send edge info to {}: {:?}", endpoint, e);
                 return;
             }
+        }
+    }
+
+    /// Sends the 'monux-direct' hotspot credentials to a newly connected
+    /// client (ServerEvent::HotspotInfo), so it can join the direct,
+    /// routerless link without the user copying anything. No-op when no
+    /// hotspot is active; the credentials travel only over this
+    /// authenticated, encrypted connection to an already-approved client.
+    async fn advertise_hotspot_info(&mut self, endpoint: &SocketAddr) {
+        if self.hotspot_credentials.is_none() {
+            self.hotspot_credentials = Some(crate::setup::active_hotspot_credentials());
+        }
+        let Some((ssid, psk)) = self.hotspot_credentials.clone().flatten() else {
+            return;
+        };
+        info!(
+            "Telling client {} about the '{}' hotspot so it can join the direct link",
+            endpoint, ssid
+        );
+        let serialized = match postcard::to_stdvec_cobs(&event::ServerEvent::HotspotInfo {
+            ssid,
+            psk,
+        }) {
+            Ok(m) => m,
+            Err(e) => {
+                error!("Failed to serialize hotspot info message: {:?}", e);
+                return;
+            }
+        };
+        let result = match self.clients.binary_search_by(|c| c.endpoint.cmp(endpoint)) {
+            Ok(idx) => {
+                let events_send = &mut self
+                    .clients
+                    .get_mut(idx)
+                    .expect("client exists after binary_search")
+                    .events_send;
+                events_send.write_all(&serialized).await
+            }
+            Err(_) => return,
+        };
+        if let Err(e) = result {
+            debug!("Failed to send hotspot info to {}: {:?}", endpoint, e);
         }
     }
 
@@ -1171,6 +1219,11 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         // the client's inferred detector is running before its first
         // activation. Unmapped clients get nothing.
         self.advertise_edge_info(&endpoint, &fingerprint).await;
+
+        // The 'monux-direct' hotspot (see setup.rs --hotspot): hand the new
+        // client the credentials over this authenticated, encrypted channel,
+        // so it can join the direct, routerless link on its own.
+        self.advertise_hotspot_info(&endpoint).await;
 
         // Topology changed: re-advertise surviving clients too — a new
         // connection can make 'auto' ambiguous, revoking a direction that

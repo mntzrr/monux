@@ -63,6 +63,16 @@ enum Role {
     Client,
 }
 
+/// `--hotspot` for `monux system setup`: host ('on', the default when the
+/// flag is given bare) or remove ('off') the 'monux-direct' hotspot profile.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hotspot {
+    /// Create and activate the hotspot profile (server side).
+    On,
+    /// Delete the profile (either role) without uninstalling monux.
+    Off,
+}
+
 impl Role {
     fn as_str(self) -> &'static str {
         match self {
@@ -468,7 +478,7 @@ fn sysctl_buf_conf_content() -> String {
     )
 }
 
-pub fn run(autostart: Option<Autostart>, hotspot: bool, hotspot_join: Option<(String, String)>) -> Result<()> {
+pub fn run(autostart: Option<Autostart>, hotspot: Option<Hotspot>, hotspot_join: Option<(String, String)>) -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         // Reaching here non-root means auto-elevation was opted out of
         // (MONUX_NO_ELEVATE). sudo resets PATH, so 'sudo monux system setup' often
@@ -486,13 +496,14 @@ pub fn run(autostart: Option<Autostart>, hotspot: bool, hotspot_join: Option<(St
     setup_socket_buffers(&mut failures);
     setup_qos_marking(&mut failures);
     match (hotspot, hotspot_join) {
-        (true, Some(_)) => {
+        (Some(_), Some(_)) => {
             failures += 1;
             println!("[fail] hotspot: --hotspot and --hotspot-join are opposite roles; pass only one");
         }
-        (true, None) => setup_hotspot(&mut failures),
-        (false, Some((ssid, psk))) => setup_hotspot_join(&ssid, &psk, &mut failures),
-        (false, None) => {}
+        (Some(Hotspot::On), None) => setup_hotspot(&mut failures),
+        (Some(Hotspot::Off), None) => remove_hotspot(&mut failures),
+        (None, Some((ssid, psk))) => setup_hotspot_join(&ssid, &psk, &mut failures),
+        (None, None) => {}
     }
     setup_autostart(autostart, &mut failures);
 
@@ -506,7 +517,7 @@ pub fn run(autostart: Option<Autostart>, hotspot: bool, hotspot_join: Option<(St
 }
 
 /// Runs a command, returning its stdout on success.
-fn run_cmd(program: &str, args: &[&str]) -> Result<String> {
+pub(crate) fn run_cmd(program: &str, args: &[&str]) -> Result<String> {
     let output = Command::new(program)
         .args(args)
         .output()
@@ -772,7 +783,7 @@ fn iw_supports_ap(iw_list: &str) -> bool {
 }
 
 /// Whether a NetworkManager connection profile with this name exists.
-fn nmcli_con_exists(name: &str) -> bool {
+pub(crate) fn nmcli_con_exists(name: &str) -> bool {
     run_cmd("nmcli", &["-t", "-f", "NAME", "connection", "show"])
         .map(|out| out.lines().any(|line| line == name))
         .unwrap_or(false)
@@ -916,6 +927,68 @@ fn setup_hotspot_join(ssid: &str, psk: &str, failures: &mut u32) {
     println!("       The previous WiFi profile reconnects automatically when the hotspot is off. Revert with: sudo nmcli connection delete {}", HOTSPOT_CON_NAME);
 }
 
+/// Removes the hotspot profile (either role) without touching anything else
+/// (`--hotspot off`): the targeted undo for the hotspot steps, as opposed to
+/// 'monux system uninstall', which removes the whole installation.
+fn remove_hotspot(failures: &mut u32) {
+    if !nmcli_con_exists(HOTSPOT_CON_NAME) {
+        println!("[ok]   hotspot: no '{}' profile installed", HOTSPOT_CON_NAME);
+        return;
+    }
+    match run_cmd("nmcli", &["connection", "delete", HOTSPOT_CON_NAME]) {
+        Ok(_) => println!("[done] hotspot: removed the '{}' profile", HOTSPOT_CON_NAME),
+        Err(e) => {
+            *failures += 1;
+            println!("[fail] hotspot: could not remove the profile: {}", e);
+        }
+    }
+}
+
+/// The active hotspot's (ssid, psk), for the server to advertise to approved
+/// clients (ServerEvent::HotspotInfo). Some only when the profile exists AND
+/// the AP is currently up: advertising a down hotspot would flap clients
+/// between profiles. Reading the passphrase needs root (the server has it).
+pub fn active_hotspot_credentials() -> Option<(String, String)> {
+    let active = run_cmd("nmcli", &["-t", "-f", "NAME", "connection", "show", "--active"])
+        .map(|out| out.lines().any(|line| line == HOTSPOT_CON_NAME))
+        .unwrap_or(false);
+    if !active {
+        return None;
+    }
+    let out = run_cmd(
+        "nmcli",
+        &[
+            "--show-secrets",
+            "-t",
+            "-f",
+            "802-11-wireless.ssid,802-11-wireless-security.psk",
+            "connection",
+            "show",
+            HOTSPOT_CON_NAME,
+        ],
+    )
+    .ok()?;
+    parse_hotspot_credentials(&out)
+}
+
+/// Parses nmcli -t property output into (ssid, psk); None when either is
+/// missing or empty (e.g. an open/unconfigured profile).
+fn parse_hotspot_credentials(output: &str) -> Option<(String, String)> {
+    let mut ssid = None;
+    let mut psk = None;
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix("802-11-wireless.ssid:") {
+            ssid = Some(value.to_string());
+        } else if let Some(value) = line.strip_prefix("802-11-wireless-security.psk:") {
+            psk = Some(value.to_string());
+        }
+    }
+    match (ssid, psk) {
+        (Some(ssid), Some(psk)) if !ssid.is_empty() && !psk.is_empty() => Some((ssid, psk)),
+        _ => None,
+    }
+}
+
 fn setup_socket_buffers(failures: &mut u32) {
     const RMEM_PROC: &str = "/proc/sys/net/core/rmem_max";
     const WMEM_PROC: &str = "/proc/sys/net/core/wmem_max";
@@ -989,6 +1062,22 @@ mod tests {
         // No easily-confused characters ever appear.
         assert!(!psk.contains('0') && !psk.contains('1') && !psk.contains('l') && !psk.contains('o'));
         assert_eq!(psk_from_bytes(&[9; 16]), psk_from_bytes(&[9; 16]));
+    }
+
+    #[test]
+    fn hotspot_credentials_parsing() {
+        let out = "802-11-wireless.ssid:monux-direct-box\n802-11-wireless-security.psk:abc123xyz4567890\n";
+        assert_eq!(
+            parse_hotspot_credentials(out),
+            Some(("monux-direct-box".to_string(), "abc123xyz4567890".to_string()))
+        );
+        // A missing or empty psk (open/unconfigured profile) advertises nothing.
+        assert_eq!(parse_hotspot_credentials("802-11-wireless.ssid:monux-direct-box\n"), None);
+        assert_eq!(
+            parse_hotspot_credentials("802-11-wireless.ssid:monux-direct-box\n802-11-wireless-security.psk:\n"),
+            None
+        );
+        assert_eq!(parse_hotspot_credentials(""), None);
     }
 
     #[test]
