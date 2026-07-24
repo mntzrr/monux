@@ -29,7 +29,13 @@ const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("MONUX_GIT_SH
         "{}\n\nWire protocol version: {}",
         env!("CARGO_PKG_DESCRIPTION"),
         monux::msgs::shared::PROTOCOL_VERSION
-    )
+    ),
+    after_long_help = "\
+EXAMPLES:
+    monux server      # machine with the physical keyboard/mouse
+    monux client      # each machine to control (mDNS auto-discovery)
+    monux status      # live state of the running daemon
+    monux update      # update to the latest version from GitHub"
 )]
 #[command(propagate_version = true)]
 struct Cli {
@@ -40,25 +46,104 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Runs a Monux server
+    ///
+    /// The machine with the physical input devices; clients connect to it.
+    #[command(after_long_help = "\
+EXAMPLES:
+    monux server
+    monux server --edge-map bottom=auto    # switch input at the bottom screen edge
+    monux server --www                     # conservative tuning for the public internet
+    monux server --fingerprints aa11bbcc   # pre-approve a client (no approval prompt)")]
     Server(ServerArgs),
 
     /// Runs a Monux client
+    ///
+    /// A machine to be controlled; connects to the given server, or discovers
+    /// it on the LAN via mDNS when no host is given.
+    #[command(after_long_help = "\
+EXAMPLES:
+    monux client                     # discover the server via mDNS
+    monux client 192.168.1.187       # connect directly
+    monux client --www kvm.example.com
+    monux client --mouse-scale 0.5   # compensate DPI/sensitivity differences")]
     Client(ClientArgs),
 
-    /// Manages this machine's system integration for monux: persisting
-    /// machine-local settings (setup), updating monux, and removing it again
-    /// (uninstall)
-    System(SystemArgs),
+    /// Optimizes this machine for local KVM, persisting machine-local settings
+    ///
+    /// No flags: applies everything ('input' group membership, /dev/uinput
+    /// permissions, WiFi power saving off, raised UDP socket buffers, DSCP
+    /// QoS marking) and re-executes with sudo automatically. ANY flag scopes
+    /// the run to that flag's actions only; '--autostart' manages a per-user
+    /// systemd unit and runs WITHOUT elevating.
+    #[command(after_long_help = "\
+EXAMPLES:
+    monux setup                        # apply everything (elevates via sudo)
+    monux setup --hotspot              # only host the direct WiFi hotspot
+    monux setup --autostart server     # only install the login service (no sudo)")]
+    Setup(SetupArgs),
 
-    /// Manages a running monux daemon through its control socket: switching
-    /// input between machines, pausing, restarting, and more
+    /// Updates monux to the latest version from GitHub, rebuilding from source
+    ///
+    /// The server protocol-compatibility gate is first refreshed from the
+    /// mDNS advertisements of servers on the LAN, so a client never installs
+    /// a build its server couldn't talk to ('--force' bypasses).
+    #[command(after_long_help = "\
+EXAMPLES:
+    monux update
+    monux update --force    # rebuild even if up to date, bypassing the protocol gate")]
+    Update(UpdateArgs),
+
+    /// Prints the live state of the running monux daemon (server or client)
+    ///
+    /// Queries the control socket in $XDG_RUNTIME_DIR/monux/ (server socket
+    /// first, then the client's): rotation target, connected clients with
+    /// fingerprint prefixes and resolved edge directions (the reference for
+    /// configuring --edge-map), clipboard owner, update availability.
+    #[command(after_long_help = "\
+EXAMPLES:
+    monux status              # server socket first, then the client's
+    monux status --json       # machine-readable raw response
+    monux status --server     # restrict to one role (or --client)")]
+    Status(StatusArgs),
+
+    /// Desktop GUI integration: the tray indicator and its visibility
+    #[command(after_long_help = "\
+EXAMPLES:
+    monux gui indicator    # run the tray icon (usually auto-spawned by the daemon)
+    monux gui tray hide    # hide the icon without stopping the daemon
+    monux gui tray show    # bring it back")]
+    Gui(GuiArgs),
+
+    /// Manages a running monux daemon through its control socket
+    ///
+    /// Switching input between machines, pausing, restarting, and more.
+    #[command(after_long_help = "\
+EXAMPLES:
+    monux daemon switch next    # or prev / local / a client fingerprint prefix
+    monux daemon pause          # ungrab everything (raw local input)
+    monux daemon resume
+    monux daemon restart        # graceful restart into the installed binary
+    monux daemon exit           # graceful stop")]
     Daemon(DaemonArgs),
+
+    /// Destructive operations: removing monux from this machine
+    #[command(after_long_help = "\
+EXAMPLES:
+    monux system uninstall           # interactive confirmation
+    monux system uninstall --yes     # no prompt (for scripts)")]
+    System(SystemArgs),
 }
 
 #[derive(Args)]
 struct SystemArgs {
     #[command(subcommand)]
     command: SystemCommands,
+}
+
+#[derive(Args)]
+struct GuiArgs {
+    #[command(subcommand)]
+    command: GuiCommands,
 }
 
 #[derive(Args)]
@@ -69,9 +154,6 @@ struct DaemonArgs {
 
 #[derive(Subcommand)]
 enum DaemonCommands {
-    /// Prints the daemon's live state (same as 'monux system status')
-    Status(StatusArgs),
-
     /// Switches input to the next or previous client, the local machine, or a
     /// client fingerprint prefix
     Switch(DaemonSwitchArgs),
@@ -95,6 +177,50 @@ enum DaemonCommands {
     Update,
 }
 
+#[derive(Subcommand)]
+enum GuiCommands {
+    /// Runs a StatusNotifierItem tray indicator for the local monux daemon
+    ///
+    /// A colored dot (green = input local, blue = input on a client, grey =
+    /// paused, red = degraded link / client not connected, hollow "?" = monux
+    /// not running) whose menu drives switches, pause/resume, update checks,
+    /// diagnostics copy, and restart/exit via the control socket. Needs a
+    /// desktop session with an SNI host (waybar, KDE Plasma, ...). Started
+    /// automatically with 'monux server'/'monux client' (opt out with
+    /// --no-indicator); a manually started instance takes over from the
+    /// auto-spawned one — only one indicator runs at a time.
+    Indicator,
+
+    /// Hides or restores the auto-spawned tray indicator without restarting
+    /// the daemon
+    ///
+    /// 'hide' SIGTERMs the daemon's spawned indicator and suppresses respawns
+    /// (the daemon itself keeps running), 'show' spawns it again. The hidden
+    /// state is per-daemon-run only — a daemon restart always starts the
+    /// indicator. Talks to the daemon's control socket (server socket first,
+    /// then the client's), like 'monux status'.
+    Tray(TrayArgs),
+}
+
+#[derive(Subcommand)]
+enum SystemCommands {
+    /// Removes monux from this machine
+    ///
+    /// Stops any running server/client, then removes the binary (and stale
+    /// copies), the /usr/local/bin link, and the system settings persisted by
+    /// 'monux setup'. Asks for confirmation first (skip with '--yes'), and
+    /// separately before also removing ~/.config/monux (identity keypair and
+    /// peer approvals).
+    Uninstall(UninstallArgs),
+}
+
+#[derive(Args)]
+struct UninstallArgs {
+    /// Skip the interactive confirmation prompt (for scripts)
+    #[arg(long)]
+    yes: bool,
+}
+
 #[derive(Args)]
 struct DaemonSwitchArgs {
     /// next, prev, local, or a client fingerprint prefix
@@ -103,61 +229,6 @@ struct DaemonSwitchArgs {
 
     /// Query this explicit control socket path instead of the default
     /// $XDG_RUNTIME_DIR/monux/{server,client}.sock locations
-    #[arg(long, value_name = "path")]
-    socket: Option<PathBuf>,
-}
-
-#[derive(Subcommand)]
-enum SystemCommands {
-    /// Persists machine-local settings that optimize this machine for local KVM
-    /// (input device access, /dev/uinput permissions, WiFi power saving,
-    /// UDP socket buffers). Re-executes with sudo automatically.
-    Setup(SetupArgs),
-
-    /// Prints the live state of the running monux daemon (server or client)
-    /// via its control socket in $XDG_RUNTIME_DIR/monux/: rotation target,
-    /// connected clients, clipboard owner, update availability.
-    Status(StatusArgs),
-
-    /// Lists the server's connected clients with fingerprint prefixes and
-    /// resolved edge directions — the reference for configuring --edge-map.
-    Clients(ClientsArgs),
-
-    /// Updates monux to the latest version from GitHub, rebuilding from
-    /// source. The server protocol-compatibility gate is first refreshed
-    /// from the mDNS advertisements of servers on the LAN.
-    Update(UpdateArgs),
-
-    /// Runs a StatusNotifierItem tray indicator for the local monux daemon:
-    /// a colored dot (green = input local, blue = input on a client, grey =
-    /// paused, red = degraded link / client not connected, hollow "?" = monux
-    /// not running) whose menu drives switches, pause/resume, update checks,
-    /// diagnostics copy, and restart/exit via the control socket. Needs a
-    /// desktop session with an SNI host (waybar, KDE Plasma, ...). Started
-    /// automatically with 'monux server'/'monux client' (opt out with
-    /// --no-indicator); running it manually takes over from the auto-spawned
-    /// instance — only one indicator runs at a time.
-    Indicator,
-
-    /// Hides or restores the auto-spawned tray indicator without restarting
-    /// the daemon: 'hide' SIGTERMs the daemon's spawned indicator and
-    /// suppresses respawns (the daemon itself keeps running), 'show' spawns
-    /// it again. The hidden state is per-daemon-run only — a daemon restart
-    /// always starts the indicator. Talks to the daemon's control socket
-    /// (server socket first, then the client's), like 'monux system status'.
-    Tray(TrayArgs),
-
-    /// Removes monux from this machine: stops any running server/client, then
-    /// removes the binary (and stale copies), the /usr/local/bin link, and the
-    /// system settings persisted by 'monux system setup'. Asks before also
-    /// removing ~/.config/monux (identity keypair and peer approvals).
-    Uninstall,
-}
-
-#[derive(Args)]
-struct ClientsArgs {
-    /// Query this explicit control socket path instead of the default
-    /// $XDG_RUNTIME_DIR/monux/server.sock location
     #[arg(long, value_name = "path")]
     socket: Option<PathBuf>,
 }
@@ -212,17 +283,17 @@ struct SetupArgs {
 
     /// Host ('on', the default when the flag is given bare) or remove ('off')
     /// a dedicated 'monux-direct' WiFi hotspot on this machine (server side):
-    /// the KVM link then bypasses the router entirely. The peer's internet
-    /// keeps working — NATed through this machine — and approved clients
-    /// receive the credentials automatically over the encrypted connection
-    /// (protocol v14), or you can join manually with --hotspot-join. 'off'
-    /// deletes the profile without uninstalling anything else.
+    /// the KVM link then bypasses the router entirely, and the peer's internet
+    /// keeps working, NATed through this machine. Approved clients receive the
+    /// credentials automatically over the encrypted connection (protocol v14);
+    /// manual join with --hotspot-join. 'off' deletes the profile without
+    /// uninstalling anything else.
     #[arg(long, value_enum, default_missing_value = "on", num_args = 0..=1, value_name = "on|off")]
     hotspot: Option<monux::setup::Hotspot>,
 
     /// Join this machine to a 'monux-direct' hotspot hosted by the other
     /// machine (client side): '--hotspot-join <ssid> <psk>' as printed by
-    /// 'monux system setup --hotspot' there. NOTE: this moves the machine's
+    /// 'monux setup --hotspot' there. NOTE: this moves the machine's
     /// WiFi association to the hotspot; its internet then flows through the
     /// hosting machine.
     #[arg(long, num_args = 2, value_names = ["ssid", "psk"])]
@@ -332,7 +403,7 @@ struct ServerArgs {
     #[arg(long)]
     no_auto_update: bool,
 
-    /// Do not auto-spawn the tray indicator (monux system indicator) with the
+    /// Do not auto-spawn the tray indicator (monux gui indicator) with the
     /// daemon. By default the indicator starts once the daemon is up whenever
     /// a desktop session bus is available, and stops with the daemon. Can
     /// also be disabled with MONUX_NO_INDICATOR=1.
@@ -389,7 +460,7 @@ struct ClientArgs {
     /// (protocol v14: a hosting server hands approved clients the hotspot
     /// credentials over the encrypted connection, and the client provisions
     /// and joins it by default). Manual join remains available with
-    /// 'monux system setup --hotspot-join'.
+    /// 'monux setup --hotspot-join'.
     #[arg(long)]
     no_auto_hotspot: bool,
 
@@ -416,7 +487,7 @@ struct ClientArgs {
     #[arg(long)]
     no_auto_update: bool,
 
-    /// Do not auto-spawn the tray indicator (monux system indicator) with the
+    /// Do not auto-spawn the tray indicator (monux gui indicator) with the
     /// daemon. By default the indicator starts once the daemon is up whenever
     /// a desktop session bus is available, and stops with the daemon. Can
     /// also be disabled with MONUX_NO_INDICATOR=1.
@@ -543,20 +614,10 @@ fn main() -> Result<()> {
     // Record the exact build in the log: invaluable when diagnosing bug reports.
     info!("monux v{} starting", VERSION);
 
-    // System commands and update don't need the config dir, devices, or the
-    // async runtime.
+    // Setup/update/status/gui/system/daemon commands don't need the config
+    // dir, devices, or the async runtime.
     match &cli.command {
         Commands::Daemon(args) => match &args.command {
-            DaemonCommands::Status(args) => {
-                let out = monux::control::status_cli(
-                    args.server,
-                    args.client,
-                    args.socket.as_deref(),
-                    args.json,
-                )?;
-                println!("{}", out);
-                return Ok(());
-            }
             DaemonCommands::Switch(args) => {
                 let request = format!(r#"{{"cmd":"switch","target":"{}"}}"#, args.target);
                 let out = monux::control::daemon_cli(&request, "Switch requested", args.socket.as_deref())?;
@@ -593,65 +654,66 @@ fn main() -> Result<()> {
                 return Ok(());
             }
         },
-        Commands::System(args) => match &args.command {
-            SystemCommands::Setup(args) => {
+        Commands::Setup(args) => {
+            // Elevate only when the selected steps need root: the base set
+            // (a no-flags run) and the hotspot steps persist root-owned
+            // system settings; --autostart manages a per-user systemd unit
+            // and must run as the invoking user instead.
+            let base_set = args.autostart.is_none()
+                && args.hotspot.is_none()
+                && args.hotspot_join.is_none();
+            if base_set || args.hotspot.is_some() || args.hotspot_join.is_some() {
                 maybe_elevate("to persist system settings")?;
-                return monux::setup::run(
-                    args.autostart,
-                    args.hotspot,
-                    args.hotspot_join.as_ref().map(|v| (v[0].clone(), v[1].clone())),
-                );
             }
-            SystemCommands::Status(args) => {
-                let out = monux::control::status_cli(
-                    args.server,
-                    args.client,
-                    args.socket.as_deref(),
-                    args.json,
-                )?;
-                println!("{}", out);
-                return Ok(());
-            }
-            SystemCommands::Clients(args) => {
-                let out = monux::control::clients_cli(args.socket.as_deref())?;
-                println!("{}", out);
-                return Ok(());
-            }
-            SystemCommands::Update(args) => {
-                // Gate on the server's protocol version when this machine acts as
-                // a client, so an update can't break the connection. The version
-                // recorded at the last handshake can be stale (the server upgraded
-                // while this client was away), so refresh it from the servers'
-                // mDNS advertisements first; the config dir may not exist yet, the
-                // constraint is simply absent then.
-                let constraint = if args.force {
-                    // --force bypasses the gate; skip the discovery delay.
-                    None
-                } else if single_instance::live_holder("server").is_some()
-                    && single_instance::live_holder("client").is_none()
-                {
-                    // This machine runs a monux server and no client: it leads
-                    // protocol upgrades, and the gate must not block it (its own
-                    // mDNS advertisement or a stale client-role record would
-                    // otherwise refuse the update).
-                    info!("This machine runs a monux server and no client: the protocol-compatibility gate does not apply");
-                    None
-                } else {
-                    let config_dir = home::home_dir().map(|h| h.join(".config").join("monux"));
-                    monux::update::refresh_protocol_constraint(config_dir.as_deref())
-                };
-                return monux::update::run(args.force, false, constraint).map(|_| ());
-            }
-            SystemCommands::Tray(args) => {
+            return monux::setup::run(
+                args.autostart,
+                args.hotspot,
+                args.hotspot_join.as_ref().map(|v| (v[0].clone(), v[1].clone())),
+            );
+        }
+        Commands::Update(args) => {
+            // Gate on the server's protocol version when this machine acts as
+            // a client, so an update can't break the connection. The version
+            // recorded at the last handshake can be stale (the server upgraded
+            // while this client was away), so refresh it from the servers'
+            // mDNS advertisements first; the config dir may not exist yet, the
+            // constraint is simply absent then.
+            let constraint = if args.force {
+                // --force bypasses the gate; skip the discovery delay.
+                None
+            } else if single_instance::live_holder("server").is_some()
+                && single_instance::live_holder("client").is_none()
+            {
+                // This machine runs a monux server and no client: it leads
+                // protocol upgrades, and the gate must not block it (its own
+                // mDNS advertisement or a stale client-role record would
+                // otherwise refuse the update).
+                info!("This machine runs a monux server and no client: the protocol-compatibility gate does not apply");
+                None
+            } else {
+                let config_dir = home::home_dir().map(|h| h.join(".config").join("monux"));
+                monux::update::refresh_protocol_constraint(config_dir.as_deref())
+            };
+            return monux::update::run(args.force, false, constraint).map(|_| ());
+        }
+        Commands::Status(args) => {
+            let out = monux::control::status_cli(
+                args.server,
+                args.client,
+                args.socket.as_deref(),
+                args.json,
+            )?;
+            println!("{}", out);
+            return Ok(());
+        }
+        Commands::Gui(args) => match &args.command {
+            GuiCommands::Tray(args) => {
                 let hide = matches!(args.action, TrayAction::Hide);
                 let out = monux::control::tray_cli(hide, args.socket.as_deref())?;
                 println!("{}", out);
                 return Ok(());
             }
-            SystemCommands::Uninstall => {
-                return monux::uninstall::run();
-            }
-            SystemCommands::Indicator => {
+            GuiCommands::Indicator => {
                 // Headless sessions fail here, before touching the lock: no
                 // point holding (or taking over) the single-instance lock for
                 // an indicator that can't even reach a session bus.
@@ -665,6 +727,11 @@ fn main() -> Result<()> {
                 // indicator (auto-spawned or manual).
                 let _indicator_lock = single_instance::acquire("indicator")?;
                 return monux::indicator::run();
+            }
+        },
+        Commands::System(args) => match &args.command {
+            SystemCommands::Uninstall(args) => {
+                return monux::uninstall::run(args.yes);
             }
         },
         _ => {}
@@ -687,8 +754,13 @@ fn main() -> Result<()> {
     );
 
     match cli.command {
-        Commands::System(_) | Commands::Daemon(_) => {
-            unreachable!("system and daemon commands are handled before runtime initialization")
+        Commands::Setup(_)
+        | Commands::Update(_)
+        | Commands::Status(_)
+        | Commands::Gui(_)
+        | Commands::System(_)
+        | Commands::Daemon(_) => {
+            unreachable!("setup/update/status/gui/system/daemon commands are handled before runtime initialization")
         }
         Commands::Server(args) => {
             if args.port == 0 {
@@ -984,10 +1056,10 @@ fn settle_after_takeover(lock: &single_instance::InstanceLock) {
     }
 }
 
-/// 'monux system setup' persists system settings and needs root. Rather than
-/// making the user type 'sudo monux system setup' (which also trips over
-/// sudo's restricted PATH hiding ~/.local/bin), re-exec with sudo -E,
-/// prompting for the password.
+/// 'monux setup' persists system settings and (for the base set and the
+/// hotspot steps) needs root. Rather than making the user type 'sudo monux
+/// setup' (which also trips over sudo's restricted PATH hiding ~/.local/bin),
+/// re-exec with sudo -E, prompting for the password.
 /// Opt out with MONUX_NO_ELEVATE=1 to get the manual invocation instead.
 fn maybe_elevate(reason: &str) -> Result<()> {
     if unsafe { libc::geteuid() } == 0 || std::env::var_os("MONUX_NO_ELEVATE").is_some() {
@@ -1493,15 +1565,21 @@ async fn client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use std::path::Path;
 
     #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
     fn tray_subcommand_parses_hide_show_and_socket() {
-        let cli = Cli::try_parse_from(["monux", "system", "tray", "hide"]).unwrap();
-        let Commands::System(args) = cli.command else {
-            panic!("expected a system command")
+        let cli = Cli::try_parse_from(["monux", "gui", "tray", "hide"]).unwrap();
+        let Commands::Gui(args) = cli.command else {
+            panic!("expected a gui command")
         };
-        let SystemCommands::Tray(tray) = args.command else {
+        let GuiCommands::Tray(tray) = args.command else {
             panic!("expected the tray subcommand")
         };
         assert!(matches!(tray.action, TrayAction::Hide));
@@ -1509,17 +1587,17 @@ mod tests {
 
         let cli = Cli::try_parse_from([
             "monux",
-            "system",
+            "gui",
             "tray",
             "show",
             "--socket",
             "/tmp/x/monux/client.sock",
         ])
         .unwrap();
-        let Commands::System(args) = cli.command else {
-            panic!("expected a system command")
+        let Commands::Gui(args) = cli.command else {
+            panic!("expected a gui command")
         };
-        let SystemCommands::Tray(tray) = args.command else {
+        let GuiCommands::Tray(tray) = args.command else {
             panic!("expected the tray subcommand")
         };
         assert!(matches!(tray.action, TrayAction::Show));
@@ -1531,8 +1609,44 @@ mod tests {
 
     #[test]
     fn tray_subcommand_rejects_missing_and_unknown_actions() {
-        assert!(Cli::try_parse_from(["monux", "system", "tray"]).is_err());
-        assert!(Cli::try_parse_from(["monux", "system", "tray", "blink"]).is_err());
+        assert!(Cli::try_parse_from(["monux", "gui", "tray"]).is_err());
+        assert!(Cli::try_parse_from(["monux", "gui", "tray", "blink"]).is_err());
+    }
+
+    #[test]
+    fn uninstall_accepts_yes_and_defaults_to_prompt() {
+        let cli = Cli::try_parse_from(["monux", "system", "uninstall", "--yes"]).unwrap();
+        let Commands::System(args) = cli.command else {
+            panic!("expected a system command")
+        };
+        // 'system' has exactly one subcommand, so this pattern is irrefutable.
+        let SystemCommands::Uninstall(uninstall) = args.command;
+        assert!(uninstall.yes);
+
+        let cli = Cli::try_parse_from(["monux", "system", "uninstall"]).unwrap();
+        let Commands::System(args) = cli.command else {
+            panic!("expected a system command")
+        };
+        let SystemCommands::Uninstall(uninstall) = args.command;
+        assert!(!uninstall.yes);
+    }
+
+    #[test]
+    fn removed_command_paths_are_rejected() {
+        // Folded into first-level commands or 'gui'.
+        assert!(Cli::try_parse_from(["monux", "system", "status"]).is_err());
+        assert!(Cli::try_parse_from(["monux", "system", "clients"]).is_err());
+        assert!(Cli::try_parse_from(["monux", "system", "update"]).is_err());
+        assert!(Cli::try_parse_from(["monux", "system", "setup"]).is_err());
+        assert!(Cli::try_parse_from(["monux", "system", "tray", "hide"]).is_err());
+        assert!(Cli::try_parse_from(["monux", "system", "indicator"]).is_err());
+        assert!(Cli::try_parse_from(["monux", "daemon", "status"]).is_err());
+        // ...and the new paths parse.
+        assert!(Cli::try_parse_from(["monux", "status"]).is_ok());
+        assert!(Cli::try_parse_from(["monux", "update"]).is_ok());
+        assert!(Cli::try_parse_from(["monux", "setup"]).is_ok());
+        assert!(Cli::try_parse_from(["monux", "gui", "indicator"]).is_ok());
+        assert!(Cli::try_parse_from(["monux", "daemon", "switch", "next"]).is_ok());
     }
 
     #[test]

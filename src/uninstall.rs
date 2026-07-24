@@ -3,11 +3,13 @@
 //! uninstaller lives in the binary itself; uninstall.sh is a thin wrapper.
 //!
 //! Order matters:
+//! 0. the user confirms the destructive run up front (skipped with --yes;
+//!    without a terminal the run aborts instead of guessing);
 //! 1. running server/client instances are asked to shut down first (a running
 //!    server may hold input devices grabbed);
 //! 2. the user is asked about ~/.config/monux (identity keypair + peer
 //!    approvals) — only on a terminal, otherwise it is kept;
-//! 3. root-owned system settings persisted by `monux system setup` — the
+//! 3. root-owned system settings persisted by `monux setup` — the
 //!    files, plus the netfilter DSCP marks — and the /usr/local/bin link are
 //!    removed via sudo subprocesses (unlike setup, no sudo re-exec: uninstall
 //!    must not swap its own process image mid-flight);
@@ -29,7 +31,13 @@ use crate::{setup, single_instance};
 
 /// Runs the uninstall. Best-effort throughout: individual failures downgrade
 /// to notes with manual-removal hints instead of aborting the remaining steps.
-pub fn run() -> Result<()> {
+pub fn run(assume_yes: bool) -> Result<()> {
+    // Nothing is touched before this confirmation lands.
+    if !assume_yes && !confirm_uninstall() {
+        println!("Aborted; nothing was removed.");
+        return Ok(());
+    }
+
     // First: a running server may hold input devices grabbed.
     stop_running_instances();
 
@@ -51,7 +59,7 @@ pub fn run() -> Result<()> {
 /// temporary directories).
 struct Plan {
     /// Existing root-owned paths to remove via sudo: the system settings
-    /// persisted by `monux system setup`, plus /usr/local/bin/monux when it is
+    /// persisted by `monux setup`, plus /usr/local/bin/monux when it is
     /// clearly ours.
     root_owned: Vec<PathBuf>,
     /// User-owned binaries to remove directly: the running executable and
@@ -180,7 +188,7 @@ fn remove_root_owned(paths: &[PathBuf]) {
     if paths.is_empty() {
         return;
     }
-    println!("Removing system settings persisted by 'monux system setup'...");
+    println!("Removing system settings persisted by 'monux setup'...");
     let removed = Command::new("sudo")
         .arg("rm")
         .arg("-f")
@@ -218,7 +226,7 @@ fn remove_root_owned(paths: &[PathBuf]) {
     }
 }
 
-/// Removes the netfilter DSCP marks 'monux system setup' installs. The rules
+/// Removes the netfilter DSCP marks 'monux setup' installs. The rules
 /// are self-describing (our own nftables table; two exact iptables rules), so
 /// removal is idempotent and needs no state. Non-interactive: when sudo would
 /// have to ask for a password (nothing earlier in the uninstall warmed the
@@ -257,7 +265,7 @@ fn remove_qos_marking() {
     println!("Removed DSCP QoS marking rules (if any were installed).");
 }
 
-/// Removes the hotspot pieces 'monux system setup --hotspot/--hotspot-join'
+/// Removes the hotspot pieces 'monux setup --hotspot/--hotspot-join'
 /// installs: the monux-hotspot systemd unit (stop+disable first, so the AP
 /// interface, NAT and dnsmasq come down cleanly), /etc/monux, the NAT table
 /// and the vif if they linger, and the 'monux-direct' NetworkManager profile
@@ -352,6 +360,27 @@ fn stop_running_instances() {
             }
             Err(e) => println!("note: couldn't stop the running monux {}: {}", kind, e),
         }
+    }
+}
+
+/// Pre-flight confirmation for the destructive uninstall, reading from
+/// /dev/tty like the config prompt below. Without a usable terminal (cron,
+/// CI, a pipe) there is no one to ask, so the run aborts: unattended removal
+/// needs --yes.
+fn confirm_uninstall() -> bool {
+    let tty = match fs::File::open("/dev/tty") {
+        Ok(tty) => tty,
+        Err(_) => {
+            println!("No terminal to ask for confirmation (and --yes not given); aborting.");
+            return false;
+        }
+    };
+    print!("This will stop any running monux daemon and remove the binary, /usr/local/bin link, and persisted system settings. Continue? [y/N] ");
+    let _ = io::stdout().flush();
+    let mut answer = String::new();
+    match io::BufReader::new(tty).read_line(&mut answer) {
+        Ok(_) => answered_yes(&answer),
+        Err(_) => false,
     }
 }
 

@@ -1,7 +1,9 @@
-//! `monux system setup`: persists machine-local settings that optimize the host for
+//! `monux setup`: persists machine-local settings that optimize the host for
 //! local KVM use. Everything here is idempotent and reported step by step.
+//! No flags applies the full base set below; ANY flag scopes the run to that
+//! flag's actions only.
 //!
-//! Currently applied:
+//! The base set:
 //! - `input` group membership for the invoking user (input device access
 //!   without running monux as root; takes effect on next login)
 //! - a udev rule making /dev/uinput accessible to the `input` group (only if
@@ -16,16 +18,19 @@
 //! - DSCP CS6 netfilter marking of monux's UDP traffic (the AP/router hop
 //!   picks its downlink queue from each packet's DSCP; quinn overwrites the
 //!   TOS byte per packet, so only netfilter can set it)
+//!
+//! The flag-scoped actions:
 //! - with `--hotspot`, a 'monux-direct' WiFi hotspot hosted by this machine:
 //!   hostapd drives a dedicated AP interface (NetworkManager is left managing
 //!   only the host's own WiFi — the NM AP path is a dead end on iwlwifi,
 //!   which only beacons on '__ap' vifs NM can't activate), dnsmasq serves
-//!   DHCP/DNS, and the peer is NATed through this machine so its internet
-//!   keeps working while the KVM link bypasses the router; with
-//!   `--hotspot-join`, this machine joins the other machine's hotspot
+//!   DHCP/DNS, and the peer is NATed through this machine (IPv4 forwarding
+//!   enabled) so its internet keeps working while the KVM link bypasses the
+//!   router; with `--hotspot-join`, this machine joins the other machine's
+//!   hotspot
 //! - with `--autostart`, a per-user systemd service starting monux with the
-//!   graphical session (the only step that is NOT machine tuning; off by
-//!   default)
+//!   graphical session (the only action that does NOT need root; it manages
+//!   the invoking user's own systemd units)
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -179,7 +184,7 @@ fn hotspot_live_subnet() -> Option<String> {
 /// Where per-user systemd units live, relative to the target user's home.
 const SYSTEMD_USER_UNIT_DIR: &str = ".config/systemd/user";
 
-/// `--autostart` for `monux system setup`: manage a per-user systemd service
+/// `--autostart` for `monux setup`: manage a per-user systemd service
 /// that starts monux with the graphical session. When the flag is omitted, no
 /// autostart changes are made.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,7 +204,7 @@ enum Role {
     Client,
 }
 
-/// `--hotspot` for `monux system setup`: host ('on', the default when the
+/// `--hotspot` for `monux setup`: host ('on', the default when the
 /// flag is given bare) or remove ('off') the 'monux-direct' hotspot profile.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hotspot {
@@ -615,22 +620,33 @@ fn sysctl_buf_conf_content() -> String {
 }
 
 pub fn run(autostart: Option<Autostart>, hotspot: Option<Hotspot>, hotspot_join: Option<(String, String)>) -> Result<()> {
-    if unsafe { libc::geteuid() } != 0 {
+    // Flag scoping: no flags means the full base set below; ANY flag scopes
+    // the run to that flag's actions only.
+    let scoped = autostart.is_some() || hotspot.is_some() || hotspot_join.is_some();
+    // The base set and the hotspot steps persist root-owned system settings.
+    // --autostart manages a per-user systemd unit and must NOT elevate: the
+    // unit lands in the invoking user's home (main.rs skips the sudo re-exec
+    // for an --autostart-only run).
+    let needs_root = !scoped || hotspot.is_some() || hotspot_join.is_some();
+    if needs_root && unsafe { libc::geteuid() } != 0 {
         // Reaching here non-root means auto-elevation was opted out of
-        // (MONUX_NO_ELEVATE). sudo resets PATH, so 'sudo monux system setup' often
+        // (MONUX_NO_ELEVATE). sudo resets PATH, so 'sudo monux setup' often
         // fails with "command not found": print the full invocation that works.
         let exe = std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "monux".to_string());
-        bail!("monux system setup persists system settings and needs root. Run it with: sudo {} system setup (or re-run without MONUX_NO_ELEVATE to elevate automatically)", exe);
+        let args = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+        bail!("monux setup persists system settings and needs root. Run it with: sudo {} {} (or re-run without MONUX_NO_ELEVATE to elevate automatically)", exe, args);
     }
 
     let mut failures = 0;
-    setup_input_group(&mut failures);
-    setup_uinput_access(&mut failures);
-    setup_wifi_powersave(&mut failures);
-    setup_socket_buffers(&mut failures);
-    setup_qos_marking(&mut failures);
+    if !scoped {
+        setup_input_group(&mut failures);
+        setup_uinput_access(&mut failures);
+        setup_wifi_powersave(&mut failures);
+        setup_socket_buffers(&mut failures);
+        setup_qos_marking(&mut failures);
+    }
     match (hotspot, hotspot_join) {
         (Some(_), Some(_)) => {
             failures += 1;
@@ -644,10 +660,12 @@ pub fn run(autostart: Option<Autostart>, hotspot: Option<Hotspot>, hotspot_join:
     setup_autostart(autostart, &mut failures);
 
     println!();
-    if failures == 0 {
+    if failures > 0 {
+        println!("Done with {} failed step(s); see messages above.", failures);
+    } else if !scoped {
         println!("All done. Undo any of these by removing the files listed above, removing the user from the 'input' group, and/or deleting the QoS rules ('sudo nft delete table inet {}' or the iptables -D equivalents).", NFT_QOS_TABLE);
     } else {
-        println!("Done with {} failed step(s); see messages above.", failures);
+        println!("All done.");
     }
     Ok(())
 }
@@ -1010,7 +1028,7 @@ fn verify_ip_forward_still_on(failures: &mut u32) {
         return;
     }
     *failures += 1;
-    println!("[fail] ip forward: net.ipv4.ip_forward is OFF although the hotspot is up — hotspot clients get no internet in this state. Something (VPN teardown?) reset it after it was enabled. Fix with: sudo sysctl -w net.ipv4.ip_forward=1 (or re-run 'monux system setup --hotspot')");
+    println!("[fail] ip forward: net.ipv4.ip_forward is OFF although the hotspot is up — hotspot clients get no internet in this state. Something (VPN teardown?) reset it after it was enabled. Fix with: sudo sysctl -w net.ipv4.ip_forward=1 (or re-run 'monux setup --hotspot')");
 }
 
 /// Installs the workaround for Mullvad's VPN breaking the hotspot client's
@@ -1024,7 +1042,7 @@ fn install_vpn_workaround(failures: &mut u32) {
     let subnet = match hotspot_live_subnet() {
         Some(subnet) => subnet,
         None => {
-            println!("[warn] hotspot: couldn't read the hotspot subnet yet; re-run 'monux system setup --hotspot' once the AP is up to install the VPN workaround");
+            println!("[warn] hotspot: couldn't read the hotspot subnet yet; re-run 'monux setup --hotspot' once the AP is up to install the VPN workaround");
             return;
         }
     };
@@ -1067,7 +1085,7 @@ fn install_vpn_workaround(failures: &mut u32) {
             }
         }
     }
-    println!("[note] hotspot: Mullvad regenerates its firewall when the tunnel reconnects; re-run 'monux system setup --hotspot' then to re-install the workaround");
+    println!("[note] hotspot: Mullvad regenerates its firewall when the tunnel reconnects; re-run 'monux setup --hotspot' then to re-install the workaround");
 }
 
 /// Removes the VPN workaround pieces (tagged nft rule + the policy rule).
@@ -1190,7 +1208,7 @@ pub fn start_hotspot_if_configured() {
     if hotspot_unit_active() {
         return;
     }
-    tracing::info!("Starting monux-hotspot (installed by 'monux system setup --hotspot')");
+    tracing::info!("Starting monux-hotspot (installed by 'monux setup --hotspot')");
     if let Err(e) = run_cmd_timeout("systemctl", &["start", "monux-hotspot"], 10) {
         tracing::warn!("could not start monux-hotspot: {}", e);
     }
@@ -1354,7 +1372,7 @@ fn setup_hotspot(failures: &mut u32) {
                 );
                 verify_ip_forward_still_on(failures);
                 handle_vpn_after_up(&tunnels, failures);
-                println!("       Join the other machine with: sudo monux system setup --hotspot-join '{}' '{}'", ssid, psk);
+                println!("       Join the other machine with: sudo monux setup --hotspot-join '{}' '{}'", ssid, psk);
                 println!("       If the router hops channels, re-run this setup or: sudo systemctl restart monux-hotspot");
                 return;
             }
@@ -1426,11 +1444,11 @@ fn setup_hotspot(failures: &mut u32) {
     println!("[done] hotspot: hosting '{}' (WPA2) on {} — the KVM link now bypasses the router ({} keeps its normal WiFi)", ssid, AP_IFACE_NAME, ifname);
     verify_ip_forward_still_on(failures);
     handle_vpn_after_up(&tunnels, failures);
-    println!("       Join the other machine with: sudo monux system setup --hotspot-join '{}' '{}'", ssid, psk);
+    println!("       Join the other machine with: sudo monux setup --hotspot-join '{}' '{}'", ssid, psk);
     println!("       Its internet keeps working through this machine (NAT); the WiFi may hiccup for a second while the AP starts.");
     println!("       The hotspot persists across reboots (systemd unit) and, when the monux server runs as root, starts/stops with it.");
     println!("       If the router hops channels, re-run this setup or: sudo systemctl restart monux-hotspot");
-    println!("       Revert with: sudo monux system setup --hotspot off");
+    println!("       Revert with: sudo monux setup --hotspot off");
 }
 
 /// After the AP is up: install the Mullvad workaround when its table is

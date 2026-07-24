@@ -20,7 +20,7 @@ This fork adds low-latency tuning for local networks and a `--www` mode for use 
 
 - Linux with `uinput` and `evdev` kernel modules enabled (`/dev/uinput` and `/dev/input/` should exist).
 - A Rust toolchain (`rustup` recommended).
-- Access to input devices: your user in the `input` group with `/dev/uinput` group-writable. `monux system setup` persists both for you (it re-executes with sudo and prompts for your password; log out and back in after the group change). Running the server as root with `sudo -E monux server` also works as a fallback, `-E` preserving your session so clipboard sharing works.
+- Access to input devices: your user in the `input` group with `/dev/uinput` group-writable. `monux setup` persists both for you (it re-executes with sudo and prompts for your password; log out and back in after the group change). Running the server as root with `sudo -E monux server` also works as a fallback, `-E` preserving your session so clipboard sharing works.
 
 ### From this repository
 
@@ -38,19 +38,19 @@ cargo install --path . --root ~/.local
 
 The repository includes `.cargo/config.toml` with `target-cpu=native`, so the binary is automatically optimized for the machine you build it on.
 
-To uninstall later: `monux system uninstall` stops any running server/client, removes the binary (and stale copies), the `/usr/local/bin` link, and the system settings persisted by `monux system setup` (udev rules, uinput module load, WiFi powersave and UDP buffer configs). It asks before removing `~/.config/monux` (identity keypair and peer approvals) — non-interactively the config is kept — and prints a hint for undoing the `input` group membership (`sudo gpasswd -d $USER input`), which is deliberately left alone since it may predate monux. If the binary is already gone, `./uninstall.sh` from the repo is a fallback wrapper that prints the remaining manual steps.
+To uninstall later: `monux system uninstall` asks for confirmation (skip with `--yes` for scripts; without a terminal it aborts instead), stops any running server/client, removes the binary (and stale copies), the `/usr/local/bin` link, and the system settings persisted by `monux setup` (udev rules, uinput module load, WiFi powersave and UDP buffer configs). It asks before removing `~/.config/monux` (identity keypair and peer approvals) — non-interactively the config is kept — and prints a hint for undoing the `input` group membership (`sudo gpasswd -d $USER input`), which is deliberately left alone since it may predate monux. If the binary is already gone, `./uninstall.sh` from the repo is a fallback wrapper that prints the remaining manual steps.
 
 After installation, the binary is available as `monux` in `~/.local/bin`, which is in `PATH` by default on systemd-based distros and in most shell profiles (unlike `~/.cargo/bin`). If your shell doesn't find it, add `export PATH="$HOME/.local/bin:$PATH"` to your shell's rc file.
 
 ### Autostart on login (optional)
 
-`monux system setup` can also install a per-user systemd service that starts monux with your graphical session:
+`monux setup` can also install a per-user systemd service that starts monux with your graphical session:
 
 ```bash
-monux system setup --autostart server   # or: --autostart client
+monux setup --autostart server   # or: --autostart client
 ```
 
-This writes `~/.config/systemd/user/monux-<role>.service` and enables+starts it via `systemctl --user` (`Restart=on-failure`, 3s delay). The client service runs plain `monux client` with no address argument, so it finds the server via mDNS auto-discovery — nothing machine-specific is baked into the unit. `--autostart off` disables both services and removes the unit files; omitting the flag leaves autostart untouched. The tray indicator comes for free: the daemon auto-spawns it (see the tray-indicator section below), subject to the same `DBUS_SESSION_BUS_ADDRESS` caveat as clipboard sharing.
+This writes `~/.config/systemd/user/monux-<role>.service` and enables+starts it via `systemctl --user` (`Restart=on-failure`, 3s delay). The client service runs plain `monux client` with no address argument, so it finds the server via mDNS auto-discovery — nothing machine-specific is baked into the unit. `--autostart off` disables both services and removes the unit files. Setup is flag-scoped: any flag (like `--autostart` here) runs only that flag's actions — and `--autostart` alone doesn't even elevate, being per-user — while a bare `monux setup` applies the full machine-tuning set (and elevates via sudo). The tray indicator comes for free: the daemon auto-spawns it (see the tray-indicator section below), subject to the same `DBUS_SESSION_BUS_ADDRESS` caveat as clipboard sharing.
 
 Check status and logs with:
 
@@ -68,7 +68,7 @@ Remove or edit `.cargo/config.toml` and change `target-cpu=native` to `target-cp
 ## Updating
 
 ```bash
-monux system update
+monux update
 ```
 
 This pulls the latest source from GitHub into `~/.cache/monux/src`, rebuilds it on this machine (with `target-cpu=native`), and installs over the existing binary. Run it on each machine (server and clients), then restart any running `monux server` / `monux client` to pick up the new version. `monux --version` prints the commit the binary was built from, so you can check that all machines match.
@@ -78,11 +78,11 @@ Updating never disrupts a running session: the processes keep their in-memory bi
 To pick up the new version, restart the processes — the session then heals itself:
 
 - **Server:** start `monux server` again however you normally run it (the new instance asks the old one to shut down and takes over). Clients reconnect within a few seconds, and the machine that was active is re-activated automatically — no client-side steps needed.
-- **Client:** run `monux system update` on the client machine and restart the client there (e.g. over SSH). It reconnects and resumes by itself. With auto-update (below, on by default) it does both by itself — no remote access needed.
+- **Client:** run `monux update` on the client machine and restart the client there (e.g. over SSH). It reconnects and resumes by itself. With auto-update (below, on by default) it does both by itself — no remote access needed.
 
 Active-session resumption survives server restarts for up to an hour (see `active_client` in `~/.config/monux`).
 
-**Protocol-compatibility gate:** a client never installs a build whose protocol version differs from its server's — such a build would be unable to reconnect. The client records the server's protocol version at every connection, including handshakes the server refused, and `monux system update`` (manual or automatic) checks the new source against it before building. Servers also advertise their protocol version via mDNS, so a manual `monux system update`` first refreshes the record from the LAN (gating on the lowest version when several servers answer) and only falls back to the last recorded version when no server answers. If they differ, the update is skipped with a log message telling you to update the server first; once the server is updated, the client learns the new version via mDNS or on its next (refused) connection attempt and the gate opens by itself. `monux system update` --force` bypasses the gate. Touchpad multitouch (gestures) requires protocol v9 or newer on both ends — earlier versions only forward single-touch pointer and button events — and mixed versions refuse to connect at the handshake anyway.
+**Protocol-compatibility gate:** a client never installs a build whose protocol version differs from its server's — such a build would be unable to reconnect. The client records the server's protocol version at every connection, including handshakes the server refused, and `monux update` (manual or automatic) checks the new source against it before building. Servers also advertise their protocol version via mDNS, so a manual `monux update` first refreshes the record from the LAN (gating on the lowest version when several servers answer) and only falls back to the last recorded version when no server answers. If they differ, the update is skipped with a log message telling you to update the server first; once the server is updated, the client learns the new version via mDNS or on its next (refused) connection attempt and the gate opens by itself. `monux update --force` bypasses the gate. Touchpad multitouch (gestures) requires protocol v9 or newer on both ends — earlier versions only forward single-touch pointer and button events — and mixed versions refuse to connect at the handshake anyway.
 
 ### Automatic updates
 
@@ -112,7 +112,7 @@ The first time a client connects, verify the fingerprint shown on both sides mat
 
 ### Server: sudo vs non-sudo
 
-The server runs as your normal user (in the `input` group, with `/dev/uinput` accessible — see `monux system setup`). This is the recommended setup.
+The server runs as your normal user (in the `input` group, with `/dev/uinput` accessible — see `monux setup`). This is the recommended setup.
 
 `sudo -E monux server` remains available as a fallback (e.g. if device permissions aren't set up); `-E` preserves your session environment so clipboard sharing keeps working. Note that running as root did **not** prove to prevent intermittent input freezes: with aggressive clipboard managers (`wl-clip-persist`, `wl-paste --watch`) a stall is still possible on some compositors. If you hit freezes, see *Troubleshooting* — `WAYLAND_DISPLAY= monux server` (clipboard sharing disabled) is the isolation test.
 
@@ -173,16 +173,16 @@ By default the server coalesces pointer motion **adaptively**: **250 updates per
 
 When the server's mouse and the client's machine disagree on DPI/sensitivity, scale the deltas on the client: `--mouse-scale 0.5` halves pointer motion, `--scroll-scale 2` doubles scroll steps (including hi-res wheels). Both default to `1.0` and accept values from 0.05 to 20. Fractional remainders are carried between events per axis, so small scales lose no motion over time — 0.5x emits exactly one tick per two input ticks. The scaling applies only where the client injects into its own virtual devices; the server machine's local input always stays 1:1.
 
-### Control socket and `monux system status`
+### Control socket and `monux status`
 
 Both daemons publish their live state and accept a small command set over a per-user unix socket: `$XDG_RUNTIME_DIR/monux/server.sock` and `$XDG_RUNTIME_DIR/monux/client.sock` (under `/tmp/monux-<uid>/` when XDG_RUNTIME_DIR is unset). The socket is same-user only — the directory is 0700, there is no further authentication — and the file is removed again on shutdown.
 
-The quickest way to use it is the built-in CLI, which pretty-prints the daemon's state (rotation target, connected clients with RTT, clipboard owner, update availability) or the raw JSON with `--json`:
+The quickest way to use it is the built-in CLI, which pretty-prints the daemon's state (rotation target, connected clients with fingerprint prefixes, RTT and resolved edge directions, clipboard owner, update availability) or the raw JSON with `--json`:
 
 ```bash
-monux system status            # server socket first, then the client's
-monux system status --client   # restrict to one role
-monux system status --json     # machine-readable response
+monux status            # server socket first, then the client's
+monux status --client   # restrict to one role
+monux status --json     # machine-readable response
 ```
 
 The wire protocol is newline-delimited JSON, one request and one response per line, so any language can drive it (this is the backend of the tray indicator below). Requests: `{"cmd":"status"}`, `{"cmd":"diagnostics"}` (a troubleshooting bundle: state dump plus the daemon's recent log lines), `{"cmd":"switch","target":"next"|"prev"|"local"|<fingerprint-prefix>}`, `{"cmd":"pause"}` / `{"cmd":"resume"}` (idempotent: pausing a paused server is a no-op), `{"cmd":"update_now"}` (wakes the background update check), `{"cmd":"indicator","action":"hide"|"show"}` (hides the auto-spawned tray indicator without stopping the daemon, or restores it), `{"cmd":"restart"}` (graceful shutdown + re-exec, like after an update), `{"cmd":"exit"}`. Responses: `{"ok":true,"state":{...}}` for status, `{"ok":true,"diagnostics":{...}}` for diagnostics, `{"ok":true}` for accepted commands, `{"ok":false,"error":"..."}` on failure. The server socket serves the full set; the client socket only status/diagnostics/update_now/indicator/restart/exit — rotation and pause are server concepts. Example with socat:
@@ -196,7 +196,6 @@ echo '{"cmd":"pause"}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/monux/server.sock
 The same socket backs the `monux daemon` management verbs — drive the running daemon without touching its terminal or signals:
 
 ```bash
-monux daemon status              # live state (same as 'monux system status')
 monux daemon switch next         # or prev / local / a client fingerprint prefix
 monux daemon pause               # ungrab everything (raw local input)
 monux daemon resume
@@ -207,9 +206,9 @@ monux daemon update              # wake the background update check now
 
 Commands try the server socket first, then the client's (`--socket <path>` overrides where offered); server-only actions (switch/pause/resume) return the daemon's error when pointed at a client. Acknowledgement is immediate — `switch` is queued to the rotation, `exit`/`restart` ack before the daemon begins shutting down.
 
-### Tray indicator (`monux system indicator`)
+### Tray indicator (`monux gui indicator`)
 
-`monux system indicator` puts a StatusNotifierItem (SNI) tray icon in your panel — any SNI host works: waybar (with a `tray` module), KDE Plasma, xfce4-panel, and so on. It is a thin client of the control socket: it polls `{"cmd":"status"}` every 2 seconds (server socket first, then the client's) and never talks to the daemon's event loops, so it can neither stall nor be stalled by monux.
+`monux gui indicator` puts a StatusNotifierItem (SNI) tray icon in your panel — any SNI host works: waybar (with a `tray` module), KDE Plasma, xfce4-panel, and so on. It is a thin client of the control socket: it polls `{"cmd":"status"}` every 2 seconds (server socket first, then the client's) and never talks to the daemon's event loops, so it can neither stall nor be stalled by monux.
 
 The icon is a colored dot whose tooltip carries the details ("monux: input on 192.168.1.102", per-client RTT and uptime, clipboard owner):
 
@@ -221,11 +220,11 @@ The icon is a colored dot whose tooltip carries the details ("monux: input on 19
 
 The menu follows the current state: switch to local / to a specific client and pause/resume (server only), per-client connection facts and clipboard owner, "Check for update now" (or "Update available: `<sha>` — update now" when the auto-updater has seen a newer commit), "Copy diagnostics" (puts a bug-report bundle — version, state dump, recent logs — on the clipboard via `wl-copy`/`xclip`/`xsel`), and "Restart monux" / "Exit monux".
 
-The indicator starts automatically with the daemon: whenever `monux server` or `monux client` runs with a desktop session bus available, it spawns `monux system indicator` as a child process and stops it again on shutdown (opt out with `--no-indicator` or `MONUX_NO_INDICATOR=1`). If the indicator dies on its own (e.g. its tray host restarted), the daemon respawns it — a bounded few times, after which it logs how to start it manually. Only one indicator runs at a time: a manually started `monux system indicator` takes over from the auto-spawned one (and vice versa), never a duplicate icon.
+The indicator starts automatically with the daemon: whenever `monux server` or `monux client` runs with a desktop session bus available, it spawns `monux gui indicator` as a child process and stops it again on shutdown (opt out with `--no-indicator` or `MONUX_NO_INDICATOR=1`). If the indicator dies on its own (e.g. its tray host restarted), the daemon respawns it — a bounded few times, after which it logs how to start it manually. Only one indicator runs at a time: a manually started `monux gui indicator` takes over from the auto-spawned one (and vice versa), never a duplicate icon.
 
-You can hide the icon without stopping the daemon — the menu's **Hide tray icon**, or `monux system tray hide` — and bring it back with `monux system tray show` (or a manually started `monux system indicator`); the daemon suppresses (re)spawns only until then, and a daemon restart always starts the indicator fresh. `show` refuses to override a daemon started with `--no-indicator`.
+You can hide the icon without stopping the daemon — the menu's **Hide tray icon**, or `monux gui tray hide` — and bring it back with `monux gui tray show` (or a manually started `monux gui indicator`); the daemon suppresses (re)spawns only until then, and a daemon restart always starts the indicator fresh. `show` refuses to override a daemon started with `--no-indicator`.
 
-Headless sessions are detected and skipped silently by the daemon; a manually started indicator there exits with a "no D-Bus session / no tray host" error. The systemd units installed by `monux system setup --autostart` get the indicator for free, since the daemon spawns it — with the same caveat as clipboard sharing: the service needs `DBUS_SESSION_BUS_ADDRESS` in the systemd user manager's environment (see the autostart caveat above), otherwise the auto-spawn is skipped.
+Headless sessions are detected and skipped silently by the daemon; a manually started indicator there exits with a "no D-Bus session / no tray host" error. The systemd units installed by `monux setup --autostart` get the indicator for free, since the daemon spawns it — with the same caveat as clipboard sharing: the service needs `DBUS_SESSION_BUS_ADDRESS` in the systemd user manager's environment (see the autostart caveat above), otherwise the auto-spawn is skipped.
 
 ## Troubleshooting
 
@@ -262,19 +261,19 @@ When the machines sit next to each other, the link should feel like it. Both end
 
 The other half of proximity is the *path*: everything normally goes via the router even when the machines are arm's-length apart. monux can steer the connection onto a **direct, routerless link** instead, in two ways:
 
-- **A hosted hotspot (no cable)**: `sudo monux system setup --hotspot` on the server creates a 'monux-direct' WiFi hotspot on a **dedicated AP interface** (`monux-ap`, created from your WiFi card when it supports managed+AP — checked) so the server's own WiFi stays up alongside. The AP is driven by **hostapd** with **dnsmasq** serving DHCP/DNS (setup installs them when missing), wired up as a `monux-hotspot` systemd unit — NetworkManager is deliberately not involved on the host: iwlwifi-class cards only beacon on `__ap` interfaces, which NM can't activate (the NM AP path kept seizing or breaking the host's own WiFi). Clients then provision themselves: the server hands the credentials to each approved client over the encrypted, mutually-authenticated KVM connection (they never travel any other way), and the client creates and joins the profile on its own — nothing to copy. The client re-associates to the hotspot — its old WiFi profile returns automatically when the hotspot is off — and its internet keeps working, NATed through the server. Discovery prefers the direct link automatically. Opt out on the client with `--no-auto-hotspot`, or join manually with the printed `sudo monux system setup --hotspot-join '<ssid>' '<psk>'` (e.g. where polkit blocks user-level profile creation). Remove the hotspot with `sudo monux system setup --hotspot off` on either machine (or let `monux system uninstall` do it). The unit **persists across reboots** (it recreates the AP interface, address, NAT and daemons on every start), and when the monux server runs as root the hotspot also starts and stops with it — a down server leaves no dead-end AP for clients to join (a server run as the plain user leaves the hotspot alone, so it can never prompt for sudo). Notes: the hotspot shares the router's channel on a single-radio card (it removes the router's buffering and other clients from the path, not the band's airtime contention), and the config bakes the setup-time channel — if the router hops channels, re-run setup or `sudo systemctl restart monux-hotspot`. **VPN on the server**: a Mullvad tunnel normally breaks the NAT that gives hotspot clients internet, at two levels: its forward-dropping firewall and policy routing, and the `net.ipv4.ip_forward` sysctl its teardown can leave off. Setup handles both: it enables IPv4 forwarding persistently (and re-verifies it once the AP is up), and when it sees Mullvad's table it installs a workaround — a tagged forward-accept rule for the hotspot subnet in Mullvad's own chain, plus a policy rule routing that subnet around the tunnel, so the client's internet exits via the router regardless of VPN state. Mullvad regenerates its firewall when the tunnel reconnects, so re-run `sudo monux system setup --hotspot` after that; `--hotspot off` and uninstall remove the rules again (the live ip_forward sysctl is left alone — docker or a VPN may need it). Mullvad's lockdown mode treats the new network as an internet loss and blocks everything while it reconnects; if you run the hotspot with Mullvad, consider `mullvad lockdown-mode set off`. Other VPNs' layouts can't be auto-fixed — setup warns; disconnect them while using the hotspot.
+- **A hosted hotspot (no cable)**: `sudo monux setup --hotspot` on the server creates a 'monux-direct' WiFi hotspot on a **dedicated AP interface** (`monux-ap`, created from your WiFi card when it supports managed+AP — checked) so the server's own WiFi stays up alongside. The AP is driven by **hostapd** with **dnsmasq** serving DHCP/DNS (setup installs them when missing), wired up as a `monux-hotspot` systemd unit — NetworkManager is deliberately not involved on the host: iwlwifi-class cards only beacon on `__ap` interfaces, which NM can't activate (the NM AP path kept seizing or breaking the host's own WiFi). Clients then provision themselves: the server hands the credentials to each approved client over the encrypted, mutually-authenticated KVM connection (they never travel any other way), and the client creates and joins the profile on its own — nothing to copy. The client re-associates to the hotspot — its old WiFi profile returns automatically when the hotspot is off — and its internet keeps working, NATed through the server. Discovery prefers the direct link automatically. Opt out on the client with `--no-auto-hotspot`, or join manually with the printed `sudo monux setup --hotspot-join '<ssid>' '<psk>'` (e.g. where polkit blocks user-level profile creation). Remove the hotspot with `sudo monux setup --hotspot off` on either machine (or let `monux system uninstall` do it). The unit **persists across reboots** (it recreates the AP interface, address, NAT and daemons on every start), and when the monux server runs as root the hotspot also starts and stops with it — a down server leaves no dead-end AP for clients to join (a server run as the plain user leaves the hotspot alone, so it can never prompt for sudo). Notes: the hotspot shares the router's channel on a single-radio card (it removes the router's buffering and other clients from the path, not the band's airtime contention), and the config bakes the setup-time channel — if the router hops channels, re-run setup or `sudo systemctl restart monux-hotspot`. **VPN on the server**: a Mullvad tunnel normally breaks the NAT that gives hotspot clients internet, at two levels: its forward-dropping firewall and policy routing, and the `net.ipv4.ip_forward` sysctl its teardown can leave off. Setup handles both: it enables IPv4 forwarding persistently (and re-verifies it once the AP is up), and when it sees Mullvad's table it installs a workaround — a tagged forward-accept rule for the hotspot subnet in Mullvad's own chain, plus a policy rule routing that subnet around the tunnel, so the client's internet exits via the router regardless of VPN state. Mullvad regenerates its firewall when the tunnel reconnects, so re-run `sudo monux setup --hotspot` after that; `--hotspot off` and uninstall remove the rules again (the live ip_forward sysctl is left alone — docker or a VPN may need it). Mullvad's lockdown mode treats the new network as an internet loss and blocks everything while it reconnects; if you run the hotspot with Mullvad, consider `mullvad lockdown-mode set off`. Other VPNs' layouts can't be auto-fixed — setup warns; disconnect them while using the hotspot.
 - **A plain Ethernet cable**: plug it between the machines (both ends auto-assign link-local addresses, no DHCP or config needed) and mDNS discovery steers the connection over it automatically.
 
 Connecting by hand with `monux client <ip>` always overrides the preference.
 
 When the link is degraded, monux says so in several places: a desktop notification (at most once per 5 minutes, plus once on recovery), the client's `Link stats:` / `Link degraded:` log lines (every 15s sample), and the server's 10-second input-status heartbeat (`Link to <client> is degraded: rtt=...`, only while above the threshold). If you see sporadic RTT spikes on WiFi, the checklist:
 
-1. **Power saving off on BOTH machines** — check with `iw dev <iface> get power_save` (`monux system setup` disables it, but only on the machine where you ran it).
+1. **Power saving off on BOTH machines** — check with `iw dev <iface> get power_save` (`monux setup` disables it, but only on the machine where you ran it).
 2. **2.4 GHz congestion** — wireless peripherals, Bluetooth, USB3 ports, and the neighbors' networks all share the band; sporadic spikes that correlate with nothing on either machine are usually this.
 3. **Move the AP and clients to 5 GHz** — the single biggest fix when the hardware allows it.
 4. Read the trend around a spike in the client's debug-level `Link stats:` lines (rtt and window loss every 15s).
 
-What monux already marks for you: in local mode both endpoints run with `SO_PRIORITY=6` on the QUIC socket, which the WiFi driver maps to 802.11 UP 6 — the voice access category (AC_VO) — so monux packets cut ahead of best-effort traffic in each machine's own wireless uplink queue, no router cooperation needed. A DSCP mark on the wire is not possible from inside the process (quinn-udp overwrites the TOS byte per packet with its ECN codepoint), so the AP/router hop (which picks its downlink queue from each packet's DSCP) is covered by netfilter rules instead: `monux system setup` installs them automatically on both server and client machines (a dedicated `inet monux-qos` nftables table, or two iptables mangle OUTPUT rules as fallback), and `monux system uninstall` removes them again. The rules don't persist across reboots — re-run `monux system setup` after a reboot (or wrap the manual equivalent below in a systemd unit):
+What monux already marks for you: in local mode both endpoints run with `SO_PRIORITY=6` on the QUIC socket, which the WiFi driver maps to 802.11 UP 6 — the voice access category (AC_VO) — so monux packets cut ahead of best-effort traffic in each machine's own wireless uplink queue, no router cooperation needed. A DSCP mark on the wire is not possible from inside the process (quinn-udp overwrites the TOS byte per packet with its ECN codepoint), so the AP/router hop (which picks its downlink queue from each packet's DSCP) is covered by netfilter rules instead: `monux setup` installs them automatically on both server and client machines (a dedicated `inet monux-qos` nftables table, or two iptables mangle OUTPUT rules as fallback), and `monux system uninstall` removes them again. The rules don't persist across reboots — re-run `monux setup` after a reboot (or wrap the manual equivalent below in a systemd unit):
 
 ```bash
 # nftables

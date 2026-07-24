@@ -1,10 +1,10 @@
-//! Auto-spawning the tray indicator (`monux system indicator`) alongside
+//! Auto-spawning the tray indicator (`monux gui indicator`) alongside
 //! `monux server` / `monux client`, so the tray icon appears whenever a
 //! daemon runs in a desktop session — no separate compositor autostart entry
 //! needed.
 //!
 //! The daemon spawns the indicator as a child process (its own binary with
-//! `system indicator`), inheriting stdout/stderr so the indicator's log lines
+//! `gui indicator`), inheriting stdout/stderr so the indicator's log lines
 //! fold into the daemon's log. The child is supervised:
 //!
 //! - Graceful daemon shutdown (any path: SIGTERM/SIGINT, control-socket
@@ -18,11 +18,11 @@
 //!   also keeps a manually-started indicator from duplicating the icon.
 //! - If the indicator exits on its own (its tray host, e.g. waybar, died),
 //!   the supervisor respawns it, bounded by RespawnPolicy; after giving up it
-//!   stays down until `monux system tray show` (or a manual indicator).
+//!   stays down until `monux gui tray show` (or a manual indicator).
 //!
 //! The icon can be HIDDEN without killing the daemon and SHOWN again without
 //! restarting it (control socket `{"cmd":"indicator","action":...}`, driven
-//! by the tray menu's "Hide tray icon" and by `monux system tray hide|show`;
+//! by the tray menu's "Hide tray icon" and by `monux gui tray hide|show`;
 //! see SupervisorHandle). Hidden means: the spawned child is SIGTERM'd and
 //! the supervisor neither spawns nor respawns (the respawn policy stays
 //! dormant). The hidden state is IN-MEMORY ONLY: a daemon (re)start always
@@ -91,7 +91,7 @@ pub fn spawn_veto(
 /// layout, where the address is derivable from the uid even when the env var
 /// isn't set). Used by the auto-spawn guard, by show() (re-probed live: the
 /// session may have appeared since the daemon started), and by the manual
-/// `monux system indicator` entry point, which checks this before touching
+/// `monux gui indicator` entry point, which checks this before touching
 /// the single-instance lock so headless sessions exit cleanly, lock-free.
 pub fn has_desktop_session() -> bool {
     probe_session_bus_env() || probe_user_bus_socket()
@@ -133,7 +133,7 @@ impl RespawnPolicy {
 }
 
 /// Spawns the indicator as a child of this daemon: our own binary with
-/// `system indicator`. stdin is /dev/null; stdout/stderr are inherited so
+/// `gui indicator`. stdin is /dev/null; stdout/stderr are inherited so
 /// the indicator's log lines fold into the daemon's log.
 fn spawn_indicator() -> Result<Child> {
     let exe = std::env::current_exe()
@@ -142,7 +142,7 @@ fn spawn_indicator() -> Result<Child> {
     // Linux then reports our exe as "<path> (deleted)" (see main.rs).
     let exe = exe.to_string_lossy().trim_end_matches(" (deleted)").to_string();
     Command::new(exe)
-        .args(["system", "indicator"])
+        .args(["gui", "indicator"])
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -478,13 +478,13 @@ async fn monitor_loop(shared: Arc<Mutex<Shared>>, shutdown: Arc<AtomicBool>) {
         let (delay, attempt) = match action {
             ExitAction::TakenOver => {
                 info!(
-                    "Tray indicator was terminated (takeover or kill); staying down until 'monux system tray show'"
+                    "Tray indicator was terminated (takeover or kill); staying down until 'monux gui tray show'"
                 );
                 continue;
             }
             ExitAction::GiveUp => {
                 warn!(
-                    "Tray indicator keeps exiting (giving up after {} respawns) — restore it with 'monux system tray show' or 'monux system indicator'",
+                    "Tray indicator keeps exiting (giving up after {} respawns) — restore it with 'monux gui tray show' or 'monux gui indicator'",
                     MAX_RESPAWNS
                 );
                 continue;
@@ -525,7 +525,7 @@ async fn monitor_loop(shared: Arc<Mutex<Shared>>, shutdown: Arc<AtomicBool>) {
                 Err(e) => {
                     shared.hidden = true;
                     warn!(
-                        "Failed to respawn the tray indicator: {:#} — restore it with 'monux system tray show' or 'monux system indicator'",
+                        "Failed to respawn the tray indicator: {:#} — restore it with 'monux gui tray show' or 'monux gui indicator'",
                         e
                     );
                 }

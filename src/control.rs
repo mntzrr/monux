@@ -1,7 +1,7 @@
 //! Local control IPC: both daemons (server and client) publish their live
 //! state and accept a small command set over a per-user unix socket. This is
-//! the backend of `monux system status` and of the tray indicator
-//! (`monux system indicator`), so the field names below are STABLE — the tray
+//! the backend of `monux status` and of the tray indicator
+//! (`monux gui indicator`), so the field names below are STABLE — the tray
 //! consumes them.
 //!
 //! # Socket location
@@ -44,7 +44,7 @@
 //!   always starts the indicator fresh. show is REFUSED when the daemon runs
 //!   with --no-indicator — an explicit opt-out the socket may not override.
 //!   Manually-started indicators are never managed by this. The tray menu's
-//!   "Hide tray icon" and `monux system tray hide|show` drive this command.
+//!   "Hide tray icon" and `monux gui tray hide|show` drive this command.
 //! - `{"cmd":"restart"}` — graceful shutdown, then re-exec into the installed
 //!   binary (the auto-updater's restart path).
 //! - `{"cmd":"exit"}` — graceful shutdown.
@@ -78,8 +78,9 @@
 //! - `listen`: QUIC listen address, "ip:port"
 //! - `paused`: bool — input handling suspended (see pause/resume)
 //! - `current_target`: "local" or the addr of the client owning input
-//! - `clients`: array of `{addr, fingerprint, connected_since_secs, rtt_ms}`
-//!   (rtt_ms from QUIC path stats, null when unavailable)
+//! - `clients`: array of `{addr, fingerprint, connected_since_secs, rtt_ms,
+//!   edge}` (rtt_ms from QUIC path stats, null when unavailable; edge the
+//!   resolved --edge-map direction, null when unmapped)
 //! - `clipboard`: `{owner: "none"|"local"|client addr, types: [mime strings]}`
 //! - `update_available`: sha of a newer commit the auto-updater has seen,
 //!   or null
@@ -220,7 +221,7 @@ pub enum State {
 }
 
 impl std::fmt::Display for State {
-    /// Human-readable rendering for `monux system status`.
+    /// Human-readable rendering for `monux status`.
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             State::Server(s) => {
@@ -242,18 +243,21 @@ impl std::fmt::Display for State {
                 writeln!(f, "clients ({}):", s.clients.len())?;
                 for c in &s.clients {
                     // Lead with the fingerprint prefix that --edge-map and
-                    // --shortcut-goto accept, so it's copy-paste ready.
+                    // --shortcut-goto accept, so it's copy-paste ready. The
+                    // resolved edge direction verifies --edge-map without
+                    // testing edges.
                     let prefix: String = c.fingerprint.chars().take(8).collect();
                     writeln!(
                         f,
-                        "  {} fingerprint {} (prefix: {}) connected {}s ago, rtt {}",
+                        "  {} fingerprint {} (prefix: {}) connected {}s ago, rtt {}, edge {}",
                         c.addr,
                         c.fingerprint,
                         prefix,
                         c.connected_since_secs,
                         c.rtt_ms
                             .map(|rtt| format!("{}ms", rtt))
-                            .unwrap_or_else(|| "?".to_string())
+                            .unwrap_or_else(|| "?".to_string()),
+                        c.edge.as_deref().unwrap_or("-")
                     )?;
                 }
                 Ok(())
@@ -793,7 +797,7 @@ const SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Sends one request to a control socket and returns the raw response line.
 /// Synchronous with a short timeout: used by the short-lived
-/// `monux system status` CLI and the tray indicator's poll loop.
+/// `monux status` CLI and the tray indicator's poll loop.
 pub fn request_line(socket: &Path, request: &str) -> Result<String> {
     use std::io::{BufRead, BufReader, Write};
     let stream = std::os::unix::net::UnixStream::connect(socket)
@@ -826,7 +830,7 @@ struct RawResponse {
     error: Option<String>,
 }
 
-/// Implements `monux system status`: queries a daemon's control socket and
+/// Implements `monux status`: queries a daemon's control socket and
 /// returns the text to print — the raw response line with `json`, otherwise a
 /// human-readable summary. `server`/`client` restrict the default discovery
 /// to that role's socket; `socket` overrides discovery entirely.
@@ -873,7 +877,7 @@ pub fn daemon_cli(request: &str, ok_message: &str, socket: Option<&Path>) -> Res
     Ok(ok_message.to_string())
 }
 
-/// Implements `monux system tray hide|show`: sends the indicator hide/show
+/// Implements `monux gui tray hide|show`: sends the indicator hide/show
 /// command to the daemon's control socket (server socket first, then the
 /// client's, exactly like status discovery; `socket` overrides) and returns
 /// the text to print. The daemon's error string propagates — e.g. the
@@ -895,56 +899,16 @@ pub fn tray_cli(hide: bool, socket: Option<&Path>) -> Result<String> {
         );
     }
     Ok(if hide {
-        "Tray indicator hidden (no respawns until 'monux system tray show' or a daemon restart)".to_string()
+        "Tray indicator hidden (no respawns until 'monux gui tray show' or a daemon restart)".to_string()
     } else {
         "Tray indicator shown".to_string()
     })
 }
 
-/// Implements `monux system clients`: lists the server's connected clients
-/// with fingerprint prefixes and resolved edge directions — the reference for
-/// configuring and verifying --edge-map.
-pub fn clients_cli(socket: Option<&Path>) -> Result<String> {
-    let candidates: Vec<PathBuf> = match socket {
-        Some(path) => vec![path.to_path_buf()],
-        None => vec![socket_path(Role::Server)],
-    };
-    let (path, raw) = query_first(&candidates, r#"{"cmd":"status"}"#)?;
-    let response: RawResponse = serde_json::from_str(&raw)
-        .with_context(|| format!("Malformed response from {}: {}", path.display(), raw))?;
-    if !response.ok {
-        bail!(
-            "The daemon reported an error: {}",
-            response.error.unwrap_or_default()
-        );
-    }
-    let state: State = serde_json::from_value(
-        response.state.context("The daemon returned no state")?,
-    )
-    .with_context(|| format!("Unrecognized state from {}", path.display()))?;
-    let State::Server(server) = state else {
-        bail!("This machine is running a monux client, not a server");
-    };
-    if server.clients.is_empty() {
-        return Ok("No clients connected.".to_string());
-    }
-    let mut out = String::from("prefix   addr                     rtt    edge\n");
-    for c in &server.clients {
-        let prefix: String = c.fingerprint.chars().take(8).collect();
-        let edge = c.edge.as_deref().unwrap_or("-");
-        let rtt = c
-            .rtt_ms
-            .map(|r| format!("{}ms", r))
-            .unwrap_or_else(|| "?".to_string());
-        out.push_str(&format!("{:<8} {:<24} {:<6} {}\n", prefix, c.addr, rtt, edge));
-    }
-    Ok(out.trim_end().to_string())
-}
-
 /// Sends `request` to the first candidate socket that answers, returning the
 /// answering path and the raw response line. The first socket that answers
 /// wins; missing files and stale sockets (crash remnants) fall through to
-/// the next candidate. Shared by status_cli, clients_cli and tray_cli.
+/// the next candidate. Shared by status_cli, daemon_cli and tray_cli.
 fn query_first(candidates: &[PathBuf], request: &str) -> Result<(PathBuf, String)> {
     let mut last_err = None;
     for path in candidates {
@@ -1444,7 +1408,7 @@ mod tests {
     fn state_parses_and_pretty_prints() {
         // The wire JSON parses into the tagged State enum by "role"...
         let server: State = serde_json::from_str(
-            r#"{"role":"server","version":"1.4.0","protocol_version":8,"listen":"127.0.0.1:9999","paused":true,"current_target":"10.0.0.2:1213","clients":[{"addr":"10.0.0.2:1213","fingerprint":"d1d88653","connected_since_secs":42,"rtt_ms":1}],"clipboard":{"owner":"local","types":["text/plain"]},"update_available":"abc123"}"#,
+            r#"{"role":"server","version":"1.4.0","protocol_version":8,"listen":"127.0.0.1:9999","paused":true,"current_target":"10.0.0.2:1213","clients":[{"addr":"10.0.0.2:1213","fingerprint":"d1d88653","connected_since_secs":42,"rtt_ms":1,"edge":"right"}],"clipboard":{"owner":"local","types":["text/plain"]},"update_available":"abc123"}"#,
         )
         .unwrap();
         let text = server.to_string();
@@ -1453,7 +1417,7 @@ mod tests {
         assert!(text.contains("paused:         yes"));
         assert!(text.contains("available (abc123)"));
         assert!(text.contains(
-            "10.0.0.2:1213 fingerprint d1d88653 (prefix: d1d88653) connected 42s ago, rtt 1ms"
+            "10.0.0.2:1213 fingerprint d1d88653 (prefix: d1d88653) connected 42s ago, rtt 1ms, edge right"
         ));
         assert!(text.contains("owner:          local"));
 

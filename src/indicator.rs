@@ -1,4 +1,4 @@
-//! `monux system indicator` — a StatusNotifierItem tray icon for the local
+//! `monux gui indicator` — a StatusNotifierItem tray icon for the local
 //! monux daemon, built on the ksni crate (pure-Rust SNI client over D-Bus).
 //!
 //! The indicator is a THIN CLIENT of the control socket (control.rs): every
@@ -252,7 +252,7 @@ enum MenuAction {
     UpdateNow,
     CopyDiagnostics,
     /// Hides the tray icon (the daemon SIGTERMs this very process, after
-    /// acking) until 'monux system tray show' or a daemon restart.
+    /// acking) until 'monux gui tray show' or a daemon restart.
     HideTray,
     Restart,
     Exit,

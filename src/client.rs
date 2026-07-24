@@ -364,7 +364,7 @@ impl Connection {
         transport::send_version(&mut events_send).await?;
         let server_version = transport::recv_version(&mut events_recv, &mut event_bytes).await?;
         // Record the server's version (even on mismatch) for the update gate:
-        // 'monux system update' refuses builds our server couldn't talk to. Recording
+        // 'monux update' refuses builds our server couldn't talk to. Recording
         // a refused handshake too is what unblocks the gate after the server
         // upgrades ahead of us.
         crate::update::record_server_protocol_version(config_dir, server_version);
@@ -875,7 +875,7 @@ impl Connection {
                     // channel: join it so the KVM link moves off the router.
                     if self.no_auto_hotspot {
                         info!(
-                            "Server hosts the '{}' hotspot; --no-auto-hotspot given, not joining (join with 'monux system setup --hotspot-join', see README)",
+                            "Server hosts the '{}' hotspot; --no-auto-hotspot given, not joining (join with 'monux setup --hotspot-join', see README)",
                             ssid
                         );
                     } else {
@@ -1331,7 +1331,7 @@ fn provision_hotspot(ssid: String, psk: String) {
             }
             Err(e) => {
                 warn!(
-                    "Failed to join the server's '{}' hotspot automatically: {:#}. Join manually with 'sudo monux system setup --hotspot-join' (the credentials are printed by 'monux system setup --hotspot' on the server)",
+                    "Failed to join the server's '{}' hotspot automatically: {:#}. Join manually with 'sudo monux setup --hotspot-join' (the credentials are printed by 'monux setup --hotspot' on the server)",
                     ssid, e
                 );
                 // Don't leave a half-configured profile behind.
