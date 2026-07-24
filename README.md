@@ -40,7 +40,7 @@ The repository includes `.cargo/config.toml` with `target-cpu=native`, so the bi
 
 To uninstall later: `monux system uninstall` asks for confirmation (skip with `--yes` for scripts; without a terminal it aborts instead), stops any running server/client, removes the binary (and stale copies), the `/usr/local/bin` link, and the system settings persisted by `monux setup` (udev rules, uinput module load, WiFi powersave and UDP buffer configs). It asks before removing `~/.config/monux` (identity keypair and peer approvals) — non-interactively the config is kept — and prints a hint for undoing the `input` group membership (`sudo gpasswd -d $USER input`), which is deliberately left alone since it may predate monux. If the binary is already gone, `./uninstall.sh` from the repo is a fallback wrapper that prints the remaining manual steps.
 
-After installation, the binary is available as `monux` in `~/.local/bin`, which is in `PATH` by default on systemd-based distros and in most shell profiles (unlike `~/.cargo/bin`). If your shell doesn't find it, add `export PATH="$HOME/.local/bin:$PATH"` to your shell's rc file.
+After installation, the binary is available as `monux` in `~/.local/bin`, which is in `PATH` by default on systemd-based distros and in most shell profiles (unlike `~/.cargo/bin`). If your shell doesn't find it, add `export PATH="$HOME/.local/bin:$PATH"` to your shell's rc file. A shorthand alias `mx` (a relative symlink next to the binary, refreshed by every update) is installed alongside it — every command in this document works as `mx <cmd>` too; an `mx` you created yourself for another purpose is never overwritten (and never removed by the uninstaller either).
 
 ### Autostart on login (optional)
 

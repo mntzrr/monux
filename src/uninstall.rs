@@ -67,6 +67,9 @@ struct Plan {
     user_binaries: Vec<PathBuf>,
     /// ~/.config/monux, when it exists.
     config_dir: Option<PathBuf>,
+    /// Where the 'mx' alias symlink lives (home-relative), checked at
+    /// execution time.
+    alias_dir: PathBuf,
     /// Whether to remove the config dir; set by the interactive prompt.
     remove_config: bool,
 }
@@ -121,6 +124,7 @@ fn plan_impl(home: &Path, current_exe: &Path, system_paths: &[PathBuf], usr_loca
         root_owned,
         user_binaries,
         config_dir: config_dir.is_dir().then_some(config_dir),
+        alias_dir: home.join(".local").join("bin"),
         remove_config: false,
     }
 }
@@ -164,6 +168,14 @@ fn execute(plan: &Plan) {
             Ok(()) => println!("Removed {}", path.display()),
             Err(e) => println!("note: couldn't remove {}: {}", path.display(), e),
         }
+    }
+
+    // The 'mx' alias — removed only when it's our symlink (alias::remove
+    // leaves a foreign 'mx' alone).
+    match crate::alias::remove(&plan.alias_dir) {
+        Ok(true) => println!("Removed the 'mx' alias from {}", plan.alias_dir.display()),
+        Ok(false) => {}
+        Err(e) => println!("note: couldn't remove the 'mx' alias: {}", e),
     }
 
     match (&plan.config_dir, plan.remove_config) {

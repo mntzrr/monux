@@ -130,7 +130,7 @@ The config file is persistent flag storage; `mx config` is its CLI.
 
 ## Phase C — `mx` alias (item 2)
 
-- [ ] `mx -> monux` symlink in `~/.local/bin`: created by install.sh and by the
+- [x] `mx -> monux` symlink in `~/.local/bin`: created by install.sh and by the
       atomic-install staging in update.rs; removed by uninstall.rs ONLY if it's a
       symlink pointing at monux. Collision guard: existing non-monux `mx` → skip
       with warning.

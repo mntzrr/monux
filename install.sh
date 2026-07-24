@@ -60,6 +60,24 @@ done
 
 echo "Installed monux to $(which monux 2>/dev/null || echo "$HOME/.local/bin/monux")"
 
+# 'mx' shorthand: a symlink next to the binary (relative target, so the
+# atomic binary replacement during updates keeps it valid). Works in every
+# shell and in scripts, unlike a shell rc alias. Never overwrite an 'mx'
+# that isn't ours.
+mx="$HOME/.local/bin/mx"
+if [ -L "$mx" ]; then
+    target=$(readlink "$mx")
+    case "$target" in
+        monux|*/monux) ln -sf monux "$mx" ;;
+        *) echo "note: $mx points at $target; leaving it alone — the 'mx' alias is unavailable" ;;
+    esac
+elif [ -e "$mx" ]; then
+    echo "note: $mx exists and is not our symlink; leaving it alone — the 'mx' alias is unavailable"
+else
+    ln -s monux "$mx"
+    echo "Alias: mx -> monux"
+fi
+
 # 'sudo monux ...' (e.g. 'sudo monux setup') fails with "command not found"
 # because sudo resets PATH to secure_path, which excludes ~/.local/bin.
 # /usr/local/bin is in secure_path, so link the binary there too (needs sudo).

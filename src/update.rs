@@ -10,7 +10,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const DEFAULT_REPO: &str = "https://github.com/mntzrr/monux.git";
 /// Commit this binary was built from, set by build.rs ("<sha>" or "<sha>-dirty").
@@ -183,6 +183,14 @@ pub fn run(force: bool, low_priority: bool, protocol_constraint: Option<u64>) ->
         &root.join("bin").join("monux"),
     )?;
     let _ = std::fs::remove_dir_all(&staging);
+    // The 'mx' shorthand lives next to the binary (a relative symlink, so the
+    // atomic rename above keeps it valid). Never fail the update over it.
+    match crate::alias::ensure(&root.join("bin")) {
+        Ok(crate::alias::EnsureOutcome::Created) => info!("Alias: mx -> monux (in {})", root.join("bin").display()),
+        Ok(crate::alias::EnsureOutcome::Refreshed) => info!("Refreshed the mx -> monux alias"),
+        Ok(_) => {}
+        Err(e) => warn!("Couldn't create the 'mx' alias: {:#}", e),
+    }
     info!(
         "Updated monux to {} at {}. Restart any running monux server/client to pick it up.",
         latest,

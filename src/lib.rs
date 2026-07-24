@@ -1,3 +1,4 @@
+pub mod alias;
 pub mod autoupdate;
 pub mod client;
 pub mod clipboard;
