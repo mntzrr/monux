@@ -63,12 +63,27 @@ fn lock_path(kind: &str) -> PathBuf {
 /// and to find the process to signal; the flock itself is authoritative.
 pub fn acquire(kind: &str) -> Result<InstanceLock> {
     let path = lock_path(kind);
+    // The lock dir is world-writable (/tmp): a planted symlink at the lock
+    // path would be created/followed, chmodded 0666, flocked and truncated
+    // below. Refuse it up front; O_NOFOLLOW on both opens covers the
+    // swap-after-check race.
+    if fs::symlink_metadata(&path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        bail!(
+            "Refusing to use {} lock file {}: it is a symlink",
+            kind,
+            path.display()
+        );
+    }
     // 0666 so that instances running as other users (e.g. root via sudo)
     // share the same lock; chmod too since umask may restrict the create mode.
     let file = match fs::OpenOptions::new()
         .create(true)
         .write(true)
         .mode(0o666)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
     {
         Ok(file) => file,
@@ -76,6 +91,7 @@ pub fn acquire(kind: &str) -> Result<InstanceLock> {
         // (e.g. created before the 0666 scheme): flock works on a read-only fd.
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => fs::OpenOptions::new()
             .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
             .with_context(|| format!("Failed to open {} lock file: {}", kind, path.display()))?,
         Err(e) => {
@@ -240,5 +256,73 @@ pub fn live_holder(kind: &str) -> Option<i32> {
         Some(pid)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Restores MONUX_LOCK_DIR on drop so a failing assertion can't leak the
+    /// override into other tests of this binary.
+    struct LockDirGuard;
+
+    impl Drop for LockDirGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(LOCK_DIR_ENV);
+        }
+    }
+
+    /// Serializes the env-overriding tests below: MONUX_LOCK_DIR is
+    /// process-global and tests run on parallel threads.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn override_lock_dir(dir: &std::path::Path) -> LockDirGuard {
+        std::env::set_var(LOCK_DIR_ENV, dir);
+        LockDirGuard
+    }
+
+    /// A planted symlink at the lock path (the dir is world-writable /tmp by
+    /// default) must make acquire fail — and the link target must be left
+    /// completely untouched: no follow, no chmod 0666, no truncate.
+    #[test]
+    fn symlink_lock_path_is_refused_and_target_untouched() {
+        let _serial = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = override_lock_dir(dir.path());
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "precious").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("monux-synctest.lock")).unwrap();
+
+        let err = match acquire("synctest") {
+            // InstanceLock has no Debug, hence no unwrap_err.
+            Ok(_lock) => panic!("a symlink lock path must not acquire"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{:#}", err).contains("symlink"),
+            "unexpected error: {:#}",
+            err
+        );
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+        assert_eq!(fs::metadata(&victim).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    /// The normal path still works with O_NOFOLLOW: a plain lock file (or no
+    /// file at all) acquires fine.
+    #[test]
+    fn regular_lock_path_still_acquires() {
+        let _serial = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = override_lock_dir(dir.path());
+        let lock = acquire("regulartest").unwrap();
+        assert!(!lock.took_over);
+        assert!(lock_path("regulartest").exists());
+        drop(lock);
+        // A pre-existing regular file is reused, not refused.
+        let lock = acquire("regulartest").unwrap();
+        assert!(!lock.took_over);
     }
 }

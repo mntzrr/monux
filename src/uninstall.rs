@@ -13,9 +13,12 @@
 //!    files, plus the netfilter DSCP marks — and the /usr/local/bin link are
 //!    removed via sudo subprocesses (unlike setup, no sudo re-exec: uninstall
 //!    must not swap its own process image mid-flight);
-//! 4. the running binary itself plus stale copies are removed (self-delete is
+//! 4. the per-user autostart units `monux setup --autostart` installed are
+//!    disabled and removed (otherwise systemd retries the deleted binary at
+//!    every login);
+//! 5. the running binary itself plus stale copies are removed (self-delete is
 //!    fine on Linux: the file unlinks while the process keeps running);
-//! 5. ~/.config/monux is removed, only if the user said yes.
+//! 6. ~/.config/monux is removed, only if the user said yes.
 //!
 //! The `input` group membership is deliberately left alone (it may predate
 //! monux or be used by other software); a hint with the undo command is printed.
@@ -67,6 +70,9 @@ struct Plan {
     user_binaries: Vec<PathBuf>,
     /// ~/.config/monux, when it exists.
     config_dir: Option<PathBuf>,
+    /// Where the per-user autostart units 'monux setup --autostart' writes
+    /// live (home-relative), checked at execution time.
+    autostart_unit_dir: PathBuf,
     /// Where the 'mx' alias symlink lives (home-relative), checked at
     /// execution time.
     alias_dir: PathBuf,
@@ -99,7 +105,7 @@ fn plan_impl(home: &Path, current_exe: &Path, system_paths: &[PathBuf], usr_loca
         .filter(|p| p.exists())
         .cloned()
         .collect();
-    if let Some(path) = removable_usr_local(usr_local, current_exe) {
+    if let Some(path) = removable_usr_local(usr_local, current_exe, home) {
         root_owned.push(path);
     }
 
@@ -124,20 +130,43 @@ fn plan_impl(home: &Path, current_exe: &Path, system_paths: &[PathBuf], usr_loca
         root_owned,
         user_binaries,
         config_dir: config_dir.is_dir().then_some(config_dir),
+        autostart_unit_dir: home.join(setup::SYSTEMD_USER_UNIT_DIR),
         alias_dir: home.join(".local").join("bin"),
         remove_config: false,
     }
 }
 
 /// /usr/local/bin/monux qualifies for removal only when it is clearly ours:
-/// a symlink (install.sh links it to ~/.local/bin/monux) or a file identical
-/// to the running binary. Anything else there is left alone.
-fn removable_usr_local(usr_local: &Path, current_exe: &Path) -> Option<PathBuf> {
+/// a symlink resolving to the running binary or into the user's own install
+/// locations (install.sh links it to ~/.local/bin/monux), or a file identical
+/// to the running binary. Anything else there — including another tool's
+/// symlink — is left alone.
+fn removable_usr_local(usr_local: &Path, current_exe: &Path, home: &Path) -> Option<PathBuf> {
     let meta = fs::symlink_metadata(usr_local).ok()?;
-    if meta.file_type().is_symlink() || files_identical(usr_local, current_exe) {
-        return Some(usr_local.to_path_buf());
+    if meta.file_type().is_symlink() {
+        let ours =
+            same_file(usr_local, current_exe) || symlink_target_is_user_install(usr_local, home);
+        return ours.then(|| usr_local.to_path_buf());
     }
-    None
+    files_identical(usr_local, current_exe).then(|| usr_local.to_path_buf())
+}
+
+/// Whether a symlink's target is one of the user's own monux install
+/// locations (~/.local/bin/monux, ~/.cargo/bin/monux) — the links install.sh
+/// creates. A dangling link (the binary already removed) still counts.
+fn symlink_target_is_user_install(link: &Path, home: &Path) -> bool {
+    let Ok(target) = fs::read_link(link) else {
+        return false;
+    };
+    // A relative target resolves against the link's own directory (join
+    // leaves an absolute target unchanged).
+    let target = link
+        .parent()
+        .map(|parent| parent.join(&target))
+        .unwrap_or(target);
+    [".local/bin/monux", ".cargo/bin/monux"]
+        .iter()
+        .any(|install| same_file(&target, &home.join(install)))
 }
 
 fn files_identical(a: &Path, b: &Path) -> bool {
@@ -162,6 +191,7 @@ fn execute(plan: &Plan) {
     remove_root_owned(&plan.root_owned);
     remove_qos_marking();
     remove_hotspot_profile();
+    remove_autostart_units(&plan.autostart_unit_dir, &mut systemctl_user);
 
     for path in &plan.user_binaries {
         match fs::remove_file(path) {
@@ -342,6 +372,49 @@ fn remove_hotspot_profile() {
             let _ = Command::new("sudo").args(["nft", &rule]).status();
         }
     }
+}
+
+/// Removes the per-user autostart units 'monux setup --autostart' installs:
+/// left in place and enabled, systemd would retry the deleted binary at every
+/// login. Best-effort and user-level (no sudo): disable+stop both services
+/// via the user's manager (tolerating its absence — e.g. uninstall run from a
+/// root shell — with a note), remove the unit files, then daemon-reload so
+/// systemd forgets them. Nothing happens at all when no unit files exist.
+/// The systemctl runner is a seam so tests stay off the real systemd.
+fn remove_autostart_units(unit_dir: &Path, systemctl: &mut dyn FnMut(&[&str]) -> bool) {
+    const UNITS: [&str; 2] = ["monux-server.service", "monux-client.service"];
+    if !UNITS.iter().any(|unit| unit_dir.join(unit).exists()) {
+        return;
+    }
+    let mut disable: Vec<&str> = vec!["disable", "--now"];
+    disable.extend(UNITS);
+    if !systemctl(&disable) {
+        println!(
+            "note: couldn't disable the monux user services (no reachable user manager); after the next login, run: systemctl --user disable --now {}",
+            UNITS.join(" ")
+        );
+    }
+    for unit in UNITS {
+        let path = unit_dir.join(unit);
+        match fs::remove_file(&path) {
+            Ok(()) => println!("Removed {}", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => println!("note: couldn't remove {}: {}", path.display(), e),
+        }
+    }
+    // Forget the removed units; a failure here is harmless.
+    let _ = systemctl(&["daemon-reload"]);
+}
+
+/// `systemctl --user <args>` for the autostart cleanup; false when the
+/// command can't run or fails (the cleanup tolerates either and moves on).
+fn systemctl_user(args: &[&str]) -> bool {
+    Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// Runs sudo non-interactively with output captured; None when sudo needs a
@@ -530,6 +603,79 @@ mod tests {
             &tmp.path().join("usr-local-monux"),
         );
         assert!(plan.root_owned.is_empty());
+    }
+
+    #[test]
+    fn usr_local_foreign_symlink_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("monux");
+        write_file(&exe, b"binary");
+        // Another tool's symlink — even to a byte-identical file — is not
+        // ours and must survive the uninstall.
+        let foreign = tmp.path().join("some-other-tool");
+        write_file(&foreign, b"binary");
+        let link = tmp.path().join("usr-local-monux");
+        std::os::unix::fs::symlink(&foreign, &link).unwrap();
+        let plan = plan_impl(&tmp.path().join("home"), &exe, &[], &link);
+        assert!(plan.root_owned.is_empty());
+    }
+
+    #[test]
+    fn usr_local_user_install_symlink_is_removable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let exe = tmp.path().join("monux");
+        write_file(&exe, b"binary");
+        // install.sh links /usr/local/bin/monux into the user's own install
+        // locations; the link is ours even when its target is already gone
+        // (dangling), e.g. after the binary was removed by hand.
+        let link = tmp.path().join("usr-local-monux");
+        std::os::unix::fs::symlink(home.join(".local/bin/monux"), &link).unwrap();
+        let plan = plan_impl(&home, &exe, &[], &link);
+        assert_eq!(plan.root_owned, vec![link]);
+    }
+
+    #[test]
+    fn autostart_units_are_disabled_and_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit_dir = tmp.path().join("systemd-user");
+        write_file(&unit_dir.join("monux-server.service"), b"unit");
+        write_file(&unit_dir.join("monux-client.service"), b"unit");
+        let recorded: std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let rec = recorded.clone();
+        let mut systemctl = move |args: &[&str]| -> bool {
+            rec.borrow_mut()
+                .push(args.iter().map(|s| s.to_string()).collect());
+            true
+        };
+        remove_autostart_units(&unit_dir, &mut systemctl);
+        assert!(!unit_dir.join("monux-server.service").exists());
+        assert!(!unit_dir.join("monux-client.service").exists());
+        // Disabled first, then a daemon-reload after the files are gone.
+        let calls = recorded.borrow();
+        assert_eq!(
+            calls.as_slice(),
+            vec![
+                vec!["disable", "--now", "monux-server.service", "monux-client.service"],
+                vec!["daemon-reload"],
+            ]
+        );
+    }
+
+    #[test]
+    fn autostart_removal_tolerates_systemctl_failure_and_absence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit_dir = tmp.path().join("systemd-user");
+        write_file(&unit_dir.join("monux-server.service"), b"unit");
+        // A failing systemctl (no reachable user manager) must not stop the
+        // unit files from being removed.
+        let mut failing = |_: &[&str]| false;
+        remove_autostart_units(&unit_dir, &mut failing);
+        assert!(!unit_dir.join("monux-server.service").exists());
+        // No unit files planted: systemctl is never invoked.
+        let mut panicking = |_: &[&str]| -> bool { panic!("no systemctl calls without unit files") };
+        remove_autostart_units(&unit_dir, &mut panicking);
     }
 
     #[test]

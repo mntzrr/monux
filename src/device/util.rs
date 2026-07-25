@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use evdev::{AbsoluteAxisCode, Device, EvdevEnum, InputEvent, EventSummary, KeyCode};
+use evdev::{AbsoluteAxisCode, Device, EvdevEnum, InputEvent, EventSummary, KeyCode, KeyEvent};
 use tracing::{debug, info, trace};
 
 #[derive(Debug, PartialEq)]
@@ -124,9 +124,12 @@ pub fn log_device_info(
 /// Summarizes an evdev InputEvent, hiding the key being pressed in the case of a key event.
 pub fn log_event(event: &InputEvent) -> String {
     let kind = match event.destructure() {
-        EventSummary::Key(evt, _code, value) => {
-            // Replace the key with an X to avoid logging passwords etc
-            EventSummary::Key(evt, KeyCode::KEY_X, value)
+        EventSummary::Key(_evt, _code, value) => {
+            // Replace the key with an X to avoid logging passwords etc. BOTH
+            // fields must be rebuilt: KeyEvent's own Debug prints its code,
+            // so keeping the original event as the first field would still
+            // leak the real key.
+            EventSummary::Key(KeyEvent::new(KeyCode::KEY_X, value), KeyCode::KEY_X, value)
         }
         k => k,
     };
@@ -207,5 +210,31 @@ mod tests {
         ] {
             assert_ne!(axis_scale_type(axis), AxisScale::Discrete, "{:?}", axis);
         }
+    }
+
+    /// A key event's log summary must not reveal the real key anywhere:
+    /// EventSummary::Key's first field Debug-prints its own code, so the mask
+    /// has to cover both fields (passwords land in trace logs otherwise).
+    #[test]
+    fn key_event_logging_hides_the_real_key() {
+        let event: InputEvent = KeyEvent::new(KeyCode::KEY_A, 1).into();
+        let summary = log_event(&event);
+        assert!(
+            !summary.contains("KEY_A"),
+            "real key code leaked into the log summary: {}",
+            summary
+        );
+        assert!(
+            summary.contains("KEY_X"),
+            "mask missing from the log summary: {}",
+            summary
+        );
+        // Non-key events are summarized unchanged.
+        let rel: InputEvent = evdev::InputEvent::new(
+            evdev::EventType::RELATIVE.0,
+            evdev::RelativeAxisCode::REL_X.0,
+            5,
+        );
+        assert!(log_event(&rel).contains("REL_X"));
     }
 }

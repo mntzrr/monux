@@ -337,8 +337,9 @@ pub async fn run_server_connections_loop(
     // story (outdated client auto-updating) and notes when it catches up.
     let peer_versions = Arc::new(Mutex::new(PeerVersions::default()));
     // How long a single connection handshake may take before it is dropped.
-    // Local mode must outlast the interactive approval prompt (60s), which runs
-    // inside the handshake. Www mode never prompts, so it can be much stricter.
+    // Local mode is generous (an approval-pending peer retries anyway);
+    // Www mode never prompts, so it can be much stricter. The interactive
+    // approval prompt never runs inside the handshake (approval.rs).
     let handshake_timeout = match mode {
         transport::NetworkMode::Local => Duration::from_secs(75),
         transport::NetworkMode::Www => Duration::from_secs(15),
@@ -385,7 +386,15 @@ pub async fn run_server_connections_loop(
             let conn = match tokio::time::timeout(handshake_timeout, connecting).await {
                 Ok(Ok(conn)) => conn,
                 Ok(Err(e)) => {
-                    error!("Client failed to connect: {}", e);
+                    // An unapproved cert rejects instantly and the peer
+                    // retries every few seconds until the prompt is answered
+                    // (approval.rs): that's a normal pairing flow, not an
+                    // error storm.
+                    if is_approval_pending(&e) {
+                        info!("Client failed to connect: {}", e);
+                    } else {
+                        error!("Client failed to connect: {}", e);
+                    }
                     return;
                 }
                 Err(_) => {
@@ -441,6 +450,18 @@ pub async fn run_server_connections_loop(
             };
         });
     }
+}
+
+/// Whether a connection failure is just an unapproved certificate: the
+/// verifier rejects instantly and the peer retries automatically until the
+/// console prompt is answered (see approval.rs), so these are expected
+/// during pairing and log at info level. Needles match the rejection
+/// messages in approval.rs.
+fn is_approval_pending(e: impl std::fmt::Display) -> bool {
+    let text = e.to_string();
+    text.contains("approval pending")
+        || text.contains("approval prompt is already pending")
+        || text.contains("recently declined or timed out")
 }
 
 async fn handle_connection(

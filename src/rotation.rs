@@ -675,6 +675,11 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// EdgeDirectionsCache): re-resolved only on client add/remove and from
     /// set_edge_map, so building server_state never hits DNS.
     edge_dirs: EdgeDirectionsCache,
+    /// Hostname → IPs resolution cache for --edge-map hostname targets (see
+    /// edge::ResolveCache): refresh_edge_dirs/advertise_edge_info resolve
+    /// against it, so those rotation-loop paths never run a blocking
+    /// getaddrinfo themselves.
+    resolve_cache: Arc<edge::ResolveCache>,
     /// Last advertised EdgeInfo directions per client, so unchanged maps
     /// aren't re-sent on topology changes (each re-advertise respawns the
     /// client's edge detector, resetting any in-progress dwell).
@@ -786,12 +791,14 @@ fn edge_info_directions(
 }
 
 /// Cached --edge-map resolutions for the control-socket status
-/// (Rotation::server_state). Resolution can hit DNS — edge::resolve_hostname
-/// does a blocking getaddrinfo per hostname target — so it must never run
-/// per rotation-loop iteration (thousands of lookups a second at 8kHz
-/// input, on a shared tokio worker). Refreshed ONLY when the resolution can
-/// change: a client add/remove (including an in-place reconnect replace,
-/// which may carry a new fingerprint) or set_edge_map. Reads are free.
+/// (Rotation::server_state). Resolution can hit DNS — a hostname target needs
+/// a getaddrinfo — so it must never run per rotation-loop iteration
+/// (thousands of lookups a second at 8kHz input, on a shared tokio worker).
+/// Refreshed ONLY when the resolution can change: a client add/remove
+/// (including an in-place reconnect replace, which may carry a new
+/// fingerprint) or set_edge_map. Reads are free. Even those refreshes never
+/// resolve synchronously: hostname lookups go through the ResolveCache (see
+/// Rotation::resolve_cache), whose background refill serves the next pass.
 #[derive(Default)]
 struct EdgeDirectionsCache {
     /// endpoint -> the edge directions that client sits beyond (empty vec =
@@ -899,6 +906,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             edge_client_tx: None,
             edge_map: None,
             edge_dirs: EdgeDirectionsCache::default(),
+            resolve_cache: Arc::new(edge::ResolveCache::default()),
             edge_info_sent: HashMap::new(),
             last_diagnostics_refresh: None,
         })
@@ -928,27 +936,36 @@ impl<O: device::output::OutputHandler> Rotation<O> {
 
     /// Re-resolves the cached per-client edge directions (see
     /// EdgeDirectionsCache). Called on client add/remove and from
-    /// set_edge_map — the only moments the resolution can change.
+    /// set_edge_map — the only moments the resolution can change. Hostname
+    /// targets resolve against the ResolveCache (a miss is "unresolvable"
+    /// for this pass); the queued background refresh serves the next pass.
     fn refresh_edge_dirs(&mut self) {
+        if let Some(map) = &self.edge_map {
+            self.resolve_cache.queue_map_refresh(map);
+        }
+        let resolver = self.resolve_cache.resolver();
         let entries = self.edge_client_entries();
         self.edge_dirs
-            .refresh(self.edge_map.as_ref(), &entries, &edge::resolve_hostname);
+            .refresh(self.edge_map.as_ref(), &entries, &resolver);
     }
 
     /// Sends EdgeInfo for every edge-map direction resolving to this client,
     /// so it can infer its return edge (see ServerEvent::EdgeInfo). Used at
     /// add time and to re-advertise when the topology changes (a peer's
     /// removal can make 'auto' resolve to a remaining client, or resolve it
-    /// away from one).
+    /// away from one). Hostname targets resolve against the ResolveCache,
+    /// never blocking getaddrinfo on this async loop (see refresh_edge_dirs).
     async fn advertise_edge_info(&mut self, endpoint: &SocketAddr, fingerprint: &str) {
         let Some(map) = &self.edge_map else {
             return;
         };
+        self.resolve_cache.queue_map_refresh(map);
+        let resolver = self.resolve_cache.resolver();
         let directions: BTreeSet<event::Direction> = edge_info_directions(
             map,
             &self.edge_client_entries(),
             fingerprint,
-            &edge::resolve_hostname,
+            &resolver,
         )
         .into_iter()
         .collect();

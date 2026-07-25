@@ -188,7 +188,9 @@ impl VirtualUInputDevices {
                 } else if self.touchpad_keys.contains(code) {
                     Some(EventDest::Touchpad)
                 } else {
-                    debug!("Dropping key event with unsupported code: {:?}", code);
+                    // The real code is masked (like util::log_event): key
+                    // codes must never reach the logs (passwords).
+                    debug!("Dropping key event with unsupported code: {:?}", KeyCode::KEY_X);
                     None
                 }
             }

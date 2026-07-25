@@ -422,9 +422,10 @@ impl Connection {
         // remembered server addresses (known_servers.rs), and a dead one must
         // fail fast — a silent address otherwise rides the full QUIC idle
         // timeout. Www gets longer so slow internet handshakes still pass.
-        // Note an interactive cert-approval prompt runs INSIDE this future:
-        // a timeout drops that attempt, but the answer is still honored (the
-        // cert is written to disk) and a later retry connects.
+        // The cert-approval prompt never blocks this future: an unknown cert
+        // is rejected instantly while the prompt runs on its own thread
+        // (approval.rs), and the reconnect loop's retry converges once the
+        // user approves.
         let connect_timeout = match mode {
             transport::NetworkMode::Local => Duration::from_secs(3),
             transport::NetworkMode::Www => Duration::from_secs(10),

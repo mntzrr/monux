@@ -167,9 +167,14 @@ pub fn discover_servers_blocking(timeout: Option<Duration>) -> Result<Vec<Discov
     let mut fullnames: Vec<String> = Vec::new();
 
     loop {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or_else(|| anyhow!("{}", DISCOVERY_TIMEOUT_HINT))?;
+        let remaining = match deadline.checked_duration_since(Instant::now()) {
+            Some(remaining) => remaining,
+            // The grace period can outlast the overall timeout: a first
+            // resolve arriving in its last moments must not fail discovery
+            // AFTER finding a server — return what we have.
+            None if keep_found_past_deadline(&instances) => break,
+            None => bail!("{}", DISCOVERY_TIMEOUT_HINT),
+        };
         let wait = match grace_deadline {
             Some(grace) => match grace.checked_duration_since(Instant::now()) {
                 Some(grace_remaining) => grace_remaining,
@@ -238,6 +243,15 @@ pub fn discover_servers_blocking(timeout: Option<Duration>) -> Result<Vec<Discov
 
     let _ = daemon.shutdown();
     Ok(instances)
+}
+
+/// Whether an expired overall discovery deadline ends the browse with what
+/// was found (true) instead of failing with DISCOVERY_TIMEOUT_HINT (false):
+/// the grace period extends past the deadline, so a first resolve can arrive
+/// when the deadline has already passed — finding a server must never fail
+/// discovery.
+fn keep_found_past_deadline(instances: &[DiscoveredServer]) -> bool {
+    !instances.is_empty()
 }
 
 /// Discovers a Monux server on the local network via mDNS.
@@ -592,6 +606,22 @@ mod tests {
         assert_eq!(protocol_version_constraint(&[]), None);
         assert_eq!(protocol_version_constraint(&[8]), Some(8));
         assert_eq!(protocol_version_constraint(&[8, 7, 9]), Some(7));
+    }
+
+    #[test]
+    fn expired_deadline_keeps_already_found_servers() {
+        // Nothing found: the deadline expiry still fails the discovery.
+        assert!(!keep_found_past_deadline(&[]));
+        // A resolve landing in the last grace window (past the deadline) is
+        // returned, not discarded by the timeout error.
+        let found = vec![DiscoveredServer {
+            name: "host".to_string(),
+            addrs: vec!["192.168.1.2".parse().unwrap()],
+            port: 1213,
+            protocol_version: None,
+            fingerprint: None,
+        }];
+        assert!(keep_found_past_deadline(&found));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use rustix::fs::{fcntl_setfl, OFlags};
 use tokio::task;
 use tracing::{debug, trace, warn};
 use wayland_client::globals::registry_queue_init;
-use wayland_client::{Connection, EventQueue};
+use wayland_client::{Connection, DispatchError, EventQueue};
 
 use crate::clipboard::{CLIPBOARD_TIMEOUT_SECS, ClipboardReader as ClipboardReaderTrait, limited};
 use crate::clipboard::wayland::{common, state};
@@ -25,7 +25,7 @@ pub struct ClipboardReader {
     /// if the awaiting read was cancelled (e.g. a client-side read timeout) —
     /// so a wedged compositor roundtrip can never strand them on the detached
     /// worker and permanently kill the reader (see run_on_worker).
-    slot: Arc<BlockingSlot<ReaderInner>>,
+    slot: Arc<BlockingSlot<ReaderConn>>,
 }
 
 /// The wayland event queue and its dispatch state. Roundtrips block on the
@@ -34,6 +34,37 @@ pub struct ClipboardReader {
 struct ReaderInner {
     queue: EventQueue<state::State>,
     state: state::State,
+}
+
+/// The reader's compositor connection: live, or dead after a failed
+/// roundtrip. The wayland connection dies with the compositor and every
+/// roundtrip on it then fails forever — the type watcher (type_watcher.rs)
+/// has its own reconnect loop, but without rebuilding here the reader would
+/// keep advertising healthy types while every fetch fails until monux
+/// restarts. Dead (not a flag on a live-looking inner) so "no connection" is
+/// representable and the next fetch knows to rebuild before reading.
+enum ReaderConn {
+    Live(ReaderInner),
+    Dead,
+}
+
+impl ReaderConn {
+    /// Hands out the live inner, rebuilding the connection first when the
+    /// previous fetch marked it dead (see ReaderConn). A failed rebuild —
+    /// the compositor is still down — bails this fetch and stays Dead, so a
+    /// later fetch retries instead of failing forever.
+    fn ensure_live(&mut self) -> Result<&mut ReaderInner> {
+        if matches!(self, ReaderConn::Dead) {
+            *self = ReaderConn::Live(
+                ReaderInner::connect()
+                    .context("Failed to rebuild the Wayland clipboard connection after the compositor died")?,
+            );
+        }
+        match self {
+            ReaderConn::Live(inner) => Ok(inner),
+            ReaderConn::Dead => unreachable!("a dead connection was just rebuilt"),
+        }
+    }
 }
 
 /// Shared slot for state that blocking workers borrow and always return (see
@@ -131,6 +162,17 @@ where
 
 impl ClipboardReader {
     pub fn new() -> Result<Self> {
+        Ok(Self{
+            slot: Arc::new(BlockingSlot::new(ReaderConn::Live(ReaderInner::connect()?))),
+        })
+    }
+}
+
+impl ReaderInner {
+    /// Connects to the compositor and sets up the clipboard registry, seats
+    /// and initial state. Used by ClipboardReader::new and by the rebuild
+    /// after a compositor restart (see ReaderConn).
+    fn connect() -> Result<Self> {
         let conn = Connection::connect_to_env().context("Couldn't reach Wayland compositor socket")?;
         let (globals, mut queue) = registry_queue_init::<state::State>(&conn)
             .context("Failed to init Wayland registry queue")?;
@@ -152,9 +194,7 @@ impl ClipboardReader {
         // Initial load of clipboard/mimetype data
         queue.roundtrip(&mut state)?;
 
-        Ok(Self{
-            slot: Arc::new(BlockingSlot::new(ReaderInner { queue, state })),
-        })
+        Ok(ReaderInner { queue, state })
     }
 }
 
@@ -199,9 +239,22 @@ impl ClipboardReaderTrait for ClipboardReader {
         // a blocking worker so a wedged compositor can't park an async
         // executor thread for the duration.
         let mime_type = requested_type.to_string();
-        let offer = run_on_worker(&self.slot, move |mut inner| {
-            let offer = inner.get_offer(mime_type);
-            (inner, offer)
+        let offer = run_on_worker(&self.slot, move |mut conn| {
+            let offer = match conn.ensure_live() {
+                Ok(inner) => match inner.get_offer(mime_type) {
+                    // A dispatch error means the connection died with the
+                    // compositor: mark it dead so the NEXT fetch rebuilds it
+                    // (see ReaderConn) instead of failing forever on the dead
+                    // queue. This fetch bails.
+                    Err(e) if e.downcast_ref::<DispatchError>().is_some() => {
+                        conn = ReaderConn::Dead;
+                        Err(e)
+                    }
+                    other => other,
+                },
+                Err(e) => Err(e),
+            };
+            (conn, offer)
         })
         .await??;
         let pipe_reader = if let Some(rdr) = offer {
@@ -330,5 +383,30 @@ mod tests {
         // The state is gone: every later read fails fast with the original error.
         let lost = run_on_worker(&slot, |n| (n, n)).await;
         assert!(format!("{:?}", lost.unwrap_err()).contains("lost to a failed roundtrip"));
+    }
+
+    /// Dead → rebuild attempted → compositor still down → the fetch bails and
+    /// the connection stays Dead, so a later fetch retries instead of the
+    /// reader being lost forever (the pre-reconnect behavior). Runs only
+    /// where no compositor is reachable; with a live one the rebuild succeeds
+    /// and there is nothing headless to check. (The Live → Dead transition on
+    /// a failed roundtrip needs a killable compositor, so it can't be tested
+    /// headless.)
+    #[test]
+    fn dead_reader_stays_dead_until_a_rebuild_succeeds() {
+        if Connection::connect_to_env().is_ok() {
+            return;
+        }
+        let mut conn = ReaderConn::Dead;
+        let err = match conn.ensure_live() {
+            Ok(_) => panic!("a rebuild without a compositor must not succeed"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{:#}", err).contains("rebuild"),
+            "unexpected error: {:#}",
+            err
+        );
+        assert!(matches!(conn, ReaderConn::Dead));
     }
 }

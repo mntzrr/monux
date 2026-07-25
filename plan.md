@@ -135,6 +135,45 @@ The config file is persistent flag storage; `mx config` is its CLI.
       symlink pointing at monux. Collision guard: existing non-monux `mx` → skip
       with warning.
 
+## Phase G — review remediation (v9.1.1)
+
+From the 2026-07-24 codebase review (8 scopes, ~50 findings). Fix tier 1 (HIGH+MEDIUM):
+
+- [x] G1 approval.rs: move the 60s cert prompt OFF quinn's single endpoint driver
+      (reject + dedicated prompt thread + retry-succeeds); fixes the flush().expect
+      panic, the dead poisoned-lock reset, prompt_active wedging
+- [x] G2 device/util.rs: log_event masks only half the key event (real code leaks
+      to trace logs)
+- [x] G3 single_instance.rs: O_NOFOLLOW on the /tmp lock open; bail on symlink
+- [x] G4 control.rs: control-socket /tmp fallback dir: verify uid ownership,
+      hard-fail chmod
+- [x] G5 setup.rs: write_unit_file root write follows symlinks (O_NOFOLLOW/tmp+rename)
+- [x] G6 setup.rs: run_cmd error includes full argv — redact after wifi-sec.psk
+- [x] G7 discovery.rs: deadline expiry bails even with found servers — break instead
+- [x] G8 rotation/edge: blocking getaddrinfo on the input loop (edge hostname
+      resolution on add/remove/log paths) — off-loop + cache
+- [x] G9 update.rs: no cross-process update lock — flock around run()
+- [x] G10 clipboard: reader never recreated after compositor restart
+- [x] G11 convert.rs: zip send-side uncompressed-size budget (timeout detaches, zip
+      keeps running)
+- [x] G12 uninstall.rs: autostart units never disabled/removed
+- [x] G13 uninstall.rs: removable_usr_local removes ANY symlink — resolve+compare
+- [x] G14 setup.rs: hotspot_live_subnet matches first 10.42.* on any iface; aborts
+      retry on cmd error
+- [x] G15 setup.rs: stale hotspot join profile accepted as success — update+reconnect
+
+## Phase H — review remediation, LOW tier (later)
+
+recv_version size cap; dedicated bulk-handshake buffers; pin cleared only after
+Installed; is_newer_remote ancestry check; known_servers hostname sanitization;
+v_clipboard_kb ceiling; graceful-close RemoveClient; fingerprint-slot race;
+stale edge_info_sent; clipboard temp-dir sweep cross-process; hostapd.conf 0644
+window; uninstall root HOME guard; pause vs silence/recovery switches; dead
+clipboard channel killing the connection; indicator_spawn races; wedged-compositor
+thread leak; serve.rs Arc<[u8]> cache; IGNORED_MIME_TYPE early return; uri-list
+parsing; event Display allocs; motion-history alloc; degraded-link log spam;
+.local.local lookup; accept() warn labels.
+
 ## Future / on hold
 
 - **Protocol feature-negotiation** — SHIPPED in v9.0.0 (protocol v16): v16+ peers

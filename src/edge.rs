@@ -31,11 +31,12 @@
 //! with a warning. The layout is re-queried periodically so monitor
 //! (un)plugs and resolution changes recompute the trigger zones.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -531,6 +532,104 @@ pub fn resolve_hostname(name: &str) -> Vec<IpAddr> {
     ips
 }
 
+/// Cache of hostname → resolved IPs for --edge-map hostname targets, so the
+/// async loops (rotation, edge manager) never run a blocking getaddrinfo
+/// themselves (resolve_hostname does one per call): a DNS-missing name would
+/// otherwise stall input routing for seconds, multiplied by directions ×
+/// clients. The sync resolution passes read only the cache — a miss means
+/// "unresolvable" for that pass — and queue a refresh that re-resolves on
+/// the blocking thread pool, so the filled cache serves the NEXT pass. (The
+/// edge fire path needs no cache: it already resolves inside spawn_blocking.)
+#[derive(Default)]
+pub struct ResolveCache {
+    /// Hostname → last resolved IPs (an empty vec = resolved to nothing).
+    ips: RwLock<BTreeMap<String, Vec<IpAddr>>>,
+    /// Hostnames a queued refresh is already resolving: dedupes the
+    /// back-to-back refreshes of client add/remove bursts while DNS is slow.
+    pending: Mutex<BTreeSet<String>>,
+}
+
+impl ResolveCache {
+    /// A resolver for resolve_edge_target that reads only the cache: a miss
+    /// yields no IPs, i.e. "unresolvable" for this pass (the refresh queued
+    /// alongside the pass serves the next one).
+    pub fn resolver(self: &Arc<Self>) -> impl Fn(&str) -> Vec<IpAddr> {
+        let cache = Arc::clone(self);
+        move |name| {
+            cache
+                .ips
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(name)
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    /// Re-resolves every Named target of `map` on the blocking thread pool,
+    /// filling the cache for later passes (see hostname_targets for why
+    /// fingerprint prefixes ride along). 'auto' needs no resolution.
+    pub fn queue_map_refresh(self: &Arc<Self>, map: &EdgeMap) {
+        self.queue_refresh(hostname_targets(map), resolve_hostname);
+    }
+
+    /// Queues a background re-resolution of `names` (see queue_map_refresh),
+    /// deduped against refreshes already in flight. `resolve` is the system
+    /// resolver in production, a fake in tests. Without a tokio runtime the
+    /// refresh runs inline instead (production call sites all have one).
+    fn queue_refresh(self: &Arc<Self>, names: Vec<String>, resolve: fn(&str) -> Vec<IpAddr>) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let names: Vec<String> = names
+            .into_iter()
+            .filter(|name| pending.insert(name.clone()))
+            .collect();
+        drop(pending);
+        if names.is_empty() {
+            return;
+        }
+        let cache = Arc::clone(self);
+        let spawn = move || {
+            let resolved: Vec<(String, Vec<IpAddr>)> = names
+                .into_iter()
+                .map(|name| {
+                    let ips = resolve(&name);
+                    (name, ips)
+                })
+                .collect();
+            {
+                let mut ips = cache.ips.write().unwrap_or_else(|e| e.into_inner());
+                for (name, addrs) in &resolved {
+                    ips.insert(name.clone(), addrs.clone());
+                }
+            }
+            let mut pending = cache.pending.lock().unwrap_or_else(|e| e.into_inner());
+            for (name, _) in resolved {
+                pending.remove(&name);
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(spawn);
+            }
+            Err(_) => spawn(),
+        }
+    }
+}
+
+/// The Named targets of an edge map — the only targets needing system
+/// resolution ('auto' resolves locally against the client list). A Named
+/// target may still be a fingerprint prefix (matched locally first); the
+/// harmless background lookup for those just fills an unread cache entry.
+fn hostname_targets(map: &EdgeMap) -> Vec<String> {
+    map.targets
+        .values()
+        .filter_map(|target| match target {
+            EdgeTarget::Named(name) => Some(name.clone()),
+            EdgeTarget::Auto => None,
+        })
+        .collect()
+}
+
 /// How often the cursor position is polled from Hyprland's IPC.
 const POLL_INTERVAL: Duration = Duration::from_millis(40);
 
@@ -859,8 +958,11 @@ async fn run_inner(
             )
         })
         .collect();
+    // Hostname targets resolve off-loop through this cache (see ResolveCache):
+    // the resolution passes below read it, its refreshes fill it.
+    let resolve_cache = Arc::new(ResolveCache::default());
     if let Some(rx) = &clients_rx {
-        log_edge_resolutions(&map, &rx.borrow());
+        log_edge_resolutions(&map, &rx.borrow(), &resolve_cache);
     }
     // The last polled cursor position: client mode reads the crossing
     // fraction off it at fire time.
@@ -914,7 +1016,7 @@ async fn run_inner(
                     return;
                 }
                 if let Some(rx) = &clients_rx {
-                    log_edge_resolutions(&map, &rx.borrow());
+                    log_edge_resolutions(&map, &rx.borrow(), &resolve_cache);
                 }
             }
             // Client mode only: the request receiver was dropped with the
@@ -1060,10 +1162,19 @@ fn log_layout(layout: &[OutputRect]) {
 
 /// Resolves every mapped target against the current client list and logs the
 /// outcome — at startup and on every client (dis)connect, so the mapping is
-/// visible before anyone pushes the cursor into an edge.
-fn log_edge_resolutions(map: &EdgeMap, clients: &[(SocketAddr, String)]) {
+/// visible before anyone pushes the cursor into an edge. Hostname targets
+/// resolve against the ResolveCache (never blocking getaddrinfo here: this
+/// runs while the clients watch read guard is held); a cache miss logs as
+/// unresolvable for this pass and the queued refresh serves the next.
+fn log_edge_resolutions(
+    map: &EdgeMap,
+    clients: &[(SocketAddr, String)],
+    resolve_cache: &Arc<ResolveCache>,
+) {
+    resolve_cache.queue_map_refresh(map);
+    let resolver = resolve_cache.resolver();
     for (dir, target) in &map.targets {
-        match resolve_edge_target(target, clients, &resolve_hostname) {
+        match resolve_edge_target(target, clients, &resolver) {
             Ok(fingerprint) => info!(
                 "Screen-edge switching: {} edge → client {} (target '{}')",
                 dir.as_str(),
@@ -1376,6 +1487,80 @@ mod tests {
             resolve_edge_target(&target_named("laptop"), &clients, &resolver),
             Err(ResolveError::HostnameMatchesNothing("laptop".to_string()))
         );
+    }
+
+    #[test]
+    fn edge_map_hostnames_are_the_named_targets() {
+        let map = parse_edge_map(&["left=laptop,right=auto".to_string()]).unwrap();
+        assert_eq!(hostname_targets(&map), vec!["laptop".to_string()]);
+        let map = parse_edge_map(&["left=aa11bb,bottom=desk".to_string()]).unwrap();
+        assert_eq!(
+            hostname_targets(&map),
+            vec!["aa11bb".to_string(), "desk".to_string()]
+        );
+    }
+
+    /// Miss-then-hit: a cache miss resolves to "unresolvable" for that pass;
+    /// the queued refresh fills the cache and the NEXT pass resolves. (No
+    /// runtime here, so the refresh runs inline — see queue_refresh.)
+    #[test]
+    fn resolve_cache_miss_then_hit() {
+        let cache = Arc::new(ResolveCache::default());
+        let resolver = cache.resolver();
+        let clients = client_list(&[("10.0.0.2:9000", "bbbb2222ffff")]);
+
+        // Miss: nothing cached yet, so the target is unresolvable this pass.
+        assert!(resolver("laptop").is_empty());
+        assert_eq!(
+            resolve_edge_target(&target_named("laptop"), &clients, &resolver),
+            Err(ResolveError::UnresolvedHostname("laptop".to_string()))
+        );
+
+        // The queued refresh (a fake system resolver here) fills the cache...
+        let fake_resolve: fn(&str) -> Vec<IpAddr> = |name| match name {
+            "laptop" => vec!["10.0.0.2".parse().unwrap()],
+            _ => vec![],
+        };
+        cache.queue_refresh(vec!["laptop".to_string()], fake_resolve);
+
+        // ...and the next pass resolves from it.
+        let laptop_ip: IpAddr = "10.0.0.2".parse().unwrap();
+        assert_eq!(resolver("laptop"), vec![laptop_ip]);
+        assert_eq!(
+            resolve_edge_target(&target_named("laptop"), &clients, &resolver),
+            Ok("bbbb2222ffff".to_string())
+        );
+    }
+
+    /// With a runtime the refresh is filled via spawn_blocking: the queueing
+    /// pass never blocks on the resolver.
+    #[tokio::test]
+    async fn resolve_cache_refills_off_loop() {
+        let cache = Arc::new(ResolveCache::default());
+        let resolver = cache.resolver();
+        let fake_resolve: fn(&str) -> Vec<IpAddr> = |_| vec!["10.0.0.7".parse().unwrap()];
+        cache.queue_refresh(vec!["host".to_string()], fake_resolve);
+        // The fill lands on the blocking pool: poll until it is served.
+        for _ in 0..100 {
+            if !resolver("host").is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let host_ip: IpAddr = "10.0.0.7".parse().unwrap();
+        assert_eq!(resolver("host"), vec![host_ip]);
+
+        // The in-flight marker was cleared: a follow-up refresh re-resolves
+        // (here to nothing, e.g. the name dropped out of DNS).
+        let no_resolve: fn(&str) -> Vec<IpAddr> = |_| vec![];
+        cache.queue_refresh(vec!["host".to_string()], no_resolve);
+        for _ in 0..100 {
+            if resolver("host").is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(resolver("host").is_empty());
     }
 
     #[test]

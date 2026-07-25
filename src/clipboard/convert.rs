@@ -333,8 +333,17 @@ fn build_zip_payload(file_uri_strs: Vec<&str>, max_compressed_size_bytes: u64) -
             warn!("Skipping path that isn't a file or directory: {:?}", path);
         }
     }
-    // Then write the files to the zip file, aborting internally if the compressed size gets too big
-    let (uncompressed_len, zipdata) = zip_files(&files_to_zip, max_compressed_size_bytes)?;
+    // Then write the files to the zip file, aborting internally if the
+    // compressed size gets too big, or if the UNCOMPRESSED total passes the
+    // receive side's budget (main.rs derives it as 10x the configured
+    // clipboard size): without that cap a huge compressible payload (e.g. a
+    // 10GB sparse file) is fully read from disk on every paste request.
+    let max_uncompressed_size_bytes = max_compressed_size_bytes.saturating_mul(10);
+    let (uncompressed_len, zipdata) = zip_files(
+        &files_to_zip,
+        max_compressed_size_bytes,
+        max_uncompressed_size_bytes,
+    )?;
     debug!(
         "Zipped {} files ({} bytes) into {} bytes",
         files_to_zip.len(),
@@ -347,6 +356,7 @@ fn build_zip_payload(file_uri_strs: Vec<&str>, max_compressed_size_bytes: u64) -
 fn zip_files(
     files_to_zip: &Vec<PathBuf>,
     max_compressed_size_bytes: u64,
+    max_uncompressed_size_bytes: u64,
 ) -> Result<(usize, Vec<u8>)> {
     let mut uncompressed_len = 0;
     let mut cursor = limited::LimitedCursor::new(max_compressed_size_bytes);
@@ -381,6 +391,16 @@ fn zip_files(
                     }
                     len => {
                         uncompressed_len += len;
+                        // Stop reading once the receive side's uncompressed
+                        // budget is exceeded: the LimitedCursor only caps the
+                        // COMPRESSED output, so without this check a huge
+                        // compressible file is read to EOF per paste request.
+                        if uncompressed_len as u64 > max_uncompressed_size_bytes {
+                            bail!(
+                                "Copied files exceed the maximum uncompressed clipboard size of {} bytes",
+                                max_uncompressed_size_bytes
+                            );
+                        }
                         zipwriter.write_all(&buf[..len])?;
                     }
                 }
@@ -725,5 +745,27 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[test]
+    fn zip_aborts_when_uncompressed_budget_is_exceeded() {
+        let src = tempfile::tempdir().unwrap();
+        let big = temp_file(src.path(), "big.bin", &vec![0u8; 1_000_000]);
+        let files = vec![big];
+
+        // Highly compressible zeros fit the COMPRESSED cap easily, but the
+        // uncompressed budget aborts the zip mid-read with a clear error
+        // instead of reading the whole payload per paste request.
+        let err = zip_files(&files, GENEROUS_CAP, 500_000).unwrap_err();
+        assert!(
+            format!("{:#}", err).contains("uncompressed clipboard size"),
+            "unexpected error: {:#}",
+            err
+        );
+
+        // Within the budget the same file zips fine.
+        let (uncompressed_len, zipdata) = zip_files(&files, GENEROUS_CAP, 1_000_000).unwrap();
+        assert_eq!(uncompressed_len, 1_000_000);
+        assert!(!zipdata.is_empty());
     }
 }

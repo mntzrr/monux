@@ -85,6 +85,11 @@ pub fn run(
             .join("monux")
             .join("src"),
     };
+    // Serialize against other updaters before touching the checkout: the
+    // other daemon on a dual-daemon machine, or a manual 'monux update'
+    // mid-build. The second contender waits, then sees AlreadyCurrent
+    // instead of colliding with the first on git locks.
+    let _update_lock = acquire_update_lock(&src_dir)?;
 
     if src_dir.join(".git").exists() {
         if to.is_some() {
@@ -326,6 +331,55 @@ pub fn run(
         }
     }
     Ok(UpdateStatus::Installed)
+}
+
+/// Holds the cross-process update flock for the duration of an update run
+/// (dropped when run() returns).
+struct UpdateLock {
+    _file: std::fs::File,
+}
+
+/// The update lock file: a sibling of the source checkout, derived from the
+/// same MONUX_UPDATE_CACHE-aware path, so every updater on this machine —
+/// either daemon, or a manual 'monux update' — serializes on the one file.
+fn update_lock_path(src_dir: &Path) -> PathBuf {
+    src_dir
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("monux-update.lock")
+}
+
+/// Takes the update flock (blocking LOCK_EX). flock is tied to the open file
+/// description, so the kernel releases it when the process dies for any
+/// reason — the lock can never go stale, and the file itself is never
+/// deleted.
+fn acquire_update_lock(src_dir: &Path) -> Result<UpdateLock> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let path = update_lock_path(src_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    // 0666 like the single-instance locks: a root-run daemon and the user's
+    // own updater must share the file; flock itself is the authority. chmod
+    // too since umask may restrict the create mode.
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .mode(0o666)
+        .open(&path)
+        .with_context(|| format!("Failed to open the update lock {}", path.display()))?;
+    let _ = std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o666));
+    let fd = file.as_raw_fd();
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        info!("Waiting for another monux update to finish...");
+        if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("Failed to lock {}", path.display()));
+        }
+    }
+    Ok(UpdateLock { _file: file })
 }
 
 /// Reads the protocol version a source checkout speaks, straight from its
@@ -875,6 +929,25 @@ mod tests {
         assert_eq!(std::fs::read(&to).unwrap(), b"new-binary");
         assert!(!from.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_lock_is_shared_by_sequential_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The lock sits next to the (not yet existing) source checkout.
+        let src_dir = tmp.path().join("cache").join("monux").join("src");
+        let lock_path = update_lock_path(&src_dir);
+        // Two sequential runs (the second having waited for the first)
+        // acquire and release the one shared lock file.
+        {
+            let _first = acquire_update_lock(&src_dir).unwrap();
+        }
+        let _second = acquire_update_lock(&src_dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+        // World-writable, like the single-instance locks: a root-run daemon
+        // and the user's own updater must both be able to take it.
+        assert_eq!(mode, 0o666);
     }
 
     #[test]

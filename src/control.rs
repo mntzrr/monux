@@ -17,9 +17,11 @@
 //!
 //! Same-user only: XDG_RUNTIME_DIR is 0700 per the XDG spec and the /tmp
 //! fallback dir is created 0700 as well, so no other user can reach the
-//! socket. There is no authentication beyond that — any process running as
-//! the same user can drive switches, pause, updates and shutdown, exactly as
-//! it already could via signals (SIGUSR1/SIGUSR2/SIGTERM).
+//! socket. bind() also refuses a socket dir owned by another user (a
+//! pre-existing /tmp/monux-<uid> must never be trusted) and treats a failed
+//! 0700 chmod as fatal. There is no authentication beyond that — any process
+//! running as the same user can drive switches, pause, updates and shutdown,
+//! exactly as it already could via signals (SIGUSR1/SIGUSR2/SIGTERM).
 //!
 //! # Wire protocol (newline-delimited JSON)
 //!
@@ -140,7 +142,9 @@ impl Role {
 }
 
 /// The directory holding the control sockets, honoring XDG_RUNTIME_DIR (also
-/// the test override) with a per-user /tmp fallback.
+/// the test override) with a per-user /tmp fallback. The fallback lives in
+/// world-writable /tmp, so bind() verifies the dir's ownership before
+/// trusting it (see prepare_socket_dir).
 fn socket_dir_from(runtime_dir: Option<&std::ffi::OsStr>) -> PathBuf {
     match runtime_dir {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("monux"),
@@ -156,6 +160,41 @@ pub fn socket_dir() -> PathBuf {
 /// The default socket path for `role`.
 pub fn socket_path(role: Role) -> PathBuf {
     socket_dir().join(role.socket_name())
+}
+
+/// Creates the socket dir if needed, then makes sure it is safe to trust
+/// (see the module docs' Security section): it must be owned by us — a
+/// pre-existing dir owned by another user could have its socket replaced,
+/// feeding fake acks/state to `monux status` — and locked down to 0700. A
+/// failed chmod is a hard error for the same reason.
+fn prepare_socket_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("Failed to create control socket dir {}", dir.display()))?;
+    ensure_dir_owner(dir, unsafe { libc::geteuid() })?;
+    // 0700 even if the dir pre-existed with looser perms: the socket is
+    // same-user only (see module docs).
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("Failed to lock down control socket dir {}", dir.display()))?;
+    Ok(())
+}
+
+/// Bails unless `dir` is owned by `expected_uid` (the euid at the call site;
+/// a parameter so the mismatch branch is testable without root).
+fn ensure_dir_owner(dir: &Path, expected_uid: libc::uid_t) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let owner = std::fs::metadata(dir)
+        .with_context(|| format!("Failed to stat control socket dir {}", dir.display()))?
+        .uid();
+    if owner != expected_uid {
+        bail!(
+            "Control socket dir {} is owned by uid {}, not by us (uid {}): refusing to trust it — remove it or fix its ownership",
+            dir.display(),
+            owner,
+            expected_uid
+        );
+    }
+    Ok(())
 }
 
 /// Live server state, published in status responses (see module docs).
@@ -683,12 +722,7 @@ impl Listener {
     /// Binds the default socket path for `role` (see socket_path).
     pub fn bind(role: Role) -> Result<Listener> {
         let dir = socket_dir();
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("Failed to create control socket dir {}", dir.display()))?;
-        // 0700 even if the dir pre-existed with looser perms: the socket is
-        // same-user only (see module docs).
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        prepare_socket_dir(&dir)?;
         Self::bind_at(&dir.join(role.socket_name()), role.as_str())
     }
 
@@ -1035,6 +1069,33 @@ mod tests {
         let fallback = PathBuf::from(format!("/tmp/monux-{}", unsafe { libc::geteuid() }));
         assert_eq!(socket_dir_from(None), fallback);
         assert_eq!(socket_dir_from(Some(std::ffi::OsStr::new(""))), fallback);
+    }
+
+    #[test]
+    fn socket_dir_owned_by_another_user_is_rejected() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join("monux");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+
+        // Our own dir: prepare passes and locks it down to 0700.
+        prepare_socket_dir(&socket_dir).unwrap();
+        assert_eq!(
+            std::fs::metadata(&socket_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        ensure_dir_owner(&socket_dir, unsafe { libc::geteuid() }).unwrap();
+
+        // A dir owned by another user must be refused. (A foreign-owned dir
+        // can't be chowned into existence without root, so the mismatch
+        // branch is exercised with a uid that isn't the dir's owner.)
+        let foreign_uid = std::fs::metadata(&socket_dir).unwrap().uid().wrapping_add(1);
+        let err = ensure_dir_owner(&socket_dir, foreign_uid).unwrap_err();
+        assert!(
+            format!("{:#}", err).contains("refusing to trust"),
+            "unexpected error: {:#}",
+            err
+        );
     }
 
     #[test]

@@ -156,6 +156,31 @@ pub(crate) fn monux_rule_handles(nft_list_output: &str) -> Vec<u64> {
         .collect()
 }
 
+/// The hotspot subnet from `ip -o -4 addr show scope global` output: the
+/// 10.42.* address on the AP interface ONLY — another interface (a VPN
+/// tunnel, say) can carry a 10.42.* address too, and with a lower ifindex it
+/// would otherwise win and get the VPN workaround configured for the wrong
+/// subnet.
+fn ap_subnet(ip_addr_output: &str) -> Option<String> {
+    for line in ip_addr_output.lines() {
+        // `ip -o` lines look like: "5: monux-ap    inet 10.42.0.1/24 brd ...".
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.get(1) != Some(&AP_IFACE_NAME) {
+            continue;
+        }
+        let Some(pos) = tokens.iter().position(|t| *t == "inet") else {
+            continue;
+        };
+        let Some(addr) = tokens.get(pos + 1) else {
+            continue;
+        };
+        if addr.starts_with("10.42.") {
+            return subnet_of(addr);
+        }
+    }
+    None
+}
+
 /// The hotspot's live subnet: the AP interface carries the static address
 /// 10.42.0.1/24 once the hotspot unit is up. Polled briefly — the address
 /// can lag the unit start by a moment.
@@ -164,25 +189,20 @@ fn hotspot_live_subnet() -> Option<String> {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
-        let out = run_cmd("ip", &["-o", "-4", "addr", "show", "scope", "global"]).ok()?;
-        for line in out.lines() {
-            let tokens: Vec<&str> = line.split_whitespace().collect();
-            let Some(pos) = tokens.iter().position(|t| *t == "inet") else {
-                continue;
-            };
-            let Some(addr) = tokens.get(pos + 1) else {
-                continue;
-            };
-            if addr.starts_with("10.42.") {
-                return subnet_of(addr);
-            }
+        // A failed `ip` invocation is transient: retry like a not-yet-up
+        // address instead of aborting the whole probe.
+        let Ok(out) = run_cmd("ip", &["-o", "-4", "addr", "show", "scope", "global"]) else {
+            continue;
+        };
+        if let Some(subnet) = ap_subnet(&out) {
+            return Some(subnet);
         }
     }
     None
 }
 
 /// Where per-user systemd units live, relative to the target user's home.
-const SYSTEMD_USER_UNIT_DIR: &str = ".config/systemd/user";
+pub(crate) const SYSTEMD_USER_UNIT_DIR: &str = ".config/systemd/user";
 
 /// `--autostart` for `monux setup`: manage a per-user systemd service
 /// that starts monux with the graphical session. When the flag is omitted, no
@@ -426,12 +446,55 @@ fn write_unit_file(path: &Path, role: Role, owner: Option<(u32, u32)>) -> Result
             }
         }
     }
-    std::fs::write(path, unit_content(role))
+    atomic_write_no_follow(path, &unit_content(role))
         .with_context(|| format!("could not write {}", path.display()))?;
     if let Some((uid, gid)) = owner {
         chown_best_effort(path, uid, gid);
     }
     Ok(())
+}
+
+/// Writes `content` to `path` via a same-dir temp file + rename(2): atomic,
+/// and symlink-safe in both directions. The temp is opened
+/// O_NOFOLLOW|O_CREAT|O_EXCL so it can never be pre-seeded, and the rename
+/// replaces a symlink at `path` instead of following it — this write can run
+/// as root (--autostart combined with root-requiring flags) into the invoking
+/// user's home, where a pre-placed unit-path symlink would otherwise be
+/// clobbered through.
+fn atomic_write_no_follow(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unit");
+    let tmp = path.with_file_name(format!(".{}.tmp-{}", name, std::process::id()));
+    let open_tmp = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o644)
+            .open(&tmp)
+    };
+    // A leftover temp from a killed earlier run is removed once and the
+    // exclusive create retried; O_EXCL|O_NOFOLLOW still refuse anything
+    // planted in between.
+    let mut file = match open_tmp() {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(&tmp)?;
+            open_tmp()?
+        }
+        Err(e) => return Err(e),
+    };
+    let result = file
+        .write_all(content.as_bytes())
+        .and_then(|_| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Applies the `--autostart` choice: writes/removes the unit files under the
@@ -670,6 +733,24 @@ pub fn run(autostart: Option<Autostart>, hotspot: Option<Hotspot>, hotspot_join:
     Ok(())
 }
 
+/// The argv with secrets scrubbed for error messages (which land in the
+/// system journal via the callers' warnings): the element following
+/// `wifi-sec.psk` is the cleartext hotspot password.
+fn redacted_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut redact_next = false;
+    args.iter()
+        .map(|arg| {
+            if std::mem::replace(&mut redact_next, false) {
+                return "<redacted>";
+            }
+            if *arg == "wifi-sec.psk" {
+                redact_next = true;
+            }
+            *arg
+        })
+        .collect()
+}
+
 /// Runs a command, returning its stdout on success.
 pub(crate) fn run_cmd(program: &str, args: &[&str]) -> Result<String> {
     let output = Command::new(program)
@@ -680,7 +761,7 @@ pub(crate) fn run_cmd(program: &str, args: &[&str]) -> Result<String> {
         bail!(
             "{} {} failed: {}",
             program,
-            args.join(" "),
+            redacted_args(args).join(" "),
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
@@ -1468,6 +1549,40 @@ fn handle_vpn_after_up(tunnels: &[String], failures: &mut u32) {
     }
 }
 
+/// What an existing 'monux-direct' join profile needs, given the credentials
+/// it currently carries and the ones the host now advertises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinProfileVerdict {
+    /// The profile already carries these credentials.
+    Unchanged,
+    /// The profile carries stale credentials (the host regenerated them, so
+    /// association would fail forever while setup reported success): update
+    /// the profile and reconnect.
+    Update,
+}
+
+fn join_profile_verdict(cur_ssid: &str, cur_psk: &str, ssid: &str, psk: &str) -> JoinProfileVerdict {
+    if cur_ssid == ssid && cur_psk == psk {
+        JoinProfileVerdict::Unchanged
+    } else {
+        JoinProfileVerdict::Update
+    }
+}
+
+/// The join profile's current (ssid, psk) from NetworkManager; None when the
+/// profile is missing or its credentials can't be read.
+fn nmcli_join_profile_credentials() -> Option<(String, String)> {
+    let out = run_cmd(
+        "nmcli",
+        &["-g", "wifi.ssid,wifi-sec.psk", "connection", "show", HOTSPOT_CON_NAME],
+    )
+    .ok()?;
+    let mut lines = out.lines();
+    let ssid = lines.next()?.to_string();
+    let psk = lines.next()?.to_string();
+    Some((ssid, psk))
+}
+
 /// Joins this machine to the other machine's 'monux-direct' hotspot
 /// (--hotspot-join, client side). NOTE the topology change: this machine's
 /// WiFi association moves to the hotspot (its previous profile reconnects
@@ -1479,8 +1594,47 @@ fn setup_hotspot_join(ssid: &str, psk: &str, failures: &mut u32) {
         return;
     }
     if nmcli_con_exists(HOTSPOT_CON_NAME) {
-        println!("[ok]   hotspot: profile '{}' already exists", HOTSPOT_CON_NAME);
-        return;
+        // An existing profile can carry stale credentials (the host
+        // regenerates its psk when its hotspot config is lost): accepting it
+        // as-is would report success while association fails forever.
+        let verdict = nmcli_join_profile_credentials()
+            .map(|(cur_ssid, cur_psk)| join_profile_verdict(&cur_ssid, &cur_psk, ssid, psk));
+        match verdict {
+            Some(JoinProfileVerdict::Unchanged) => {
+                println!(
+                    "[ok]   hotspot: profile '{}' already joins '{}' (credentials unchanged)",
+                    HOTSPOT_CON_NAME, ssid
+                );
+                return;
+            }
+            Some(JoinProfileVerdict::Update) => {
+                // The psk argv is redacted from any error by run_cmd.
+                let update = run_cmd(
+                    "nmcli",
+                    &[
+                        "connection", "modify", HOTSPOT_CON_NAME, "wifi.ssid", ssid,
+                        "wifi-sec.psk", psk,
+                    ],
+                )
+                .and_then(|_| run_cmd("nmcli", &["connection", "up", HOTSPOT_CON_NAME]));
+                match update {
+                    Ok(_) => println!(
+                        "[done] hotspot: updated the '{}' profile to the host's current credentials and reconnected ('{}')",
+                        HOTSPOT_CON_NAME, ssid
+                    ),
+                    Err(e) => {
+                        *failures += 1;
+                        println!("[fail] hotspot: could not update the stale '{}' profile: {}", HOTSPOT_CON_NAME, e);
+                    }
+                }
+                return;
+            }
+            // The profile's credentials can't be read: delete it and fall
+            // through to the fresh-join below.
+            None => {
+                let _ = run_cmd("nmcli", &["connection", "delete", HOTSPOT_CON_NAME]);
+            }
+        }
     }
     if let Err(e) = run_cmd(
         "nmcli",
@@ -1681,6 +1835,20 @@ mod tests {
     }
 
     #[test]
+    fn ap_subnet_picks_the_ap_interface_only() {
+        // A foreign VPN interface with a lower ifindex also carrying 10.42.*:
+        // only monux-ap's address is the hotspot subnet.
+        let out = "2: tun0    inet 10.42.7.2/24 scope global tun0\\       valid_lft forever preferred_lft forever\n5: monux-ap    inet 10.42.0.1/24 brd 10.42.0.255 scope global monux-ap\\       valid_lft forever preferred_lft forever\n";
+        assert_eq!(ap_subnet(out), Some("10.42.0.0/24".to_string()));
+        // No AP interface address at all: a foreign 10.42.* never wins.
+        assert_eq!(
+            ap_subnet("2: tun0    inet 10.42.7.2/24 scope global tun0\n"),
+            None
+        );
+        assert_eq!(ap_subnet(""), None);
+    }
+
+    #[test]
     fn tagged_rule_handles_are_found() {
         let list = "table inet mullvad {\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy drop;\n\t\tip saddr 10.42.0.0/24 accept comment \"monux-hotspot\" # handle 7\n\t\tct state established,related accept # handle 2\n\t}\n}\n";
         assert_eq!(monux_rule_handles(list), vec![7]);
@@ -1708,6 +1876,30 @@ mod tests {
         let start = std::time::Instant::now();
         assert!(run_cmd_timeout("sleep", &["10"], 1).is_err());
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn psk_is_redacted_from_error_messages() {
+        let redacted = redacted_args(&[
+            "connection", "modify", "monux-direct", "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk",
+            "s3cret-p4ss",
+        ]);
+        assert_eq!(
+            redacted.join(" "),
+            "connection modify monux-direct wifi-sec.key-mgmt wpa-psk wifi-sec.psk <redacted>"
+        );
+        // No psk flag: every argument passes through.
+        assert_eq!(
+            redacted_args(&["connection", "up", "monux-direct"]).join(" "),
+            "connection up monux-direct"
+        );
+        // The real error path: the failing command's message carries the
+        // redaction marker and never the secret.
+        let err = run_cmd("false", &["wifi-sec.psk", "s3cret-p4ss"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("<redacted>"), "{}", err);
+        assert!(!err.contains("s3cret-p4ss"), "{}", err);
     }
 
     #[test]
@@ -2033,5 +2225,44 @@ mod tests {
         assert_eq!(failures, 1);
         // The unit file was still written, so the printed manual commands work.
         assert!(tmp.path().join("monux-client.service").exists());
+    }
+
+    #[test]
+    fn unit_file_write_replaces_a_symlink_without_following_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit_path = tmp.path().join("monux-server.service");
+        // A pre-placed symlink at the unit path: the write (possibly running
+        // as root) must replace the link, never clobber its target.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::write(&elsewhere, "precious").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &unit_path).unwrap();
+        write_unit_file(&unit_path, Role::Server, None).unwrap();
+        let meta = std::fs::symlink_metadata(&unit_path).unwrap();
+        assert!(!meta.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&unit_path).unwrap(),
+            unit_content(Role::Server)
+        );
+        // The symlink's old target is untouched, and no temp file lingers.
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "precious");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn join_profile_verdict_detects_stale_credentials() {
+        // Same ssid and psk: the profile joins as-is.
+        assert_eq!(
+            join_profile_verdict("monux-direct-box", "abc123xyz4567890", "monux-direct-box", "abc123xyz4567890"),
+            JoinProfileVerdict::Unchanged
+        );
+        // A regenerated psk (or a renamed ssid): update and reconnect.
+        assert_eq!(
+            join_profile_verdict("monux-direct-box", "old-stale-psk-000", "monux-direct-box", "abc123xyz4567890"),
+            JoinProfileVerdict::Update
+        );
+        assert_eq!(
+            join_profile_verdict("monux-direct-old", "abc123xyz4567890", "monux-direct-box", "abc123xyz4567890"),
+            JoinProfileVerdict::Update
+        );
     }
 }
