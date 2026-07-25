@@ -16,6 +16,34 @@
 //! and drives `show`/`keys`/`set`/`unset`/`validate`; a test in main.rs maps
 //! every registry entry to a real clap flag so the two can't drift apart.
 //! Renamed keys are honored through ALIASES for a deprecation window.
+//!
+//! ## History
+//!
+//! Every mutation through `mx config` (set/unset/edit — and revert itself)
+//! preserves the replaced value as a comment directly above the key (or in
+//! the was-block an `unset` leaves in its place), newest first, at most
+//! HISTORY_CAP entries per key:
+//!
+//! ```toml
+//! [server]
+//! # was: "leftshift,leftalt,r" @ 2026-07-25T01:12:03Z
+//! shortcut = "leftshift,leftalt,q"
+//! ```
+//!
+//! Values are rendered as TOML so they re-validate on revert; timestamps
+//! are UTC, RFC3339 seconds. A comment is treated as history ONLY when it
+//! matches the full strict shape `# was: <valid-TOML-value> @ <timestamp>`
+//! AND sits in a managed position (directly above a managed key, or in a
+//! was-block left by `unset`): human comments — even ones starting with
+//! `# was:` — that don't fully parse are never listed, moved, or pruned.
+//! The mutation path edits through toml_edit so all of this (and any other
+//! comment or formatting) survives; the daemon LOAD path above stays on
+//! plain toml, which simply ignores comments. `mx config history` shows the
+//! stacks; `mx config revert` restores an entry and banks the current
+//! value, so a revert is itself undoable. A was-block left by `unset`
+//! carries no key name, so it is attributed to an absent key by validator
+//! fit (first match in file order) — exact for a single unset key; revert
+//! one key at a time to keep it exact.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -649,19 +677,584 @@ fn value_strings(value: &toml::Value) -> Option<Vec<String>> {
     })
 }
 
-/// Reads the file as a raw TOML document, preserving unknown keys and
-/// sections `set`/`unset` don't manage. A missing file is an empty document.
-fn read_doc(path: &Path) -> Result<toml::Table> {
+/// Reads the file as an editable TOML document, preserving comments,
+/// formatting, and the unknown keys/sections `set`/`unset` don't manage.
+/// A missing file is an empty document.
+fn read_doc(path: &Path) -> Result<toml_edit::DocumentMut> {
     match fs::read_to_string(path) {
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(toml::Table::new()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(toml_edit::DocumentMut::new()),
         Err(e) => Err(e).with_context(|| format!("Failed to read {}", path.display())),
-        Ok(text) => toml::from_str(&text).with_context(|| {
+        Ok(text) => text.parse::<toml_edit::DocumentMut>().with_context(|| {
             format!(
                 "{} is not valid TOML; fix it with 'mx config edit' or check it with 'mx config validate'",
                 path.display()
             )
         }),
     }
+}
+
+// --- History (# was: comments) ----------------------------------------------
+
+/// Maximum history entries kept per key; the oldest falls off.
+const HISTORY_CAP: usize = 5;
+
+/// Every history entry is a comment of exactly this shape, directly above
+/// the key it belongs to (or in the was-block an `unset` left behind):
+/// `# was: <TOML value> @ <RFC3339-seconds UTC timestamp>`.
+const WAS_PREFIX: &str = "# was: ";
+
+/// One parsed `# was:` history line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WasEntry {
+    /// The previous value, rendered as TOML (so it re-validates on revert).
+    value: String,
+    /// RFC3339-seconds UTC timestamp (YYYY-MM-DDTHH:MM:SSZ).
+    timestamp: String,
+}
+
+impl WasEntry {
+    fn render(&self) -> String {
+        format!("{}{} @ {}\n", WAS_PREFIX, self.value, self.timestamp)
+    }
+}
+
+/// Parses a comment line as a history entry. The shape is strict: exactly
+/// `# was: <value> @ <timestamp>` at column 0, a plausible timestamp, and a
+/// value that parses as TOML. Anything less is a human comment and is never
+/// treated as history.
+fn parse_was_line(line: &str) -> Option<WasEntry> {
+    let rest = line.strip_prefix(WAS_PREFIX)?;
+    let (value, timestamp) = rest.rsplit_once(" @ ")?;
+    if !valid_timestamp(timestamp) {
+        return None;
+    }
+    value.parse::<toml_edit::Value>().ok()?;
+    Some(WasEntry {
+        value: value.to_string(),
+        timestamp: timestamp.to_string(),
+    })
+}
+
+/// Exactly YYYY-MM-DDTHH:MM:SSZ with plausible field ranges.
+fn valid_timestamp(ts: &str) -> bool {
+    let b = ts.as_bytes();
+    if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[19] != b'Z' {
+        return false;
+    }
+    let field = |from: usize, to: usize| -> Option<u32> {
+        let s = &ts[from..to];
+        if !s.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        s.parse().ok()
+    };
+    let (Some(_year), Some(month), Some(day), Some(hour), Some(min), Some(sec)) = (
+        field(0, 4),
+        field(5, 7),
+        field(8, 10),
+        field(11, 13),
+        field(14, 16),
+        field(17, 19),
+    ) else {
+        return false;
+    };
+    (1..=12).contains(&month) && (1..=31).contains(&day) && hour <= 23 && min <= 59 && sec <= 59
+}
+
+/// The current UTC time as an RFC3339-seconds timestamp. No clock crate in
+/// the dependency tree: days→civil date via Howard Hinnant's algorithm.
+fn now_timestamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format_timestamp(secs)
+}
+
+fn format_timestamp(secs: u64) -> String {
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year,
+        month,
+        day,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// Days since the Unix epoch → (year, month, day).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// The contiguous run of strict was-lines directly at the bottom of `prefix`
+/// — i.e. directly above the key the prefix belongs to — is that key's
+/// was-stack, newest first. Returns (head, stack); the head is user content
+/// that is never touched.
+fn split_bottom_stack(prefix: &str) -> (&str, Vec<WasEntry>) {
+    let mut segs: Vec<&str> = prefix.split_inclusive('\n').collect();
+    // A trailing whitespace-only segment without a newline is the key's own
+    // indent, not a comment line — it stays part of the head.
+    while matches!(segs.last(), Some(s) if !s.contains('\n') && s.trim().is_empty()) {
+        segs.pop();
+    }
+    let mut head_end = prefix.len();
+    let mut stack = vec![];
+    while let Some(seg) = segs.last() {
+        let line = seg.strip_suffix('\n').unwrap_or(seg);
+        match parse_was_line(line) {
+            Some(entry) => {
+                stack.push(entry);
+                head_end -= seg.len();
+                segs.pop();
+            }
+            None => break,
+        }
+    }
+    stack.reverse(); // file order is newest first
+    (&prefix[..head_end], stack)
+}
+
+/// Every maximal run of strict was-lines in `text`, as (start, end, entries)
+/// byte ranges in file order.
+fn scan_runs(text: &str) -> Vec<(usize, usize, Vec<WasEntry>)> {
+    let mut runs = vec![];
+    let mut current: Option<(usize, usize, Vec<WasEntry>)> = None;
+    let mut offset = 0;
+    for seg in text.split_inclusive('\n') {
+        let line = seg.strip_suffix('\n').unwrap_or(seg);
+        match parse_was_line(line) {
+            Some(entry) => match &mut current {
+                Some((_, end, entries)) => {
+                    *end = offset + seg.len();
+                    entries.push(entry);
+                }
+                None => current = Some((offset, offset + seg.len(), vec![entry])),
+            },
+            None => {
+                if let Some(run) = current.take() {
+                    runs.push(run);
+                }
+            }
+        }
+        offset += seg.len();
+    }
+    if let Some(run) = current.take() {
+        runs.push(run);
+    }
+    runs
+}
+
+/// The strict was-runs in a key's prefix that are NOT the key's own stack
+/// (not directly above the key line): orphan blocks left by `unset`. For
+/// unmanaged keys even the bottom run counts — "directly above a managed
+/// key" is the managed position.
+fn orphan_runs_in(prefix: &str, managed: bool) -> Vec<(usize, usize, Vec<WasEntry>)> {
+    let mut runs = scan_runs(prefix);
+    if !managed {
+        return runs;
+    }
+    if let Some(last) = runs.last() {
+        // The bottom run is the key's stack only when nothing (not even a
+        // blank line) sits between it and the key line.
+        let after = &prefix[last.1..];
+        if !after.contains('\n') && after.trim().is_empty() {
+            runs.pop();
+        }
+    }
+    runs
+}
+
+/// Pushes `entry` onto the was-stack at the bottom of `prefix` (newest
+/// first, capped at HISTORY_CAP — the oldest falls off) and returns the new
+/// prefix. The user content above the stack is preserved verbatim.
+fn push_stack(prefix: &str, entry: WasEntry) -> String {
+    let (head, mut stack) = split_bottom_stack(prefix);
+    stack.insert(0, entry);
+    stack.truncate(HISTORY_CAP);
+    render_stack_block(head, &stack)
+}
+
+/// Rebuilds a prefix from user content + a was-stack.
+fn render_stack_block(head: &str, stack: &[WasEntry]) -> String {
+    let mut out = String::from(head);
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    for entry in stack {
+        out.push_str(&entry.render());
+    }
+    out
+}
+
+/// Where an orphan was-block (left by `unset`) is stored.
+#[derive(Debug)]
+enum OrphanHolder {
+    /// In the prefix of the key `flag` of the section (not directly above
+    /// it).
+    KeyPrefix(&'static str, String),
+    /// In the header decor of the following section.
+    NextHeader(String),
+    /// In the document trailing (the section is the last one).
+    DocTrailing,
+}
+
+/// An orphan was-block and where to find it.
+#[derive(Debug)]
+struct Orphan {
+    entries: Vec<WasEntry>,
+    holder: OrphanHolder,
+    /// Index among the strict runs in the holder's text.
+    run_index: usize,
+}
+
+/// The comment prefix of a table key.
+fn key_prefix<'a>(table: &'a toml_edit::Table, flag: &str) -> &'a str {
+    table
+        .get_key_value(flag)
+        .and_then(|(key, _)| key.leaf_decor().prefix())
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+}
+
+/// All orphan was-blocks of a section, in file order: strict was-runs in a
+/// managed position that don't sit directly above a managed key — above a
+/// following key's own comments/stack, in the next section's header decor,
+/// or in the document trailing for the last section.
+fn gather_orphans(doc: &toml_edit::DocumentMut, section: &'static str) -> Vec<Orphan> {
+    let mut out = vec![];
+    if let Some(table) = doc.get(section).and_then(|i| i.as_table()) {
+        for (flag, _) in table.iter() {
+            let prefix = key_prefix(table, flag);
+            let managed = find(&format!("{}.{}", section, flag)).is_some();
+            for (run_index, (_, _, entries)) in orphan_runs_in(prefix, managed).into_iter().enumerate() {
+                out.push(Orphan {
+                    entries,
+                    holder: OrphanHolder::KeyPrefix(section, flag.to_string()),
+                    run_index,
+                });
+            }
+        }
+    }
+    // The section tail: the following section's header decor, or the
+    // document trailing when this is the last section.
+    let sections: Vec<&str> = doc.iter().map(|(name, _)| name).collect();
+    match sections.iter().position(|name| *name == section) {
+        Some(i) if i + 1 < sections.len() => {
+            let next = sections[i + 1];
+            if let Some(table) = doc.get(next).and_then(|i| i.as_table()) {
+                let prefix = table
+                    .decor()
+                    .prefix()
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("");
+                for (run_index, (_, _, entries)) in scan_runs(prefix).into_iter().enumerate() {
+                    out.push(Orphan {
+                        entries,
+                        holder: OrphanHolder::NextHeader(next.to_string()),
+                        run_index,
+                    });
+                }
+            }
+        }
+        Some(_) => {
+            let trailing = doc.trailing().as_str().unwrap_or("");
+            for (run_index, (_, _, entries)) in scan_runs(trailing).into_iter().enumerate() {
+                out.push(Orphan {
+                    entries,
+                    holder: OrphanHolder::DocTrailing,
+                    run_index,
+                });
+            }
+        }
+        None => {}
+    }
+    out
+}
+
+/// Whether every entry of an orphan block passes the key's validator.
+fn orphan_fits(orphan: &Orphan, spec: &KeySpec) -> bool {
+    orphan.entries.iter().all(|e| {
+        e.value
+            .parse::<toml_edit::Value>()
+            .ok()
+            .and_then(|v| te_to_model(&v))
+            .and_then(|m| check_value(spec, &m).ok())
+            .is_some()
+    })
+}
+
+/// The orphan block attributed to an absent managed key: orphan blocks
+/// whose entries all pass the key's validator, the first in file order —
+/// exact for a single unset key. With several unset keys of compatible
+/// value shapes the match is best-effort (the file order usually keeps the
+/// original key order); unset/revert one key at a time to keep it exact.
+fn find_orphan(doc: &toml_edit::DocumentMut, spec: &KeySpec) -> Option<Orphan> {
+    gather_orphans(doc, spec.section.as_str())
+        .into_iter()
+        .find(|o| orphan_fits(o, spec))
+}
+
+/// The byte range of the run `run_index` together with the comment lines
+/// directly above it (the block an `unset` left) and one blank separator
+/// line after it.
+fn run_block_range(text: &str, run_index: usize) -> Option<(usize, usize)> {
+    let (mut start, mut end, _) = *scan_runs(text).get(run_index)?;
+    while start > 0 {
+        let prev_end = start - 1; // the '\n' ending the previous line
+        let prev_start = text[..prev_end].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let prev = &text[prev_start..prev_end];
+        // The unset key's own comments travel with the block; another
+        // was-run's line or a non-comment does not.
+        if prev.starts_with('#') && parse_was_line(prev).is_none() {
+            start = prev_start;
+        } else {
+            break;
+        }
+    }
+    if text[end..].starts_with('\n') {
+        end += 1;
+    }
+    Some((start, end))
+}
+
+/// Removes the block `run_index` from `text`, returning (text-without,
+/// block). The block is normalized to end with a single newline.
+fn excise_run(text: &str, run_index: usize) -> (String, String) {
+    let Some((start, end)) = run_block_range(text, run_index) else {
+        return (text.to_string(), String::new());
+    };
+    let mut block = text[start..end].trim_end_matches('\n').to_string();
+    block.push('\n');
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..start]);
+    out.push_str(&text[end..]);
+    // Tidy any blank-line buildup the removal left behind.
+    while out.contains("\n\n\n") {
+        out = out.replace("\n\n\n", "\n\n");
+    }
+    (out, block)
+}
+
+/// Rewrites the text an orphan holder holds. `f` maps the old text to the
+/// new one.
+fn rewrite_holder(doc: &mut toml_edit::DocumentMut, holder: &OrphanHolder, f: impl FnOnce(&str) -> String) {
+    match holder {
+        OrphanHolder::KeyPrefix(section, flag) => {
+            if let Some(table) = doc.get_mut(section).and_then(|i| i.as_table_mut()) {
+                if let Some((mut key, _)) = table.get_key_value_mut(flag) {
+                    let old = key
+                        .leaf_decor_mut()
+                        .prefix()
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    key.leaf_decor_mut().set_prefix(f(&old));
+                }
+            }
+        }
+        OrphanHolder::NextHeader(name) => {
+            if let Some(table) = doc.get_mut(name).and_then(|i| i.as_table_mut()) {
+                let old = table
+                    .decor()
+                    .prefix()
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                table.decor_mut().set_prefix(f(&old));
+            }
+        }
+        OrphanHolder::DocTrailing => {
+            let old = doc.trailing().as_str().unwrap_or("").to_string();
+            doc.set_trailing(f(&old));
+        }
+    }
+}
+
+/// Removes an absent key's orphan block from wherever it lives and returns
+/// its text (comments + was-lines), for re-attaching above a recreated key.
+fn adopt_orphan(doc: &mut toml_edit::DocumentMut, spec: &KeySpec) -> Option<String> {
+    let orphan = find_orphan(doc, spec)?;
+    let mut block = String::new();
+    rewrite_holder(doc, &orphan.holder, |old| {
+        let (without, taken) = excise_run(old, orphan.run_index);
+        block = taken;
+        without
+    });
+    if block.is_empty() { None } else { Some(block) }
+}
+
+/// Converts an editable TOML value into the plain `toml` model the load
+/// path and the validators use. Only the scalar/array shapes config keys
+/// take; datetimes and tables are out of scope (None).
+fn te_to_model(value: &toml_edit::Value) -> Option<toml::Value> {
+    Some(match value {
+        toml_edit::Value::Boolean(b) => toml::Value::from(*b.value()),
+        toml_edit::Value::Integer(i) => toml::Value::from(*i.value()),
+        toml_edit::Value::Float(f) => toml::Value::from(*f.value()),
+        toml_edit::Value::String(s) => toml::Value::from(s.value().clone()),
+        toml_edit::Value::Array(items) => toml::Value::Array(
+            items
+                .iter()
+                .map(te_to_model)
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        _ => return None,
+    })
+}
+
+/// A stored value rendered as canonical single-line TOML (decor and
+/// comments stripped) for display and history entries.
+fn render_value(value: &toml_edit::Value) -> String {
+    match te_to_model(value) {
+        Some(model) => model.to_string(),
+        None => value.to_string().trim().to_string(),
+    }
+}
+
+fn render_item(item: &toml_edit::Item) -> String {
+    match item.as_value() {
+        Some(value) => render_value(value),
+        None => item.to_string().trim().to_string(),
+    }
+}
+
+/// The value as it will appear in a `# was:` entry: single-line TOML, or
+/// None when it can't be represented on one line (then no entry is banked).
+fn render_entry_value(value: &toml_edit::Value) -> Option<String> {
+    let rendered = render_value(value);
+    if rendered.contains('\n') {
+        None
+    } else {
+        Some(rendered)
+    }
+}
+
+/// Semantic equality of two stored values, normalized via the key's kind
+/// (float keys match `40` with `40.0`); invalid stored values fall back to
+/// comparing their literal rendering.
+fn values_equal(spec: &KeySpec, a: &toml_edit::Value, b: &toml_edit::Value) -> bool {
+    let normalized = |v: &toml_edit::Value| te_to_model(v).and_then(|m| check_value(spec, &m).ok());
+    match (normalized(a), normalized(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => a.to_string().trim() == b.to_string().trim(),
+    }
+}
+
+/// The section's table, creating an explicit empty one at the end of the
+/// document when missing. Bails when the name is taken by a non-table.
+fn section_table<'a>(
+    doc: &'a mut toml_edit::DocumentMut,
+    section: &str,
+    path: &Path,
+) -> Result<&'a mut toml_edit::Table> {
+    match doc.get(section) {
+        None => {
+            doc.as_table_mut()
+                .insert(section, toml_edit::Item::Table(toml_edit::Table::new()));
+        }
+        Some(item) if item.is_table() => {}
+        Some(_) => bail!(
+            "'{}' in {} is a value, not a [section] table",
+            section,
+            path.display()
+        ),
+    }
+    Ok(doc
+        .get_mut(section)
+        .and_then(|i| i.as_table_mut())
+        .expect("section table just ensured"))
+}
+
+/// Appends a comment block at the end of a section: into the following
+/// section's header decor, or the document trailing for the last section.
+fn attach_tail(doc: &mut toml_edit::DocumentMut, section: &str, block: &str) {
+    let sections: Vec<String> = doc.iter().map(|(name, _)| name.to_string()).collect();
+    let next = sections
+        .iter()
+        .position(|name| name == section)
+        .and_then(|i| sections.get(i + 1));
+    match next {
+        Some(name) if doc.get(name).map_or(false, |i| i.is_table()) => {
+            let table = doc
+                .get_mut(name)
+                .and_then(|i| i.as_table_mut())
+                .expect("checked above");
+            let mut prefix = table
+                .decor()
+                .prefix()
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string();
+            append_block(&mut prefix, block);
+            if !prefix.ends_with("\n\n") {
+                prefix.push('\n');
+            }
+            table.decor_mut().set_prefix(prefix);
+        }
+        _ => {
+            let mut trailing = doc.trailing().as_str().unwrap_or("").to_string();
+            append_block(&mut trailing, block);
+            doc.set_trailing(trailing);
+        }
+    }
+}
+
+/// Attaches a comment block where a removed key was: above the next key of
+/// the section, or at the section's end when the key was the last one.
+fn attach_block(
+    doc: &mut toml_edit::DocumentMut,
+    section: &str,
+    next_flag: Option<&str>,
+    block: &str,
+) {
+    if block.is_empty() {
+        return;
+    }
+    if let Some(flag) = next_flag {
+        if let Some(table) = doc.get_mut(section).and_then(|i| i.as_table_mut()) {
+            if let Some((mut key, _)) = table.get_key_value_mut(flag) {
+                let old = key
+                    .leaf_decor_mut()
+                    .prefix()
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                key.leaf_decor_mut().set_prefix(format!(
+                    "{}\n\n{}",
+                    block.trim_end_matches('\n'),
+                    old.trim_start_matches('\n')
+                ));
+                return;
+            }
+        }
+    }
+    attach_tail(doc, section, block);
+}
+
+/// Appends a block to comment text, separated from previous content by a
+/// blank line; the result ends with a single newline.
+fn append_block(text: &mut String, block: &str) {
+    let trimmed = text.trim_end_matches('\n');
+    if !trimmed.is_empty() {
+        text.truncate(trimmed.len());
+        text.push_str("\n\n");
+    }
+    text.push_str(block.trim_end_matches('\n'));
+    text.push('\n');
 }
 
 /// Writes a file atomically (same-dir tmp + rename) with owner-only
@@ -695,10 +1288,15 @@ pub struct SetOutcome {
     /// The previous override, rendered as TOML; None when the key was at
     /// its default.
     pub old_value: Option<String>,
+    /// True when the stored value already was the current one: a complete
+    /// no-op — no was-entry, no file write.
+    pub unchanged: bool,
 }
 
-/// Validates and stores a config value. Scalars take exactly one value,
-/// repeatable (array) keys one or more.
+/// Validates and stores a config value, banking the replaced one as a
+/// `# was:` history entry. Scalars take exactly one value, repeatable
+/// (array) keys one or more. Setting the value the key already has is a
+/// complete no-op.
 pub fn set_value(path: &Path, key: &str, values: &[String]) -> Result<SetOutcome> {
     let spec = find(key).ok_or_else(|| unknown_key_error(key))?;
     if spec.kind == Kind::StrArray {
@@ -711,39 +1309,85 @@ pub fn set_value(path: &Path, key: &str, values: &[String]) -> Result<SetOutcome
     let refs: Vec<&str> = values.iter().map(String::as_str).collect();
     (spec.validate)(&refs).map_err(|e| anyhow!("invalid value for '{}': {}", key, e))?;
     let stored = match spec.kind {
-        Kind::Bool => toml::Value::from(refs[0].parse::<bool>().expect("validated above")),
-        Kind::Int => toml::Value::from(refs[0].parse::<i64>().expect("validated above")),
-        Kind::Float => toml::Value::from(refs[0].parse::<f64>().expect("validated above")),
-        Kind::Str => toml::Value::from(refs[0]),
+        Kind::Bool => toml_edit::Value::from(refs[0].parse::<bool>().expect("validated above")),
+        Kind::Int => toml_edit::Value::from(refs[0].parse::<i64>().expect("validated above")),
+        Kind::Float => toml_edit::Value::from(refs[0].parse::<f64>().expect("validated above")),
+        Kind::Str => toml_edit::Value::from(refs[0]),
         Kind::StrArray => {
-            toml::Value::Array(refs.iter().map(|s| toml::Value::from(*s)).collect())
+            let mut array = toml_edit::Array::new();
+            for s in &refs {
+                array.push(*s);
+            }
+            toml_edit::Value::Array(array)
         }
     };
+    let new_render = render_value(&stored);
     let mut doc = read_doc(path)?;
-    match doc.get(spec.section.as_str()) {
-        None => {
-            doc.insert(
-                spec.section.as_str().to_string(),
-                toml::Value::Table(toml::Table::new()),
-            );
+    let section = spec.section.as_str();
+    let table = section_table(&mut doc, section, path)?;
+    if let Some(old_item) = table.get(spec.flag) {
+        let old_render = render_item(old_item);
+        let old_value = old_item.as_value();
+        if let Some(old_value) = old_value {
+            if values_equal(spec, old_value, &stored) {
+                return Ok(SetOutcome {
+                    key: spec.key,
+                    new_value: new_render,
+                    old_value: Some(old_render),
+                    unchanged: true,
+                });
+            }
         }
-        Some(toml::Value::Table(_)) => {}
-        Some(_) => bail!(
-            "'{}' in {} is a value, not a [section] table",
-            spec.section.as_str(),
-            path.display()
-        ),
+        let entry_value = old_value.and_then(render_entry_value);
+        let decor = old_value.map(|v| v.decor().clone());
+        // A real transition: bank the current value on the key's was-stack
+        // (even when the new value equals an entry already in the stack),
+        // then replace the value, keeping its decor (spacing, trailing
+        // comment).
+        if let Some(entry_value) = entry_value {
+            let (mut key_mut, _) = table.get_key_value_mut(spec.flag).expect("present");
+            let prefix = key_mut
+                .leaf_decor_mut()
+                .prefix()
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string();
+            key_mut.leaf_decor_mut().set_prefix(push_stack(
+                &prefix,
+                WasEntry {
+                    value: entry_value,
+                    timestamp: now_timestamp(),
+                },
+            ));
+        }
+        let mut new_value = stored;
+        if let Some(decor) = decor {
+            *new_value.decor_mut() = decor;
+        }
+        *table.get_mut(spec.flag).expect("present") = toml_edit::Item::Value(new_value);
+        atomic_write(path, &doc.to_string())?;
+        return Ok(SetOutcome {
+            key: spec.key,
+            new_value: new_render,
+            old_value: Some(old_render),
+            unchanged: false,
+        });
     }
-    let table = doc
-        .get_mut(spec.section.as_str())
-        .and_then(|v| v.as_table_mut())
-        .expect("section table just ensured");
-    let old = table.insert(spec.flag.to_string(), stored.clone());
-    atomic_write(path, &toml::to_string(&doc).context("Failed to serialize config")?)?;
+    // A new key: nothing to bank, but adopt the was-block an earlier unset
+    // left behind so the key keeps its history.
+    let adopted = adopt_orphan(&mut doc, spec);
+    let table = section_table(&mut doc, section, path)?;
+    table.insert(spec.flag, toml_edit::Item::Value(stored));
+    if let Some(block) = adopted {
+        let (mut key_mut, _) = table.get_key_value_mut(spec.flag).expect("just inserted");
+        key_mut.leaf_decor_mut().set_prefix(block);
+    }
+    atomic_write(path, &doc.to_string())?;
     Ok(SetOutcome {
         key: spec.key,
-        new_value: stored.to_string(),
-        old_value: old.map(|v| v.to_string()),
+        new_value: new_render,
+        old_value: None,
+        unchanged: false,
     })
 }
 
@@ -759,30 +1403,283 @@ pub enum UnsetOutcome {
     RemovedUnknown(String, String),
 }
 
-/// Removes a config value. Unknown keys error out — unless they are actually
-/// present in the file, which is exactly the stale-key cleanup case.
+/// Removes a config value, banking it as a `# was:` history entry: the
+/// was-block stays where the key was. Unknown keys error out — unless they
+/// are actually present in the file, which is exactly the stale-key cleanup
+/// case (no history: unknown keys are not managed).
 pub fn unset_value(path: &Path, key: &str) -> Result<UnsetOutcome> {
     let mut doc = read_doc(path)?;
     let spec = find(key);
+    // Capture the key's prefix (comments + was-stack) and the following
+    // key before removing it.
     let removed = match key.split_once('.') {
         Some((section, flag)) => doc
             .get_mut(section)
-            .and_then(|v| v.as_table_mut())
-            .and_then(|table| table.remove(flag)),
+            .and_then(|i| i.as_table_mut())
+            .map(|table| {
+                let prefix = key_prefix(table, flag).to_string();
+                let next_flag = table
+                    .iter()
+                    .skip_while(|(name, _)| *name != flag)
+                    .nth(1)
+                    .map(|(name, _)| name.to_string());
+                (section.to_string(), table.remove(flag), prefix, next_flag)
+            }),
         None => None,
+    };
+    let Some((section, removed, prefix, next_flag)) = removed else {
+        return match spec {
+            Some(spec) => Ok(UnsetOutcome::AlreadyDefault(spec)),
+            None => Err(unknown_key_error(key)),
+        };
     };
     match (spec, removed) {
         (Some(spec), Some(old)) => {
-            atomic_write(path, &toml::to_string(&doc).context("Failed to serialize config")?)?;
-            Ok(UnsetOutcome::Removed(spec, old.to_string()))
+            // Bank the removed value at the bottom of the key's own
+            // was-stack; the block stays in place in the section.
+            let block = match old.as_value().and_then(render_entry_value) {
+                Some(value) => push_stack(
+                    &prefix,
+                    WasEntry {
+                        value,
+                        timestamp: now_timestamp(),
+                    },
+                ),
+                None => prefix,
+            };
+            attach_block(&mut doc, &section, next_flag.as_deref(), &block);
+            atomic_write(path, &doc.to_string())?;
+            Ok(UnsetOutcome::Removed(spec, render_item(&old)))
         }
         (Some(spec), None) => Ok(UnsetOutcome::AlreadyDefault(spec)),
         (None, Some(old)) => {
-            atomic_write(path, &toml::to_string(&doc).context("Failed to serialize config")?)?;
-            Ok(UnsetOutcome::RemovedUnknown(key.to_string(), old.to_string()))
+            // Unknown (stale) key: no history, but its comments survive.
+            attach_block(&mut doc, &section, next_flag.as_deref(), &prefix);
+            atomic_write(path, &doc.to_string())?;
+            Ok(UnsetOutcome::RemovedUnknown(
+                key.to_string(),
+                render_item(&old),
+            ))
         }
         (None, None) => Err(unknown_key_error(key)),
     }
+}
+
+/// Outcome of a `revert`.
+#[derive(Debug)]
+pub struct RevertOutcome {
+    pub key: &'static str,
+    /// The restored value, rendered as TOML.
+    pub restored: String,
+    /// The value it replaced (banked onto the stack, so the revert is
+    /// itself undoable); None when the key was unset.
+    pub replaced: Option<String>,
+}
+
+/// Restores a previous value from a key's was-stack: the newest entry, or
+/// the one matching `to` exactly. The entry is re-validated with the key's
+/// registry validator, the current value (if any) is banked as usual, and
+/// the key line is recreated when it was unset.
+pub fn revert_value(path: &Path, key: &str, to: Option<&str>) -> Result<RevertOutcome> {
+    let spec = find(key).ok_or_else(|| unknown_key_error(key))?;
+    let mut doc = read_doc(path)?;
+    let section = spec.section.as_str();
+    let present = doc
+        .get(section)
+        .and_then(|i| i.as_table())
+        .map_or(false, |t| t.contains_value(spec.flag));
+    let stack = key_stack(&doc, spec);
+    if stack.is_empty() {
+        bail!("no history for '{}' — nothing to revert to", key);
+    }
+    let idx = match to {
+        None => 0,
+        Some(timestamp) => match stack.iter().position(|e| e.timestamp == timestamp) {
+            Some(i) => i,
+            None => bail!(
+                "no history entry for '{}' at {}\navailable:\n{}",
+                key,
+                timestamp,
+                stack
+                    .iter()
+                    .map(|e| format!("  {} @ {}", e.value, e.timestamp))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        },
+    };
+    let entry = stack[idx].clone();
+    // The recorded value must still pass the key's validator.
+    let parsed: toml_edit::Value = entry
+        .value
+        .parse()
+        .map_err(|_| anyhow!("history entry for '{}' is not a TOML value: {}", key, entry.value))?;
+    let model = te_to_model(&parsed)
+        .with_context(|| format!("history entry for '{}' is not a config value: {}", key, entry.value))?;
+    check_value(spec, &model).map_err(|e| {
+        anyhow!(
+            "the recorded value {} for '{}' no longer validates: {} — fix or remove the entry by hand",
+            entry.value,
+            key,
+            e
+        )
+    })?;
+    let restored = render_value(&parsed);
+    // Pop the entry; bank the current value on top as usual.
+    let mut remaining = stack.clone();
+    remaining.remove(idx);
+    let mut replaced = None;
+    if present {
+        let table = doc
+            .get(section)
+            .and_then(|i| i.as_table())
+            .expect("checked present");
+        let old_item = table.get(spec.flag).expect("checked present");
+        replaced = Some(render_item(old_item));
+        if let Some(value) = old_item.as_value().and_then(render_entry_value) {
+            remaining.insert(
+                0,
+                WasEntry {
+                    value,
+                    timestamp: now_timestamp(),
+                },
+            );
+            remaining.truncate(HISTORY_CAP);
+        }
+    }
+    if present {
+        let table = doc
+            .get_mut(section)
+            .and_then(|i| i.as_table_mut())
+            .expect("checked present");
+        let (mut key_mut, _) = table.get_key_value_mut(spec.flag).expect("checked present");
+        let prefix = key_mut
+            .leaf_decor_mut()
+            .prefix()
+            .and_then(|p| p.as_str())
+            .unwrap_or("")
+            .to_string();
+        let (head, _) = split_bottom_stack(&prefix);
+        key_mut
+            .leaf_decor_mut()
+            .set_prefix(render_stack_block(head, &remaining));
+        let decor = table
+            .get(spec.flag)
+            .and_then(|i| i.as_value())
+            .map(|v| v.decor().clone());
+        let mut new_value = parsed;
+        if let Some(decor) = decor {
+            *new_value.decor_mut() = decor;
+        }
+        *table.get_mut(spec.flag).expect("checked present") = toml_edit::Item::Value(new_value);
+    } else {
+        // Recreate the key line below its (remaining) was-block.
+        let adopted = adopt_orphan(&mut doc, spec).unwrap_or_default();
+        let (head, _) = split_bottom_stack(&adopted);
+        let head = head.to_string();
+        let table = section_table(&mut doc, section, path)?;
+        table.insert(spec.flag, toml_edit::Item::Value(parsed));
+        let (mut key_mut, _) = table.get_key_value_mut(spec.flag).expect("just inserted");
+        key_mut
+            .leaf_decor_mut()
+            .set_prefix(render_stack_block(&head, &remaining));
+    }
+    atomic_write(path, &doc.to_string())?;
+    Ok(RevertOutcome {
+        key: spec.key,
+        restored,
+        replaced,
+    })
+}
+
+/// The was-stack of a managed key: the run directly above its line, or the
+/// orphan block it left behind when unset.
+fn key_stack(doc: &toml_edit::DocumentMut, spec: &KeySpec) -> Vec<WasEntry> {
+    let section = spec.section.as_str();
+    if let Some(table) = doc.get(section).and_then(|i| i.as_table()) {
+        if table.contains_value(spec.flag) {
+            return split_bottom_stack(key_prefix(table, spec.flag)).1;
+        }
+    }
+    match find_orphan(doc, spec) {
+        Some(orphan) => orphan.entries,
+        None => vec![],
+    }
+}
+
+/// One key's history, for `config history`.
+#[derive(Debug)]
+struct KeyHistory {
+    spec: &'static KeySpec,
+    /// The current value rendered as TOML; None when unset.
+    current: Option<String>,
+    /// The was-stack, newest first.
+    entries: Vec<WasEntry>,
+}
+
+/// Every registry key's current value and was-stack. Orphan blocks are
+/// attributed greedily in registry order — each block is listed under at
+/// most one absent key.
+fn read_history(path: &Path) -> Result<Vec<KeyHistory>> {
+    let text = match fs::read_to_string(path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Ok(REGISTRY
+                .iter()
+                .map(|spec| KeyHistory {
+                    spec,
+                    current: None,
+                    entries: vec![],
+                })
+                .collect())
+        }
+        Err(e) => return Err(e).with_context(|| format!("Failed to read {}", path.display())),
+        Ok(text) => text,
+    };
+    let doc = text.parse::<toml_edit::DocumentMut>().with_context(|| {
+        format!(
+            "{} is not valid TOML; fix it with 'mx config edit' or check it with 'mx config validate'",
+            path.display()
+        )
+    })?;
+    let mut orphan_pools: std::collections::HashMap<&'static str, Vec<Orphan>> = [
+        (
+            Section::Server.as_str(),
+            gather_orphans(&doc, Section::Server.as_str()),
+        ),
+        (
+            Section::Client.as_str(),
+            gather_orphans(&doc, Section::Client.as_str()),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    Ok(REGISTRY
+        .iter()
+        .map(|spec| {
+            let current = doc
+                .get(spec.section.as_str())
+                .and_then(|i| i.as_table())
+                .and_then(|t| t.get(spec.flag))
+                .filter(|i| i.is_value())
+                .map(render_item);
+            let entries = if current.is_some() {
+                key_stack(&doc, spec)
+            } else {
+                let pool = orphan_pools
+                    .get_mut(spec.section.as_str())
+                    .expect("both sections pooled");
+                pool.iter()
+                    .position(|o| orphan_fits(o, spec))
+                    .map(|i| pool.remove(i).entries)
+                    .unwrap_or_default()
+            };
+            KeyHistory {
+                spec,
+                current,
+                entries,
+            }
+        })
+        .collect())
 }
 
 /// The error for a `set`/`unset` on a key that is neither in the registry
@@ -1182,6 +2079,8 @@ pub enum Action {
     Unset { key: String },
     Edit,
     Validate,
+    History { key: Option<String> },
+    Revert { key: String, to: Option<String> },
 }
 
 /// Runs a `config` subcommand action. The bool is the "clean" verdict used
@@ -1208,6 +2107,14 @@ pub fn cli(config_dir: &Path, action: &Action) -> Result<bool> {
         }
         Action::Edit => cli_edit(&path),
         Action::Validate => cli_validate(&path),
+        Action::History { key } => {
+            cli_history(&path, key.as_deref())?;
+            Ok(true)
+        }
+        Action::Revert { key, to } => {
+            cli_revert(&path, key, to.as_deref())?;
+            Ok(true)
+        }
     }
 }
 
@@ -1261,6 +2168,10 @@ fn cli_set(path: &Path, key: &str, values: &[String]) -> Result<()> {
         return print_key_card(path, spec);
     }
     let outcome = set_value(path, key, values)?;
+    if outcome.unchanged {
+        println!("{} = {} (unchanged)", outcome.key, outcome.new_value);
+        return Ok(());
+    }
     let was = outcome
         .old_value
         .unwrap_or_else(|| format!("{} (default)", spec.default_display));
@@ -1308,6 +2219,73 @@ fn cli_unset(path: &Path, key: &str) -> Result<()> {
         UnsetOutcome::RemovedUnknown(key, old) => {
             println!("removed unknown key {} = {}", key, old)
         }
+    }
+    Ok(())
+}
+
+/// `config history [key]`: the current value plus the was-stack, numbered
+/// newest-first — the revert preview.
+fn cli_history(path: &Path, key: Option<&str>) -> Result<()> {
+    let all = read_history(path)?;
+    match key {
+        Some(key) => {
+            let spec = find(key).ok_or_else(|| unknown_key_error(key))?;
+            let h = all
+                .iter()
+                .find(|h| h.spec.key == spec.key)
+                .expect("every registry key is listed");
+            print_history(h);
+        }
+        None => {
+            if all.iter().all(|h| h.entries.is_empty()) {
+                println!("no history");
+                return Ok(());
+            }
+            for section in [Section::Server, Section::Client] {
+                let in_section: Vec<&KeyHistory> = all
+                    .iter()
+                    .filter(|h| h.spec.section == section && !h.entries.is_empty())
+                    .collect();
+                if in_section.is_empty() {
+                    continue;
+                }
+                println!("[{}]", section.as_str());
+                for h in in_section {
+                    print_history(h);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One key's history block: the current value, then the stack.
+fn print_history(h: &KeyHistory) {
+    match &h.current {
+        Some(v) => println!("{} = {} (current)", h.spec.key, v),
+        None => println!("{} (unset)", h.spec.key),
+    }
+    if h.entries.is_empty() {
+        println!("  no history");
+        return;
+    }
+    for (i, e) in h.entries.iter().enumerate() {
+        let note = if i == 0 { " (restored by plain revert)" } else { "" };
+        println!(" {}. {} @ {}{}", i + 1, e.value, e.timestamp, note);
+    }
+}
+
+fn cli_revert(path: &Path, key: &str, to: Option<&str>) -> Result<()> {
+    let outcome = revert_value(path, key, to)?;
+    let was = outcome.replaced.unwrap_or_else(|| "unset".to_string());
+    println!("{} = {} (was: {})", outcome.key, outcome.restored, was);
+    // Daemons read the file once at startup; a live one needs a restart.
+    let spec = find(key).expect("revert_value validated the key");
+    if single_instance::live_holder(spec.section.as_str()).is_some() {
+        println!(
+            "note: a {} daemon is running — restart to apply: mx daemon restart",
+            spec.section.as_str()
+        );
     }
     Ok(())
 }
@@ -1384,7 +2362,7 @@ fn edit_loop(path: &Path, scratch: &Path) -> Result<bool> {
             .filter(|i| matches!(i.severity, Severity::Error))
             .collect();
         if blocking.is_empty() {
-            atomic_write(path, &fs::read_to_string(scratch)?)?;
+            atomic_write(path, &inject_edit_history(path, scratch)?)?;
             println!("installed {}", path.display());
             return Ok(true);
         }
@@ -1400,6 +2378,82 @@ fn edit_loop(path: &Path, scratch: &Path) -> Result<bool> {
             return Ok(false);
         }
     }
+}
+
+/// `config edit` installs a hand-edited file: diff it against the current
+/// one per managed key and bank a was-entry for every changed or removed
+/// key (added keys get none), so hand edits are revertable like `set`s.
+/// Returns the text to install.
+fn inject_edit_history(path: &Path, scratch: &Path) -> Result<String> {
+    let new_text = fs::read_to_string(scratch)?;
+    // The scratch validated already; an unparseable old file means no diff
+    // is possible and the new text installs as-is.
+    let (Ok(mut new_doc), Ok(old_doc)) = (
+        new_text.parse::<toml_edit::DocumentMut>(),
+        fs::read_to_string(path)
+            .unwrap_or_default()
+            .parse::<toml_edit::DocumentMut>(),
+    ) else {
+        return Ok(new_text);
+    };
+    let timestamp = now_timestamp();
+    for spec in REGISTRY {
+        let section = spec.section.as_str();
+        let old_value = old_doc
+            .get(section)
+            .and_then(|i| i.as_table())
+            .and_then(|t| t.get(spec.flag))
+            .and_then(|i| i.as_value());
+        let Some(old_value) = old_value else {
+            continue; // added keys get no history
+        };
+        let Some(entry_value) = render_entry_value(old_value) else {
+            continue;
+        };
+        let new_item = new_doc
+            .get(section)
+            .and_then(|i| i.as_table())
+            .and_then(|t| t.get(spec.flag));
+        match new_item.and_then(|i| i.as_value()) {
+            Some(new_value) => {
+                if values_equal(spec, old_value, new_value) {
+                    continue;
+                }
+                let table = new_doc
+                    .get_mut(section)
+                    .and_then(|i| i.as_table_mut())
+                    .expect("the key exists in a section table");
+                let (mut key_mut, _) = table.get_key_value_mut(spec.flag).expect("the key exists");
+                let prefix = key_mut
+                    .leaf_decor_mut()
+                    .prefix()
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                key_mut.leaf_decor_mut().set_prefix(push_stack(
+                    &prefix,
+                    WasEntry {
+                        value: entry_value,
+                        timestamp: timestamp.clone(),
+                    },
+                ));
+            }
+            None => {
+                // Removed key: leave the was-block at the end of the section.
+                section_table(&mut new_doc, section, scratch)?;
+                attach_tail(
+                    &mut new_doc,
+                    section,
+                    &WasEntry {
+                        value: entry_value,
+                        timestamp: timestamp.clone(),
+                    }
+                    .render(),
+                );
+            }
+        }
+    }
+    Ok(new_doc.to_string())
 }
 
 /// Asks "re-edit?" on /dev/tty (never stdin, which scripts may redirect).
@@ -1681,5 +2735,319 @@ mod tests {
                 .trim(),
             "99.0.0"
         );
+    }
+
+    // --- History (# was: comments) ----------------------------------------
+
+    fn read_text(path: &Path) -> String {
+        fs::read_to_string(path).unwrap()
+    }
+
+    /// The was-stack of one key as (value, timestamp) pairs, newest first.
+    fn stack_of(path: &Path, key: &str) -> Vec<(String, String)> {
+        read_history(path)
+            .unwrap()
+            .into_iter()
+            .find(|h| h.spec.key == key)
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|e| (e.value, e.timestamp))
+            .collect()
+    }
+
+    #[test]
+    fn comments_and_formatting_survive_set_and_unset() {
+        let (_dir, path) = tmp_config();
+        fs::write(
+            &path,
+            "# monux config — hand-maintained\n\n[server] # server side\n# keep this note\nport = 4321 # inline note\n\n[client]\nwww = true\n",
+        )
+        .unwrap();
+        set_value(&path, "server.port", &["5555".to_string()]).unwrap();
+        let text = read_text(&path);
+        assert!(text.contains("# monux config — hand-maintained"));
+        assert!(text.contains("[server] # server side"));
+        assert!(text.contains("# keep this note"));
+        assert!(text.contains("port = 5555 # inline note"));
+        assert!(text.contains("[client]\nwww = true\n"));
+        unset_value(&path, "server.port").unwrap();
+        let text = read_text(&path);
+        assert!(text.contains("# keep this note"));
+        assert!(text.contains("[client]\nwww = true\n"));
+        assert!(!text.contains("port = "));
+        // The daemon load path is unaffected by any of this.
+        assert_eq!(load(&path).unwrap().get_bool("client.www"), Some(true));
+    }
+
+    #[test]
+    fn set_banks_was_entries_newest_first() {
+        let (_dir, path) = tmp_config();
+        set_value(&path, "server.shortcut", &["leftshift,leftalt,r".to_string()]).unwrap();
+        set_value(&path, "server.shortcut", &["leftshift,leftalt,q".to_string()]).unwrap();
+        let text = read_text(&path);
+        assert!(
+            text.contains("# was: \"leftshift,leftalt,r\" @ "),
+            "was-entry in:\n{}",
+            text
+        );
+        // The comment sits directly above the key.
+        let pos_was = text.find("# was: ").unwrap();
+        let pos_key = text.find("shortcut = ").unwrap();
+        assert!(pos_was < pos_key);
+        assert_eq!(stack_of(&path, "server.shortcut").len(), 1);
+        // Arrays render inline.
+        set_value(&path, "server.edge-map", &["right=auto".to_string()]).unwrap();
+        set_value(
+            &path,
+            "server.edge-map",
+            &["right=auto".to_string(), "left=aa11bb".to_string()],
+        )
+        .unwrap();
+        let stack = stack_of(&path, "server.edge-map");
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack[0].0, "[\"right=auto\"]");
+    }
+
+    #[test]
+    fn same_value_set_is_a_complete_noop() {
+        let (_dir, path) = tmp_config();
+        set_value(&path, "server.port", &["4321".to_string()]).unwrap();
+        let before = read_text(&path);
+        let outcome = set_value(&path, "server.port", &["4321".to_string()]).unwrap();
+        assert!(outcome.unchanged);
+        assert_eq!(read_text(&path), before, "no file write on a no-op set");
+        assert!(stack_of(&path, "server.port").is_empty());
+        // Float keys normalize: 40 stored, set "40" again — still a no-op.
+        set_value(&path, "client.bulk-throttle-mbps", &["40".to_string()]).unwrap();
+        let before = read_text(&path);
+        assert!(set_value(&path, "client.bulk-throttle-mbps", &["40".to_string()])
+            .unwrap()
+            .unchanged);
+        assert_eq!(read_text(&path), before);
+    }
+
+    #[test]
+    fn sixth_set_drops_the_oldest_entry() {
+        let (_dir, path) = tmp_config();
+        for port in [1000, 1001, 1002, 1003, 1004, 1005, 1006] {
+            set_value(&path, "server.port", &[port.to_string()]).unwrap();
+        }
+        let stack = stack_of(&path, "server.port");
+        assert_eq!(stack.len(), HISTORY_CAP);
+        let values: Vec<&str> = stack.iter().map(|(v, _)| v.as_str()).collect();
+        assert_eq!(values, vec!["1005", "1004", "1003", "1002", "1001"]);
+    }
+
+    #[test]
+    fn setting_a_value_equal_to_a_stack_entry_still_pushes() {
+        let (_dir, path) = tmp_config();
+        set_value(&path, "server.port", &["1000".to_string()]).unwrap();
+        set_value(&path, "server.port", &["2000".to_string()]).unwrap();
+        set_value(&path, "server.port", &["1000".to_string()]).unwrap();
+        let stack = stack_of(&path, "server.port");
+        // A real transition: 1000 was already in the stack, 2000 is banked.
+        let values: Vec<&str> = stack.iter().map(|(v, _)| v.as_str()).collect();
+        assert_eq!(values, vec!["2000", "1000"]);
+    }
+
+    #[test]
+    fn unset_banks_the_value_and_leaves_the_block() {
+        let (_dir, path) = tmp_config();
+        set_value(&path, "server.port", &["4321".to_string()]).unwrap();
+        set_value(&path, "server.www", &["true".to_string()]).unwrap();
+        unset_value(&path, "server.port").unwrap();
+        let text = read_text(&path);
+        assert!(!text.contains("port ="), "key line removed:\n{}", text);
+        assert!(text.contains("# was: 4321 @ "), "was-block in:\n{}", text);
+        assert!(load(&path).unwrap().get_int::<u16>("server.port").is_none());
+        assert_eq!(stack_of(&path, "server.port").len(), 1);
+        // Unset-when-unset is a no-op: same bytes, AlreadyDefault.
+        let before = read_text(&path);
+        assert!(matches!(
+            unset_value(&path, "server.port").unwrap(),
+            UnsetOutcome::AlreadyDefault(_)
+        ));
+        assert_eq!(read_text(&path), before);
+        // ...also when nothing was ever set.
+        assert!(matches!(
+            unset_value(&path, "server.listen").unwrap(),
+            UnsetOutcome::AlreadyDefault(_)
+        ));
+    }
+
+    #[test]
+    fn revert_pops_newest_and_banks_current() {
+        let (_dir, path) = tmp_config();
+        set_value(&path, "server.port", &["1000".to_string()]).unwrap();
+        set_value(&path, "server.port", &["2000".to_string()]).unwrap();
+        let outcome = revert_value(&path, "server.port", None).unwrap();
+        assert_eq!(outcome.restored, "1000");
+        assert_eq!(outcome.replaced.as_deref(), Some("2000"));
+        assert_eq!(load(&path).unwrap().get_int::<u16>("server.port"), Some(1000));
+        // The revert is itself undoable.
+        let stack = stack_of(&path, "server.port");
+        let values: Vec<&str> = stack.iter().map(|(v, _)| v.as_str()).collect();
+        assert_eq!(values, vec!["2000"]);
+        let outcome = revert_value(&path, "server.port", None).unwrap();
+        assert_eq!(outcome.restored, "2000");
+        assert_eq!(load(&path).unwrap().get_int::<u16>("server.port"), Some(2000));
+        let stack = stack_of(&path, "server.port");
+        let values: Vec<&str> = stack.iter().map(|(v, _)| v.as_str()).collect();
+        assert_eq!(values, vec!["1000"]);
+    }
+
+    #[test]
+    fn revert_recreates_an_unset_key() {
+        let (_dir, path) = tmp_config();
+        set_value(&path, "server.shortcut", &["leftshift,leftalt,q".to_string()]).unwrap();
+        unset_value(&path, "server.shortcut").unwrap();
+        let outcome = revert_value(&path, "server.shortcut", None).unwrap();
+        assert_eq!(outcome.restored, "\"leftshift,leftalt,q\"");
+        assert_eq!(outcome.replaced, None);
+        assert_eq!(
+            load(&path).unwrap().get_str("server.shortcut").as_deref(),
+            Some("leftshift,leftalt,q")
+        );
+        assert!(stack_of(&path, "server.shortcut").is_empty());
+    }
+
+    #[test]
+    fn revert_to_an_older_timestamp() {
+        let (_dir, path) = tmp_config();
+        fs::write(
+            &path,
+            "[server]\n# was: 2000 @ 2026-07-25T01:12:04Z\n# was: 1000 @ 2026-07-25T01:12:03Z\nport = 3000\n",
+        )
+        .unwrap();
+        let outcome = revert_value(&path, "server.port", Some("2026-07-25T01:12:03Z")).unwrap();
+        assert_eq!(outcome.restored, "1000");
+        // The current value was banked, the matching entry popped.
+        let stack = stack_of(&path, "server.port");
+        let values: Vec<&str> = stack.iter().map(|(v, _)| v.as_str()).collect();
+        assert_eq!(values, vec!["3000", "2000"]);
+    }
+
+    #[test]
+    fn revert_errors_on_missing_history_and_unknown_timestamp() {
+        let (_dir, path) = tmp_config();
+        let err = revert_value(&path, "server.port", None).unwrap_err();
+        assert!(err.to_string().contains("no history"), "{}", err);
+        set_value(&path, "server.port", &["1000".to_string()]).unwrap();
+        set_value(&path, "server.port", &["2000".to_string()]).unwrap();
+        let err = revert_value(&path, "server.port", Some("1999-12-31T23:59:59Z")).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("no history entry"), "{}", msg);
+        assert!(msg.contains("available:"), "{}", msg);
+        // The available timestamps are listed.
+        let ts = stack_of(&path, "server.port")[0].1.clone();
+        assert!(msg.contains(&ts), "{}", msg);
+        // Unknown keys get the usual error.
+        assert!(revert_value(&path, "server.bogus", None).is_err());
+    }
+
+    #[test]
+    fn revert_revalidates_the_recorded_value() {
+        let (_dir, path) = tmp_config();
+        fs::write(
+            &path,
+            "[server]\n# was: 99999 @ 2026-07-25T01:12:03Z\nport = 4321\n",
+        )
+        .unwrap();
+        let err = revert_value(&path, "server.port", None).unwrap_err();
+        assert!(err.to_string().contains("no longer validates"), "{}", err);
+        // Nothing changed.
+        assert_eq!(load(&path).unwrap().get_int::<u16>("server.port"), Some(4321));
+    }
+
+    #[test]
+    fn malformed_was_lines_are_neither_listed_nor_pruned() {
+        let (_dir, path) = tmp_config();
+        let original = "[server]\n# was: hello\n# was: 1 @ not-a-timestamp\n# was: 1 @ 2026-13-99T99:99:99Z\n# a human note\nport = 4321\n";
+        fs::write(&path, original).unwrap();
+        // None of these parse as history — the key has no stack.
+        assert!(stack_of(&path, "server.port").is_empty());
+        // A mutation leaves every one of them untouched.
+        set_value(&path, "server.port", &["5555".to_string()]).unwrap();
+        let text = read_text(&path);
+        assert!(text.contains("# was: hello\n"));
+        assert!(text.contains("# was: 1 @ not-a-timestamp\n"));
+        assert!(text.contains("# was: 1 @ 2026-13-99T99:99:99Z\n"));
+        assert!(text.contains("# a human note\n"));
+        // Only the one strict entry we just wrote is listed.
+        assert_eq!(stack_of(&path, "server.port").len(), 1);
+        // A valid was-line above a malformed one is not "directly above the
+        // key" either — the malformed line shields it.
+        fs::write(
+            &path,
+            "[server]\n# was: 1000 @ 2026-07-25T01:12:03Z\n# was: oops\nport = 4321\n",
+        )
+        .unwrap();
+        assert!(stack_of(&path, "server.port").is_empty());
+    }
+
+    #[test]
+    fn edit_diff_injects_was_for_changed_and_removed_keys_only() {
+        let (_dir, path) = tmp_config();
+        fs::write(
+            &path,
+            "[server]\nport = 4321\nshortcut = \"leftshift,leftalt,r\"\nwww = true\n",
+        )
+        .unwrap();
+        let scratch = path.with_extension("edit-test");
+        // port unchanged, shortcut changed, www removed, motion-hz added.
+        fs::write(
+            &scratch,
+            "[server]\nport = 4321\nshortcut = \"leftshift,leftalt,q\"\nmotion-hz = 250\n",
+        )
+        .unwrap();
+        let installed = inject_edit_history(&path, &scratch).unwrap();
+        // Changed key: the old value is banked directly above it.
+        let shortcut_pos = installed.find("shortcut = ").unwrap();
+        let was_pos = installed
+            .find("# was: \"leftshift,leftalt,r\" @ ")
+            .unwrap();
+        assert!(was_pos < shortcut_pos, "{}", installed);
+        // Removed key: a was-block exists for it (at the section end).
+        assert!(installed.contains("# was: true @ "), "{}", installed);
+        // Unchanged and added keys get nothing.
+        assert!(!installed.contains("# was: 4321"), "{}", installed);
+        let motion_pos = installed.find("motion-hz = ").unwrap();
+        assert!(!installed[..motion_pos].contains("# was: 250"), "{}", installed);
+        // The result parses and holds the new values.
+        let file = File::parse(&installed).unwrap();
+        assert_eq!(
+            file.get_str("server.shortcut").as_deref(),
+            Some("leftshift,leftalt,q")
+        );
+        assert!(file.get_bool("server.www").is_none());
+        // And the injected history is revertable.
+        fs::write(&path, &installed).unwrap();
+        assert_eq!(stack_of(&path, "server.shortcut").len(), 1);
+        assert_eq!(stack_of(&path, "server.www").len(), 1);
+        let outcome = revert_value(&path, "server.www", None).unwrap();
+        assert_eq!(outcome.restored, "true");
+        assert_eq!(load(&path).unwrap().get_bool("server.www"), Some(true));
+    }
+
+    #[test]
+    fn timestamps_are_rfc3339_seconds_utc() {
+        assert_eq!(format_timestamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_timestamp(86400), "1970-01-02T00:00:00Z");
+        assert_eq!(format_timestamp(1735689600), "2025-01-01T00:00:00Z");
+        assert_eq!(format_timestamp(1767225600), "2026-01-01T00:00:00Z");
+        // The strict parser accepts what we write and rejects lookalikes.
+        assert!(valid_timestamp("2026-07-25T01:12:03Z"));
+        assert!(!valid_timestamp("2026-13-25T01:12:03Z"));
+        assert!(!valid_timestamp("2026-07-25T25:12:03Z"));
+        assert!(!valid_timestamp("2026-07-25 01:12:03Z"));
+        assert!(!valid_timestamp("2026-07-25T01:12:03+00:00"));
+        assert!(!valid_timestamp("not-a-timestamp"));
+        // Written entries always carry a valid timestamp.
+        let (_dir, path) = tmp_config();
+        set_value(&path, "server.port", &["1000".to_string()]).unwrap();
+        set_value(&path, "server.port", &["2000".to_string()]).unwrap();
+        let ts = &stack_of(&path, "server.port")[0].1;
+        assert!(valid_timestamp(ts));
     }
 }

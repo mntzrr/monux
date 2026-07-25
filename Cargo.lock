@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "monux"
-version = "9.2.0"
+version = "9.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1065,6 +1065,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "toml_edit 0.22.27",
  "tracing",
  "tracing-subscriber",
  "url",

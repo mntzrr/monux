@@ -1,6 +1,6 @@
 [package]
 name = "monux"
-version = "9.2.0"
+version = "9.3.0"
 authors = ["Montazar <github.mdtk4@passmail.com>"]
 license = "AGPL-3.0-or-later"
 edition = "2021"
@@ -46,6 +46,10 @@ sha2 = "0.11"
 signal-hook = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "net", "io-util", "time", "sync"] }
 toml = "0.8"
+# The config-file WRITER (mx config set/unset/revert/edit) edits through
+# toml_edit so comments (history entries) and formatting survive; the daemon
+# load path stays on plain toml. Pinned to the 0.22 line that toml 0.8 uses.
+toml_edit = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.4"

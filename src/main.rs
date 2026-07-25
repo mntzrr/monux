@@ -150,7 +150,9 @@ EXAMPLES:
     monux config set server.port 4321        # persist a value (validated like --port)
     monux config set server.edge-map right=auto left=aa11bb
     monux config unset client.mouse-scale    # revert to the built-in default
-    monux config edit                        # edit in $EDITOR, validated on save")]
+    monux config edit                        # edit in $EDITOR, validated on save
+    monux config history server.shortcut     # previous values, newest first
+    monux config revert server.shortcut      # restore the previous value (undoable)")]
     Config(ConfigArgs),
 
     /// Manages a running monux daemon through its control socket
@@ -238,6 +240,29 @@ enum ConfigCommands {
     /// did-you-mean suggestions and the exact 'unset' cleanup lines) and
     /// invalid values, with line numbers
     Validate,
+
+    /// Shows the value history of a key (or of every key that has one): the
+    /// current value and the stack of previous values with timestamps,
+    /// newest first — the preview of what 'revert' restores. Every set,
+    /// unset, edit, and revert banks the replaced value as a '# was:'
+    /// comment above the key (at most 5 per key)
+    History {
+        /// The full key name: server.<flag> or client.<flag>; omit to list
+        /// every key that has history
+        key: Option<String>,
+    },
+
+    /// Restores a key's previous value from its history: the newest entry
+    /// (or the one matching --to) is re-validated and set, banking the
+    /// current value — a revert is itself undoable. Recreates the key line
+    /// when the key was unset
+    Revert {
+        /// The full key name: server.<flag> or client.<flag>
+        key: String,
+        /// Restore the entry with this exact timestamp instead of the newest
+        #[arg(long)]
+        to: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -932,6 +957,13 @@ fn main() -> Result<()> {
                 },
                 Some(ConfigCommands::Edit) => monux::config::Action::Edit,
                 Some(ConfigCommands::Validate) => monux::config::Action::Validate,
+                Some(ConfigCommands::History { key }) => monux::config::Action::History {
+                    key: key.clone(),
+                },
+                Some(ConfigCommands::Revert { key, to }) => monux::config::Action::Revert {
+                    key: key.clone(),
+                    to: to.clone(),
+                },
             };
             // False only for a failed 'validate' or an aborted 'edit'.
             if !monux::config::cli(&init_config_dir()?, &action)? {
@@ -2143,6 +2175,43 @@ mod tests {
         assert!(Cli::try_parse_from(["monux", "config", "edit"]).is_ok());
         assert!(Cli::try_parse_from(["monux", "config", "validate"]).is_ok());
         assert!(Cli::try_parse_from(["monux", "config", "bogus"]).is_err());
+
+        // history / revert: bare, with a key, and with --to.
+        let cli = Cli::try_parse_from(["monux", "config", "history"]).unwrap();
+        let Commands::Config(args) = cli.command else {
+            panic!("expected the config subcommand")
+        };
+        assert!(matches!(
+            args.command,
+            Some(ConfigCommands::History { key: None })
+        ));
+        let cli = Cli::try_parse_from(["monux", "config", "history", "server.port"]).unwrap();
+        let Commands::Config(args) = cli.command else {
+            panic!("expected the config subcommand")
+        };
+        let Some(ConfigCommands::History { key }) = args.command else {
+            panic!("expected config history")
+        };
+        assert_eq!(key, Some("server.port".to_string()));
+        let cli = Cli::try_parse_from([
+            "monux",
+            "config",
+            "revert",
+            "server.port",
+            "--to",
+            "2026-07-25T01:12:03Z",
+        ])
+        .unwrap();
+        let Commands::Config(args) = cli.command else {
+            panic!("expected the config subcommand")
+        };
+        let Some(ConfigCommands::Revert { key, to }) = args.command else {
+            panic!("expected config revert")
+        };
+        assert_eq!(key, "server.port");
+        assert_eq!(to, Some("2026-07-25T01:12:03Z".to_string()));
+        assert!(Cli::try_parse_from(["monux", "config", "revert", "server.port"]).is_ok());
+        assert!(Cli::try_parse_from(["monux", "config", "revert"]).is_err());
     }
 
     #[test]

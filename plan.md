@@ -184,6 +184,19 @@ the all-exposed-segments behavior. The qualifier matches the output name
 or description; name-only compositors degrade silently. Unknown qualifiers and
 multi-output matches warn (on change only); the layout log prints identifiers.
 
+## Phase J — config history (inline `# was:` comments) — v9.3.0
+
+- [x] Switch config.rs raw-doc writer to toml_edit (comments/formatting survive
+      set/unset/edit)
+- [x] History entries `# was: <TOML> @ <timestamp>` above keys, newest first,
+      cap 5/key; strict-format parsing (human comments never touched)
+- [x] set: push current onto stack (same-value = no-op, no write); unset: bank
+      value as was-comment + remove key; edit: diff-inject was for changed/removed
+- [x] `mx config history [key]`: stack per key / full timeline (revert preview)
+- [x] `mx config revert <key> [--to <timestamp>]`: pop previous value, bank
+      current (undoable undo); revalidates; recreates unset keys
+- [x] Docs: README config section, subcommand help/examples, module docs
+
 ## Future / on hold
 
 - **Protocol feature-negotiation** — SHIPPED in v9.0.0 (protocol v16): v16+ peers
