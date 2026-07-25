@@ -8,7 +8,14 @@
 //! (server-side roster changes), `monux-connection` (client-side
 //! connect/lost), `monux-link` (degradation/recovery), `monux-indicator`
 //! (tray indicator action feedback).
+//!
+//! Under `cargo test` (the lib's cfg(test) build) notifications are
+//! suppressed: unit tests exercise call sites that notify for real (the
+//! rotation pause/switch tests among them), and the popups must not spam the
+//! developer's desktop — they previously looked exactly like a phantom
+//! daemon pausing itself.
 
+#[cfg(not(test))]
 use std::process::{Command, Stdio};
 
 /// notify-send urgency (-u).
@@ -19,6 +26,7 @@ pub enum Urgency {
 }
 
 impl Urgency {
+    #[cfg(not(test))]
     fn as_str(self) -> &'static str {
         match self {
             Urgency::Low => "low",
@@ -34,6 +42,7 @@ impl Urgency {
 /// Safe to call from any thread: std::process needs no tokio runtime, unlike
 /// tokio::process, whose spawn panics ("there is no reactor running") on
 /// plain threads such as the tray indicator's menu-action callbacks.
+#[cfg(not(test))]
 pub fn notify(id: &str, urgency: Urgency, timeout_ms: u32, summary: &str, body: &str) {
     let timeout = timeout_ms.to_string();
     let hint = format!("string:x-canonical-private-synchronous:{}", id);
@@ -62,6 +71,12 @@ pub fn notify(id: &str, urgency: Urgency, timeout_ms: u32, summary: &str, body: 
         });
     }
 }
+
+/// Test builds notify nothing: unit tests drive call sites that fire real
+/// notifications (pause/switch, connection lifecycle), and 'cargo test' must
+/// not popup-spam the developer's desktop (see the module docs).
+#[cfg(test)]
+pub fn notify(_id: &str, _urgency: Urgency, _timeout_ms: u32, _summary: &str, _body: &str) {}
 
 #[cfg(test)]
 mod tests {
