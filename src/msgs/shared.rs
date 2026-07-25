@@ -3,7 +3,62 @@ use serde::{Deserialize, Serialize};
 /// The protocol version exchanged between client and server on each stream.
 /// This is compared on initial connection between client and server.
 /// If the event/bulk definitions change, then this should change.
-pub const PROTOCOL_VERSION: u64 = 15;
+pub const PROTOCOL_VERSION: u64 = 16;
+
+/// The first protocol version whose peers can negotiate: two v16+ peers
+/// connect at min(their, our) and each side only uses features the negotiated
+/// version supports (see [`negotiate`]). Pre-negotiation peers still require
+/// an exact match.
+pub const PROTOCOL_VERSION_NEGOTIATION: u64 = 16;
+
+/// The oldest protocol version this binary can fully speak: the direct
+/// ancestor of [`PROTOCOL_VERSION_NEGOTIATION`]. A newer client clamps down
+/// to a speakable older server (see client.rs); anything older is refused.
+pub const MIN_SPEAKABLE_VERSION: u64 = 15;
+
+/// The protocol version a pair runs at, or None when the connection must be
+/// refused. Equal versions always pair (the fast path: nothing degraded);
+/// two negotiation-era peers (v16+) run at the lower version, each side
+/// using only features that version supports (see [`features_above`]).
+/// Anything else is a pre-negotiation mismatch and is refused, as before
+/// negotiation existed.
+pub fn negotiate(theirs: u64, ours: u64) -> Option<u64> {
+    if theirs == ours {
+        Some(ours)
+    } else if theirs >= PROTOCOL_VERSION_NEGOTIATION && ours >= PROTOCOL_VERSION_NEGOTIATION {
+        Some(theirs.min(ours))
+    } else {
+        None
+    }
+}
+
+/// Version-gated wire features, oldest first: the version that introduced
+/// the feature and its name, for degraded-set logging when a pair negotiates
+/// down (see [`features_above`]). v16 itself is the negotiation machinery —
+/// no new wire feature rides it.
+const FEATURES: &[(u64, &str)] = &[(15, "server hostname in handshake")];
+
+/// The features a version misses out on: every feature newer than `v`,
+/// oldest first. Logged as the degraded set when a pair negotiates below our
+/// own version.
+pub fn features_above(v: u64) -> Vec<(u64, &'static str)> {
+    FEATURES
+        .iter()
+        .copied()
+        .filter(|(since, _)| *since > v)
+        .collect()
+}
+
+/// The degraded set for a negotiated version as a log-ready list: the
+/// comma-separated names of every feature newer than `v`, or "nothing".
+pub fn disabled_features(v: u64) -> String {
+    let names: Vec<&str> = features_above(v).iter().map(|(_, name)| *name).collect();
+    if names.is_empty() {
+        "nothing".to_string()
+    } else {
+        names.join(", ")
+    }
+}
 
 /// The protocol version that introduced the server-hostname frame: right
 /// after the events-stream version exchange, the server sends its hostname
@@ -12,17 +67,17 @@ pub const PROTOCOL_VERSION: u64 = 15;
 pub const PROTOCOL_VERSION_HOSTNAME: u64 = 15;
 
 /// Whether the server sends its hostname after the events-stream version
-/// exchange: only to a client that spoke v15+ — an older client would
-/// misparse the bytes as the start of an event frame.
-pub fn sends_hostname(client_version: u64) -> bool {
-    client_version >= PROTOCOL_VERSION_HOSTNAME
+/// exchange: only when the pair's NEGOTIATED version is v15+ — an older
+/// client would misparse the bytes as the start of an event frame.
+pub fn sends_hostname(negotiated: u64) -> bool {
+    negotiated >= PROTOCOL_VERSION_HOSTNAME
 }
 
 /// Whether the client expects a hostname after the events-stream version
-/// exchange: only from a server that spoke v15+ — an older server sends
-/// nothing, so there is nothing to wait for.
-pub fn expects_hostname(server_version: u64) -> bool {
-    server_version >= PROTOCOL_VERSION_HOSTNAME
+/// exchange: only when the pair's NEGOTIATED version is v15+ — an older
+/// server sends nothing, so there is nothing to wait for.
+pub fn expects_hostname(negotiated: u64) -> bool {
+    negotiated >= PROTOCOL_VERSION_HOSTNAME
 }
 
 /// Cap on the hostname as sent on the wire: gethostname(2) allows at most 64
@@ -90,6 +145,42 @@ pub const MAX_FRAME_BUFFER_BYTES: usize = 1024 * 1024;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn negotiate_pins_the_three_branches() {
+        // Fast path: equal versions pair at themselves, nothing degraded —
+        // including pre-negotiation versions (two v15 peers still pair).
+        assert_eq!(negotiate(16, 16), Some(16));
+        assert_eq!(negotiate(15, 15), Some(15));
+        assert_eq!(negotiate(0, 0), Some(0));
+        // Negotiation era: two v16+ peers run at the lower version.
+        assert_eq!(negotiate(17, 16), Some(16));
+        assert_eq!(negotiate(16, 17), Some(16));
+        assert_eq!(negotiate(18, 17), Some(17));
+        // Pre-negotiation peer in a mismatch: refused (a v15 peer can't
+        // negotiate, so a v15/v16 pair only connects via the client clamp).
+        assert_eq!(negotiate(15, 16), None);
+        assert_eq!(negotiate(16, 15), None);
+        assert_eq!(negotiate(14, 16), None);
+        assert_eq!(negotiate(14, 15), None);
+    }
+
+    #[test]
+    fn features_above_content() {
+        // v16 rides no new wire feature: nothing is newer than v15 yet.
+        assert_eq!(features_above(15), vec![]);
+        assert_eq!(features_above(16), vec![]);
+        assert_eq!(features_above(u64::MAX), vec![]);
+        // Below v15 the hostname frame is missing.
+        assert_eq!(features_above(14), vec![(15, "server hostname in handshake")]);
+        assert_eq!(features_above(0), vec![(15, "server hostname in handshake")]);
+    }
+
+    #[test]
+    fn disabled_features_list_for_logs() {
+        assert_eq!(disabled_features(15), "nothing");
+        assert_eq!(disabled_features(14), "server hostname in handshake");
+    }
 
     #[test]
     fn cobs_frame_detection() {

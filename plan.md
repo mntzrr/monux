@@ -137,12 +137,11 @@ The config file is persistent flag storage; `mx config` is its CLI.
 
 ## Future / on hold
 
-- **Protocol feature-negotiation** (prerequisite for downgrade): handshake connects
-  at min(their, our) protocol instead of exact-match refusal; feature→version map
-  in msgs/ gates each message on the negotiated version; degraded set is logged
-  ("peer speaks v14: hostname, hotspot auto-join disabled"). Bootstrap: pairs with
-  a pre-v15 peer keep exact-match refusal; negotiation starts at v15.
-- **Item 5 (downgrade)** — blocked on the above. Then: `monux update --to
+- **Protocol feature-negotiation** — SHIPPED in v9.0.0 (protocol v16): v16+ peers
+  connect at min(their, our); pre-negotiation pairs keep exact-match refusal; a
+  newer client clamps once to a >= v15 server; the feature map + degraded-set
+  logging live in msgs/shared.rs; the update gate keys off pair_works().
+- **Item 5 (downgrade)** — UNBLOCKED (negotiation shipped). Spec: `monux update --to
   <version|commit>` (scan Cargo.toml history / commit prefix; read target protocol
   from checked-out source; gate = target ≥ supported floor, server leads; `--force`),
   `--rollback` sugar via recorded previous version, update-pin file so daily

@@ -43,7 +43,9 @@ const HOTSPOT_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 /// Tracks per-client protocol versions so a version-mismatched client reads
 /// like the self-healing flow it is (it will auto-update and return), not
 /// like a broken connection erroring every few seconds — and so the moment
-/// it catches up is visible too.
+/// it catches up is visible too. From protocol v16 on, a newer client is not
+/// refused at all: the pair negotiates (shared::negotiate) and runs at our
+/// version.
 #[derive(Default)]
 struct PeerVersions {
     /// ip -> version from the last successful exchange (for the update note).
@@ -56,14 +58,15 @@ struct PeerVersions {
 }
 
 impl PeerVersions {
-    /// Judges a client version from the exchange: Ok when compatible (and a
-    /// log line when the client just upgraded), Err when it must be refused
+    /// Judges a client version from the exchange: Ok when the pair can run
+    /// (exact match, or a negotiation-era client we run at our version — and
+    /// a log line when the client just upgraded), Err when it must be refused
     /// (a rate-limited, self-healing-framed warning on the first/log-worthy
     /// refusal, silence otherwise).
     fn check(&mut self, addr: SocketAddr, version: u64) -> Result<(), ()> {
         let ip = addr.ip();
         let ours = shared::PROTOCOL_VERSION;
-        if version == ours {
+        if shared::negotiate(version, ours).is_some() {
             if let Some(old) = self.seen.insert(ip, version) {
                 if old < version {
                     info!(
@@ -82,17 +85,13 @@ impl PeerVersions {
             .is_none_or(|last| last.elapsed() >= REFUSAL_LOG_INTERVAL);
         if should_log {
             self.last_refusal_log.insert(ip, Instant::now());
-            if version < ours {
-                warn!(
-                    "Client {} speaks protocol v{} but we speak v{}: it's outdated and will auto-update and reconnect shortly (refusing until then)",
-                    addr, version, ours
-                );
-            } else {
-                warn!(
-                    "Client {} speaks protocol v{} but we speak v{}: THIS server is outdated — update it so the versions line up",
-                    addr, version, ours
-                );
-            }
+            // A refused client is always older than us and pre-negotiation
+            // (a newer one would have negotiated above): it will auto-update
+            // and reconnect.
+            warn!(
+                "Client {} speaks protocol v{} but we speak v{}: it's outdated and will auto-update and reconnect shortly (refusing until then)",
+                addr, version, ours
+            );
         }
         Err(())
     }
@@ -463,9 +462,11 @@ async fn handle_connection(
     let client_version = transport::recv_version(&mut events_recv, &mut event_bytes).await?;
     // Reply with our own version BEFORE rejecting a mismatch, so that the
     // client learns it (its update gate needs it to catch up after we upgrade).
-    transport::send_version(&mut events_send).await?;
+    transport::send_version(&mut events_send, shared::PROTOCOL_VERSION).await?;
     // Judge the client's version with context (an upgrade note on success, a
-    // friendly rate-limited refusal otherwise) before the hard gate.
+    // friendly rate-limited refusal otherwise) before the hard gate. The
+    // server is the acceptor: it cannot retry or clamp, so a client too old
+    // to negotiate is refused exactly as before negotiation existed.
     if peer_versions
         .lock()
         .expect("peer versions lock poisoned")
@@ -474,13 +475,30 @@ async fn handle_connection(
     {
         return Err(VersionMismatch.into());
     }
+    // check() accepted, so the pair is compatible by definition of
+    // negotiate(). From v16 on a newer client runs at OUR version.
+    let negotiated = match shared::negotiate(client_version, shared::PROTOCOL_VERSION) {
+        Some(negotiated) => negotiated,
+        None => return Err(VersionMismatch.into()),
+    };
+    if negotiated < shared::PROTOCOL_VERSION {
+        info!(
+            "Client {} speaks protocol v{}, we speak v{}: running at v{} (disabled: {})",
+            conn.remote_address(),
+            client_version,
+            shared::PROTOCOL_VERSION,
+            negotiated,
+            shared::disabled_features(negotiated)
+        );
+    }
 
     // Protocol v15: tell the client our hostname right after the version
-    // exchange (length-prefixed; the client reads it only when we spoke
-    // v15+, so mixed pairs behave exactly as before). Direct-IP connects get
-    // the same display name as mDNS-discovered ones (approval prompt), and
-    // the client can remember us by name (known_servers.rs).
-    if shared::sends_hostname(client_version) {
+    // exchange (length-prefixed; the client reads it only when the negotiated
+    // version has the feature, so mixed pairs behave exactly as before).
+    // Direct-IP connects get the same display name as mDNS-discovered ones
+    // (approval prompt), and the client can remember us by name
+    // (known_servers.rs).
+    if shared::sends_hostname(negotiated) {
         let hostname = crate::discovery::get_hostname().unwrap_or_default();
         events_send
             .write_all(&shared::encode_hostname(&hostname))
@@ -500,9 +518,18 @@ async fn handle_connection(
     // Receive the version a second time, on the bulk stream.
     // Sending some data is required to initialize the bulk stream, so let's just repeat ourselves.
     // Maybe we'll want to have different per-stream versions someday? Probably not.
-    let client_version = transport::recv_version(&mut bulk_recv, &mut event_bytes).await?;
-    transport::send_version(&mut bulk_send).await?;
-    transport::ensure_compatible_version(client_version)?;
+    let bulk_client_version = transport::recv_version(&mut bulk_recv, &mut event_bytes).await?;
+    transport::send_version(&mut bulk_send, shared::PROTOCOL_VERSION).await?;
+    // Same peer as the events stream, whose version was already judged there
+    // (PeerVersions + negotiate): it must speak the same version here.
+    if bulk_client_version != client_version {
+        bail!(
+            "Client {} spoke protocol v{} on the events stream but v{} on the bulk stream",
+            conn.remote_address(),
+            client_version,
+            bulk_client_version
+        );
+    }
 
     // Add client to the rotation after a successful init
     rotation_tx
@@ -823,9 +850,15 @@ mod tests {
     }
 
     #[test]
-    fn newer_version_refuses_as_server_outdated() {
+    fn newer_negotiation_era_version_is_accepted() {
+        // From v16 on, a newer client is not refused: the pair negotiates
+        // (shared::negotiate) and runs at OUR version.
         let mut pv = PeerVersions::default();
-        assert!(pv.check(addr(), shared::PROTOCOL_VERSION + 1).is_err());
+        assert!(pv.check(addr(), shared::PROTOCOL_VERSION + 1).is_ok());
+        assert_eq!(
+            pv.seen.get(&addr().ip()),
+            Some(&(shared::PROTOCOL_VERSION + 1))
+        );
     }
 
     #[test]

@@ -319,12 +319,8 @@ pub fn log_conn_stats(conn: &quinn::Connection) {
     );
 }
 
-pub async fn send_version(send: &mut SendStream) -> Result<()> {
-    let msg = shared::VersionBootstrapMessage {
-        version: shared::PROTOCOL_VERSION,
-    };
-    let serializedmsg = postcard::to_stdvec_cobs(&msg)
-        .map_err(|e| anyhow!("Failed to serialize version message: {:?}", e))?;
+pub async fn send_version(send: &mut SendStream, version: u64) -> Result<()> {
+    let serializedmsg = version_bootstrap_bytes(version)?;
     trace!(
         "Sending {} byte version: {:X?}",
         serializedmsg.len(),
@@ -336,9 +332,19 @@ pub async fn send_version(send: &mut SendStream) -> Result<()> {
     Ok(())
 }
 
+/// The wire bytes of the version bootstrap for `version` (postcard + COBS).
+/// Callers normally pass PROTOCOL_VERSION; a client clamping to an older
+/// server passes the clamped version instead (see client.rs).
+fn version_bootstrap_bytes(version: u64) -> Result<Vec<u8>> {
+    let msg = shared::VersionBootstrapMessage { version };
+    postcard::to_stdvec_cobs(&msg)
+        .map_err(|e| anyhow!("Failed to serialize version message: {:?}", e))
+}
+
 /// Returns the peer's protocol version. Does NOT check it against ours:
 /// callers learn the version either way (a client records it for the update
-/// gate), then call ensure_compatible_version.
+/// gate), then judge it — shared::negotiate, with ensure_compatible_version
+/// for the pre-negotiation refusal path.
 pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<u64> {
     debug!("Waiting to receive version");
     // Loop until we have a complete COBS frame: the version message can be
@@ -435,5 +441,19 @@ mod tests {
             addr.ip(),
             "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
         );
+    }
+
+    /// The clamp retry sends the clamped version, not ours: the bootstrap
+    /// construction must carry the version it is given (send_version just
+    /// writes these bytes).
+    #[test]
+    fn version_bootstrap_carries_the_given_version() {
+        for version in [shared::MIN_SPEAKABLE_VERSION, shared::PROTOCOL_VERSION, 0, u64::MAX] {
+            let mut bytes = version_bootstrap_bytes(version).unwrap();
+            let (decoded, _) =
+                postcard::take_from_bytes_cobs::<shared::VersionBootstrapMessage>(&mut bytes)
+                    .unwrap();
+            assert_eq!(decoded.version, version);
+        }
     }
 }

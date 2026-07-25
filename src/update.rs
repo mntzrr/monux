@@ -53,9 +53,21 @@ pub enum UpdateStatus {
     Installed,
     /// Already up to date; nothing was built.
     AlreadyCurrent,
-    /// The new source speaks a different protocol version than our server;
-    /// nothing was built (see the protocol_constraint parameter of run).
+    /// The new source speaks a protocol version our server couldn't pair
+    /// with (see pair_works); nothing was built (see the
+    /// protocol_constraint parameter of run).
     SkippedIncompatible,
+}
+
+/// Whether a build speaking `target` protocol can pair with a server
+/// speaking `server`: exact matches always pair (the pre-negotiation rule),
+/// and from the negotiation era (v16) on, any pair connects at the lower
+/// version (shared::negotiate). Everything else is refused — e.g. a v16
+/// build against a v15 server: a v16 client CAN clamp to it, but the gate
+/// keeps the server-first update order regardless (the clamp covers version
+/// splits in the field, not updates).
+pub fn pair_works(target: u64, server: u64) -> bool {
+    target.min(server) >= crate::msgs::shared::PROTOCOL_VERSION_NEGOTIATION || target == server
 }
 
 pub fn run(force: bool, low_priority: bool, protocol_constraint: Option<u64>) -> Result<UpdateStatus> {
@@ -103,16 +115,23 @@ pub fn run(force: bool, low_priority: bool, protocol_constraint: Option<u64>) ->
         return Ok(UpdateStatus::AlreadyCurrent);
     }
 
-    // The update gate: a client never installs a build whose protocol version
-    // differs from its server's — it would be unable to reconnect. Checked
-    // from the pulled source, before the expensive build.
+    // The update gate: a client never installs a build its server couldn't
+    // pair with. Since protocol v16 pairs negotiate (connecting at the lower
+    // version), the gate accepts any negotiation-era pair; a pre-negotiation
+    // server still demands an exact match (see pair_works). Checked from the
+    // pulled source, before the expensive build.
     if !force {
         if let Some(server_version) = protocol_constraint {
             let source_version = source_protocol_version(&src_dir)?;
-            if source_version != server_version {
+            if !pair_works(source_version, server_version) {
+                let remedy = if source_version > server_version {
+                    "Update the server first"
+                } else {
+                    "Downgrade the server first"
+                };
                 info!(
-                    "Not updating to {}: it speaks protocol v{}, but the server speaks v{}. Update the server first; this gate opens automatically once this client reconnects to it (or use --force to override).",
-                    latest, source_version, server_version
+                    "Not updating to {}: it speaks protocol v{}, but the server speaks v{} — the pair couldn't negotiate a common protocol. {}; this gate opens automatically once this client reconnects to it (or use --force to override).",
+                    latest, source_version, server_version, remedy
                 );
                 return Ok(UpdateStatus::SkippedIncompatible);
             }
@@ -283,7 +302,9 @@ pub fn clear_protocol_constraint(config_dir: &Path) {
 /// versions Monux servers currently advertise via mDNS (also recorded, healing
 /// a stale gate file), falling back to the version this client recorded at its
 /// last handshake when no server answers (offline, another subnet, or a build
-/// predating the advertisement). Never fails: discovery is best-effort. Blocks
+/// predating the advertisement). Since protocol v16 the gate accepts any
+/// negotiation-era pair (see pair_works), so this value is the pair's floor,
+/// not a demanded exact match. Never fails: discovery is best-effort. Blocks
 /// for up to the mDNS discovery timeout: call it from a blocking context.
 pub fn refresh_protocol_constraint(config_dir: Option<&Path>) -> Option<u64> {
     let recorded = config_dir.and_then(server_protocol_constraint);
@@ -464,6 +485,28 @@ mod tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "unknown"
         ));
+    }
+
+    #[test]
+    fn pair_works_matrix() {
+        // Exact matches always pair (the pre-negotiation rule).
+        assert!(pair_works(15, 15));
+        assert!(pair_works(16, 16));
+        assert!(pair_works(14, 14));
+        // Negotiation era: any v16+ pair connects at the lower version,
+        // whichever side is newer.
+        assert!(pair_works(16, 17));
+        assert!(pair_works(17, 16));
+        assert!(pair_works(17, 18));
+        // A pre-negotiation server still demands an exact match — even
+        // though a v16 client could clamp to it, the gate keeps the
+        // server-first update order.
+        assert!(!pair_works(16, 15));
+        assert!(!pair_works(15, 16));
+        assert!(!pair_works(17, 15));
+        assert!(!pair_works(15, 17));
+        assert!(!pair_works(16, 14));
+        assert!(!pair_works(14, 15));
     }
 
     #[test]
