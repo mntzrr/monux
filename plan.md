@@ -231,11 +231,6 @@ NM/driver/VPN/channel matrix). Remove it entirely:
   (Cargo.toml-history scan, commit-prefix fallback), `--rollback` (records the
   replaced build per install), the update-pin (auto-update skips, plain update
   unpins), detached-HEAD reattach, direction-aware pair_works gate.
-- **Hotspot leftovers**: fix hostapd presence check (`hostapd -v` exits 1 → always
-  "installs"; check /usr/bin/hostapd instead); `ensure_ap_interface` must verify
-  the existing vif's type (a stale `managed` vif breaks hostapd beaconing) and
-  delete+recreate on mismatch; optional ieee80211n/ac in hostapd.conf. User then
-  re-runs `monux setup --hotspot` and tests client internet via NAT.
 - **Awaiting user data**: phantom pause (watch for 'Control socket: pause
   requested'), clipboard wedge (capture `monux status` from both machines on
   recurrence), drag-lag (Link stats on repro).
