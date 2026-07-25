@@ -740,6 +740,20 @@ fn write_desktop_shortcut(path: &Path, owner: Option<(u32, u32)>) -> Result<()> 
     Ok(())
 }
 
+/// Ensures the desktop entry EXISTS, without touching one that's already
+/// there: called by the updater so installs done via 'monux update' (which
+/// never runs install.sh) get the shortcut too. Returns true when it wrote
+/// the file. Never fails hard over it — the caller logs and moves on; an
+/// existing file (stock or user-edited) is left alone.
+pub fn ensure_desktop_shortcut(home: &Path, xdg_data_home: Option<&std::ffi::OsStr>) -> Result<bool> {
+    let path = applications_dir_from(home, xdg_data_home).join(DESKTOP_SHORTCUT_NAME);
+    if path.exists() {
+        return Ok(false);
+    }
+    write_desktop_shortcut(&path, None)?;
+    Ok(true)
+}
+
 /// `--desktop-shortcut`: installs a .desktop entry so the tray can be
 /// launched from the desktop's app menu. User-level, like --autostart: it
 /// never elevates; the file lands in the invoking user's data home.
@@ -1732,6 +1746,21 @@ mod tests {
             display_unit_path(plain, &plain.join("monux-server.service")),
             "/tmp/x/monux-server.service"
         );
+    }
+
+    #[test]
+    #[test]
+    fn ensure_desktop_shortcut_creates_only_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // Missing: written.
+        assert!(ensure_desktop_shortcut(home, None).unwrap());
+        let path = applications_dir_from(home, None).join(DESKTOP_SHORTCUT_NAME);
+        assert!(path.exists());
+        // Present: left alone (even user-edited), and reports so.
+        std::fs::write(&path, "user edits").unwrap();
+        assert!(!ensure_desktop_shortcut(home, None).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "user edits");
     }
 
     #[test]
