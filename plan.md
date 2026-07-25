@@ -197,6 +197,30 @@ multi-output matches warn (on change only); the layout log prints identifiers.
       current (undoable undo); revalidates; recreates unset keys
 - [x] Docs: README config section, subcommand help/examples, module docs
 
+## Phase K — scrap the hotspot feature — v10.0.0
+
+The feature is structurally flaky (single-radio client+AP at the mercy of
+NM/driver/VPN/channel matrix). Remove it entirely:
+
+- [x] msgs: keep the HotspotInfo variant (same index/payload), mark deprecated —
+      never send, ignore on receipt. Wire stays v16, no protocol bump.
+- [x] setup.rs: remove all hotspot code (host/join/remove, hostapd/dnsmasq/unit
+      writers, NAT, ip-forward, Mullvad workaround, vif mgmt, psk, flags +
+      elevation/scoping branches)
+- [x] server.rs: remove HotspotInfo advertisement, credential probe, lifecycle
+      start/stop hooks
+- [x] client.rs: remove HotspotInfo handler, provision_hotspot (NM auto-join),
+      --no-auto-hotspot
+- [x] config.rs: drop client.no-auto-hotspot registry key (staleness policy
+      covers existing configs)
+- [x] uninstall.rs: KEEPS the teardown (unit, /etc/monux, NAT, vif, NM profile);
+      needed constants move in from setup.rs
+- [x] Docs: README hotspot sections, help text, config keys/help
+- [x] Validation: zero-warning build, green tests, `grep -ri hotspot` returns
+      only uninstall teardown + deprecated variant + history files
+- [x] Report includes the manual teardown commands for live installs
+      (disable monux-hotspot unit, delete monux-direct profile)
+
 ## Future / on hold
 
 - **Protocol feature-negotiation** — SHIPPED in v9.0.0 (protocol v16): v16+ peers

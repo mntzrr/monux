@@ -78,7 +78,6 @@ EXAMPLES:
     #[command(after_long_help = "\
 EXAMPLES:
     monux setup                        # apply everything (elevates via sudo)
-    monux setup --hotspot              # only host the direct WiFi hotspot
     monux setup --autostart server     # only install the login service (no sudo)")]
     Setup(SetupArgs),
 
@@ -393,24 +392,6 @@ struct SetupArgs {
     /// autostart changes are made.
     #[arg(long, value_enum, value_name = "server|client|off")]
     autostart: Option<monux::setup::Autostart>,
-
-    /// Host ('on', the default when the flag is given bare) or remove ('off')
-    /// a dedicated 'monux-direct' WiFi hotspot on this machine (server side):
-    /// the KVM link then bypasses the router entirely, and the peer's internet
-    /// keeps working, NATed through this machine. Approved clients receive the
-    /// credentials automatically over the encrypted connection (protocol v14);
-    /// manual join with --hotspot-join. 'off' deletes the profile without
-    /// uninstalling anything else.
-    #[arg(long, value_enum, default_missing_value = "on", num_args = 0..=1, value_name = "on|off")]
-    hotspot: Option<monux::setup::Hotspot>,
-
-    /// Join this machine to a 'monux-direct' hotspot hosted by the other
-    /// machine (client side): '--hotspot-join <ssid> <psk>' as printed by
-    /// 'monux setup --hotspot' there. NOTE: this moves the machine's
-    /// WiFi association to the hotspot; its internet then flows through the
-    /// hosting machine.
-    #[arg(long, num_args = 2, value_names = ["ssid", "psk"])]
-    hotspot_join: Option<Vec<String>>,
 }
 
 #[derive(Args)]
@@ -629,14 +610,6 @@ struct ClientArgs {
     #[arg(long, value_name = "mbps", value_parser = monux::config::parse_bulk_throttle)]
     bulk_throttle_mbps: Option<f64>,
 
-    /// Don't join the server's advertised 'monux-direct' hotspot automatically
-    /// (protocol v14: a hosting server hands approved clients the hotspot
-    /// credentials over the encrypted connection, and the client provisions
-    /// and joins it by default). Manual join remains available with
-    /// 'monux setup --hotspot-join'.
-    #[arg(long, num_args = 0, default_missing_value = "true")]
-    no_auto_hotspot: Option<bool>,
-
     /// Switching BACK to the server by screen edge (Hyprland only for now):
     /// while this client has input, pushing the cursor against this screen
     /// edge and dwelling there asks the server to take input back. Usually
@@ -698,10 +671,6 @@ impl ClientArgs {
             .bulk_throttle_mbps
             .take()
             .or_else(|| cfg.get_f64("client.bulk-throttle-mbps"));
-        self.no_auto_hotspot = self
-            .no_auto_hotspot
-            .take()
-            .or_else(|| cfg.get_bool("client.no-auto-hotspot"));
         self.edge_map = self.edge_map.take().or_else(|| cfg.get_str_vec("client.edge-map"));
         self.edge_dwell_ms = self
             .edge_dwell_ms
@@ -857,20 +826,13 @@ fn main() -> Result<()> {
         },
         Commands::Setup(args) => {
             // Elevate only when the selected steps need root: the base set
-            // (a no-flags run) and the hotspot steps persist root-owned
-            // system settings; --autostart manages a per-user systemd unit
-            // and must run as the invoking user instead.
-            let base_set = args.autostart.is_none()
-                && args.hotspot.is_none()
-                && args.hotspot_join.is_none();
-            if base_set || args.hotspot.is_some() || args.hotspot_join.is_some() {
+            // (a no-flags run) persists root-owned system settings;
+            // --autostart manages a per-user systemd unit and must run as
+            // the invoking user instead.
+            if args.autostart.is_none() {
                 maybe_elevate("to persist system settings")?;
             }
-            return monux::setup::run(
-                args.autostart,
-                args.hotspot,
-                args.hotspot_join.as_ref().map(|v| (v[0].clone(), v[1].clone())),
-            );
+            return monux::setup::run(args.autostart);
         }
         Commands::Update(args) => {
             let config_dir = monux::update::default_config_dir();
@@ -1163,7 +1125,6 @@ fn main() -> Result<()> {
             let auto_update = !args.no_auto_update.unwrap_or(false);
             let auto_indicator = !args.no_indicator.unwrap_or(false);
             let www = args.www.unwrap_or(false);
-            let no_auto_hotspot = args.no_auto_hotspot.unwrap_or(false);
             let mouse_scale = args.mouse_scale.unwrap_or(monux::config::DEFAULT_INPUT_SCALE);
             let scroll_scale = args
                 .scroll_scale
@@ -1263,7 +1224,6 @@ fn main() -> Result<()> {
                         args.edge_dwell_ms
                             .unwrap_or(monux::config::DEFAULT_EDGE_DWELL_MS),
                     ),
-                    no_auto_hotspot,
                     auto_update,
                     auto_indicator,
                 )
@@ -1340,10 +1300,9 @@ fn settle_after_takeover(lock: &single_instance::InstanceLock) {
     }
 }
 
-/// 'monux setup' persists system settings and (for the base set and the
-/// hotspot steps) needs root. Rather than making the user type 'sudo monux
-/// setup' (which also trips over sudo's restricted PATH hiding ~/.local/bin),
-/// re-exec with sudo -E, prompting for the password.
+/// 'monux setup' persists system settings and needs root. Rather than making
+/// the user type 'sudo monux setup' (which also trips over sudo's restricted
+/// PATH hiding ~/.local/bin), re-exec with sudo -E, prompting for the password.
 /// Opt out with MONUX_NO_ELEVATE=1 to get the manual invocation instead.
 fn maybe_elevate(reason: &str) -> Result<()> {
     if unsafe { libc::geteuid() } == 0 || std::env::var_os("MONUX_NO_ELEVATE").is_some() {
@@ -1558,9 +1517,6 @@ async fn server(
     // The daemon is up (listening, rotation running): start the tray
     // indicator alongside it.
     indicator.launch();
-    // The hotspot lives for the KVM: if the user set one up, bring it up with
-    // the server (root only — a daemon must never trigger a sudo prompt).
-    monux::setup::start_hotspot_if_configured();
     if let Some(exit_secs) = exit_secs {
         info!("Exiting in {} seconds...", exit_secs);
         tokio::select! {
@@ -1583,7 +1539,6 @@ async fn server(
                 // a restart (e.g. after 'monux update') resumes the session
                 // automatically when the client reconnects (bounded by
                 // ACTIVE_CLIENT_MAX_AGE).
-                monux::setup::stop_hotspot_if_active();
                 info!("Shutting down...");
                 return Ok(());
             },
@@ -1606,7 +1561,6 @@ async fn server(
                 // a restart (e.g. after 'monux update') resumes the session
                 // automatically when the client reconnects (bounded by
                 // ACTIVE_CLIENT_MAX_AGE).
-                monux::setup::stop_hotspot_if_active();
                 info!("Shutting down...");
                 return Ok(());
             },
@@ -1741,7 +1695,6 @@ async fn client(
     throttle_mode: monux::rotation::ThrottleMode,
     edge_map: Option<monux::edge::EdgeMap>,
     edge_dwell: Duration,
-    no_auto_hotspot: bool,
     auto_update: bool,
     auto_indicator: bool,
 ) -> Result<()> {
@@ -1824,7 +1777,6 @@ async fn client(
                 throttle_mode,
                 edge_map.clone(),
                 edge_dwell,
-                no_auto_hotspot,
             ) => {
                 // client::run only returns on failure (its loop never exits otherwise).
                 if let Err(e) = run_result {
@@ -2289,7 +2241,7 @@ mod tests {
     #[test]
     fn client_args_resolve_flag_beats_config_beats_default() {
         let cfg =
-            monux::config::File::parse("[client]\nmouse-scale = 0.5\nno-auto-hotspot = true\n")
+            monux::config::File::parse("[client]\nmouse-scale = 0.5\nedge-dwell-ms = 400\n")
                 .unwrap();
 
         // Explicit flag wins; config fills the rest.
@@ -2299,7 +2251,7 @@ mod tests {
         };
         args.resolve(&cfg);
         assert_eq!(args.mouse_scale, Some(2.0));
-        assert_eq!(args.no_auto_hotspot, Some(true));
+        assert_eq!(args.edge_dwell_ms, Some(400));
 
         // Without a config file the use sites fall back to the built-ins.
         let cli = Cli::try_parse_from(["monux", "client"]).unwrap();
@@ -2312,7 +2264,7 @@ mod tests {
             args.mouse_scale.unwrap_or(monux::config::DEFAULT_INPUT_SCALE),
             1.0
         );
-        assert!(!args.no_auto_hotspot.unwrap_or(false));
+        assert!(args.edge_dwell_ms.is_none());
         assert!(args.host.is_none(), "the positional host is not configurable");
     }
 }

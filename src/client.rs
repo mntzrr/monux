@@ -121,7 +121,6 @@ pub async fn run<O: output::OutputHandler>(
     throttle_mode: ThrottleMode,
     edge_map: Option<crate::edge::EdgeMap>,
     edge_dwell: Duration,
-    no_auto_hotspot: bool,
 ) -> Result<()> {
     // speak_as is None normally (our bootstrap claims our own
     // PROTOCOL_VERSION); the clamp retry below claims an older server's
@@ -139,7 +138,6 @@ pub async fn run<O: output::OutputHandler>(
             throttle_mode,
             edge_map.is_some(),
             edge_dwell,
-            no_auto_hotspot,
             speak_as,
         )
     };
@@ -334,9 +332,6 @@ struct Connection {
     edge_inference: EdgeInference,
     /// Dwell for the inferred edge detector (--edge-dwell-ms).
     edge_dwell: Duration,
-    /// --no-auto-hotspot: don't join the server's advertised hotspot
-    /// automatically (ServerEvent::HotspotInfo).
-    no_auto_hotspot: bool,
     /// The server's hostname, learned from the v15+ handshake (None from an
     /// older server): feeds the approval prompt and the remembered-servers
     /// store (known_servers.rs).
@@ -410,7 +405,6 @@ impl Connection {
         throttle_mode: ThrottleMode,
         edge_map_explicit: bool,
         edge_dwell: Duration,
-        no_auto_hotspot: bool,
         speak_as: Option<u64>,
     ) -> Result<(Self, Instant)> {
         let bind_addr: SocketAddr = match server_addr {
@@ -621,7 +615,6 @@ impl Connection {
                 switch_request_rx: None,
                 edge_inference: EdgeInference::new(edge_map_explicit),
                 edge_dwell,
-                no_auto_hotspot,
                 server_hostname,
             },
             connect_time,
@@ -1049,19 +1042,11 @@ impl Connection {
                         ),
                     }
                 }
-                event::ServerEvent::HotspotInfo { ssid, psk } => {
-                    // The server hosts a 'monux-direct' hotspot and handed us
-                    // the credentials over this authenticated, encrypted
-                    // channel: join it so the KVM link moves off the router.
-                    if self.no_auto_hotspot {
-                        info!(
-                            "Server hosts the '{}' hotspot; --no-auto-hotspot given, not joining (join with 'monux setup --hotspot-join', see README)",
-                            ssid
-                        );
-                    } else {
-                        provision_hotspot(ssid.to_string(), psk.to_string());
-                    }
-                }
+                // DEPRECATED (protocol v14; the hotspot feature was removed
+                // in v10.0.0): a not-yet-updated server may still advertise
+                // its hotspot credentials — ignore them. The variant keeps
+                // its wire position until the next protocol bump.
+                event::ServerEvent::HotspotInfo { .. } => {}
             }
             offset += consumed;
         }
@@ -1478,67 +1463,6 @@ impl DegradationEpisode {
             sent.saturating_sub(self.sent_at_start),
         )
     }
-}
-
-/// Provisions the 'monux-direct' profile from the server-advertised
-/// credentials (ServerEvent::HotspotInfo) and joins the hotspot, as the
-/// session user via polkit — no sudo: NetworkManager's default policy lets
-/// an active local session manage connections. Runs once per process, off
-/// the step loop (nmcli calls block).
-fn provision_hotspot(ssid: String, psk: String) {
-    static PROVISIONED: AtomicBool = AtomicBool::new(false);
-    if PROVISIONED.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    tokio::task::spawn_blocking(move || {
-        let con = crate::setup::HOTSPOT_CON_NAME;
-        if crate::setup::nmcli_con_exists(con) {
-            debug!("Hotspot profile '{}' already exists; nothing to provision", con);
-            return;
-        }
-        let result = crate::setup::run_cmd_timeout(
-            "nmcli",
-            &[
-                "connection", "add", "type", "wifi", "con-name", con, "autoconnect", "yes",
-                "connection.autoconnect-priority", "10", "ssid", &ssid,
-            ],
-            10,
-        )
-        .and_then(|_| {
-            crate::setup::run_cmd_timeout(
-                "nmcli",
-                &["connection", "modify", con, "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", &psk],
-                10,
-            )
-        })
-        .and_then(|_| crate::setup::run_cmd_timeout("nmcli", &["connection", "up", con], 30));
-        match result {
-            Ok(_) => {
-                info!(
-                    "Joined the server's '{}' hotspot: the KVM link now bypasses the router (this machine's internet flows through the server; its previous WiFi profile returns when the hotspot is off)",
-                    ssid
-                );
-                notify::notify(
-                    "monux-connection",
-                    notify::Urgency::Normal,
-                    8000,
-                    "monux: joined direct hotspot",
-                    &format!(
-                        "Connected to '{}': the KVM link now bypasses the router; this machine's internet flows through the server",
-                        ssid
-                    ),
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to join the server's '{}' hotspot automatically: {:#}. Join manually with 'sudo monux setup --hotspot-join' (the credentials are printed by 'monux setup --hotspot' on the server)",
-                    ssid, e
-                );
-                // Don't leave a half-configured profile behind.
-                let _ = crate::setup::run_cmd_timeout("nmcli", &["connection", "delete", con], 10);
-            }
-        }
-    });
 }
 
 /// Samples the connection's QUIC path stats on a timer and warns — at most

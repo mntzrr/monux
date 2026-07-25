@@ -37,13 +37,13 @@ pub enum ServerEvent<'a> {
     /// applies. Appended variant (protocol v13).
     EdgeInfoRevoke { direction: Direction },
 
-    /// Credentials of the server's 'monux-direct' hotspot, so the client can
-    /// join it and move the KVM link off the router without the user copying
-    /// anything (see setup.rs --hotspot). Sent once per connection, only when
-    /// the hotspot profile exists AND is active, and only over this
-    /// authenticated, encrypted channel to an already-approved client — the
-    /// passphrase never travels any other way. Appended variant (protocol
-    /// v14).
+    /// DEPRECATED (protocol v14): credentials of the server's 'monux-direct'
+    /// WiFi hotspot. The hotspot feature was removed in v10.0.0 — nothing
+    /// constructs this variant anymore, and receivers must ignore it (a
+    /// not-yet-updated v14–v16 peer can still send it during the transition).
+    /// The variant stays at this exact position with this exact payload to
+    /// keep the wire format stable; it will be dropped at the next
+    /// PROTOCOL_VERSION bump.
     HotspotInfo { ssid: String, psk: String },
 }
 
@@ -444,8 +444,9 @@ mod tests {
 
     #[test]
     fn hotspot_info_roundtrip_without_leaking_psk_to_display() {
-        // The hotspot auto-provisioning advertisement (protocol v14): both
-        // fields survive the round trip, and Display never prints the psk.
+        // Pins the wire shape of the DEPRECATED HotspotInfo variant (see its
+        // doc comment): it must keep (de)serializing identically until the
+        // next protocol bump drops it, and Display never prints the psk.
         let msg = ServerEvent::HotspotInfo {
             ssid: "monux-direct-box".to_string(),
             psk: "sekrit123".to_string(),

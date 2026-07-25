@@ -102,8 +102,11 @@ mod golden_tests {
 
     #[test]
     fn golden_server_event_hotspot_info() {
-        // Appended variant (protocol v14): variant index 6 followed by the
-        // two length-prefixed strings (ssid, psk).
+        // DEPRECATED variant (protocol v14; the hotspot feature was removed
+        // in v10.0.0, see event.rs): variant index 6 followed by the two
+        // length-prefixed strings (ssid, psk). The golden bytes stay pinned
+        // so the wire format cannot shift before the variant is dropped at
+        // the next protocol bump.
         let msg = event::ServerEvent::HotspotInfo {
             ssid: "ap".to_string(),
             psk: "pw".to_string(),

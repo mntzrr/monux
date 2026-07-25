@@ -32,6 +32,52 @@ use anyhow::{Context, Result};
 
 use crate::{setup, single_instance};
 
+// --- Hotspot teardown ------------------------------------------------------
+// The 'monux-direct' WiFi hotspot feature was removed in v10.0.0, but a
+// machine that once ran 'monux setup --hotspot'/'--hotspot-join' can still
+// have the unit, configs, NAT table, vif and NM profile installed — the
+// uninstaller keeps tearing all of it down. These constants therefore moved
+// here from setup.rs with the feature's removal.
+
+/// Persistent net.ipv4.ip_forward enablement the removed hotspot's NAT
+/// needed ('monux setup --hotspot' wrote it).
+const IP_FORWARD_SYSCTL_PATH: &str = "/etc/sysctl.d/90-monux-ip-forward.conf";
+/// systemd unit bringing up the AP interface, hostapd, dnsmasq and the NAT.
+const HOTSPOT_UNIT_PATH: &str = "/etc/systemd/system/monux-hotspot.service";
+/// hostapd config for the hotspot AP (ssid + WPA2 psk lived here).
+const HOSTAPD_CONF_PATH: &str = "/etc/monux/hostapd.conf";
+/// dnsmasq config (DHCP + DNS for hotspot clients).
+const DNSMASQ_CONF_PATH: &str = "/etc/monux/dnsmasq.conf";
+/// Directory holding the hotspot's hostapd/dnsmasq configuration.
+const HOTSPOT_CONF_DIR: &str = "/etc/monux";
+/// Name of the dedicated AP interface the hotspot ran on, driven by hostapd.
+const AP_IFACE_NAME: &str = "monux-ap";
+/// nftables table for the hotspot's NAT masquerade (removed on unit stop).
+const HOTSPOT_NAT_TABLE: &str = "monux-hotspot-nat";
+/// Name of the NetworkManager connection profile for the direct, routerless
+/// KVM link: the client's join profile, or a migration leftover on the host.
+const HOTSPOT_CON_NAME: &str = "monux-direct";
+/// Priority of the policy rule that routed the hotspot subnet around a VPN
+/// (one above Mullvad's 32764 suppress rule, so it won).
+const VPN_WORKAROUND_RULE_PRIORITY: u32 = 32763;
+/// The comment tag on the nftables rule setup inserted into Mullvad's table,
+/// so teardown finds it even after Mullvad regenerates everything around it.
+const VPN_WORKAROUND_COMMENT: &str = "monux-hotspot";
+
+/// Handles of our comment-tagged rules in `nft -a list table inet mullvad`
+/// output (the tag lets teardown find the rules after Mullvad rewrites the
+/// rest of its table).
+fn monux_rule_handles(nft_list_output: &str) -> Vec<u64> {
+    nft_list_output
+        .lines()
+        .filter(|line| line.contains(VPN_WORKAROUND_COMMENT))
+        .filter_map(|line| {
+            line.rsplit_once("handle ")
+                .and_then(|(_, handle)| handle.trim().parse().ok())
+        })
+        .collect()
+}
+
 /// Runs the uninstall. Best-effort throughout: individual failures downgrade
 /// to notes with manual-removal hints instead of aborting the remaining steps.
 pub fn run(assume_yes: bool) -> Result<()> {
@@ -111,10 +157,10 @@ fn plan(home: &Path, current_exe: &Path) -> Plan {
         PathBuf::from(setup::MODULES_LOAD_PATH),
         PathBuf::from(setup::NM_POWERSAVE_CONF_PATH),
         PathBuf::from(setup::SYSCTL_BUF_CONF_PATH),
-        PathBuf::from(setup::IP_FORWARD_SYSCTL_PATH),
-        PathBuf::from(setup::HOTSPOT_UNIT_PATH),
-        PathBuf::from(setup::HOSTAPD_CONF_PATH),
-        PathBuf::from(setup::DNSMASQ_CONF_PATH),
+        PathBuf::from(IP_FORWARD_SYSCTL_PATH),
+        PathBuf::from(HOTSPOT_UNIT_PATH),
+        PathBuf::from(HOSTAPD_CONF_PATH),
+        PathBuf::from(DNSMASQ_CONF_PATH),
     ];
     plan_impl(
         home,
@@ -333,12 +379,13 @@ fn remove_qos_marking() {
 }
 
 /// Removes the hotspot pieces 'monux setup --hotspot/--hotspot-join'
-/// installs: the monux-hotspot systemd unit (stop+disable first, so the AP
-/// interface, NAT and dnsmasq come down cleanly), /etc/monux, the NAT table
-/// and the vif if they linger, and the 'monux-direct' NetworkManager profile
-/// (the client's join profile, or a migration leftover on the host). All
-/// self-describing and idempotent. Same non-interactive rule as the QoS
-/// cleanup: only attempted when sudo won't prompt.
+/// installed before the feature was removed in v10.0.0: the monux-hotspot
+/// systemd unit (stop+disable first, so the AP interface, NAT and dnsmasq
+/// come down cleanly), /etc/monux, the NAT table and the vif if they linger,
+/// and the 'monux-direct' NetworkManager profile (the client's join profile,
+/// or a migration leftover on the host). All self-describing and idempotent.
+/// Same non-interactive rule as the QoS cleanup: only attempted when sudo
+/// won't prompt.
 fn remove_hotspot_profile() {
     let sudo_ready = Command::new("sudo")
         .args(["-n", "true"])
@@ -348,14 +395,14 @@ fn remove_hotspot_profile() {
     if !sudo_ready {
         println!(
             "note: the hotspot (monux-hotspot unit / '{}' profile, if installed) was left in place; remove it with:",
-            setup::HOTSPOT_CON_NAME
+            HOTSPOT_CON_NAME
         );
         println!("  sudo systemctl disable --now monux-hotspot");
         println!(
             "  sudo rm -rf {} {}",
-            setup::HOTSPOT_CONF_DIR, setup::HOTSPOT_UNIT_PATH
+            HOTSPOT_CONF_DIR, HOTSPOT_UNIT_PATH
         );
-        println!("  sudo nmcli connection delete {}", setup::HOTSPOT_CON_NAME);
+        println!("  sudo nmcli connection delete {}", HOTSPOT_CON_NAME);
         return;
     }
     // Stop+disable first: stopping runs the unit's ExecStopPost teardown
@@ -371,28 +418,28 @@ fn remove_hotspot_profile() {
         .args(["systemctl", "daemon-reload"])
         .status();
     let _ = Command::new("sudo")
-        .args(["rm", "-rf", setup::HOTSPOT_CONF_DIR])
+        .args(["rm", "-rf", HOTSPOT_CONF_DIR])
         .status();
     // Belt-and-suspenders for a crashed or hand-built state.
     let _ = Command::new("sudo")
-        .args(["nft", "delete", "table", "ip", setup::HOTSPOT_NAT_TABLE])
+        .args(["nft", "delete", "table", "ip", HOTSPOT_NAT_TABLE])
         .status();
     let _ = Command::new("sudo")
-        .args(["iw", "dev", setup::AP_IFACE_NAME, "del"])
+        .args(["iw", "dev", AP_IFACE_NAME, "del"])
         .status();
     let _ = Command::new("sudo")
-        .args(["nmcli", "connection", "delete", setup::HOTSPOT_CON_NAME])
+        .args(["nmcli", "connection", "delete", HOTSPOT_CON_NAME])
         .status();
-    println!("Removed the monux hotspot (unit, configs, NAT, AP interface) and the '{}' profile (if installed).", setup::HOTSPOT_CON_NAME);
+    println!("Removed the monux hotspot (unit, configs, NAT, AP interface) and the '{}' profile (if installed).", HOTSPOT_CON_NAME);
     // The VPN workaround rules setup may have installed: the tagged rule in
     // Mullvad's table, and the policy rule by its priority. Best-effort —
     // anything already gone is skipped silently.
-    let priority = setup::VPN_WORKAROUND_RULE_PRIORITY.to_string();
+    let priority = VPN_WORKAROUND_RULE_PRIORITY.to_string();
     let _ = Command::new("sudo")
         .args(["ip", "rule", "del", "priority", &priority])
         .status();
     if let Some(list) = sudo_output(&["nft", "-a", "list", "table", "inet", "mullvad"]) {
-        for handle in setup::monux_rule_handles(&list) {
+        for handle in monux_rule_handles(&list) {
             let rule = format!("delete rule inet mullvad forward handle {}", handle);
             let _ = Command::new("sudo").args(["nft", &rule]).status();
         }
@@ -554,6 +601,15 @@ mod tests {
     fn write_file(path: &Path, contents: &[u8]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn tagged_rule_handles_are_found() {
+        let list = "table inet mullvad {\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy drop;\n\t\tip saddr 10.42.0.0/24 accept comment \"monux-hotspot\" # handle 7\n\t\tct state established,related accept # handle 2\n\t}\n}\n";
+        assert_eq!(monux_rule_handles(list), vec![7]);
+        let untagged = "table inet mullvad {\n\tchain forward {\n\t\tct state established,related accept # handle 2\n\t}\n}\n";
+        assert!(monux_rule_handles(untagged).is_empty());
+        assert!(monux_rule_handles("").is_empty());
     }
 
     #[test]

@@ -404,17 +404,6 @@ pub static REGISTRY: &[KeySpec] = &[
         since: BASELINE_SINCE,
     },
     KeySpec {
-        key: "client.no-auto-hotspot",
-        section: Section::Client,
-        flag: "no-auto-hotspot",
-        expects: "true|false",
-        default_display: "false",
-        help: "do not join the server's advertised 'monux-direct' hotspot automatically",
-        kind: Kind::Bool,
-        validate: v_bool,
-        since: BASELINE_SINCE,
-    },
-    KeySpec {
         key: "client.edge-map",
         section: Section::Client,
         flag: "edge-map",
@@ -2575,6 +2564,19 @@ mod tests {
         let mut unknown = file.unknown.clone();
         unknown.sort();
         assert_eq!(unknown, vec!["bogus.x".to_string(), "server.frobnicate".to_string()]);
+    }
+
+    #[test]
+    fn removed_no_auto_hotspot_key_warns_and_is_ignored() {
+        // 'client.no-auto-hotspot' went away with the hotspot feature in
+        // v10.0.0: an existing config carrying it must hit the staleness
+        // policy — warned about (unknown list) and ignored, never an error.
+        let file = File::parse("[client]\nmouse-scale = 0.5\nno-auto-hotspot = true\n").unwrap();
+        assert_eq!(file.unknown, vec!["client.no-auto-hotspot".to_string()]);
+        assert!(file.invalid.is_empty());
+        // The rest of the file still loads.
+        assert_eq!(file.get_f64("client.mouse-scale"), Some(0.5));
+        assert!(file.get_bool("client.no-auto-hotspot").is_none());
     }
 
     #[test]
