@@ -361,7 +361,7 @@ struct AutostartTarget {
 }
 
 /// Looks up a user's home directory and uid/gid (getpwnam(3)).
-fn passwd_entry(name: &str) -> Result<(PathBuf, u32, u32)> {
+pub(crate) fn passwd_entry(name: &str) -> Result<(PathBuf, u32, u32)> {
     use std::os::unix::ffi::OsStrExt;
     let cname = std::ffi::CString::new(name).context("Invalid user name")?;
     let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
@@ -1213,6 +1213,24 @@ fn hostapd_conf_content(ssid: &str, psk: &str, channel: u32, hw_mode: &str) -> S
     )
 }
 
+/// Writes hostapd.conf with owner-only permissions from the first open: the
+/// file holds the WPA psk, so a default-perms create (0644 under a typical
+/// umask) chmodded down only afterwards would leave a world-readable window
+/// on every (re)write. .mode covers a fresh create; the explicit
+/// set_permissions covers a pre-existing file carrying wider perms (mirrors
+/// config.rs's atomic_write).
+fn write_hostapd_conf(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    std::io::Write::write_all(&mut file, contents.as_bytes())
+}
+
 /// dnsmasq configuration: DHCP (+ DNS forwarding) for hotspot clients on the
 /// 10.42.0.0/24 subnet, this machine being the gateway at 10.42.0.1. The pid
 /// file lets the unit stop dnsmasq cleanly (it daemonizes, so systemd doesn't
@@ -1471,11 +1489,9 @@ fn setup_hotspot(failures: &mut u32) {
         println!("[fail] hotspot: could not create {}: {}", HOTSPOT_CONF_DIR, e);
         return;
     }
-    // The psk is a secret: 0600 (the server reads it as root to advertise it).
-    use std::os::unix::fs::PermissionsExt;
-    if let Err(e) = std::fs::write(HOSTAPD_CONF_PATH, &hostapd_conf).and_then(|_| {
-        std::fs::set_permissions(HOSTAPD_CONF_PATH, std::fs::Permissions::from_mode(0o600))
-    }) {
+    // The psk is a secret: 0600 from the first open, no world-readable
+    // window (the server reads it as root to advertise it).
+    if let Err(e) = write_hostapd_conf(Path::new(HOSTAPD_CONF_PATH), &hostapd_conf) {
         *failures += 1;
         println!("[fail] hotspot: could not write {}: {}", HOSTAPD_CONF_PATH, e);
         return;
@@ -1900,6 +1916,24 @@ mod tests {
             .to_string();
         assert!(err.contains("<redacted>"), "{}", err);
         assert!(!err.contains("s3cret-p4ss"), "{}", err);
+    }
+
+    #[test]
+    fn hostapd_conf_is_written_0600_from_the_first_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let conf = tmp.path().join("hostapd.conf");
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        // A fresh create is 0600 immediately — no world-readable window for
+        // the psk, even before any chmod could land.
+        write_hostapd_conf(&conf, "ssid=a\nwpa_passphrase=b\n").unwrap();
+        assert_eq!(mode(&conf), 0o600);
+        // A pre-existing wider-perms file is tightened on rewrite, and the
+        // content is replaced.
+        std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_hostapd_conf(&conf, "ssid=c\n").unwrap();
+        assert_eq!(mode(&conf), 0o600);
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), "ssid=c\n");
     }
 
     #[test]

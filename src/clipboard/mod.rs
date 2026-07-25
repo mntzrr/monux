@@ -60,6 +60,48 @@ pub const CLIPBOARD_SERVE_TIMEOUT_SECS: u64 = 4;
 /// subsequent one forever (and grows the channel unboundedly while waiting).
 const WRITER_DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// After a store is abandoned (dispatch timeout — wedged compositor),
+/// advertisements are dropped instead of attempted: every abandoned store
+/// leaks its thread (plus its wayland connection and the 2-thread fetch
+/// runtime write_clipboard builds), so serving each advertisement while the
+/// compositor stays wedged bleeds ~3 threads per WRITER_DISPATCH_TIMEOUT.
+/// One probe advertisement is allowed through every WEDGE_PROBE_INTERVAL;
+/// when a store completes again the wedge is declared over.
+const WEDGE_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The dispatcher's wedge gate (see WEDGE_PROBE_INTERVAL). Pure bookkeeping
+/// over store outcomes; the clock is injected for testing.
+struct WedgeGate {
+    wedged_since: Option<std::time::Instant>,
+}
+
+impl WedgeGate {
+    fn new() -> Self {
+        WedgeGate { wedged_since: None }
+    }
+
+    /// Whether to attempt this advertisement: always while healthy; once
+    /// wedged, only as a probe after WEDGE_PROBE_INTERVAL.
+    fn should_attempt(&self, now: std::time::Instant) -> bool {
+        match self.wedged_since {
+            Some(since) => now.duration_since(since) >= WEDGE_PROBE_INTERVAL,
+            None => true,
+        }
+    }
+
+    /// A store that answered at all (success or a fast failure): the
+    /// compositor is responding, so the wedge is over.
+    fn store_completed(&mut self) {
+        self.wedged_since = None;
+    }
+
+    /// A store abandoned on the dispatch timeout: gate advertisements until
+    /// a probe succeeds.
+    fn store_abandoned(&mut self, now: std::time::Instant) {
+        self.wedged_since = Some(now);
+    }
+}
+
 /// Clipboard writes (advertising types to the local environment) can block for
 /// a long time: each call opens a fresh wayland connection, does roundtrips,
 /// and spawns a serving thread. Running them on the rotation or client event
@@ -79,11 +121,20 @@ pub(crate) fn spawn_writer_dispatcher(
     let writer = std::sync::Arc::<dyn ClipboardWriter>::from(writer);
     let (tx, rx) = std::sync::mpsc::channel::<Vec<String>>();
     std::thread::spawn(move || {
+        let mut wedge_gate = WedgeGate::new();
         while let Ok(mut types) = rx.recv() {
             // Drain stale advertisements: only the latest matters. This
             // bounds the queue under burst churn and skips pointless serves.
             while let Ok(newer) = rx.try_recv() {
                 types = newer;
+            }
+            if !wedge_gate.should_attempt(std::time::Instant::now()) {
+                // Wedged compositor: drop the advertisement instead of
+                // leaking another store thread per timeout (see
+                // WEDGE_PROBE_INTERVAL). A fresh advertisement lands once a
+                // probe succeeds, so nothing is lost permanently.
+                debug!("Dropping clipboard advertisement: wayland compositor appears wedged");
+                continue;
             }
             // Run store_types with a timeout so a wedged compositor can't
             // deadlock the dispatcher forever. store_types does blocking
@@ -97,15 +148,19 @@ pub(crate) fn spawn_writer_dispatcher(
                 let _ = result_tx.send(writer.store_types(types));
             });
             match result_rx.recv_timeout(WRITER_DISPATCH_TIMEOUT) {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    wedge_gate.store_completed();
+                }
                 Ok(Err(e)) => {
                     tracing::warn!("Failed to advertise clipboard types: {}", e);
+                    wedge_gate.store_completed();
                 }
                 Err(_) => {
                     tracing::warn!(
-                        "Clipboard advertisement timed out after {:?} (wedged compositor?); abandoning",
+                        "Clipboard advertisement timed out after {:?} (wedged compositor?); abandoning and gating advertisements until a probe succeeds",
                         WRITER_DISPATCH_TIMEOUT
                     );
+                    wedge_gate.store_abandoned(std::time::Instant::now());
                     // The store_types thread is leaked but will exit when its
                     // wayland connection drops; detach its handle.
                     let _ = handle;
@@ -176,5 +231,34 @@ mod tests {
     #[test]
     fn filter_empty_list_stays_empty() {
         assert!(filter_shareable_mime_types(vec![]).is_empty());
+    }
+
+    #[test]
+    fn wedge_gate_attempts_everything_while_healthy() {
+        let gate = WedgeGate::new();
+        assert!(gate.should_attempt(std::time::Instant::now()));
+    }
+
+    #[test]
+    fn wedge_gate_drops_until_a_probe_window_after_abandonment() {
+        let mut gate = WedgeGate::new();
+        let t0 = std::time::Instant::now();
+        gate.store_abandoned(t0);
+        // Inside the probe window advertisements are dropped: each attempt
+        // would time out and leak its store thread.
+        assert!(!gate.should_attempt(t0 + std::time::Duration::from_secs(1)));
+        assert!(!gate.should_attempt(t0 + WEDGE_PROBE_INTERVAL - std::time::Duration::from_secs(1)));
+        // After the window one probe advertisement is allowed through.
+        assert!(gate.should_attempt(t0 + WEDGE_PROBE_INTERVAL));
+    }
+
+    #[test]
+    fn wedge_gate_recovers_when_a_store_completes() {
+        let mut gate = WedgeGate::new();
+        gate.store_abandoned(std::time::Instant::now());
+        // A completed store (even a fast failure — the compositor answered)
+        // ends the wedge: advertisements flow again immediately.
+        gate.store_completed();
+        assert!(gate.should_attempt(std::time::Instant::now()));
     }
 }

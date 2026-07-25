@@ -114,8 +114,10 @@ pub async fn write(
 fn read_gnome_file_paths(buf: Vec<u8>, max_compressed_size_bytes: u64) -> Result<Vec<u8>> {
     let buf = String::from_utf8(buf)?;
     let mut lines: Vec<&str> = buf.split("\n").collect();
-    if !lines.is_empty() {
-        // Remove the "cut" or "copy"
+    // Remove the "cut"/"copy" operation line — but only when it IS one: some
+    // sources omit it, and dropping an assumed first line would lose the
+    // first URI of an operation-less payload.
+    if lines.first().is_some_and(|first| *first == "cut" || *first == "copy") {
         lines.remove(0);
     }
     // Strip trailing empty entries from a trailing newline, mirroring
@@ -145,13 +147,11 @@ fn write_gnome_file_paths(paths: Vec<PathBuf>) -> Result<Vec<u8>> {
 ///   file:///path/to/file1\r\nfile:///path/to/file2\r\n
 fn read_uri_file_paths(buf: Vec<u8>, max_compressed_size_bytes: u64) -> Result<Vec<u8>> {
     let buf = String::from_utf8(buf)?;
-    let mut lines: Vec<&str> = buf.split("\r\n").collect();
-    if let Some(last) = lines.last() {
-        if last.is_empty() {
-            // Remove final empty entry from trailing newline
-            lines.pop();
-        }
-    }
+    // Generic line boundaries: the spec says CRLF, but sources in the wild
+    // send LF-only — splitting on "\r\n" alone turns such a payload into one
+    // unparseable blob. Empty entries (a trailing blank line) are skipped by
+    // build_zip_payload.
+    let lines: Vec<&str> = buf.lines().collect();
     build_zip_payload(lines, max_compressed_size_bytes)
 }
 
@@ -204,6 +204,48 @@ fn write_zstd(
     Ok(buf)
 }
 
+/// Sweeps stale clipboard-* unpack dirs under config_dir. Two concerns:
+/// 1. Keep enough generations (current + a few prior) so a paste still
+///    referencing files from 2-3 unpacks ago isn't deleted mid-paste.
+/// 2. Only ever delete dirs whose owning pid is DEAD (left behind by a
+///    crash/restart/update). A second monux process sharing this config dir
+///    has its own counter starting at 0, so an id far behind OUR counter can
+///    be that process's just-created unpack dir — deleting it mid-paste loses
+///    the files being pasted.
+fn sweep_stale_unpack_dirs(config_dir: &Path, dir_id: usize) {
+    let dir_prefix = "clipboard-";
+    let generations_to_keep = 5;
+    // The keep window as a checked subtraction: id < cutoff is swept. A
+    // crafted clipboard-x-<usize::MAX> dir must not overflow the comparison
+    // (id + generations_to_keep would panic in debug builds).
+    let cutoff = dir_id.checked_sub(generations_to_keep);
+    if let Ok(entries) = std::fs::read_dir(config_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(suffix) = name.strip_prefix(dir_prefix) else { continue };
+            // suffix is "<pid>-<id>" — the id is after the last '-'.
+            let Some((pid_str, id_str)) = suffix.rsplit_once('-') else { continue };
+            let Ok(pid) = pid_str.parse::<u32>() else { continue };
+            let Ok(id) = id_str.parse::<usize>() else { continue };
+            if !matches!(cutoff, Some(cutoff) if id < cutoff) {
+                continue;
+            }
+            if pid_is_running(pid) {
+                continue;
+            }
+            debug!("Removing stale temp directory: {}", entry.path().display());
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Whether a process with this pid exists. On probe failure (non-Linux, no
+/// /proc) assume alive: never delete a possibly-live process's dirs.
+fn pid_is_running(pid: u32) -> bool {
+    Path::new(&format!("/proc/{}", pid)).exists()
+}
+
 /// Cap on the number of file entries in a clipboard zip payload.
 const MAX_ZIP_ENTRIES: usize = 10_000;
 
@@ -227,34 +269,8 @@ fn unpack_zip_payload(
     debug!("Creating temp directory: {}", clipboard_dir.display());
     std::fs::create_dir_all(&clipboard_dir)?;
 
-    // Clean up old temp dirs. Two concerns:
-    // 1. Keep enough generations (current + a few prior) so a paste still
-    //    referencing files from 2-3 unpacks ago isn't deleted mid-paste.
-    // 2. Sweep ALL clipboard-* dirs (not just our PID) so dirs left by
-    //    previous process runs (crash/restart/update) are cleaned too.
-    let dir_prefix = "clipboard-";
-    let generations_to_keep = 5;
-    if let Ok(entries) = std::fs::read_dir(config_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            let Some(suffix) = name.strip_prefix(dir_prefix) else { continue };
-            // suffix is "<pid>-<id>" — parse the id after the last '-'.
-            let Some(id_str) = suffix.rsplit_once('-').map(|(_, id)| id) else { continue };
-            let Ok(id) = id_str.parse::<usize>() else { continue };
-            // Only delete dirs from our own counter space (same id sequence);
-            // skip dirs whose id is within the keep window. Dirs from other
-            // processes have their own counter space starting at 0, so their
-            // ids can overlap — but that's fine: we only delete when the id
-            // is far enough behind our counter, and we delete ALL dirs with
-            // matching naming regardless of pid (handled below for stale
-            // processes by the generous keep window).
-            if id + generations_to_keep < dir_id {
-                debug!("Removing stale temp directory: {}", entry.path().display());
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
-        }
-    }
+    // Clean up old temp dirs (see sweep_stale_unpack_dirs).
+    sweep_stale_unpack_dirs(config_dir, dir_id);
 
     // Unzip payload into temp directory
     let mut ziparchive = zip::read::ZipArchive::new(std::io::Cursor::new(zipdata))?;
@@ -668,6 +684,89 @@ mod tests {
             .unwrap();
         assert_eq!(paths.len(), 1);
         assert_eq!(std::fs::read(&paths[0]).unwrap(), b"a");
+    }
+
+    #[test]
+    fn gnome_payload_without_operation_line_keeps_first_uri() {
+        // Some sources omit the cut/copy line: the first URI must survive
+        // (it used to be dropped as an assumed operation line).
+        let src = tempfile::tempdir().unwrap();
+        let a = temp_file(src.path(), "a.txt", b"a");
+        let b = temp_file(src.path(), "b.txt", b"b");
+        let zip = read_gnome_file_paths(
+            format!("{}\n{}", file_uri(&a), file_uri(&b)).into_bytes(),
+            GENEROUS_CAP,
+        )
+        .unwrap();
+        let unpack_root = tempfile::tempdir().unwrap();
+        let paths = unpack_zip_payload(zip, GENEROUS_CAP, &unpack_root.path().to_path_buf())
+            .unwrap();
+        assert_eq!(paths.len(), 2);
+    }
+
+    #[test]
+    fn uri_list_accepts_lf_only_and_mixed_endings() {
+        // The spec's CRLF is not universal: LF-only input must parse as two
+        // URIs, not one unparseable blob.
+        let src = tempfile::tempdir().unwrap();
+        let a = temp_file(src.path(), "a.txt", b"a");
+        let b = temp_file(src.path(), "b.txt", b"b");
+        for payload in [
+            format!("{}\n{}\n", file_uri(&a), file_uri(&b)),
+            format!("{}\r\n{}\n", file_uri(&a), file_uri(&b)),
+            format!("{}\r\n{}\r\n", file_uri(&a), file_uri(&b)),
+        ] {
+            let zip = read_uri_file_paths(payload.into_bytes(), GENEROUS_CAP).unwrap();
+            let unpack_root = tempfile::tempdir().unwrap();
+            let paths = unpack_zip_payload(zip, GENEROUS_CAP, &unpack_root.path().to_path_buf())
+                .unwrap();
+            assert_eq!(paths.len(), 2);
+        }
+    }
+
+    #[test]
+    fn sweep_removes_only_dead_owners_dirs_past_the_window() {
+        let root = tempfile::tempdir().unwrap();
+        let plant = |name: String| {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        // A pid guaranteed dead: spawn and reap a child, then use its pid.
+        let dead_pid = {
+            let mut child = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("exit 0")
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            pid
+        };
+        let live_pid = std::process::id();
+        let stale_dead = plant(format!("clipboard-{}-0", dead_pid));
+        let live_same_id = plant(format!("clipboard-{}-0", live_pid));
+        let recent_dead = plant(format!("clipboard-{}-9", dead_pid));
+        let crafted_max = plant(format!("clipboard-{}-{}", dead_pid, usize::MAX));
+        let malformed = plant("clipboard-x-y".to_string());
+        let unrelated = plant("some-other-dir".to_string());
+
+        sweep_stale_unpack_dirs(root.path(), 10);
+
+        // Past the keep window with a dead owner: swept (leftover from a
+        // crashed/restarted process).
+        assert!(!stale_dead.exists());
+        // Same id but a LIVE owner — a second monux process sharing the
+        // config dir, whose just-created unpack dir this may be: kept.
+        assert!(live_same_id.exists());
+        // Within the keep window: kept (a paste may still reference it).
+        assert!(recent_dead.exists());
+        // A crafted id must not overflow the window math (panic in debug):
+        // usize::MAX is never < cutoff, so it is kept.
+        assert!(crafted_max.exists());
+        // Unparseable names and unrelated dirs are left alone.
+        assert!(malformed.exists());
+        assert!(unrelated.exists());
     }
 
     #[test]

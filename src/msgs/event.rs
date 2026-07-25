@@ -51,19 +51,19 @@ impl<'a> std::fmt::Display for ServerEvent<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             ServerEvent::Switch(e) => e.fmt(f),
-            ServerEvent::Input(e) => f.write_str(format!("{:?}", e).as_str()),
+            ServerEvent::Input(e) => write!(f, "{:?}", e),
             ServerEvent::ClipboardTypes(e) => e.fmt(f),
             ServerEvent::Ping => f.write_str("Ping"),
             ServerEvent::EdgeInfo { direction } => {
-                f.write_str(format!("EdgeInfo(direction={})", direction.as_str()).as_str())
+                write!(f, "EdgeInfo(direction={})", direction.as_str())
             }
             ServerEvent::EdgeInfoRevoke { direction } => {
-                f.write_str(format!("EdgeInfoRevoke(direction={})", direction.as_str()).as_str())
+                write!(f, "EdgeInfoRevoke(direction={})", direction.as_str())
             }
             ServerEvent::HotspotInfo { ssid, .. } => {
                 // Never print the passphrase, even in a Display impl used for
                 // trace logging: the SSID alone identifies the message.
-                f.write_str(format!("HotspotInfo(ssid={})", ssid).as_str())
+                write!(f, "HotspotInfo(ssid={})", ssid)
             }
         }
     }
@@ -135,7 +135,7 @@ impl<'a> std::fmt::Display for ClientEvent<'a> {
             ClientEvent::ClipboardTypes(e) => e.fmt(f),
             ClientEvent::Pong => f.write_str("Pong"),
             ClientEvent::SwitchRequest { y_fraction } => {
-                f.write_str(format!("SwitchRequest(y_fraction={})", y_fraction).as_str())
+                write!(f, "SwitchRequest(y_fraction={})", y_fraction)
             }
         }
     }
@@ -151,7 +151,7 @@ pub struct SwitchEvent {
 
 impl std::fmt::Display for SwitchEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(format!("SwitchEvent(enabled={})", self.enabled).as_str())
+        write!(f, "SwitchEvent(enabled={})", self.enabled)
     }
 }
 
@@ -265,9 +265,9 @@ pub struct InputEvent {
 impl std::fmt::Display for InputEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         if let Some(evt) = &self.inputi32 {
-            f.write_str(format!("InputEvent(inputi32={})", evt).as_str())
+            write!(f, "InputEvent(inputi32={})", evt)
         } else if let Some(evt) = &self.inputf64 {
-            f.write_str(format!("InputEvent(inputf64={})", evt).as_str())
+            write!(f, "InputEvent(inputf64={})", evt)
         } else {
             f.write_str("InputEvent(?)")
         }
@@ -287,12 +287,10 @@ pub struct InputI32 {
 
 impl std::fmt::Display for InputI32 {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(
-            format!(
-                "InputI32(type={}, code={}, value={})",
-                self.type_, self.code, self.value
-            )
-            .as_str(),
+        write!(
+            f,
+            "InputI32(type={}, code={}, value={})",
+            self.type_, self.code, self.value
         )
     }
 }
@@ -327,12 +325,10 @@ pub struct InputF64 {
 
 impl std::fmt::Display for InputF64 {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(
-            format!(
-                "InputF64(type={}, code={}, value={})",
-                self.type_, self.code, self.value
-            )
-            .as_str(),
+        write!(
+            f,
+            "InputF64(type={}, code={}, value={})",
+            self.type_, self.code, self.value
         )
     }
 }
@@ -392,12 +388,10 @@ impl<'a> ClipboardTypes<'a> {
 
 impl<'a> std::fmt::Display for ClipboardTypes<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(
-            format!(
-                "ClipboardTypes(types=[{}], max_size_bytes={})",
-                self.types, self.max_size_bytes
-            )
-            .as_str(),
+        write!(
+            f,
+            "ClipboardTypes(types=[{}], max_size_bytes={})",
+            self.types, self.max_size_bytes
         )
     }
 }
@@ -458,6 +452,54 @@ mod tests {
         };
         assert!(!format!("{}", msg).contains("sekrit123"));
         assert_cobs_roundtrip!(ServerEvent, msg);
+    }
+
+    #[test]
+    fn display_strings_are_stable() {
+        // The exact Display strings (trace logging on the input-batch path
+        // formats these per event) — pinned so refactors of the impls can't
+        // silently change log output.
+        assert_eq!(
+            format!("{}", SwitchEvent { enabled: true }),
+            "SwitchEvent(enabled=true)"
+        );
+        assert_eq!(
+            format!("{}", ServerEvent::Input(vec![])),
+            format!("{:?}", Vec::<InputEvent>::new())
+        );
+        assert_eq!(format!("{}", ServerEvent::Ping), "Ping");
+        assert_eq!(
+            format!("{}", ServerEvent::EdgeInfo { direction: Direction::Left }),
+            "EdgeInfo(direction=left)"
+        );
+        assert_eq!(
+            format!("{}", ServerEvent::EdgeInfoRevoke { direction: Direction::Bottom }),
+            "EdgeInfoRevoke(direction=bottom)"
+        );
+        assert_eq!(
+            format!("{}", ClientEvent::SwitchRequest { y_fraction: 0.5 }),
+            "SwitchRequest(y_fraction=0.5)"
+        );
+        assert_eq!(format!("{}", ClientEvent::Pong), "Pong");
+        assert_eq!(
+            format!("{}", InputI32 { type_: 1, code: 30, value: -1 }),
+            "InputI32(type=1, code=30, value=-1)"
+        );
+        assert_eq!(
+            format!("{}", InputF64 { type_: 2, code: 0, value: 0.5 }),
+            "InputF64(type=2, code=0, value=0.5)"
+        );
+        let keyed = InputEvent {
+            inputi32: Some(InputI32 { type_: 1, code: 30, value: 1 }),
+            inputf64: None,
+        };
+        assert_eq!(format!("{}", keyed), "InputEvent(inputi32=InputI32(type=1, code=30, value=1))");
+        let empty = InputEvent { inputi32: None, inputf64: None };
+        assert_eq!(format!("{}", empty), "InputEvent(?)");
+        assert_eq!(
+            format!("{}", ClipboardTypes { types: "text/plain image/png", max_size_bytes: 7 }),
+            "ClipboardTypes(types=[text/plain image/png], max_size_bytes=7)"
+        );
     }
 
     #[test]

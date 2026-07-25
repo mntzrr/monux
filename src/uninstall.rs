@@ -44,8 +44,10 @@ pub fn run(assume_yes: bool) -> Result<()> {
     // First: a running server may hold input devices grabbed.
     stop_running_instances();
 
-    let home =
-        home::home_dir().context("No home dir found: unable to locate binaries and config")?;
+    let home = target_home(
+        unsafe { libc::geteuid() },
+        std::env::var("SUDO_USER").ok().as_deref(),
+    )?;
     let exe = current_exe_path()?;
     let mut plan = plan(&home, &exe);
 
@@ -55,6 +57,29 @@ pub fn run(assume_yes: bool) -> Result<()> {
 
     execute(&plan);
     Ok(())
+}
+
+/// The home the uninstall targets. Running as root is the `sudo monux system
+/// uninstall` path; sudo configurations that reset $HOME (sudo -H, or HOME
+/// missing from env_keep) would then aim every per-user removal — the stale
+/// binaries, ~/.config/monux, the autostart units — at /root, silently
+/// missing the real install. Resolve the INVOKING user's home via SUDO_USER
+/// instead (mirroring setup.rs's autostart target), and refuse to guess when
+/// there is no invoking user to aim at. The euid is a parameter so the
+/// decision is unit-testable.
+fn target_home(euid: u32, sudo_user: Option<&str>) -> Result<PathBuf> {
+    if euid != 0 {
+        return home::home_dir().context("No home dir found: unable to locate binaries and config");
+    }
+    match sudo_user {
+        Some(name) if !name.is_empty() && name != "root" => {
+            let (home, _uid, _gid) = setup::passwd_entry(name)?;
+            Ok(home)
+        }
+        _ => anyhow::bail!(
+            "Running as root with no invoking user (SUDO_USER unset): run the uninstall as the user, not root — as root it would target /root instead of the user's home"
+        ),
+    }
 }
 
 /// What exists and what will be removed, computed up front so the destructive
@@ -721,6 +746,58 @@ mod tests {
         fs::create_dir_all(&config_dir).unwrap();
         let plan = plan_impl(&home, &exe, &[], &missing_usr_local);
         assert_eq!(plan.config_dir, Some(config_dir));
+    }
+
+    #[test]
+    fn target_home_non_root_uses_own_home() {
+        let euid = unsafe { libc::geteuid() };
+        if euid == 0 {
+            // The test suite running as root: the non-root branch can't be
+            // exercised meaningfully (it would still return A home).
+            return;
+        }
+        assert_eq!(
+            target_home(euid, None).unwrap(),
+            home::home_dir().unwrap()
+        );
+        // SUDO_USER is irrelevant for a non-root run.
+        assert_eq!(
+            target_home(euid, Some("someone")).unwrap(),
+            home::home_dir().unwrap()
+        );
+    }
+
+    #[test]
+    fn target_home_root_without_invoking_user_bails() {
+        for sudo_user in [None, Some(""), Some("root")] {
+            let err = target_home(0, sudo_user).unwrap_err().to_string();
+            assert!(
+                err.contains("run the uninstall as the user, not root"),
+                "unexpected error for {:?}: {}",
+                sudo_user,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn target_home_root_resolves_the_invoking_users_home() {
+        // The current user's name, resolved from our own uid: as root via
+        // sudo, SUDO_USER holds exactly this kind of name.
+        let name = unsafe {
+            let pw = libc::getpwuid(libc::geteuid());
+            assert!(!pw.is_null(), "current uid must have a passwd entry");
+            std::ffi::CStr::from_ptr((*pw).pw_name)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let home = target_home(0, Some(&name)).unwrap();
+        // The resolved home is the named user's passwd home — never /root's
+        // — and it exists.
+        assert!(home.is_dir(), "{} should be a real home", home.display());
+        if name != "root" {
+            assert_ne!(home, Path::new("/root"));
+        }
     }
 
     #[test]

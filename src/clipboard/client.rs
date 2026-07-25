@@ -80,7 +80,7 @@ impl LocalClipboard {
         requested_type: &str,
         max_size_bytes: u64,
         request_client: Option<SocketAddr>,
-    ) -> Result<(Vec<u8>, Option<String>)> {
+    ) -> Result<(std::sync::Arc<[u8]>, Option<String>)> {
         let request_source = if let Some(c) = request_client {
             format!("server for {}", c)
         } else {

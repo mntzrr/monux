@@ -522,7 +522,7 @@ pub fn resolve_edge_target(
 /// it). Best-effort: an empty result just means "unresolvable here".
 pub fn resolve_hostname(name: &str) -> Vec<IpAddr> {
     let mut ips = Vec::new();
-    for candidate in [name.to_string(), format!("{}.local", name)] {
+    for candidate in lookup_candidates(name) {
         if let Ok(addrs) = (candidate.as_str(), 0).to_socket_addrs() {
             ips.extend(addrs.map(|addr| addr.ip()));
         }
@@ -530,6 +530,19 @@ pub fn resolve_hostname(name: &str) -> Vec<IpAddr> {
     ips.sort();
     ips.dedup();
     ips
+}
+
+/// The names resolve_hostname looks up, in order: the name itself, plus its
+/// `.local` mDNS variant unless it already ends in `.local` — a target
+/// written as `laptop.local` needs no useless second blocking lookup of
+/// `laptop.local.local`. A free function so the candidate selection is
+/// testable without system lookups.
+fn lookup_candidates(name: &str) -> Vec<String> {
+    let mut candidates = vec![name.to_string()];
+    if !name.ends_with(".local") {
+        candidates.push(format!("{}.local", name));
+    }
+    candidates
 }
 
 /// Cache of hostname → resolved IPs for --edge-map hostname targets, so the
@@ -1486,6 +1499,21 @@ mod tests {
         assert_eq!(
             resolve_edge_target(&target_named("laptop"), &clients, &resolver),
             Err(ResolveError::HostnameMatchesNothing("laptop".to_string()))
+        );
+    }
+
+    #[test]
+    fn lookup_candidates_skip_the_local_local_lookup() {
+        // A bare name is looked up itself and via its .local mDNS variant.
+        assert_eq!(
+            lookup_candidates("laptop"),
+            vec!["laptop".to_string(), "laptop.local".to_string()]
+        );
+        // A target already written as .local is looked up only as written:
+        // laptop.local.local never resolves and costs a blocking lookup.
+        assert_eq!(
+            lookup_candidates("laptop.local"),
+            vec!["laptop.local".to_string()]
         );
     }
 

@@ -364,7 +364,7 @@ pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<u6
             resp.bytes.len(),
             &*resp.bytes
         );
-        buf.extend_from_slice(&resp.bytes);
+        extend_version_buf(buf, &resp.bytes)?;
     }
     let version: u64;
     {
@@ -381,6 +381,18 @@ pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<u6
         buf.truncate(buf_len - consumed);
     }
     Ok(version)
+}
+
+/// Appends a version-exchange chunk to the frame buffer, enforcing the same
+/// cap as every other COBS frame path (shared::MAX_FRAME_BUFFER_BYTES): a
+/// peer that streams bytes without ever emitting a terminator would
+/// otherwise grow the buffer without bound.
+fn extend_version_buf(buf: &mut Vec<u8>, chunk: &[u8]) -> Result<()> {
+    buf.extend_from_slice(chunk);
+    if buf.len() > shared::MAX_FRAME_BUFFER_BYTES {
+        bail!("Peer sent an oversized version frame ({} bytes without a COBS terminator)", buf.len());
+    }
+    Ok(())
 }
 
 /// Reads the server-hostname frame (protocol v15: u16 big-endian length
@@ -455,5 +467,32 @@ mod tests {
                     .unwrap();
             assert_eq!(decoded.version, version);
         }
+    }
+
+    /// A peer that streams version bytes without ever emitting a COBS
+    /// terminator must be cut off at the frame cap, like every other frame
+    /// path — not grow the buffer without bound.
+    #[test]
+    fn version_frame_buffer_is_capped() {
+        let mut buf = Vec::new();
+        let chunk = [0x01u8; 4096]; // never a terminator
+        let mut err = None;
+        for _ in 0..=(shared::MAX_FRAME_BUFFER_BYTES / chunk.len()) {
+            if let Err(e) = extend_version_buf(&mut buf, &chunk) {
+                err = Some(e);
+                break;
+            }
+        }
+        let err = err.expect("terminator-free chunks must trip the frame cap");
+        assert!(
+            err.to_string().contains("oversized version frame"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(buf.len() > shared::MAX_FRAME_BUFFER_BYTES);
+        // A buffer under the cap (terminator still pending) is accepted.
+        let mut buf = Vec::new();
+        extend_version_buf(&mut buf, &[1, 2, 3]).unwrap();
+        assert_eq!(buf, vec![1, 2, 3]);
     }
 }

@@ -253,6 +253,22 @@ struct ClientLinkState {
     /// The live pacing-rate cell shared with this client's bulk writer task;
     /// rewritten on every tier transition.
     throttle: SharedThrottle,
+    /// The degraded-link log's last-reported state (see log_input_status):
+    /// only rtt-threshold CROSSINGS log, so a chronically bad link doesn't
+    /// add an INFO line per heartbeat window.
+    degraded: bool,
+}
+
+/// The degraded-link transition for this heartbeat window, if any: Some(true)
+/// = healthy→degraded, Some(false) = degraded→healthy. Only crossings are
+/// reported — the heartbeat fires every 10s, so a chronically bad link must
+/// not spam an INFO line per window. A free function so the transition logic
+/// is testable without a Rotation.
+fn degraded_link_transition(was_degraded: &mut bool, rtt: Duration) -> Option<bool> {
+    let is_degraded = rtt > HEARTBEAT_LINK_RTT_WARN;
+    let crossed = is_degraded != *was_degraded;
+    *was_degraded = is_degraded;
+    crossed.then_some(is_degraded)
 }
 
 /// Whether the client has missed enough pings to be declared silent
@@ -619,6 +635,12 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// Reusable serialization scratch for motion datagrams
     /// (try_send_motion_datagram); cleared before each datagram.
     datagram_scratch: Vec<u8>,
+    /// Reusable scratch for a motion datagram's newest-first history
+    /// (try_send_motion_datagram), refilled before each datagram: the wire
+    /// type owns its history, so the Vec is taken out for serialization and
+    /// put right back — at motion rates a fresh Vec per frame is allocator
+    /// churn, same reasoning as datagram_scratch.
+    motion_history_scratch: Vec<(i32, i32)>,
     /// How the motion flush rate is chosen (see MotionMode); the interval
     /// itself is derived on demand by motion_flush_interval().
     motion_mode: MotionMode,
@@ -687,6 +709,29 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// When the diagnostics mirror was last refreshed (see
     /// DIAGNOSTICS_REFRESH_INTERVAL); None until the first refresh.
     last_diagnostics_refresh: Option<Instant>,
+}
+
+/// The slot where a (re)connecting endpoint's entry lands in the sorted
+/// clients list: Ok(idx) replaces the existing entry in place, Err(idx)
+/// inserts. A replace also forgets the endpoint's advertised-EdgeInfo record
+/// (edge_info_sent): that record belongs to the OLD connection, and keeping
+/// it would dedup — skip — the fresh connection's EdgeInfo (see
+/// advertise_edge_info), so the reconnected client's return-edge detector
+/// would never start. A normal disconnect clears the record in
+/// handle_client_removal; the in-place replace must too.
+///
+/// A free function over plain endpoints so the replace policy is testable:
+/// ClientInfo embeds quinn handles and can't be fabricated in a unit test.
+fn reconnect_slot(
+    endpoints: &[SocketAddr],
+    edge_info_sent: &mut HashMap<SocketAddr, BTreeSet<event::Direction>>,
+    endpoint: &SocketAddr,
+) -> std::result::Result<usize, usize> {
+    let slot = endpoints.binary_search(endpoint);
+    if slot.is_ok() {
+        edge_info_sent.remove(endpoint);
+    }
+    slot
 }
 
 /// Computes the target of a previous-client switch (None = local machine).
@@ -890,6 +935,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             motion_history: VecDeque::new(),
             serialize_scratch: Vec::new(),
             datagram_scratch: Vec::new(),
+            motion_history_scratch: Vec::new(),
             motion_mode,
             throttle_mode,
             link_quality: HashMap::new(),
@@ -1111,7 +1157,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                     .clipboard_update_source(args.source, args.types, args.max_size_bytes)
                     .await
                 {
-                    warn!("Failed to update clipboard source to server: {:?}", e);
+                    warn!("Failed to update clipboard source: {:?}", e);
                 }
             }
             RotationEvent::ClipboardRequestContent(args) => {
@@ -1124,7 +1170,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                     )
                     .await
                 {
-                    warn!("Failed to retrieve clipboard content for server: {:?}", e);
+                    warn!("Failed to retrieve clipboard content: {:?}", e);
                 }
             }
             RotationEvent::ClipboardSendContent(args) => {
@@ -1177,6 +1223,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 last_sent: 0,
                 last_lost: 0,
                 throttle: throttle_cell.clone(),
+                degraded: false,
             },
         );
         let (bulk_tx, bulk_rx) = mpsc::channel::<Vec<u8>>(bulk::BULK_QUEUE_CAPACITY);
@@ -1213,8 +1260,13 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         // lands before the old connection's removal: update that entry in place
         // instead of inserting a duplicate (a later removal would clear only the
         // first copy, leaving a dead one behind). The old connection's late
-        // removal is then ignored via its stale conn_token (see RemoveClient).
-        match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
+        // removal is then ignored via its stale conn_token (see RemoveClient),
+        // and its advertised-EdgeInfo record is forgotten (see reconnect_slot).
+        let slot = {
+            let endpoints: Vec<SocketAddr> = self.clients.iter().map(|c| c.endpoint).collect();
+            reconnect_slot(&endpoints, &mut self.edge_info_sent, &endpoint)
+        };
+        match slot {
             Ok(idx) => self.clients[idx] = info,
             Err(idx) => self.clients.insert(idx, info),
         }
@@ -2015,14 +2067,14 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                             "Failed to read server clipboard for {}: {:?}",
                             request_client, e
                         );
-                        (Vec::new(), None)
+                        (Default::default(), None)
                     }
                     Err(_) => {
                         warn!(
                             "Timed out after {}s reading server clipboard for {}",
                             CLIPBOARD_SERVE_TIMEOUT_SECS, request_client
                         );
-                        (Vec::new(), None)
+                        (Default::default(), None)
                     }
                 };
                 // Symmetric with the writer's "Serving paste request ... took
@@ -2391,6 +2443,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// (silenced_endpoint): any manual switch action — chord, socket,
     /// goto, a deliberate LOCAL choice included — clears that flag, and a
     /// manual choice always wins (the client is then only marked healthy).
+    /// While paused it never fires either: rotation switches are suspended
+    /// (see prev_client), so the recovery only marks the client healthy.
     async fn note_client_heard(&mut self, endpoint: SocketAddr) {
         let now = Instant::now();
         let Some(state) = self.liveness.get_mut(&endpoint) else {
@@ -2413,7 +2467,11 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             .unwrap_or_default();
         state.silenced_since = None;
         state.recovery_pongs = 0;
-        if self.current_client.is_none() && self.silenced_endpoint == Some(endpoint) {
+        // A recovery while paused does NOT re-activate: rotation switches
+        // are suspended while paused (see prev_client), so the client is
+        // only marked healthy — the user resumes onto the target they paused
+        // on, not onto one a link flap picked meanwhile.
+        if !self.paused && self.current_client.is_none() && self.silenced_endpoint == Some(endpoint) {
             info!(
                 "Client {} is answering again ({} consecutive pongs after {:?} silenced): re-activating it",
                 endpoint, pongs, silenced_for
@@ -2421,14 +2479,19 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             self.update_current_client(Some(endpoint)).await;
         } else {
             info!(
-                "Client {} is answering again ({} consecutive pongs after {:?} silenced): input stays on the manually chosen target ({})",
+                "Client {} is answering again ({} consecutive pongs after {:?} silenced): input stays on {} ({})",
                 endpoint,
                 pongs,
                 silenced_for,
                 match &self.current_client {
                     Some(current) => current.to_string(),
                     None => "local".to_string(),
-                }
+                },
+                if self.paused {
+                    "input is paused"
+                } else {
+                    "the target was chosen manually"
+                },
             );
         }
     }
@@ -2468,7 +2531,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// (update_current_client(None) also sends Switch(false), so the client
     /// releases its keys), WITHOUT removing the client or touching the
     /// connection: the QUIC idle timeout and the existing removal/resume
-    /// paths stay as they are.
+    /// paths stay as they are. While paused the detector does not fire:
+    /// rotation switches are suspended (see prev_client) and the ungrab is
+    /// already in effect, so the first tick after resume re-evaluates.
     pub async fn ping_tick(&mut self) {
         let now = Instant::now();
         // Stall guard: the pings this detector relies on originate from THIS
@@ -2494,29 +2559,37 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         // Miss detection first, so a silent current client is ungrabbed
         // before the next ping goes out.
         if !tick_late {
-            if let Some(current) = self.current_client {
-                let missed = self
-                    .liveness
-                    .get(&current)
-                    .is_some_and(|state| liveness_miss_limit_reached(state, &now, self.pong_miss_limit));
-                if missed {
-                    let silent_for = self
+            // While paused the silence detector does not fire: rotation
+            // switches are suspended (see prev_client), and the ungrab the
+            // switch would provide is already in effect (broadcast_grab_state
+            // carries paused to every device task). The same staleness is
+            // evaluated again by the first tick after resume and fires then
+            // if the client is still silent.
+            if !self.paused {
+                if let Some(current) = self.current_client {
+                    let missed = self
                         .liveness
                         .get(&current)
-                        .map(|state| now.duration_since(state.last_heard))
-                        .unwrap_or_default();
-                    info!(
-                        "No sign of life from current client {} for {:?} (>= {} missed pings): switching to the local machine and ungrabbing; the client stays connected and will be re-activated when it answers again",
-                        current, silent_for, self.pong_miss_limit
-                    );
-                    let state = self.liveness.entry(current).or_insert_with(LivenessState::new);
-                    state.silenced_since = Some(now);
-                    state.recovery_pongs = 0;
-                    self.update_current_client(None).await;
-                    // The local target now came from the silence: automatic
-                    // re-activation is armed until any manual switch action
-                    // (see silenced_endpoint).
-                    self.silenced_endpoint = Some(current);
+                        .is_some_and(|state| liveness_miss_limit_reached(state, &now, self.pong_miss_limit));
+                    if missed {
+                        let silent_for = self
+                            .liveness
+                            .get(&current)
+                            .map(|state| now.duration_since(state.last_heard))
+                            .unwrap_or_default();
+                        info!(
+                            "No sign of life from current client {} for {:?} (>= {} missed pings): switching to the local machine and ungrabbing; the client stays connected and will be re-activated when it answers again",
+                            current, silent_for, self.pong_miss_limit
+                        );
+                        let state = self.liveness.entry(current).or_insert_with(LivenessState::new);
+                        state.silenced_since = Some(now);
+                        state.recovery_pongs = 0;
+                        self.update_current_client(None).await;
+                        // The local target now came from the silence: automatic
+                        // re-activation is armed until any manual switch action
+                        // (see silenced_endpoint).
+                        self.silenced_endpoint = Some(current);
+                    }
                 }
             }
             // A fresh miss while a silenced client was recovering resets its
@@ -2570,21 +2643,33 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// is active but nothing is forwarded. Called on a timer from the server
     /// events loop; counters reset each call.
     pub fn log_input_status(&mut self) {
-        // Per-client link quality, surfaced only past the warn threshold: a
-        // degraded link is evidence worth having in every window (even an
-        // otherwise idle one, which returns early below), while a healthy
-        // link must not add a log line every 10s.
+        // Per-client link quality, surfaced on rtt-threshold crossings only:
+        // a degraded link is evidence worth having (even in an otherwise idle
+        // window, which returns early below), but the heartbeat fires every
+        // 10s, so the line is logged on the healthy→degraded transition (and
+        // its degraded→healthy recovery), not in every window — a chronically
+        // bad link must not spam one INFO line per client per window forever.
         for c in &self.clients {
             let path = c.conn.stats().path;
-            if path.rtt > HEARTBEAT_LINK_RTT_WARN {
-                info!(
+            let Some(link) = self.link_quality.get_mut(&c.endpoint) else {
+                continue;
+            };
+            match degraded_link_transition(&mut link.degraded, path.rtt) {
+                Some(true) => info!(
                     "Link to {} is degraded: rtt={:.0}ms, {} of {} packets lost over the connection's lifetime, {} congestion events — a WiFi/link issue, not monux (check power save on both machines, 2.4GHz congestion, prefer 5GHz)",
                     c.endpoint,
                     path.rtt.as_secs_f64() * 1000.0,
                     path.lost_packets,
                     path.sent_packets,
                     path.congestion_events,
-                );
+                ),
+                Some(false) => info!(
+                    "Link to {} recovered: rtt={:.0}ms is back under the {:.0}ms degraded threshold",
+                    c.endpoint,
+                    path.rtt.as_secs_f64() * 1000.0,
+                    HEARTBEAT_LINK_RTT_WARN.as_secs_f64() * 1000.0,
+                ),
+                None => {}
             }
         }
         let counts = std::mem::take(&mut self.status_counts);
@@ -2881,10 +2966,11 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         // queued datagram when its buffer is full, so no stale-motion backlog
         // can ever pile up. Lost frames are healed position-losslessly via the
         // repeated history (see MotionDatagram).
-        let mut history = Vec::with_capacity(MOTION_HISTORY_LEN + 1);
-        history.push((dx, dy));
-        history.extend(self.motion_history.iter().copied());
-        match self.try_send_motion_datagram(&endpoint, history) {
+        self.motion_history_scratch.clear();
+        self.motion_history_scratch.push((dx, dy));
+        self.motion_history_scratch
+            .extend(self.motion_history.iter().copied());
+        match self.try_send_motion_datagram(&endpoint) {
             MotionSend::Sent => {
                 self.motion_history.push_front((dx, dy));
                 self.motion_history.truncate(MOTION_HISTORY_LEN);
@@ -2918,16 +3004,13 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
     }
 
-    /// Attempts to send a motion frame as a QUIC datagram. `history` is
-    /// newest-first: entry 0 is this frame, followed by recent frames for
-    /// loss healing (see MotionDatagram). Fallback means the peer can't do
-    /// datagrams at all (permanently); Retry means the send buffer is
-    /// momentarily full and the caller should keep the deltas pending.
-    fn try_send_motion_datagram(
-        &mut self,
-        endpoint: &SocketAddr,
-        history: Vec<(i32, i32)>,
-    ) -> MotionSend {
+    /// Attempts to send a motion frame as a QUIC datagram, serializing the
+    /// newest-first history staged in motion_history_scratch by the caller
+    /// (entry 0 is this frame, followed by recent frames for loss healing;
+    /// see MotionDatagram). Fallback means the peer can't do datagrams at all
+    /// (permanently); Retry means the send buffer is momentarily full and the
+    /// caller should keep the deltas pending.
+    fn try_send_motion_datagram(&mut self, endpoint: &SocketAddr) -> MotionSend {
         let idx = match self.clients.binary_search_by(|c| c.endpoint.cmp(endpoint)) {
             Ok(idx) => idx,
             Err(_) => return MotionSend::Fallback,
@@ -2936,17 +3019,25 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             return MotionSend::Fallback;
         }
         let seq = self.motion_seq.wrapping_add(1);
-        let msg = event::MotionDatagram { seq, history };
+        // The wire type owns its history, so the reusable scratch is taken
+        // out for the serialization and put right back below — its capacity
+        // survives for the next datagram.
+        let msg = event::MotionDatagram {
+            seq,
+            history: std::mem::take(&mut self.motion_history_scratch),
+        };
         // Serialize into the reusable scratch; quinn consumes the bytes it
         // queues, so it gets a (tiny) copy and the scratch capacity survives
         // for the next datagram.
         self.datagram_scratch.clear();
         if let Err(e) = postcard::to_io(&msg, &mut self.datagram_scratch) {
             error!("Failed to serialize motion datagram: {:?}", e);
+            self.motion_history_scratch = msg.history;
             return MotionSend::Fallback;
         }
         let serialized = Bytes::copy_from_slice(&self.datagram_scratch);
         let history_len = msg.history.len();
+        self.motion_history_scratch = msg.history;
         match self.clients[idx].conn.send_datagram(serialized) {
             Ok(()) => {
                 self.motion_seq = seq;
@@ -3074,7 +3165,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                         }
                     }
                 }
-                match self.try_send_motion_datagram(&endpoint, vec![(dx, dy)]) {
+                self.motion_history_scratch.clear();
+                self.motion_history_scratch.push((dx, dy));
+                match self.try_send_motion_datagram(&endpoint) {
                     MotionSend::Sent => {
                         self.status_counts.forwarded += event_count;
                         return Ok(());
@@ -4070,6 +4163,30 @@ mod tests {
     }
 
     #[test]
+    fn in_place_reconnect_forgets_advertised_edge_info() {
+        let endpoint: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let other: SocketAddr = "10.0.0.2:9000".parse().unwrap();
+        let endpoints = vec![endpoint, other];
+        let mut sent: HashMap<SocketAddr, BTreeSet<event::Direction>> = HashMap::new();
+        sent.insert(endpoint, [event::Direction::Left].into_iter().collect());
+        sent.insert(other, [event::Direction::Right].into_iter().collect());
+
+        // A reconnect reusing the exact addr:port replaces the entry in
+        // place and forgets the OLD connection's EdgeInfo record — otherwise
+        // advertise_edge_info dedups against it and the fresh connection is
+        // never told its edge (its return-edge detector never starts).
+        assert_eq!(reconnect_slot(&endpoints, &mut sent, &endpoint), Ok(0));
+        assert!(!sent.contains_key(&endpoint));
+        assert!(sent.contains_key(&other));
+
+        // A brand-new endpoint inserts and touches no record.
+        let new: SocketAddr = "10.0.0.3:9000".parse().unwrap();
+        assert_eq!(reconnect_slot(&endpoints, &mut sent, &new), Err(2));
+        assert_eq!(sent.len(), 1);
+        assert!(sent.contains_key(&other));
+    }
+
+    #[test]
     fn edge_dirs_cache_reads_never_resolve() {
         // Reads serve the cached resolution verbatim: the resolver is not
         // consulted again (the point of the cache — a read per control
@@ -4342,6 +4459,7 @@ mod tests {
                 last_sent: 0,
                 last_lost: 0,
                 throttle: cell.clone(),
+                degraded: false,
             },
         );
         rotation.current_client = Some(endpoint);
@@ -5028,6 +5146,27 @@ mod tests {
         assert!(!liveness_recovery_complete(&healthy, &now));
     }
 
+    #[test]
+    fn degraded_link_logs_only_on_transitions() {
+        let healthy = HEARTBEAT_LINK_RTT_WARN - Duration::from_millis(1);
+        let degraded = HEARTBEAT_LINK_RTT_WARN + Duration::from_millis(1);
+        let mut state = false;
+        // Healthy windows log nothing (exactly AT the threshold is healthy:
+        // the bar is strictly-greater).
+        assert_eq!(degraded_link_transition(&mut state, healthy), None);
+        assert_eq!(degraded_link_transition(&mut state, HEARTBEAT_LINK_RTT_WARN), None);
+        // The healthy→degraded crossing logs once...
+        assert_eq!(degraded_link_transition(&mut state, degraded), Some(true));
+        // ...then repeated degraded windows stay quiet (no per-window spam on
+        // a chronically bad link)...
+        assert_eq!(degraded_link_transition(&mut state, degraded), None);
+        assert_eq!(degraded_link_transition(&mut state, degraded), None);
+        // ...the degraded→healthy crossing reports the recovery once...
+        assert_eq!(degraded_link_transition(&mut state, healthy), Some(false));
+        // ...and healthy windows are quiet again.
+        assert_eq!(degraded_link_transition(&mut state, healthy), None);
+    }
+
     #[tokio::test]
     async fn liveness_silence_switches_local_without_removing_client() {
         let (dir, mut rotation, grab_rx) = liveness_rotation("liveness-silence").await;
@@ -5051,6 +5190,74 @@ mod tests {
         let state = &rotation.liveness[&endpoint];
         assert!(state.silenced_since.is_some());
         assert_eq!(state.recovery_pongs, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn liveness_silence_does_not_switch_while_paused() {
+        let (dir, mut rotation, _grab_rx) = liveness_rotation("liveness-paused-silence").await;
+        let endpoint: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        rotation.current_client = Some(endpoint);
+        rotation.liveness.insert(endpoint, LivenessState::new());
+        rotation.set_paused(true).await;
+
+        // The current client goes silent past the miss limit while paused:
+        // rotation switches are suspended (see prev_client), so the detector
+        // does not fire — no switch, no silenced marking, no armed recovery.
+        rotation.liveness.get_mut(&endpoint).unwrap().last_heard =
+            Instant::now() - PING_INTERVAL * PONG_MISS_LIMIT - Duration::from_secs(1);
+        rotation.ping_tick().await;
+        assert_eq!(rotation.current_client, Some(endpoint));
+        assert!(rotation.liveness[&endpoint].silenced_since.is_none());
+        assert_eq!(rotation.silenced_endpoint, None);
+
+        // After resume the same staleness fires the detector on the next
+        // (on-time) tick: the switch happens then, not during the pause.
+        rotation.set_paused(false).await;
+        rotation.ping_tick().await;
+        assert_eq!(rotation.current_client, None);
+        assert!(rotation.liveness[&endpoint].silenced_since.is_some());
+        assert_eq!(rotation.silenced_endpoint, Some(endpoint));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn liveness_recovery_does_not_reactivate_while_paused() {
+        let (dir, mut rotation, _grab_rx) = liveness_rotation("liveness-paused-recovery").await;
+        let endpoint: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        // Input is local because the client silenced (automatic re-activation
+        // is armed), then the user pauses.
+        rotation.silenced_endpoint = Some(endpoint);
+        rotation.set_paused(true).await;
+        let released = rotation.output_handler.released;
+
+        // The client answers again and meets the recovery bar while paused:
+        // marked healthy, but NOT re-activated — the user resumes onto the
+        // target they paused on, not onto one a link flap picked meanwhile.
+        // (The switch funnel was never entered: no held-key release ran —
+        // compare liveness_manual_local_choice_wins_over_auto_recovery.)
+        rotation.liveness.insert(
+            endpoint,
+            silenced_state(Duration::from_secs(10), REACTIVATE_PONGS - 1),
+        );
+        rotation.note_client_heard(endpoint).await;
+        assert!(rotation.liveness[&endpoint].silenced_since.is_none());
+        assert_eq!(rotation.current_client, None);
+        assert_eq!(rotation.output_handler.released, released);
+        assert_eq!(rotation.silenced_endpoint, Some(endpoint));
+
+        // Unpaused, the same completed recovery DOES re-activate (the
+        // attempt enters the switch funnel and runs the held-key release,
+        // which a fabricated endpoint then fails out of — see
+        // liveness_manual_local_choice_wins_over_auto_recovery).
+        rotation.set_paused(false).await;
+        rotation.liveness.insert(
+            endpoint,
+            silenced_state(Duration::from_secs(10), REACTIVATE_PONGS - 1),
+        );
+        rotation.note_client_heard(endpoint).await;
+        assert_eq!(rotation.output_handler.released, released + 1);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -162,17 +162,18 @@ From the 2026-07-24 codebase review (8 scopes, ~50 findings). Fix tier 1 (HIGH+M
       retry on cmd error
 - [x] G15 setup.rs: stale hotspot join profile accepted as success — update+reconnect
 
-## Phase H — review remediation, LOW tier (later)
+## Phase H — review remediation, LOW tier — SHIPPED in v9.1.2
 
-recv_version size cap; dedicated bulk-handshake buffers; pin cleared only after
-Installed; is_newer_remote ancestry check; known_servers hostname sanitization;
-v_clipboard_kb ceiling; graceful-close RemoveClient; fingerprint-slot race;
-stale edge_info_sent; clipboard temp-dir sweep cross-process; hostapd.conf 0644
-window; uninstall root HOME guard; pause vs silence/recovery switches; dead
-clipboard channel killing the connection; indicator_spawn races; wedged-compositor
-thread leak; serve.rs Arc<[u8]> cache; IGNORED_MIME_TYPE early return; uri-list
-parsing; event Display allocs; motion-history alloc; degraded-link log spam;
-.local.local lookup; accept() warn labels.
+All 24 items landed: recv_version size cap; dedicated bulk-handshake buffers;
+pin cleared only after Installed; is_newer_remote ancestry check; known_servers
+hostname sanitization; v_clipboard_kb ceiling; graceful-close RemoveClient;
+fingerprint-slot race eliminated (peer_identity); stale edge_info_sent; clipboard
+temp-dir sweep cross-process; hostapd.conf 0600 from first open; uninstall root
+HOME guard; pause vs silence/recovery switches; dead clipboard channel degrades;
+indicator_spawn races; wedged-compositor gate; serve.rs Arc<[u8]> cache;
+IGNORED_MIME_TYPE early return; uri-list parsing; event Display allocs;
+motion-history scratch; degraded-link transitions only; no .local.local lookup;
+neutral accept() warn labels.
 
 ## Future / on hold
 

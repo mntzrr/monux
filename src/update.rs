@@ -42,9 +42,47 @@ pub fn latest_remote_sha(repo: &str) -> Result<String> {
 
 /// Whether the remote HEAD sha means there's an update for a build with the
 /// given revision ("<sha>" or "<sha>-dirty"; "unknown" never auto-updates).
+/// Cheap and pure (no checkout needed); run() additionally refuses a remote
+/// HEAD that isn't a descendant of the build's commit (see is_rewound_remote).
 pub fn is_newer_remote(remote_sha: &str, current_revision: &str) -> bool {
     let current_base = current_revision.trim_end_matches("-dirty");
     current_base != "unknown" && !current_base.is_empty() && !remote_sha.starts_with(current_base)
+}
+
+/// Whether the just-pulled HEAD should be treated as not-newer despite
+/// differing from our build's commit: yes when that commit is known to the
+/// checkout but is NOT an ancestor of HEAD — master was rewound or
+/// force-pushed, and pure inequality (is_newer_remote) would install a
+/// downgrade. Undecidable ancestry (a commit beyond the shallow clone's
+/// boundary, e.g. an unpushed local build) keeps the old behavior.
+fn is_rewound_remote(src_dir: &Path, current_base: &str) -> bool {
+    match is_ancestor_of_head(src_dir, current_base) {
+        Some(is_ancestor) => !is_ancestor,
+        None => {
+            debug!(
+                "Can't check whether the remote HEAD descends from {} (unknown to the checkout); assuming a normal update",
+                current_base
+            );
+            false
+        }
+    }
+}
+
+/// Whether `base` is an ancestor of the checkout's HEAD: Some(true/false)
+/// when git could decide, None when it can't (the commit isn't in the
+/// checkout, e.g. beyond the shallow clone's boundary).
+fn is_ancestor_of_head(src_dir: &Path, base: &str) -> Option<bool> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(src_dir)
+        .args(["merge-base", "--is-ancestor", base, "HEAD"])
+        .output()
+        .ok()?;
+    match out.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
 }
 
 /// How an update attempt ended.
@@ -189,6 +227,21 @@ pub fn run(
                 info!(
                     "monux is already up to date ({}). Use --force to rebuild anyway.",
                     CURRENT_REVISION
+                );
+                return Ok(UpdateStatus::AlreadyCurrent);
+            }
+            // A rewound/force-pushed master: HEAD differs from our build's
+            // commit but doesn't descend from it, so installing it would be
+            // a downgrade (is_newer_remote's inequality alone can't tell).
+            // Refuse as not-newer; --force overrides.
+            if !force
+                && current_base != "unknown"
+                && !current_base.is_empty()
+                && is_rewound_remote(&src_dir, current_base)
+            {
+                info!(
+                    "Not updating to {}: the remote HEAD is not a descendant of this build's commit ({}) — master was likely rewound or force-pushed, so the update would be a downgrade. Use --force to override.",
+                    latest, CURRENT_REVISION
                 );
                 return Ok(UpdateStatus::AlreadyCurrent);
             }
@@ -1123,5 +1176,32 @@ mod tests {
         // A plain update reattaches to master.
         test_git(dir, &["checkout", "master"]);
         assert!(!head_is_detached(dir));
+    }
+
+    #[test]
+    fn rewound_remote_is_not_newer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        test_repo(dir);
+        let v1 = test_commit_version(dir, "1.0.0");
+        let v2 = test_commit_version(dir, "1.1.0");
+        // Normal history: older commits are ancestors of HEAD (HEAD included).
+        assert_eq!(is_ancestor_of_head(dir, &v1), Some(true));
+        assert_eq!(is_ancestor_of_head(dir, &v2), Some(true));
+        assert!(!is_rewound_remote(dir, &v2[..12]));
+        // Rewind master to the older commit (a force-push): the commit our
+        // build came from is no longer an ancestor of HEAD, so the differing
+        // HEAD must be treated as not-newer (installing it would downgrade).
+        test_git(dir, &["reset", "--hard", &v1]);
+        assert_eq!(is_ancestor_of_head(dir, &v2), Some(false));
+        assert!(is_rewound_remote(dir, &v2[..12]));
+        assert!(!is_rewound_remote(dir, &v1[..12]));
+        // A commit unknown to the checkout (e.g. beyond a shallow clone's
+        // boundary) is undecidable and keeps the old behavior.
+        assert_eq!(
+            is_ancestor_of_head(dir, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+            None
+        );
+        assert!(!is_rewound_remote(dir, "deadbeefdead"));
     }
 }

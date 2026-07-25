@@ -186,6 +186,15 @@ impl_dispatch_offer!(State);
 impl_dispatch_source!(State, |state: &mut Self, source: data_control::Source, event| {
     match event {
         Event::Send { mime_type, fd } => {
+            // Our own ignore marker is advertised only so the reader
+            // recognizes our own clipboards; its payload is always empty.
+            // Clipboard managers fetch every advertised type, so serving it
+            // would trigger a full cross-machine fetch for nothing — close
+            // the fd (an empty answer) instead.
+            if mime_type == state::IGNORED_MIME_TYPE {
+                return;
+            }
+
             let prepared_state = if let Some(state) = state.prepared_copy_state.as_ref() {
                 state
             } else {

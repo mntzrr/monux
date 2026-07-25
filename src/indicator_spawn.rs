@@ -196,8 +196,9 @@ struct Shared {
     spawned_at: Instant,
     /// "Stay down": no spawns and no respawns while set. Set by hide(), by
     /// an external SIGTERM death (takeover/manual kill — the supervisor must
-    /// not fight those) and by the respawn policy giving up; cleared by
-    /// show(). In-memory only: a daemon restart always starts visible.
+    /// not fight those), by the respawn policy giving up and by the
+    /// Supervisor's Drop; cleared by show(). In-memory only: a daemon
+    /// restart always starts visible.
     hidden: bool,
     /// The bounded-respawn bookkeeping; reset by show() so an explicit
     /// restore comes with a fresh budget.
@@ -273,7 +274,11 @@ fn observe_exit(shared: &mut Shared) -> Option<(bool, Duration)> {
             Some((sigterm, uptime))
         }
         Some(Err(e)) => {
+            // Mirror child_running: a poll error is treated as death and the
+            // slot is cleared — otherwise this warns every poll tick forever
+            // while the untracked child escapes supervision.
             warn!("Tray indicator: failed to poll the child: {:?}", e);
+            shared.child = None;
             None
         }
         _ => None,
@@ -315,9 +320,9 @@ fn exit_action(shared: &mut Shared, sigterm: bool, uptime: Duration) -> ExitActi
 /// child). Takes the lock before spawning so concurrent callers can't
 /// displace each other's child (which would leak an unreaped zombie).
 fn spawn_and_store(shared: &Arc<Mutex<Shared>>) -> Result<u32> {
+    let mut shared = shared.lock().unwrap();
     let child = spawn_indicator()?;
     let pid = child.id();
-    let mut shared = shared.lock().unwrap();
     // A prior child that's somehow still here (concurrent spawn raced in):
     // reap it instead of orphaning it as a zombie.
     if let Some(mut old) = shared.child.take() {
@@ -453,7 +458,14 @@ impl Drop for Supervisor {
     /// Graceful daemon shutdown: SIGTERM the indicator and reap it.
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
-        let child = self.shared.lock().unwrap().child.take();
+        let child = {
+            let mut shared = self.shared.lock().unwrap();
+            // Hidden too: a monitor preempted mid-respawn must not park a
+            // fresh child in the slot after this reap — nobody would ever
+            // reap that one (see monitor_loop's final re-check).
+            shared.hidden = true;
+            shared.child.take()
+        };
         if let Some(child) = child {
             terminate_and_reap(child);
         }
@@ -471,10 +483,15 @@ async fn monitor_loop(shared: Arc<Mutex<Shared>>, shutdown: Arc<AtomicBool>) {
             return;
         }
         // The lock is never held across an await: Drop and hide()/show()
-        // need it for their own child operations.
-        let exited = { observe_exit(&mut shared.lock().unwrap()) };
-        let Some((sigterm, uptime)) = exited else { continue };
-        let action = { exit_action(&mut shared.lock().unwrap(), sigterm, uptime) };
+        // need it for their own child operations. Observe and decide under
+        // ONE acquisition: a control-socket show() interleaving between the
+        // two would spawn a fresh child and then be re-hidden by the action
+        // below (TakenOver/GiveUp set hidden).
+        let (action, uptime) = {
+            let mut shared = shared.lock().unwrap();
+            let Some((sigterm, uptime)) = observe_exit(&mut shared) else { continue };
+            (exit_action(&mut shared, sigterm, uptime), uptime)
+        };
         let (delay, attempt) = match action {
             ExitAction::TakenOver => {
                 info!(
@@ -512,8 +529,10 @@ async fn monitor_loop(shared: Arc<Mutex<Shared>>, shutdown: Arc<AtomicBool>) {
         }
         {
             let mut shared = shared.lock().unwrap();
-            // Hidden (or shown, which spawns directly) during the delay?
-            if shared.hidden || shared.child.is_some() {
+            // Shutdown (or hidden/shown, which spawns directly) during the
+            // delay or before this final lock? A spawn after the Drop's reap
+            // would be orphaned — no supervisor is left to ever reap it.
+            if shutdown.load(Ordering::Relaxed) || shared.hidden || shared.child.is_some() {
                 continue;
             }
             match spawn_indicator() {
@@ -685,6 +704,22 @@ mod tests {
         let (sigterm, uptime) = observe_exit(&mut shared).expect("death must be observed");
         assert!(!sigterm);
         assert!(uptime >= Duration::from_secs(1));
+        assert!(shared.child.is_none());
+    }
+
+    #[test]
+    fn observe_exit_clears_the_slot_on_poll_error() {
+        let mut shared = shared_for_test();
+        let child = spawn_sh("exit 0");
+        // Reap the child behind the Child handle's back: the handle's next
+        // try_wait fails (ECHILD), standing in for a persistent poll error.
+        let pid = child.id() as i32;
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        shared.child = Some(child);
+        // The error is reported as no-exit-event, but the slot is cleared —
+        // otherwise the monitor would warn every poll tick forever.
+        assert!(observe_exit(&mut shared).is_none());
         assert!(shared.child.is_none());
     }
 

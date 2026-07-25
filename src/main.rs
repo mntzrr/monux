@@ -1,7 +1,7 @@
 use std::fs;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -836,15 +836,6 @@ fn main() -> Result<()> {
         }
         Commands::Update(args) => {
             let config_dir = monux::update::default_config_dir();
-            // A plain update returns to the latest; lift a downgrade pin
-            // first (auto-update skips while pinned and never unpins itself).
-            if !args.rollback && args.to.is_none() {
-                if let Some(dir) = config_dir.as_deref() {
-                    if monux::update::clear_update_pin(dir) {
-                        info!("unpinned; updating to latest");
-                    }
-                }
-            }
             // Gate on the server's protocol version when this machine acts as
             // a client, so an update can't break the connection. The version
             // recorded at the last handshake can be stale (the server upgraded
@@ -878,7 +869,24 @@ fn main() -> Result<()> {
             } else {
                 args.to.clone()
             };
-            return monux::update::run(args.force, false, constraint, to.as_deref()).map(|_| ());
+            let status = monux::update::run(args.force, false, constraint, to.as_deref())?;
+            // A plain update returns to the latest and lifts a downgrade pin
+            // (auto-update skips while pinned and never unpins itself) — but
+            // only once the install actually succeeded: clearing it before
+            // the attempt would let a failed update lose the pin, and the
+            // nightly auto-update would then undo the downgrade. The
+            // --to/--rollback paths (re)write their own pin inside
+            // update::run and are unaffected.
+            if !args.rollback && args.to.is_none() {
+                if let monux::update::UpdateStatus::Installed = status {
+                    if let Some(dir) = config_dir.as_deref() {
+                        if monux::update::clear_update_pin(dir) {
+                            info!("unpinned; updating to latest");
+                        }
+                    }
+                }
+            }
+            return Ok(());
         }
         Commands::Status(args) => {
             let out = monux::control::status_cli(
@@ -1002,12 +1010,10 @@ fn main() -> Result<()> {
                 // The server leads protocol upgrades: no compatibility gate.
                 rt.spawn(monux::autoupdate::run(None));
             }
-            let fingerprint = Arc::new(Mutex::new(None));
             let verifier = approval::MonuxCertVerification::new(
                 "server",
                 args.fingerprint.take().unwrap_or(vec![]),
                 &config_dir,
-                fingerprint.clone(),
                 // No interactive approval prompts when facing the public internet:
                 // unknown peers must be pre-approved via --fingerprints instead.
                 !www,
@@ -1091,7 +1097,6 @@ fn main() -> Result<()> {
                     args.device.take().unwrap_or(vec![]),
                     args.exit_secs,
                     verifier,
-                    fingerprint,
                     max_clipboard_size_bytes,
                     mode,
                     motion_mode,
@@ -1151,7 +1156,6 @@ fn main() -> Result<()> {
                 "client",
                 args.fingerprint.take().unwrap_or(vec![]),
                 &config_dir,
-                Arc::new(Mutex::new(None)),
                 // The client connects outbound to a server it chose, so interactive
                 // approval prompts stay enabled even in --www mode (unlike the server).
                 true,
@@ -1348,7 +1352,6 @@ async fn server(
     device_filters: Vec<Regex>,
     exit_secs: Option<u32>,
     verifier: Arc<approval::MonuxCertVerification<'static>>,
-    fingerprint: Arc<Mutex<Option<String>>>,
     max_clipboard_size_bytes: u64,
     mode: NetworkMode,
     motion_mode: monux::rotation::MotionMode,
@@ -1480,7 +1483,6 @@ async fn server(
         server::run_server_connections_loop(
             &listen_addr,
             verifier,
-            fingerprint,
             max_clipboard_size_bytes,
             rotation_tx2,
             mode,

@@ -48,8 +48,10 @@ struct Inner {
     reader: Box<dyn ClipboardReader>,
     /// (cache epoch, requested_type, content, data_type) of the last
     /// successful serve. Single slot: requests within a burst are for the
-    /// same clipboard.
-    last_served: Option<(u64, String, Vec<u8>, Option<String>)>,
+    /// same clipboard. The payload is Arc'd: retry bursts from clipboard
+    /// managers are the hits this cache exists for, and a Vec clone would
+    /// memcpy the whole (potentially tens of MB) payload per request.
+    last_served: Option<(u64, String, Arc<[u8]>, Option<String>)>,
     /// (cache epoch, requested_type, when) of the last failed or empty serve.
     /// A matching request within NEGATIVE_SERVE_CACHE_TTL gets an empty
     /// answer without re-reading; an epoch bump (clipboard changed) or a TTL
@@ -94,7 +96,7 @@ impl SharedClipboardReader {
         requested_type: &str,
         max_size_bytes: u64,
         request_source: &str,
-    ) -> Result<(Vec<u8>, Option<String>)> {
+    ) -> Result<(Arc<[u8]>, Option<String>)> {
         let mut inner = self.inner.lock().await;
         let epoch = self.cache_epoch.load(Ordering::SeqCst);
         if let Some((cached_epoch, cached_type, content, data_type)) = &inner.last_served {
@@ -105,7 +107,7 @@ impl SharedClipboardReader {
                     request_source,
                     content.len()
                 );
-                return Ok((content.clone(), data_type.clone()));
+                return Ok((Arc::clone(content), data_type.clone()));
             }
         }
         // Negative cache: a failed or empty serve for this type is replayed
@@ -123,7 +125,7 @@ impl SharedClipboardReader {
                     request_source,
                     when.elapsed().as_secs_f32()
                 );
-                return Ok((Vec::new(), None));
+                return Ok((Default::default(), None));
             }
         }
         let result = match inner
@@ -148,17 +150,21 @@ impl SharedClipboardReader {
                     // TTL the next request reads again — the app may answer
                     // then.
                     inner.last_failed = Some((epoch, requested_type.to_string(), Instant::now()));
+                    Ok((Default::default(), data_type))
                 } else {
+                    // Arc the payload once; the cache slot and this answer
+                    // share it (no memcpy on later hits).
+                    let content: Arc<[u8]> = content.into();
                     inner.last_served = Some((
                         epoch,
                         requested_type.to_string(),
-                        content.clone(),
+                        Arc::clone(&content),
                         data_type.clone(),
                     ));
                     // A fresh non-empty serve supersedes any negative entry.
                     inner.last_failed = None;
+                    Ok((content, data_type))
                 }
-                Ok((content, data_type))
             }
         }
     }
@@ -195,10 +201,10 @@ mod tests {
             calls: calls.clone(),
         }));
         let (content, _) = reader.read("text/plain", u64::MAX, "test").await.unwrap();
-        assert_eq!(content, b"data-for-text/plain");
+        assert_eq!(&*content, b"data-for-text/plain");
         // Second request for the same type must not hit the system clipboard again.
         let (content, _) = reader.read("text/plain", u64::MAX, "test").await.unwrap();
-        assert_eq!(content, b"data-for-text/plain");
+        assert_eq!(&*content, b"data-for-text/plain");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // A different type misses the single-slot cache and reads again.
         let _ = reader.read("text/html", u64::MAX, "test").await.unwrap();
@@ -369,7 +375,7 @@ mod tests {
 
         // Fill the cache.
         let (content, _) = reader.read("text/plain", u64::MAX, "test").await.unwrap();
-        assert_eq!(content, b"data-for-text/plain");
+        assert_eq!(&*content, b"data-for-text/plain");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         // Park a serve for a different type inside the slow underlying read:
@@ -393,12 +399,12 @@ mod tests {
         open.store(true, Ordering::SeqCst);
         release.notify_one();
         let (content, _) = parked_serve.await.unwrap().unwrap();
-        assert_eq!(content, b"data-for-text/html");
+        assert_eq!(&*content, b"data-for-text/html");
 
         // The payload cached across the invalidation must not be served: the
         // next request misses and reads the system clipboard again.
         let (content, _) = reader.read("text/html", u64::MAX, "test").await.unwrap();
-        assert_eq!(content, b"data-for-text/html");
+        assert_eq!(&*content, b"data-for-text/html");
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 }

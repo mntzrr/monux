@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::network::certs;
 
@@ -51,6 +51,26 @@ pub fn rustls_server_config(
     ))
 }
 
+/// The fingerprint of a connection peer's certificate, read back from the
+/// established connection. quinn's rustls session exposes the verified peer
+/// chain via peer_identity (leaf first), so the server pairs each connection
+/// with its own client's fingerprint directly — immune to the
+/// simultaneous-reconnect mixups of the former global fingerprint slot.
+pub fn connection_peer_fingerprint(conn: &quinn::Connection) -> Option<String> {
+    peer_fingerprint_from_identity(conn.peer_identity()?)
+}
+
+/// The leaf fingerprint of a peer identity as quinn hands it over: the Any
+/// downcasts to Vec<CertificateDer> for the rustls session (documented on
+/// quinn::Connection::peer_identity). None for a foreign session type or an
+/// empty chain.
+fn peer_fingerprint_from_identity(identity: Box<dyn std::any::Any>) -> Option<String> {
+    let chain = identity
+        .downcast::<Vec<rustls_pki_types::CertificateDer>>()
+        .ok()?;
+    chain.first().map(certs::fingerprint)
+}
+
 #[derive(Debug)]
 struct ApprovalState {
     /// Previously-approved certs: loaded from disk at startup, plus certs
@@ -80,8 +100,6 @@ pub struct MonuxCertVerification<'a> {
     approved_cert_fingerprints: Vec<String>,
     /// Mutable certificate approval state, shared with the prompt thread
     approval_state: Arc<RwLock<ApprovalState>>,
-    /// Storage for reporting the latest received fingerprint
-    fingerprint: Arc<Mutex<Option<String>>>,
     /// Whether unknown certs may be approved via an interactive prompt.
     /// Disabled for the server in --www mode, where internet-facing peers must
     /// be pre-approved instead of prompting on the console.
@@ -93,8 +111,9 @@ pub struct MonuxCertVerification<'a> {
     discovered_server_name: Mutex<Option<String>>,
     /// The server certificate's fingerprint as learned during the client-side
     /// handshake, read after a successful connect for the remembered-servers
-    /// store (known_servers.rs). Server side, the client's fingerprint
-    /// travels via the `fingerprint` slot instead (see verify_client_cert).
+    /// store (known_servers.rs). Server side, the client's fingerprint is
+    /// instead derived from the established connection after the handshake
+    /// (see connection_peer_fingerprint).
     peer_fingerprint: Mutex<Option<String>>,
     /// For rustls verify calls
     crypto_provider: Arc<rustls::crypto::CryptoProvider>,
@@ -147,7 +166,6 @@ impl<'a> MonuxCertVerification<'a> {
         splash_label: &str,
         approved_cert_fingerprints: Vec<String>,
         config_dir: &PathBuf,
-        fingerprint: Arc<Mutex<Option<String>>>,
         allow_interactive_prompts: bool,
     ) -> Result<Arc<Self>> {
         let (our_cert, our_privkey) = certs::load_keypair(splash_label, config_dir)
@@ -175,7 +193,6 @@ impl<'a> MonuxCertVerification<'a> {
                 prompt_active: false,
                 rejection_cooldowns: HashMap::new(),
             })),
-            fingerprint,
             allow_interactive_prompts,
             discovered_server_name: Mutex::new(None),
             peer_fingerprint: Mutex::new(None),
@@ -478,62 +495,13 @@ impl<'a> rustls::server::danger::ClientCertVerifier for MonuxCertVerification<'a
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
         match self.verify_cert(client_cert, "Client", true) {
             Err(e) => Err(rustls::Error::General(e.to_string())),
-            Ok(their_cert_fingerprint) => {
-                // HACK: This is storing the fingerprint for reading by server.rs
-                // This code is meant to allow pairing new connections with their cert fingerprints for use by "--shortcut-goto".
-                //
-                // In an ideal world, the solution for this could be one of the following:
-                // - Packing/embedding the fingerprint with the client here somehow
-                // - Extracting the cert/fingerprint within the server connection handling somehow
-                //
-                // But fundamentally we hit these issues:
-                // - This rustls API lets us see the cert/fingerprint, but not the client endpoint.
-                // - The quinn API lets us see the client endpoint, but not the cert/fingerprint.
-                //
-                // In order to bridge the gap, we go with this timing-based "message in a bottle" method,
-                // where we assume that a rustls cert check will be immediately followed by the quinn connection appearing.
-                // This assumption has problems, see below.
-                if let Ok(mut fingerprint) = self.fingerprint.lock() {
-                    debug!(
-                        "Saving fingerprint for connection: {}",
-                        their_cert_fingerprint
-                    );
-                    if let Some(old_fingerprint) =
-                        fingerprint.replace(their_cert_fingerprint.clone())
-                    {
-                        // The fingerprint->connection assumption could fall apart when multiple clients connect at the same time, resulting in fingerprint mismatch:
-                        // Scenario A:
-                        //   1. client A connects and its fingerprint is saved
-                        //   2. very soon after, client B connects and its fingerprint gets saved, overwriting client A's fingerprint <-- you are here
-                        //   3. then client A's connection completes and client B's fingerprint is pulled
-                        // Scenario B:
-                        //   1. client A connects and its fingerprint is saved
-                        //   2. very soon after, client B connects and its fingerprint gets saved, overwriting client A's fingerprint <-- you are here
-                        //   3. then client B's connection completes and client B's fingerprint is pulled
-                        //   3. then client A's connection completes and there is no fingerprint left
-                        //
-                        // Amelioration:
-                        // In both of these cases, if things look off, we reset the fingerprint state and reject client B, so that it can try again.
-                        // Meanwhile, server.rs will see the missing fingerprint state and reject client A.
-                        // However, another client C could swoop in at this time and store a new fingerprint to be seen by server.rs, this workaround isn't perfect either.
-                        // But at the same time, this client-fingerprint pairing is only used for "--shortcut-goto", so it's somewhat less critical that things be perfect.
-                        //
-                        // Another option would be to put the old fingerprint back and only reject client B, but then that creates a different problem, unrelated to multi-client races:
-                        // What if a client finishes cert validation here, but then disconnects before server.rs takes the fingerprint?
-                        // In that case, we'd want the unused fingerprint to be overwritten by the next connection attempt.
-                        // So it's better to leave things in a recoverable state so that the server isn't rejecting connections indefinitely.
-                        warn!("BUG: Obtained new client fingerprint {} but old fingerprint {} is still present, resetting state and rejecting new client (try again)", their_cert_fingerprint, old_fingerprint);
-                        // Reject the new client, and clear the fingerprint state. The old client (if any) should then be rejected by server.rs. Both clients can retry.
-                        let _ = fingerprint.take();
-                        Err(rustls::Error::General("Fingerprint is valid but an existing connection is still in progress, try again".to_string()))
-                    } else {
-                        Ok(rustls::server::danger::ClientCertVerified::assertion())
-                    }
-                } else {
-                    Err(rustls::Error::General(
-                        "Failed to lock fingerprint".to_string(),
-                    ))
-                }
+            Ok(_their_cert_fingerprint) => {
+                // Nothing is stored here: server.rs pairs the connection with
+                // its client's fingerprint by reading the verified chain back
+                // from the established connection (connection_peer_fingerprint),
+                // which can't mix fingerprints up between simultaneous
+                // reconnects the way a shared slot could.
+                Ok(rustls::server::danger::ClientCertVerified::assertion())
             }
         }
     }
@@ -720,7 +688,6 @@ mod tests {
             "test",
             vec![],
             &dir.to_path_buf(),
-            Arc::new(Mutex::new(None)),
             allow_interactive_prompts,
         )
         .expect("failed to construct verifier")
@@ -956,6 +923,26 @@ mod tests {
     }
 
     #[test]
+    fn peer_fingerprint_from_identity_downcasts_the_rustls_chain() {
+        let peer_dir = tempfile::tempdir().unwrap();
+        let their_cert = peer_cert(peer_dir.path());
+        let their_fingerprint = certs::fingerprint(&their_cert);
+        // What quinn's rustls session hands over: the verified peer chain
+        // boxed as Any (leaf first).
+        let identity: Box<dyn std::any::Any> = Box::new(vec![their_cert]);
+        assert_eq!(
+            peer_fingerprint_from_identity(identity),
+            Some(their_fingerprint)
+        );
+        // A foreign session type or an empty chain yields nothing.
+        let foreign: Box<dyn std::any::Any> = Box::new("not-a-cert-chain".to_string());
+        assert_eq!(peer_fingerprint_from_identity(foreign), None);
+        let empty: Box<dyn std::any::Any> =
+            Box::new(Vec::<rustls_pki_types::CertificateDer>::new());
+        assert_eq!(peer_fingerprint_from_identity(empty), None);
+    }
+
+    #[test]
     fn preapproved_fingerprint_passes_without_prompt() {
         let dir = tempfile::tempdir().unwrap();
         let peer_dir = tempfile::tempdir().unwrap();
@@ -965,7 +952,6 @@ mod tests {
             "test",
             vec![their_fingerprint.clone()],
             &dir.path().to_path_buf(),
-            Arc::new(Mutex::new(None)),
             false,
         )
         .expect("failed to construct verifier");

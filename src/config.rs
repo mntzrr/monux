@@ -48,6 +48,11 @@ pub const DEFAULT_PAUSE_SHORTCUT: &str = "";
 pub const DEFAULT_LISTEN: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
 pub const DEFAULT_PORT: u16 = 1213;
 pub const DEFAULT_MAX_CLIPBOARD_SIZE_KB: u64 = 5120;
+/// Largest accepted max-clipboard-size-kb value: the daemons convert KB to
+/// bytes with a checked *1024 (see main.rs), so the validator caps KB at the
+/// value whose conversion can never overflow — a config problem must never
+/// prevent daemon startup.
+pub const MAX_CLIPBOARD_SIZE_KB: u64 = u64::MAX / 1024;
 pub const DEFAULT_EDGE_DWELL_MS: u64 = 250;
 pub const DEFAULT_INPUT_SCALE: f64 = 1.0;
 
@@ -208,7 +213,7 @@ pub static REGISTRY: &[KeySpec] = &[
         key: "server.max-clipboard-size-kb",
         section: Section::Server,
         flag: "max-clipboard-size-kb",
-        expects: "integer (KB)",
+        expects: "integer 0-18014398509481983 (KB)",
         default_display: "5120",
         help: "maximum clipboard transfer size in KB",
         kind: Kind::Int,
@@ -319,7 +324,7 @@ pub static REGISTRY: &[KeySpec] = &[
         key: "client.max-clipboard-size-kb",
         section: Section::Client,
         flag: "max-clipboard-size-kb",
-        expects: "integer (KB)",
+        expects: "integer 0-18014398509481983 (KB)",
         default_display: "5120",
         help: "maximum clipboard transfer size in KB",
         kind: Kind::Int,
@@ -1120,7 +1125,7 @@ fn v_exit_secs(values: &[&str]) -> std::result::Result<(), String> {
 }
 
 fn v_clipboard_kb(values: &[&str]) -> std::result::Result<(), String> {
-    check_int_range(expect_one(values)?, 0, i64::MAX)
+    check_int_range(expect_one(values)?, 0, MAX_CLIPBOARD_SIZE_KB as i64)
 }
 
 fn v_motion_hz(values: &[&str]) -> std::result::Result<(), String> {
@@ -1491,6 +1496,21 @@ mod tests {
         assert_eq!(file.get_bool("server.www"), Some(true));
         assert!(file.get_int::<u16>("server.port").is_none());
         assert!(file.get_str_vec("server.edge-map").is_none());
+    }
+
+    #[test]
+    fn clipboard_kb_validation_caps_at_the_overflow_boundary() {
+        // The ceiling is exactly the value whose KB→bytes conversion (a
+        // checked *1024 in main.rs) cannot overflow: the daemon must never
+        // refuse to start over a config value the validator accepted.
+        let cap = MAX_CLIPBOARD_SIZE_KB;
+        assert!(cap.checked_mul(1024).is_some());
+        assert!(v_clipboard_kb(&[&cap.to_string()]).is_ok());
+        assert!(v_clipboard_kb(&[&(cap + 1).to_string()]).is_err());
+        assert!(v_clipboard_kb(&[&u64::MAX.to_string()]).is_err());
+        assert!(v_clipboard_kb(&["5120"]).is_ok());
+        assert!(v_clipboard_kb(&["0"]).is_ok());
+        assert!(v_clipboard_kb(&["-1"]).is_err());
     }
 
     #[test]

@@ -322,7 +322,6 @@ pub type SharedEndpoint = Arc<Mutex<Option<quinn::Endpoint>>>;
 pub async fn run_server_connections_loop(
     listen_addr: &SocketAddr,
     cert_verifier: Arc<approval::MonuxCertVerification<'static>>,
-    fingerprint: Arc<Mutex<Option<String>>>,
     max_clipboard_size_bytes: u64,
     rotation_tx: mpsc::Sender<rotation::RotationEvent>,
     mode: transport::NetworkMode,
@@ -376,12 +375,11 @@ pub async fn run_server_connections_loop(
             }
         };
         let rotation_tx_cpy = rotation_tx.clone();
-        let fingerprint_cpy = fingerprint.clone();
         let peer_versions_cpy = peer_versions.clone();
         // Complete the handshake in a spawned task so that a slow or stuck peer
-        // cannot block the accept loop for other clients. We still wait to spawn
-        // the connection task until we've gotten the fingerprint, to avoid
-        // fingerprint mismatch issues.
+        // cannot block the accept loop for other clients. The connection task
+        // is only spawned once the client's fingerprint is known: AddClient
+        // carries it (rotation.rs).
         task::spawn(async move {
             let conn = match tokio::time::timeout(handshake_timeout, connecting).await {
                 Ok(Ok(conn)) => conn,
@@ -406,48 +404,49 @@ pub async fn run_server_connections_loop(
                     return;
                 }
             };
-            // HACK: This is retrieving the fingerprint stored by approval.rs
-            // See more about this in approval.rs.
-            match fingerprint_cpy.lock() {
-                Ok(mut opt) => {
-                    if let Some(fingerprint) = opt.take() {
-                        debug!("Got fingerprint: {}", fingerprint);
-                        // Now that we have extracted the client cert fingerprint, spawn.
-                        task::spawn(async move {
-                            if let Err(e) =
-                                handle_connection(conn, fingerprint, rotation_tx_cpy.clone(), max_clipboard_size_bytes, conn_token, peer_versions_cpy)
-                                .await
-                            {
-                                // Always try to remove the client from rotation, even if it wasn't added yet.
-                                // The token lets the rotation ignore this removal if the endpoint
-                                // was since reused by a newer connection.
-                                if let Err(e) = rotation_tx_cpy
-                                    .send(rotation::RotationEvent::RemoveClient {
-                                        endpoint: remote_addr,
-                                        conn_token,
-                                    })
-                                    .await {
-                                        error!("Failed to send remove client event: {:?}", e);
-                                    };
-                                if e.downcast_ref::<VersionMismatch>().is_some() {
-                                    // Already logged with full context by the
-                                    // version check; don't error per retry.
-                                    debug!("Refused client connection from {}: protocol mismatch", remote_addr);
-                                } else {
-                                    error!("Client connection error: {:?}", e);
-                                }
-                            }
-                        });
-                    } else {
-                        // In theory, this could happen if there was a race which approval.rs cleaned up.
-                        // Drop the connection and make the client try again.
-                        warn!("BUG: Fingerprint missing for new connection, dropping connection so that client can retry");
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to lock fingerprint for new connection: {}", e);
-                },
+            // The client's cert fingerprint, derived from the established
+            // connection itself (quinn's peer_identity yields the verified
+            // chain): each connection is paired with its own fingerprint, so
+            // simultaneous reconnects can't mix them up (the old global
+            // fingerprint slot in approval.rs could).
+            let fingerprint = match approval::connection_peer_fingerprint(&conn) {
+                Some(fingerprint) => fingerprint,
+                None => {
+                    // The cert verifier demands a client cert, so an
+                    // established connection always has one; drop so the
+                    // client retries rather than running unidentifiable.
+                    warn!("BUG: No peer certificate on the established connection from {}, dropping connection so that client can retry", remote_addr);
+                    return;
+                }
             };
+            debug!("Got fingerprint: {}", fingerprint);
+            task::spawn(async move {
+                let result = handle_connection(conn, fingerprint, rotation_tx_cpy.clone(), max_clipboard_size_bytes, conn_token, peer_versions_cpy).await;
+                // Remove the client from the rotation on EVERY exit path,
+                // graceful (QUIC application close) included — an Ok return
+                // used to leave a phantom entry in the rotation. Removal is
+                // idempotent there: a duplicate (e.g. the bulk writer already
+                // dropped this client) finds no entry, and the token lets the
+                // rotation ignore this removal if the endpoint was since
+                // reused by a newer connection.
+                if let Err(e) = rotation_tx_cpy
+                    .send(rotation::RotationEvent::RemoveClient {
+                        endpoint: remote_addr,
+                        conn_token,
+                    })
+                    .await {
+                        error!("Failed to send remove client event: {:?}", e);
+                    };
+                if let Err(e) = result {
+                    if e.downcast_ref::<VersionMismatch>().is_some() {
+                        // Already logged with full context by the
+                        // version check; don't error per retry.
+                        debug!("Refused client connection from {}: protocol mismatch", remote_addr);
+                    } else {
+                        error!("Client connection error: {:?}", e);
+                    }
+                }
+            });
         });
     }
 }
@@ -539,7 +538,11 @@ async fn handle_connection(
     // Receive the version a second time, on the bulk stream.
     // Sending some data is required to initialize the bulk stream, so let's just repeat ourselves.
     // Maybe we'll want to have different per-stream versions someday? Probably not.
-    let bulk_client_version = transport::recv_version(&mut bulk_recv, &mut event_bytes).await?;
+    // The exchange gets its own scratch buffer: reusing event_bytes would
+    // parse any leftover events-stream bytes as the bulk version if either
+    // side ever pipelines data behind the version frame.
+    let mut bulk_handshake_bytes = Vec::with_capacity(1024);
+    let bulk_client_version = transport::recv_version(&mut bulk_recv, &mut bulk_handshake_bytes).await?;
     transport::send_version(&mut bulk_send, shared::PROTOCOL_VERSION).await?;
     // Same peer as the events stream, whose version was already judged there
     // (PeerVersions + negotiate): it must speak the same version here.

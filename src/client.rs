@@ -553,8 +553,12 @@ impl Connection {
         // Exchange versions again via the bulk stream.
         // This is required in order to initialize the bulk stream,
         // otherwise the server times out waiting for the stream to open.
+        // The exchange gets its own scratch buffer: reusing event_bytes
+        // would parse any leftover events-stream bytes as the bulk version
+        // if either side ever pipelines data behind the version frame.
+        let mut bulk_handshake_bytes = Vec::with_capacity(1024);
         transport::send_version(&mut bulk_send, speak_as).await?;
-        let bulk_server_version = transport::recv_version(&mut bulk_recv, &mut event_bytes).await?;
+        let bulk_server_version = transport::recv_version(&mut bulk_recv, &mut bulk_handshake_bytes).await?;
         // Same server as the events stream, whose version was already
         // negotiated there: it must speak the same version here.
         if bulk_server_version != server_version {
@@ -710,7 +714,15 @@ impl Connection {
                         .try_send(serializedmsg)
                         .context("Failed to queue clipboard request message (bulk queue full or closed)")?;
                 } else {
-                    bail!("Clipboard fetch request queue has closed");
+                    // The local clipboard stack is gone (its fetch channel
+                    // closed). Bailing would fail every step — and every
+                    // reconnect — on a local condition no reconnect can fix,
+                    // so degrade like the other optional features (see
+                    // switch_request_rx below): turn local clipboard serving
+                    // off for this connection and carry on. Fetches from the
+                    // server get an empty reply (handle_bulk_messages).
+                    warn!("Local clipboard fetch channel closed; disabling local clipboard serving for this connection");
+                    *local_clipboard = None;
                 }
             },
             types_notify = async {
@@ -722,9 +734,11 @@ impl Connection {
                 // Local machine has a new clipboard entry.
                 // If we're currently active, then store it until we're deactivated by a switch.
                 // Ignore clipboard changes when inactive: Avoid polluting the rotation with "external" clipboards.
-                if let Err(e) = types_notify {
-                    warn!("local_types_rx is closed: {:?}", e);
-                    return Err(anyhow!(e));
+                if types_notify.is_err() {
+                    // The clipboard type watcher died; degrade exactly like
+                    // the fetch channel closing above.
+                    warn!("Local clipboard types channel closed; disabling local clipboard serving for this connection");
+                    *local_clipboard = None;
                 }
                 if self.active {
                     if let Some(lc) = local_clipboard {
@@ -1195,7 +1209,27 @@ impl Connection {
                     let local_clipboard = match &mut local_clipboard {
                         Some(lc) => lc,
                         None => {
-                            bail!("Got ClipboardRequest event from server when we don't support clipboards, resetting connection");
+                            // No local clipboard to serve (never had one, or
+                            // its stack died and serving was disabled for this
+                            // connection): answer with an empty header so the
+                            // requester's paste completes with nothing, instead
+                            // of resetting the connection into a reconnect loop
+                            // that faces the same local condition.
+                            warn!("Got a clipboard fetch from the server but have no local clipboard; serving empty");
+                            let msg = bulk::ClientBulk::ClipboardHeader(bulk::ClientClipboardHeader {
+                                requested_type: &c.requested_type,
+                                data_type: None,
+                                content_len_bytes: 0,
+                                request_client: c.request_client,
+                                request_id: c.request_id,
+                            });
+                            let bytes = postcard::to_stdvec_cobs(&msg)
+                                .map_err(|e| anyhow!("Failed to serialize clipboard header message: {:?}", e))?;
+                            // try_send, same policy as the serving task below.
+                            if self.bulk_tx.try_send(bytes).is_err() {
+                                error!("Failed to queue empty clipboard content for sending: bulk queue full or closed");
+                            }
+                            continue;
                         }
                     };
                     // Serve the data from a spawned task: reading the local
@@ -1221,11 +1255,11 @@ impl Connection {
                             Ok(Ok(result)) => result,
                             Ok(Err(e)) => {
                                 warn!("Failed to read local clipboard of type {}: {:?}", requested_type, e);
-                                (Vec::new(), None)
+                                (Default::default(), None)
                             }
                             Err(_) => {
                                 warn!("Timed out after {}s reading local clipboard of type {}", CLIPBOARD_SERVE_TIMEOUT_SECS, requested_type);
-                                (Vec::new(), None)
+                                (Default::default(), None)
                             }
                         };
                         // Symmetric with the writer's "Serving paste request

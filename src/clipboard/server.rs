@@ -147,7 +147,7 @@ impl LocalClipboard {
         requested_type: &str,
         max_size_bytes: u64,
         request_client: &SocketAddr,
-    ) -> Result<(Vec<u8>, Option<String>)> {
+    ) -> Result<(std::sync::Arc<[u8]>, Option<String>)> {
         let request_source = format!("client {}", request_client);
         let (content, data_type) = reader
             .read(requested_type, max_size_bytes, &request_source)

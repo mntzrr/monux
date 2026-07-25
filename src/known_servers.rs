@@ -153,12 +153,26 @@ pub fn record(
         RememberedServer {
             addr,
             fingerprint: fingerprint.to_string(),
-            hostname: hostname.map(|h| h.to_string()),
+            hostname: sanitized_hostname(hostname),
             last_connected: now_secs,
         },
     );
     servers.truncate(MAX_REMEMBERED);
     save(config_dir, &servers)
+}
+
+/// The hostname arrives over the wire (mDNS or the v15 handshake) and goes
+/// into the store verbatim, but the store is line-based and space-separated:
+/// a hostname containing whitespace would split the record's fields and make
+/// it unloadable, and a newline would inject forged records. Legit hostnames
+/// never contain whitespace or control characters, so a hostile one is
+/// recorded as absent (the address and fingerprint still count).
+fn sanitized_hostname(hostname: Option<&str>) -> Option<String> {
+    hostname
+        .filter(|h| {
+            !h.is_empty() && h.chars().all(|c| !c.is_whitespace() && !c.is_control())
+        })
+        .map(|h| h.to_string())
 }
 
 /// Finds a remembered server by its hostname (case-insensitive).
@@ -299,6 +313,42 @@ mod tests {
         // Most recent first; the three oldest fell off.
         assert_eq!(servers[0].addr, "10.0.0.8:1213".parse().unwrap());
         assert_eq!(servers[4].addr, "10.0.0.4:1213".parse().unwrap());
+    }
+
+    #[test]
+    fn hostile_hostnames_are_recorded_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        // A space would split the record's fields and make it unloadable.
+        record(dir.path(), "10.0.0.1:1213".parse().unwrap(), "aa", Some("my host"), 100).unwrap();
+        // A newline would inject a forged record into the store.
+        record(
+            dir.path(),
+            "10.0.0.2:1213".parse().unwrap(),
+            "bb",
+            Some("evil\n10.9.9.9:1213  cc  forged  1"),
+            200,
+        )
+        .unwrap();
+        // Control characters too (a tab is whitespace; \x07 is control).
+        record(dir.path(), "10.0.0.3:1213".parse().unwrap(), "dd", Some("bell\x07"), 300).unwrap();
+        // The addr+fingerprint records survive; the hostnames read as "-".
+        assert_eq!(
+            load(dir.path()),
+            vec![
+                server("10.0.0.3:1213", "dd", None, 300),
+                server("10.0.0.2:1213", "bb", None, 200),
+                server("10.0.0.1:1213", "aa", None, 100),
+            ]
+        );
+        // No forged line materialized either.
+        let raw = fs::read_to_string(store_path(dir.path())).unwrap();
+        assert_eq!(raw.lines().count(), 3);
+        // Legit hostnames still round-trip.
+        record(dir.path(), "10.0.0.4:1213".parse().unwrap(), "ee", Some("fine-host"), 400).unwrap();
+        assert_eq!(
+            load(dir.path())[0],
+            server("10.0.0.4:1213", "ee", Some("fine-host"), 400)
+        );
     }
 
     #[test]
