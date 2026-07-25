@@ -86,11 +86,17 @@ EXAMPLES:
     ///
     /// The server protocol-compatibility gate is first refreshed from the
     /// mDNS advertisements of servers on the LAN, so a client never installs
-    /// a build its server couldn't talk to ('--force' bypasses).
+    /// a build its server couldn't talk to ('--force' bypasses). '--to'
+    /// installs a specific older (or newer) build instead — downgrade the
+    /// server first — and pins auto-update so it never undoes the downgrade;
+    /// a plain update lifts the pin.
     #[command(after_long_help = "\
 EXAMPLES:
-    monux update
-    monux update --force    # rebuild even if up to date, bypassing the protocol gate")]
+    monux update                # update to the latest version (also lifts a downgrade pin)
+    monux update --force        # rebuild even if up to date, bypassing the protocol gate
+    monux update --to 8.3.0     # downgrade to a released version (pins auto-update)
+    monux update --to 5b4c00e   # downgrade to a commit
+    monux update --rollback     # return to the previously installed build")]
     Update(UpdateArgs),
 
     /// Prints the live state of the running monux daemon (server or client)
@@ -680,6 +686,15 @@ struct UpdateArgs {
     /// server protocol-compatibility gate
     #[arg(long)]
     force: bool,
+    /// Install a specific version or commit instead of the latest (e.g.
+    /// --to 8.3.0 or --to 5b4c00e). Pins auto-update so it never undoes the
+    /// downgrade; a plain 'monux update' lifts the pin again
+    #[arg(long, value_name = "VERSION|COMMIT", conflicts_with = "rollback")]
+    to: Option<String>,
+    /// Return to the build that was installed before the current one
+    /// (recorded by every install); shorthand for --to <recorded commit>
+    #[arg(long)]
+    rollback: bool,
 }
 
 /// Listens for SIGUSR1 and SIGUSR2, treating them as "switch to next client" and "switch to prev client" respectively.
@@ -820,6 +835,16 @@ fn main() -> Result<()> {
             );
         }
         Commands::Update(args) => {
+            let config_dir = monux::update::default_config_dir();
+            // A plain update returns to the latest; lift a downgrade pin
+            // first (auto-update skips while pinned and never unpins itself).
+            if !args.rollback && args.to.is_none() {
+                if let Some(dir) = config_dir.as_deref() {
+                    if monux::update::clear_update_pin(dir) {
+                        info!("unpinned; updating to latest");
+                    }
+                }
+            }
             // Gate on the server's protocol version when this machine acts as
             // a client, so an update can't break the connection. The version
             // recorded at the last handshake can be stale (the server upgraded
@@ -839,10 +864,21 @@ fn main() -> Result<()> {
                 info!("This machine runs a monux server and no client: the protocol-compatibility gate does not apply");
                 None
             } else {
-                let config_dir = home::home_dir().map(|h| h.join(".config").join("monux"));
                 monux::update::refresh_protocol_constraint(config_dir.as_deref())
             };
-            return monux::update::run(args.force, false, constraint).map(|_| ());
+            // --rollback is shorthand for --to <the recorded previous build>.
+            let to = if args.rollback {
+                match config_dir.as_deref().and_then(monux::update::previous_version) {
+                    Some((version, commit)) => {
+                        info!("Rolling back to the previously installed build: v{} ({})", version, commit);
+                        Some(commit)
+                    }
+                    None => bail!("no previous version recorded — use --to <version>"),
+                }
+            } else {
+                args.to.clone()
+            };
+            return monux::update::run(args.force, false, constraint, to.as_deref()).map(|_| ());
         }
         Commands::Status(args) => {
             let out = monux::control::status_cli(
@@ -1945,6 +1981,26 @@ mod tests {
         assert!(Cli::try_parse_from(["monux", "setup"]).is_ok());
         assert!(Cli::try_parse_from(["monux", "gui", "indicator"]).is_ok());
         assert!(Cli::try_parse_from(["monux", "daemon", "switch", "next"]).is_ok());
+    }
+
+    #[test]
+    fn update_to_and_rollback_flags() {
+        let cli = Cli::try_parse_from(["monux", "update", "--to", "8.3.0"]).unwrap();
+        let Commands::Update(args) = cli.command else {
+            panic!("expected the update subcommand")
+        };
+        assert_eq!(args.to.as_deref(), Some("8.3.0"));
+        assert!(!args.rollback);
+        assert!(!args.force);
+        // --to and --rollback are mutually exclusive; --force combines with both.
+        assert!(Cli::try_parse_from(["monux", "update", "--to", "8.3.0", "--rollback"]).is_err());
+        let cli = Cli::try_parse_from(["monux", "update", "--rollback", "--force"]).unwrap();
+        let Commands::Update(args) = cli.command else {
+            panic!("expected the update subcommand")
+        };
+        assert!(args.rollback);
+        assert!(args.force);
+        assert!(Cli::try_parse_from(["monux", "update", "--to", "5b4c00e", "--force"]).is_ok());
     }
 
     #[test]

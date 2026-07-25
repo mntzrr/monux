@@ -134,7 +134,21 @@ pub async fn run(gate_config_dir: Option<std::path::PathBuf>) {
     // build: the gate opens once the server is updated, which the next
     // check picks up.
     let mut last_attempted: Option<String> = None;
+    // The pin lives in the config dir; servers pass no gate dir, so fall
+    // back to the default location for the pin check.
+    let pin_dir = gate_config_dir.clone().or_else(update::default_config_dir);
     loop {
+        // A manual downgrade pins the version: auto-update never downgrades
+        // (and never unpins — a plain 'monux update' does that), so a pinned
+        // machine skips every check until then.
+        if let Some((version, _commit)) = pin_dir.as_deref().and_then(update::update_pin) {
+            info!(
+                "update pinned at v{} (manual downgrade); skipping — return to latest with 'monux update'",
+                version
+            );
+            wait_for_next_check().await;
+            continue;
+        }
         let repo = update::repo_url();
         // git ls-remote is blocking network IO: run it on the blocking pool
         // so a dead route can't park an async worker for minutes (the call
@@ -162,7 +176,7 @@ pub async fn run(gate_config_dir: Option<std::path::PathBuf>) {
                         let constraint = gate_dir
                             .as_deref()
                             .and_then(|dir| update::refresh_protocol_constraint(Some(dir)));
-                        update::run(false, true, constraint)
+                        update::run(false, true, constraint, None)
                     })
                     .await;
                     match result {
@@ -195,11 +209,16 @@ pub async fn run(gate_config_dir: Option<std::path::PathBuf>) {
                 debug!("monux update check failed (offline?): {:?}", e);
             }
         }
-        tokio::select! {
-            _ = tokio::time::sleep(check_interval()) => {}
-            _ = UPDATE_HINT.notified() => {
-                info!("Update hint received; checking for updates now");
-            }
+        wait_for_next_check().await;
+    }
+}
+
+/// Waits for the next check tick, waking early on an update hint.
+async fn wait_for_next_check() {
+    tokio::select! {
+        _ = tokio::time::sleep(check_interval()) => {}
+        _ = UPDATE_HINT.notified() => {
+            info!("Update hint received; checking for updates now");
         }
     }
 }

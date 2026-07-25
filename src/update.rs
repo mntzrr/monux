@@ -70,7 +70,12 @@ pub fn pair_works(target: u64, server: u64) -> bool {
     target.min(server) >= crate::msgs::shared::PROTOCOL_VERSION_NEGOTIATION || target == server
 }
 
-pub fn run(force: bool, low_priority: bool, protocol_constraint: Option<u64>) -> Result<UpdateStatus> {
+pub fn run(
+    force: bool,
+    low_priority: bool,
+    protocol_constraint: Option<u64>,
+    to: Option<&str>,
+) -> Result<UpdateStatus> {
     let repo = repo_url();
     let src_dir = match std::env::var_os("MONUX_UPDATE_CACHE") {
         Some(dir) => PathBuf::from(dir),
@@ -82,21 +87,46 @@ pub fn run(force: bool, low_priority: bool, protocol_constraint: Option<u64>) ->
     };
 
     if src_dir.join(".git").exists() {
-        info!("Pulling latest source in {}...", src_dir.display());
-        git(&src_dir, &["pull", "--ff-only"]).with_context(|| {
-            format!(
-                "Failed to update the source checkout; delete it and retry: rm -rf {}",
-                src_dir.display()
-            )
-        })?;
+        if to.is_some() {
+            // Resolving a version scans Cargo.toml history, so fetch first
+            // (the newest commits must resolve too) and deepen the initial
+            // --depth 1 clone once.
+            if git_output(&src_dir, &["rev-parse", "--is-shallow-repository"])? == "true" {
+                git(&src_dir, &["fetch", "--unshallow"])?;
+            } else {
+                git(&src_dir, &["fetch"])?;
+            }
+        } else {
+            // A '--to' install leaves the checkout on a detached HEAD;
+            // reattach to master before pulling. The pull then fast-forwards
+            // across the pinned era like any other — no special casing.
+            if head_is_detached(&src_dir) {
+                info!("Reattaching the source checkout to master (left detached by a downgrade)...");
+                git(&src_dir, &["checkout", "master"])?;
+            }
+            info!("Pulling latest source in {}...", src_dir.display());
+            git(&src_dir, &["pull", "--ff-only"]).with_context(|| {
+                format!(
+                    "Failed to update the source checkout; delete it and retry: rm -rf {}",
+                    src_dir.display()
+                )
+            })?;
+        }
     } else {
         info!("Cloning {} into {}...", repo, src_dir.display());
         if let Some(parent) = src_dir.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create {}", parent.display()))?;
         }
+        // A '--to' install resolves versions/commits from history, so it
+        // needs a full clone; the latest-only path stays shallow.
+        let mut args = vec!["clone"];
+        if to.is_none() {
+            args.extend(["--depth", "1"]);
+        }
         let status = git_network_command()
-            .args(["clone", "--depth", "1", &repo])
+            .args(args)
+            .arg(&repo)
             .arg(&src_dir)
             .status()
             .context("Failed to run git: is it installed?")?;
@@ -105,39 +135,86 @@ pub fn run(force: bool, low_priority: bool, protocol_constraint: Option<u64>) ->
         }
     }
 
-    let latest = git_output(&src_dir, &["rev-parse", "--short=12", "HEAD"])?;
-    let current_base = CURRENT_REVISION.trim_end_matches("-dirty");
-    if !force && current_base != "unknown" && latest == current_base {
-        info!(
-            "monux is already up to date ({}). Use --force to rebuild anyway.",
-            CURRENT_REVISION
-        );
-        return Ok(UpdateStatus::AlreadyCurrent);
-    }
-
-    // The update gate: a client never installs a build its server couldn't
-    // pair with. Since protocol v16 pairs negotiate (connecting at the lower
-    // version), the gate accepts any negotiation-era pair; a pre-negotiation
-    // server still demands an exact match (see pair_works). Checked from the
-    // pulled source, before the expensive build.
-    if !force {
-        if let Some(server_version) = protocol_constraint {
-            let source_version = source_protocol_version(&src_dir)?;
-            if !pair_works(source_version, server_version) {
-                let remedy = if source_version > server_version {
-                    "Update the server first"
-                } else {
-                    "Downgrade the server first"
-                };
+    // For a '--to' install: the target's version and the protocol it speaks,
+    // kept for the pin and the install summary.
+    let mut pinned: Option<(String, u64)> = None;
+    let latest = match to {
+        Some(target) => {
+            let sha = resolve_target(&src_dir, target)?;
+            let short = git_output(&src_dir, &["rev-parse", "--short=12", &sha])?;
+            let manifest = git_output(&src_dir, &["show", &format!("{}:Cargo.toml", sha)])?;
+            let version = cargo_toml_version(&manifest)
+                .with_context(|| format!("No package version in Cargo.toml at {}", target))?;
+            let shared = git_output(&src_dir, &["show", &format!("{}:src/msgs/shared.rs", sha)])?;
+            let target_version = protocol_version_in(&shared)
+                .with_context(|| format!("Failed to read the protocol version of {}", target))?;
+            let current_base = CURRENT_REVISION.trim_end_matches("-dirty");
+            if !force && current_base != "unknown" && short == current_base {
                 info!(
-                    "Not updating to {}: it speaks protocol v{}, but the server speaks v{} — the pair couldn't negotiate a common protocol. {}; this gate opens automatically once this client reconnects to it (or use --force to override).",
-                    latest, source_version, server_version, remedy
+                    "monux is already at v{} ({}). Use --force to rebuild anyway.",
+                    version, CURRENT_REVISION
                 );
-                return Ok(UpdateStatus::SkippedIncompatible);
+                return Ok(UpdateStatus::AlreadyCurrent);
             }
+            // The update gate, on the resolved target: a client never
+            // installs a build its server couldn't pair with (see
+            // pair_works). Read from git objects above, before touching the
+            // checkout — a refusal leaves it exactly as it was.
+            if !force {
+                if let Some(server_version) = protocol_constraint {
+                    if let Err(e) = check_to_gate(&version, &short, target_version, server_version) {
+                        info!("{:#}", e);
+                        return Ok(UpdateStatus::SkippedIncompatible);
+                    }
+                }
+            }
+            info!("Checking out v{} ({})...", version, short);
+            git(&src_dir, &["checkout", &sha])?;
+            info!(
+                "Installing monux v{} ({}): the current build is {}",
+                version, short, CURRENT_REVISION
+            );
+            pinned = Some((version, target_version));
+            short
         }
-    }
-    info!("Updating monux: {} -> {}", CURRENT_REVISION, latest);
+        None => {
+            let latest = git_output(&src_dir, &["rev-parse", "--short=12", "HEAD"])?;
+            let current_base = CURRENT_REVISION.trim_end_matches("-dirty");
+            if !force && current_base != "unknown" && latest == current_base {
+                info!(
+                    "monux is already up to date ({}). Use --force to rebuild anyway.",
+                    CURRENT_REVISION
+                );
+                return Ok(UpdateStatus::AlreadyCurrent);
+            }
+
+            // The update gate: a client never installs a build its server
+            // couldn't pair with. Since protocol v16 pairs negotiate
+            // (connecting at the lower version), the gate accepts any
+            // negotiation-era pair; a pre-negotiation server still demands
+            // an exact match (see pair_works). Checked from the pulled
+            // source, before the expensive build.
+            if !force {
+                if let Some(server_version) = protocol_constraint {
+                    let source_version = source_protocol_version(&src_dir)?;
+                    if !pair_works(source_version, server_version) {
+                        let remedy = if source_version > server_version {
+                            "Update the server first"
+                        } else {
+                            "Downgrade the server first"
+                        };
+                        info!(
+                            "Not updating to {}: it speaks protocol v{}, but the server speaks v{} — the pair couldn't negotiate a common protocol. {}; this gate opens automatically once this client reconnects to it (or use --force to override).",
+                            latest, source_version, server_version, remedy
+                        );
+                        return Ok(UpdateStatus::SkippedIncompatible);
+                    }
+                }
+            }
+            info!("Updating monux: {} -> {}", CURRENT_REVISION, latest);
+            latest
+        }
+    };
 
     let root = install_root();
     let cargo = find_cargo()?;
@@ -210,11 +287,44 @@ pub fn run(force: bool, low_priority: bool, protocol_constraint: Option<u64>) ->
         Ok(_) => {}
         Err(e) => warn!("Couldn't create the 'mx' alias: {:#}", e),
     }
-    info!(
-        "Updated monux to {} at {}. Restart any running monux server/client to pick it up.",
-        latest,
-        root.join("bin/monux").display()
-    );
+    // Record the build this install replaced (the running one), so
+    // '--rollback' can return to it. A build without a revision (built
+    // outside git) can't be returned to, so nothing is recorded then.
+    let config_dir = default_config_dir();
+    if let Some(dir) = config_dir.as_deref() {
+        let current_base = CURRENT_REVISION.trim_end_matches("-dirty");
+        if current_base != "unknown" && !current_base.is_empty() {
+            record_previous_version(dir, env!("CARGO_PKG_VERSION"), current_base);
+        }
+    }
+    match pinned {
+        Some((version, target_version)) => {
+            // Pin auto-update so the daily check never undoes the manual
+            // downgrade; a plain 'monux update' lifts the pin.
+            if let Some(dir) = config_dir.as_deref() {
+                write_update_pin(dir, &version, &latest);
+            }
+            info!(
+                "Installed monux v{} ({}) at {}; it speaks protocol v{}.",
+                version,
+                latest,
+                root.join("bin/monux").display(),
+                target_version
+            );
+            info!("Restart daemons to apply: mx daemon restart");
+            info!(
+                "Auto-update is now pinned at v{} and will skip; return to latest with 'monux update'",
+                version
+            );
+        }
+        None => {
+            info!(
+                "Updated monux to {} at {}. Restart any running monux server/client to pick it up.",
+                latest,
+                root.join("bin/monux").display()
+            );
+        }
+    }
     Ok(UpdateStatus::Installed)
 }
 
@@ -224,17 +334,187 @@ fn source_protocol_version(src_dir: &Path) -> Result<u64> {
     let shared_rs = src_dir.join("src").join("msgs").join("shared.rs");
     let text = std::fs::read_to_string(&shared_rs)
         .with_context(|| format!("Failed to read {}", shared_rs.display()))?;
+    protocol_version_in(&text).with_context(|| format!("in {}", shared_rs.display()))
+}
+
+/// Parses PROTOCOL_VERSION out of shared.rs content.
+fn protocol_version_in(text: &str) -> Result<u64> {
     for line in text.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("pub const PROTOCOL_VERSION: u64 =") {
             if let Some(num) = rest.trim().strip_suffix(';') {
-                return num.trim().parse().with_context(|| {
-                    format!("Failed to parse PROTOCOL_VERSION in {}", shared_rs.display())
-                });
+                return num
+                    .trim()
+                    .parse()
+                    .context("Failed to parse PROTOCOL_VERSION");
             }
         }
     }
-    bail!("PROTOCOL_VERSION not found in {}", shared_rs.display())
+    bail!("PROTOCOL_VERSION not found")
+}
+
+/// Extracts the package version from Cargo.toml content: the first bare
+/// `version = "X.Y.Z"` line (the [package] section heads monux's manifest;
+/// dependency versions ride inline in their own entries).
+fn cargo_toml_version(manifest: &str) -> Option<String> {
+    for line in manifest.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("version") {
+            if let Some(rest) = rest.trim_start().strip_prefix('=') {
+                let rest = rest.trim();
+                if let Some(version) = rest.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+                    return Some(version.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether the source checkout is on a detached HEAD (a '--to' install
+/// leaves it that way): symbolic-ref fails then.
+fn head_is_detached(src_dir: &Path) -> bool {
+    git(src_dir, &["symbolic-ref", "-q", "HEAD"]).is_err()
+}
+
+/// The version declared by Cargo.toml at each commit that touched it,
+/// newest first: (version, sha) pairs.
+fn version_history(src_dir: &Path) -> Result<Vec<(String, String)>> {
+    let log = git_output(src_dir, &["log", "--format=%H", "--", "Cargo.toml"])?;
+    let mut history = Vec::new();
+    for sha in log.lines() {
+        let manifest = git_output(src_dir, &["show", &format!("{}:Cargo.toml", sha)])?;
+        if let Some(version) = cargo_toml_version(&manifest) {
+            history.push((version, sha.to_string()));
+        }
+    }
+    Ok(history)
+}
+
+/// Whether a '--to' argument is shaped like a release version (X.Y...),
+/// for picking the right "not found" error.
+fn looks_like_version(target: &str) -> bool {
+    target.contains('.')
+        && target
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Resolves a '--to' argument to a full commit sha: first as a released
+/// version (the newest commit whose Cargo.toml declares it wins), then as a
+/// commit prefix.
+fn resolve_target(src_dir: &Path, target: &str) -> Result<String> {
+    let history = version_history(src_dir)?;
+    let wanted = target.strip_prefix('v').unwrap_or(target);
+    if let Some((_, sha)) = history.iter().find(|(version, _)| version == wanted) {
+        return Ok(sha.clone());
+    }
+    // Not a known version: try the argument as a commit prefix.
+    let rev = format!("{}^{{commit}}", target);
+    if let Ok(sha) = git_output(src_dir, &["rev-parse", "--verify", &rev]) {
+        return Ok(sha);
+    }
+    if looks_like_version(wanted) {
+        let mut recent: Vec<&str> = Vec::new();
+        for (version, _) in &history {
+            if !recent.contains(&version.as_str()) {
+                recent.push(version);
+            }
+            if recent.len() == 10 {
+                break;
+            }
+        }
+        bail!(
+            "No version {} found in the update history; recent versions: {}",
+            target,
+            recent.join(", ")
+        );
+    }
+    bail!("No such commit: {}", target)
+}
+
+/// The '--to' update gate: refuse installing a build the server couldn't
+/// pair with (see pair_works). The refusal names the direction — downgrading
+/// a client below the server's protocol only works once the server is
+/// downgraded first, mirroring the server-first upgrade order.
+fn check_to_gate(version: &str, short: &str, target: u64, server: u64) -> Result<()> {
+    if pair_works(target, server) {
+        return Ok(());
+    }
+    let (action, remedy) = if target < server {
+        ("downgrading", "Downgrade the server first")
+    } else {
+        ("updating", "Update the server first")
+    };
+    bail!(
+        "Not {} to v{} ({}): it speaks protocol v{}, but the server speaks v{} — the pair couldn't negotiate a common protocol. {}; this gate opens automatically once this client reconnects to it (or use --force to override).",
+        action, version, short, target, server, remedy
+    )
+}
+
+/// The monux config dir (~/.config/monux), when a home dir is known.
+pub fn default_config_dir() -> Option<PathBuf> {
+    home::home_dir().map(|home| home.join(".config").join("monux"))
+}
+
+/// Name of the file (inside the config dir) pinning updates after a manual
+/// downgrade: auto-update skips while it exists and never removes it; a
+/// plain 'monux update' does. One line: "<version> <commit>".
+const UPDATE_PIN_FILE: &str = "update-pin";
+
+/// Name of the file (inside the config dir) recording the build the last
+/// install replaced, for '--rollback'. One line: "<version> <commit>".
+const PREVIOUS_VERSION_FILE: &str = "previous-version";
+
+/// Reads a "<version> <commit>" record file, tolerating a missing or
+/// garbled file (reads as absent then).
+fn read_version_record(config_dir: &Path, file: &str) -> Option<(String, String)> {
+    let text = std::fs::read_to_string(config_dir.join(file)).ok()?;
+    let mut fields = text.split_whitespace();
+    let version = fields.next()?;
+    let commit = fields.next()?;
+    Some((version.to_string(), commit.to_string()))
+}
+
+/// Writes a "<version> <commit>" record file (best-effort, like the
+/// protocol-constraint record above).
+fn write_version_record(config_dir: &Path, file: &str, version: &str, commit: &str) {
+    if let Err(e) = std::fs::write(config_dir.join(file), format!("{} {}\n", version, commit)) {
+        tracing::warn!("Failed to record {}: {:?}", file, e);
+    }
+}
+
+/// The update pin, if set: (version, commit) of the manual downgrade.
+pub fn update_pin(config_dir: &Path) -> Option<(String, String)> {
+    read_version_record(config_dir, UPDATE_PIN_FILE)
+}
+
+/// Pins updates at the given build; written after a successful
+/// '--to'/'--rollback' install.
+pub fn write_update_pin(config_dir: &Path, version: &str, commit: &str) {
+    write_version_record(config_dir, UPDATE_PIN_FILE, version, commit)
+}
+
+/// Removes the update pin; returns whether one was set.
+pub fn clear_update_pin(config_dir: &Path) -> bool {
+    match std::fs::remove_file(config_dir.join(UPDATE_PIN_FILE)) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            tracing::warn!("Failed to remove the update pin: {:?}", e);
+            false
+        }
+    }
+}
+
+/// Records the build an install replaced (for '--rollback').
+pub fn record_previous_version(config_dir: &Path, version: &str, commit: &str) {
+    write_version_record(config_dir, PREVIOUS_VERSION_FILE, version, commit)
+}
+
+/// The build the last install replaced, if recorded.
+pub fn previous_version(config_dir: &Path) -> Option<(String, String)> {
+    read_version_record(config_dir, PREVIOUS_VERSION_FILE)
 }
 
 /// Name of the file (inside the config dir) recording the protocol version of
@@ -595,5 +875,180 @@ mod tests {
         assert_eq!(std::fs::read(&to).unwrap(), b"new-binary");
         assert!(!from.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cargo_toml_version_extraction() {
+        assert_eq!(
+            cargo_toml_version("[package]\nname = \"monux\"\nversion = \"9.1.0\"\n"),
+            Some("9.1.0".to_string())
+        );
+        // Leading whitespace is fine; inline dependency versions don't match.
+        let manifest = "# comment\n  version = \"1.2.3\"\n\n[dependencies]\nanyhow = \"1.0\"\n";
+        assert_eq!(cargo_toml_version(manifest), Some("1.2.3".to_string()));
+        assert_eq!(cargo_toml_version("[package]\nname = \"monux\"\n"), None);
+    }
+
+    #[test]
+    fn protocol_version_in_parses_the_constant() {
+        // PROTOCOL_VERSION_NEGOTIATION sorts first in shared.rs; the parser
+        // must skip it.
+        let text = "pub const PROTOCOL_VERSION_NEGOTIATION: u64 = 16;\npub const PROTOCOL_VERSION: u64 = 16;\n";
+        assert_eq!(protocol_version_in(text).unwrap(), 16);
+        assert!(protocol_version_in("nothing here").is_err());
+    }
+
+    #[test]
+    fn looks_like_version_shapes() {
+        assert!(looks_like_version("9.1.0"));
+        assert!(looks_like_version("9.1"));
+        assert!(!looks_like_version("9"));
+        assert!(!looks_like_version("5b4c00e"));
+        assert!(!looks_like_version("9abcdef0"));
+    }
+
+    #[test]
+    fn update_pin_roundtrip_and_clear() {
+        let dir = std::env::temp_dir().join(format!("monux-test-pin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(update_pin(&dir), None);
+        // Clearing with no pin set is not an error and reports so.
+        assert!(!clear_update_pin(&dir));
+        write_update_pin(&dir, "9.0.0", "abcdef123456");
+        assert_eq!(
+            update_pin(&dir),
+            Some(("9.0.0".to_string(), "abcdef123456".to_string()))
+        );
+        assert!(clear_update_pin(&dir));
+        assert_eq!(update_pin(&dir), None);
+        assert!(!clear_update_pin(&dir));
+        // Garbled content reads as absent.
+        std::fs::write(dir.join(UPDATE_PIN_FILE), "garbage\n").unwrap();
+        assert_eq!(update_pin(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn previous_version_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("monux-test-prev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(previous_version(&dir), None);
+        record_previous_version(&dir, "9.0.0", "0123456789ab");
+        assert_eq!(
+            previous_version(&dir),
+            Some(("9.0.0".to_string(), "0123456789ab".to_string()))
+        );
+        // A later install overwrites the record.
+        record_previous_version(&dir, "9.1.0", "abcdef012345");
+        assert_eq!(
+            previous_version(&dir),
+            Some(("9.1.0".to_string(), "abcdef012345".to_string()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn to_gate_refusals_are_direction_aware() {
+        // Accepted pairs pass silently (pair_works semantics).
+        assert!(check_to_gate("9.1.0", "aaaaaaaaaaaa", 16, 16).is_ok());
+        assert!(check_to_gate("9.1.0", "aaaaaaaaaaaa", 17, 16).is_ok());
+        // Downgrading to a pre-negotiation build against a v16 server.
+        let err = check_to_gate("8.0.0", "bbbbbbbbbbbb", 15, 16)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Not downgrading to v8.0.0 (bbbbbbbbbbbb)"), "{}", err);
+        assert!(err.contains("Downgrade the server first"), "{}", err);
+        // Installing a newer build against a pre-negotiation server.
+        let err = check_to_gate("9.0.0", "cccccccccccc", 16, 15)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Not updating to v9.0.0 (cccccccccccc)"), "{}", err);
+        assert!(err.contains("Update the server first"), "{}", err);
+    }
+
+    /// Runs git in a test repo, failing the test on a non-zero exit.
+    fn test_git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "monux-test")
+            .env("GIT_AUTHOR_EMAIL", "monux-test@example.com")
+            .env("GIT_COMMITTER_NAME", "monux-test")
+            .env("GIT_COMMITTER_EMAIL", "monux-test@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// Commits a Cargo.toml declaring `version` into the repo, returning the
+    /// commit sha.
+    fn test_commit_version(dir: &Path, version: &str) -> String {
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"monux\"\nversion = \"{}\"\n", version),
+        )
+        .unwrap();
+        test_git(dir, &["add", "Cargo.toml"]);
+        test_git(dir, &["commit", "-m", &format!("v{}", version)]);
+        test_git(dir, &["rev-parse", "HEAD"])
+    }
+
+    fn test_repo(dir: &Path) {
+        test_git(dir, &["-c", "init.defaultBranch=master", "init"]);
+    }
+
+    #[test]
+    fn resolve_target_by_version_and_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        test_repo(dir);
+        let v1 = test_commit_version(dir, "1.0.0");
+        let v2 = test_commit_version(dir, "1.1.0");
+        // A commit that doesn't touch Cargo.toml: version resolution must
+        // skip it; commit-prefix resolution must still find it.
+        std::fs::write(dir.join("note.txt"), "x\n").unwrap();
+        test_git(dir, &["add", "note.txt"]);
+        test_git(dir, &["commit", "-m", "note"]);
+        let other = test_git(dir, &["rev-parse", "HEAD"]);
+        let v3 = test_commit_version(dir, "1.2.0");
+
+        // By version (a v-prefix is accepted); the newest match wins.
+        assert_eq!(resolve_target(dir, "1.1.0").unwrap(), v2);
+        assert_eq!(resolve_target(dir, "v1.0.0").unwrap(), v1);
+        assert_eq!(resolve_target(dir, "1.2.0").unwrap(), v3);
+        // By commit prefix, including the commit without a version bump.
+        assert_eq!(resolve_target(dir, &other[..8]).unwrap(), other);
+        assert_eq!(resolve_target(dir, &v1[..8]).unwrap(), v1);
+        // An unknown version names the recent versions in its error.
+        let err = resolve_target(dir, "9.9.9").unwrap_err().to_string();
+        assert!(err.contains("No version 9.9.9"), "{}", err);
+        assert!(err.contains("1.2.0"), "{}", err);
+        // An unknown commit prefix gets its own error.
+        let err = resolve_target(dir, "deadbeefdeadbeef")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("No such commit"), "{}", err);
+    }
+
+    #[test]
+    fn head_detached_detection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        test_repo(dir);
+        let v1 = test_commit_version(dir, "1.0.0");
+        assert!(!head_is_detached(dir));
+        // A '--to' install checks out a bare sha: detached.
+        test_git(dir, &["checkout", &v1]);
+        assert!(head_is_detached(dir));
+        // A plain update reattaches to master.
+        test_git(dir, &["checkout", "master"]);
+        assert!(!head_is_detached(dir));
     }
 }

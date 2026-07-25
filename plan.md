@@ -141,12 +141,10 @@ The config file is persistent flag storage; `mx config` is its CLI.
   connect at min(their, our); pre-negotiation pairs keep exact-match refusal; a
   newer client clamps once to a >= v15 server; the feature map + degraded-set
   logging live in msgs/shared.rs; the update gate keys off pair_works().
-- **Item 5 (downgrade)** — UNBLOCKED (negotiation shipped). Spec: `monux update --to
-  <version|commit>` (scan Cargo.toml history / commit prefix; read target protocol
-  from checked-out source; gate = target ≥ supported floor, server leads; `--force`),
-  `--rollback` sugar via recorded previous version, update-pin file so daily
-  auto-update never undoes a manual downgrade (plain `monux update` unpins), plain
-  update resets detached HEAD to origin/master. Auto-update never downgrades.
+- **Item 5 (downgrade)** — SHIPPED in v9.1.0: `monux update --to <version|commit>`
+  (Cargo.toml-history scan, commit-prefix fallback), `--rollback` (records the
+  replaced build per install), the update-pin (auto-update skips, plain update
+  unpins), detached-HEAD reattach, direction-aware pair_works gate.
 - **Hotspot leftovers**: fix hostapd presence check (`hostapd -v` exits 1 → always
   "installs"; check /usr/bin/hostapd instead); `ensure_ap_interface` must verify
   the existing vif's type (a stale `managed` vif breaks hostapd beaconing) and
