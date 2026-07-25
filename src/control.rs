@@ -621,10 +621,12 @@ impl Handler {
             }
             "restart" => {
                 info!("Control socket: restart requested");
+                crate::mark_shutting_down();
                 (Response::ok_empty(), Some(PostAction::Restart))
             }
             "exit" => {
                 info!("Control socket: exit requested");
+                crate::mark_shutting_down();
                 (Response::ok_empty(), Some(PostAction::Exit))
             }
             "indicator" => {

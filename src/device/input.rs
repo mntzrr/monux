@@ -248,12 +248,22 @@ async fn read_device_or_grab_events(
             }
             state = state_rx.changed() => {
                 if let Err(e) = state {
-                    // Sender was dropped, shouldn't happen: exit to avoid looping forever.
-                    warn!(
-                        "Error on grab watch for {:?}, removing device: {}",
-                        stream.device().name(),
-                        e
-                    );
+                    // Sender was dropped: expected during teardown (the
+                    // daemon is shutting down and closing every channel),
+                    // otherwise it shouldn't happen — exit either way to
+                    // avoid looping forever.
+                    if crate::shutting_down() {
+                        debug!(
+                            "Grab watch for {:?} closed (shutdown)",
+                            stream.device().name()
+                        );
+                    } else {
+                        warn!(
+                            "Error on grab watch for {:?}, removing device: {}",
+                            stream.device().name(),
+                            e
+                        );
+                    }
                     return
                 }
                 let target = class_grabbed(class, &state_rx.borrow_and_update());

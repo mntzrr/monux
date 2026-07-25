@@ -746,6 +746,7 @@ async fn shutdown_signal() {
         _ = tokio::signal::ctrl_c() => {}
         _ = sigterm.recv() => {}
     }
+    monux::mark_shutting_down();
 }
 
 /// Client variant of shutdown_signal: additionally resolves on SIGUSR1, SIGUSR2
@@ -770,6 +771,7 @@ async fn client_shutdown_signal() {
         _ = sigusr2.recv() => {}
         _ = sighup.recv() => {}
     }
+    monux::mark_shutting_down();
 }
 
 fn main() -> Result<()> {

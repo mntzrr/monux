@@ -103,14 +103,24 @@ impl LocalClipboard {
                                 break;
                             }
                         } else {
-                            error!("Clipboard fetch request queue has closed, exiting clipboard loop");
+                            // The queue closed: expected during teardown,
+                            // an error otherwise.
+                            if crate::shutting_down() {
+                                debug!("Clipboard fetch request queue closed (shutdown)");
+                            } else {
+                                error!("Clipboard fetch request queue has closed, exiting clipboard loop");
+                            }
                             break;
                         }
                     },
                     // Listen to local host updates to the clipboard types
                     types_notify = local_types_rx.changed() => {
                         if let Err(e) = types_notify {
-                            error!("local_types_rx has closed: {}", e);
+                            if crate::shutting_down() {
+                                debug!("local_types_rx closed (shutdown)");
+                            } else {
+                                error!("local_types_rx has closed: {}", e);
+                            }
                             break;
                         }
                         // Another application on the server machine has a clipboard entry.
