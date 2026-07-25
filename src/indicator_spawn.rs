@@ -9,9 +9,13 @@
 //!
 //! - Graceful daemon shutdown (any path: SIGTERM/SIGINT, control-socket
 //!   exit/restart, --exit-secs, a failed daemon loop) drops the Supervisor,
-//!   which SIGTERMs the child and reaps it. The auto-update re-exec is the
-//!   same path: the old image shuts down (child dies), the new image spawns
-//!   a fresh indicator.
+//!   which deliberately ORPHANS the child: it keeps running and, seeing the
+//!   daemon vanish from its poll, shows the standalone launcher state — the
+//!   tray doubles as the way to start monux again (see indicator.rs). Hide
+//!   the tray first ('monux gui tray hide') if it should die with the
+//!   daemon. The auto-update re-exec flows the same way: the old image's
+//!   orphan is taken over by the new image's spawned indicator via the
+//!   single-instance lock, so the icon never flickers out.
 //! - A daemon SIGKILL skips all of this: the orphaned indicator keeps
 //!   showing its "?" state until the NEXT daemon's indicator takes over via
 //!   the single-instance lock (single_instance.rs, kind "indicator"), which
@@ -483,19 +487,30 @@ impl Supervisor {
 }
 
 impl Drop for Supervisor {
-    /// Graceful daemon shutdown: SIGTERM the indicator and reap it.
+    /// Graceful daemon shutdown: the spawned indicator is deliberately
+    /// ORPHANED, not killed — it keeps running and, seeing the daemon
+    /// vanish from its poll, shows the standalone launcher state (the
+    /// not-running menu with Start server/client; see indicator.rs). The
+    /// next daemon's auto-spawned indicator takes over from it via the
+    /// single-instance lock. To remove the icon instead, hide it first
+    /// ('monux gui tray hide' / the tray menu).
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         let child = {
             let mut shared = self.shared.lock().unwrap();
             // Hidden too: a monitor preempted mid-respawn must not park a
-            // fresh child in the slot after this reap — nobody would ever
+            // fresh child in the slot after this Drop — nobody would ever
             // reap that one (see monitor_loop's final re-check).
             shared.hidden = true;
             shared.child.take()
         };
         if let Some(child) = child {
-            terminate_and_reap(child);
+            // Drop the handle WITHOUT terminate_and_reap: the OS process
+            // keeps running (reparented to init once we exit). Its inherited
+            // stdout/stderr may dangle if ours were pipes — its log writes
+            // then just fail, harmlessly.
+            info!("Tray indicator stays up as the standalone launcher (daemon exiting)");
+            drop(child);
         }
     }
 }
