@@ -9,7 +9,10 @@
 //! dispatch only reads mirrors, and the indicator's own socket reads carry a
 //! short timeout, so a wedged daemon degrades the icon instead of hanging
 //! the tray. When no daemon answers, the indicator keeps running and shows
-//! the "not running" state; when there is no D-Bus session bus or SNI host
+//! the "not running" state, whose menu doubles as a launcher: "Start
+//! server"/"Start client" (via the autostart systemd unit when installed,
+//! otherwise a detached `monux <role>` spawn) and "Hide tray" (exits the
+//! standalone indicator). When there is no D-Bus session bus or SNI host
 //! (headless TTY), run() fails with a clean error and exit code 1.
 //!
 //! # Icon colors (the dot is a programmatically generated ARGB pixmap — SNI
@@ -251,8 +254,13 @@ enum MenuAction {
     Resume,
     UpdateNow,
     CopyDiagnostics,
-    /// Hides the tray icon (the daemon SIGTERMs this very process, after
-    /// acking) until 'monux gui tray show' or a daemon restart.
+    /// Starts the server/client daemon (not-running menu only). Local: no
+    /// control socket exists to ask (see start_daemon).
+    StartServer,
+    StartClient,
+    /// With a daemon: hides the tray icon (the daemon SIGTERMs this very
+    /// process, after acking) until 'monux gui tray show' or a daemon
+    /// restart. Without one (the standalone tray): exits the indicator.
     HideTray,
     Restart,
     Exit,
@@ -268,6 +276,8 @@ impl MenuAction {
             MenuAction::Resume => "Resume",
             MenuAction::UpdateNow => "Update check",
             MenuAction::CopyDiagnostics => "Copy diagnostics",
+            MenuAction::StartServer => "Start server",
+            MenuAction::StartClient => "Start client",
             MenuAction::HideTray => "Hide tray icon",
             MenuAction::Restart => "Restart monux",
             MenuAction::Exit => "Exit monux",
@@ -283,6 +293,28 @@ fn menu_rows(state: Option<&State>) -> Vec<MenuRow> {
     match state {
         None => {
             rows.push(MenuRow::Label("monux is not running".to_string()));
+            rows.push(MenuRow::Separator);
+            // The standalone tray doubles as a launcher: start a daemon
+            // (via the autostart unit when installed, else a detached
+            // spawn — see start_daemon)...
+            rows.push(MenuRow::Action {
+                label: "Start server".to_string(),
+                action: MenuAction::StartServer,
+                enabled: true,
+            });
+            rows.push(MenuRow::Action {
+                label: "Start client".to_string(),
+                action: MenuAction::StartClient,
+                enabled: true,
+            });
+            rows.push(MenuRow::Separator);
+            // ...and hide, which with no daemon to ask simply exits this
+            // standalone indicator.
+            rows.push(MenuRow::Action {
+                label: "Hide tray".to_string(),
+                action: MenuAction::HideTray,
+                enabled: true,
+            });
         }
         Some(State::Server(s)) => {
             rows.push(MenuRow::Label(format!("Input: {}", s.current_target)));
@@ -653,22 +685,32 @@ fn action_request(action: &MenuAction) -> String {
         MenuAction::CopyDiagnostics => {
             unreachable!("copy diagnostics fetches instead of commanding")
         }
+        MenuAction::StartServer | MenuAction::StartClient => {
+            unreachable!("start actions are local, never socket commands")
+        }
     }
 }
 
 /// Runs one menu action against the bound socket, then re-polls immediately
 /// so the icon and menu reflect the effect — including the daemon vanishing
 /// after restart/exit, which simply lands on the not-running view until the
-/// daemon (re)appears. Errors surface in the tooltip AND a transient
-/// notification.
+/// daemon (re)appears. The not-running menu's actions (start server/client,
+/// hide) are LOCAL: there is no daemon to ask. Errors surface in the tooltip
+/// AND a transient notification.
 fn run_action(tray: &mut MonuxTray, action: &MenuAction) {
-    let outcome = match tray.socket.clone() {
-        Some(socket) => match action {
-            MenuAction::CopyDiagnostics => copy_diagnostics(&socket)
-                .map(|tool| format!("Diagnostics copied to the clipboard ({})", tool)),
-            other => send_command(&socket, &action_request(other)).map(|_| String::new()),
-        },
-        None => Err(anyhow!("monux is not running")),
+    let outcome = match (action, tray.socket.clone()) {
+        (MenuAction::StartServer, _) => start_daemon(Role::Server).map(|_| String::new()),
+        (MenuAction::StartClient, _) => start_daemon(Role::Client).map(|_| String::new()),
+        // Standalone indicator (no daemon to hide us): exiting is the hide;
+        // 'monux gui tray show' / 'monux gui indicator' brings a tray back.
+        (MenuAction::HideTray, None) => {
+            info!("Hiding the standalone tray indicator on request");
+            std::process::exit(0);
+        }
+        (MenuAction::CopyDiagnostics, Some(socket)) => copy_diagnostics(&socket)
+            .map(|tool| format!("Diagnostics copied to the clipboard ({})", tool)),
+        (other, Some(socket)) => send_command(&socket, &action_request(other)).map(|_| String::new()),
+        (_, None) => Err(anyhow!("monux is not running")),
     };
     match outcome {
         Ok(note) => {
@@ -686,6 +728,95 @@ fn run_action(tray: &mut MonuxTray, action: &MenuAction) {
         }
     }
     tray.refresh();
+}
+
+/// How to start a daemon role from the not-running menu: through the
+/// autostart unit when one is installed (systemd then owns restarts and the
+/// login lifecycle), otherwise by spawning `monux <role>` detached.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StartHow {
+    /// `systemctl --user start <unit file name>` (the unit file exists).
+    Systemctl(PathBuf),
+    /// A detached `monux <role>` spawn (no unit installed).
+    Spawn(Role),
+}
+
+/// The start decision, pure over the pre-probed unit path (testable without
+/// touching the home dir or systemd).
+fn start_decision(unit_path: Option<&Path>, role: Role) -> StartHow {
+    match unit_path {
+        Some(path) if path.exists() => StartHow::Systemctl(path.to_path_buf()),
+        _ => StartHow::Spawn(role),
+    }
+}
+
+/// The autostart unit path for a role (~/.config/systemd/user/monux-<role>.service,
+/// the same path `monux setup --autostart <role>` writes).
+fn unit_path(role: Role) -> Option<PathBuf> {
+    Some(
+        home::home_dir()?
+            .join(crate::setup::SYSTEMD_USER_UNIT_DIR)
+            .join(crate::setup::unit_name_for(role.as_str())),
+    )
+}
+
+/// Starts a daemon role from the not-running menu (see start_decision). On
+/// success nothing more is done: the daemon appears within seconds and the
+/// poll loop transitions to the normal state by itself — and the daemon's
+/// own auto-spawned indicator then takes over from this standalone one via
+/// the single-instance indicator lock (single_instance.rs, kind "indicator").
+fn start_daemon(role: Role) -> Result<()> {
+    match start_decision(unit_path(role).as_deref(), role) {
+        StartHow::Systemctl(path) => {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("autostart unit path has no usable file name")?;
+            info!("Starting monux {} via systemd unit {}", role.as_str(), name);
+            start_via_systemctl(name)
+        }
+        StartHow::Spawn(role) => {
+            info!(
+                "Starting monux {} detached (no autostart unit installed)",
+                role.as_str()
+            );
+            spawn_daemon(role)
+        }
+    }
+}
+
+/// `systemctl --user start <unit>` — starts the autostart-installed daemon.
+/// The stderr text propagates on failure (no user manager, unit failed to
+/// start) so the tray notification says something useful.
+fn start_via_systemctl(unit_name: &str) -> Result<()> {
+    let output = Command::new("systemctl")
+        .args(["--user", "start", unit_name])
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to run systemctl")?;
+    if !output.status.success() {
+        bail!(
+            "systemctl --user start {}: {}",
+            unit_name,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Spawns `monux <role>` detached: our own binary re-run as the daemon,
+/// stdin null and output dropped (the daemon outlives this indicator, so it
+/// must not hold our stdio handles open). Unsupervised: the indicator is not
+/// a service manager, the daemon keeps running after we exit.
+fn spawn_daemon(role: Role) -> Result<()> {
+    Command::new(crate::indicator_spawn::own_exe()?)
+        .arg(role.as_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to spawn monux {}", role.as_str()))?;
+    Ok(())
 }
 
 /// Fetches the diagnostics bundle from the daemon and copies it to the
@@ -1071,9 +1202,38 @@ mod tests {
     }
 
     #[test]
-    fn menu_without_a_daemon_is_a_single_disabled_label() {
+    fn menu_without_a_daemon_offers_start_actions_and_hide() {
         let rows = menu_rows(None);
-        assert_eq!(rows, vec![MenuRow::Label("monux is not running".to_string())]);
+        assert_eq!(
+            rows,
+            vec![
+                MenuRow::Label("monux is not running".to_string()),
+                MenuRow::Separator,
+                action_row("Start server", MenuAction::StartServer, true),
+                action_row("Start client", MenuAction::StartClient, true),
+                MenuRow::Separator,
+                action_row("Hide tray", MenuAction::HideTray, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn start_decision_prefers_the_unit_when_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = tmp.path().join("monux-server.service");
+        std::fs::write(&unit, "[Unit]\n").unwrap();
+        // Unit file present: systemd starts the daemon.
+        assert_eq!(
+            start_decision(Some(&unit), Role::Server),
+            StartHow::Systemctl(unit.clone())
+        );
+        // Unit file absent (or the home dir unresolvable): detached spawn.
+        let missing = tmp.path().join("monux-client.service");
+        assert_eq!(
+            start_decision(Some(&missing), Role::Client),
+            StartHow::Spawn(Role::Client)
+        );
+        assert_eq!(start_decision(None, Role::Server), StartHow::Spawn(Role::Server));
     }
 
     #[test]

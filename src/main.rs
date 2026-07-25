@@ -74,11 +74,14 @@ EXAMPLES:
     /// permissions, WiFi power saving off, raised UDP socket buffers, DSCP
     /// QoS marking) and re-executes with sudo automatically. ANY flag scopes
     /// the run to that flag's actions only; '--autostart' manages a per-user
-    /// systemd unit and runs WITHOUT elevating.
+    /// systemd unit and '--desktop-shortcut' a per-user app-menu entry, both
+    /// WITHOUT elevating.
     #[command(after_long_help = "\
 EXAMPLES:
     monux setup                        # apply everything (elevates via sudo)
-    monux setup --autostart server     # only install the login service (no sudo)")]
+    monux setup --autostart server     # only install the login service (no sudo)
+    monux setup --autostart status     # report the autostart state (no sudo, read-only)
+    monux setup --desktop-shortcut     # install the app-menu tray shortcut (no sudo)")]
     Setup(SetupArgs),
 
     /// Updates monux to the latest version from GitHub, rebuilding from source
@@ -133,7 +136,7 @@ EXAMPLES:
 EXAMPLES:
     monux gui indicator    # run the tray icon (usually auto-spawned by the daemon)
     monux gui tray hide    # hide the icon without stopping the daemon
-    monux gui tray show    # bring it back")]
+    monux gui tray show    # bring it back — or start a standalone tray when no daemon runs")]
     Gui(GuiArgs),
 
     /// Manages the persistent configuration (~/.config/monux/config.toml)
@@ -303,14 +306,17 @@ enum GuiCommands {
     /// auto-spawned one — only one indicator runs at a time.
     Indicator,
 
-    /// Hides or restores the auto-spawned tray indicator without restarting
-    /// the daemon
+    /// Hides or restores the tray indicator; 'show' without a daemon starts
+    /// a standalone one
     ///
     /// 'hide' SIGTERMs the daemon's spawned indicator and suppresses respawns
     /// (the daemon itself keeps running), 'show' spawns it again. The hidden
     /// state is per-daemon-run only — a daemon restart always starts the
     /// indicator. Talks to the daemon's control socket (server socket first,
-    /// then the client's), like 'monux status'.
+    /// then the client's), like 'monux status'. When NO daemon answers on the
+    /// default discovery path, 'show' instead starts a standalone tray
+    /// indicator (its menu offers to start the server or client); an explicit
+    /// --socket that doesn't answer stays an error.
     Tray(TrayArgs),
 }
 
@@ -367,7 +373,8 @@ struct StatusArgs {
 
 #[derive(Args)]
 struct TrayArgs {
-    /// 'hide' removes the tray icon (the daemon keeps running), 'show' restores it
+    /// 'hide' removes the tray icon (the daemon keeps running), 'show' restores it —
+    /// or starts a standalone tray when no daemon runs
     #[arg(value_enum, value_name = "hide|show")]
     action: TrayAction,
 
@@ -388,10 +395,19 @@ struct SetupArgs {
     /// Also (de)activate autostart via a per-user systemd service: 'server' or
     /// 'client' writes ~/.config/systemd/user/monux-<role>.service and
     /// enables+starts it (client runs without an address, using mDNS
-    /// auto-discovery); 'off' disables and removes both. When omitted, no
+    /// auto-discovery); 'off' disables and removes both; 'status' prints a
+    /// read-only report for both roles (unit installed? enabled? running —
+    /// autostarted or manually?) and changes nothing. When omitted, no
     /// autostart changes are made.
-    #[arg(long, value_enum, value_name = "server|client|off")]
+    #[arg(long, value_enum, value_name = "server|client|status|off")]
     autostart: Option<monux::setup::Autostart>,
+
+    /// Also install a desktop shortcut ('monux tray' in the app menu) that
+    /// runs 'monux gui tray show': writes
+    /// ~/.local/share/applications/monux-tray.desktop (XDG_DATA_HOME
+    /// honored). User-level, like --autostart: no elevation.
+    #[arg(long)]
+    desktop_shortcut: bool,
 }
 
 #[derive(Args)]
@@ -829,12 +845,12 @@ fn main() -> Result<()> {
         Commands::Setup(args) => {
             // Elevate only when the selected steps need root: the base set
             // (a no-flags run) persists root-owned system settings;
-            // --autostart manages a per-user systemd unit and must run as
-            // the invoking user instead.
-            if args.autostart.is_none() {
+            // --autostart/--desktop-shortcut manage per-user files and must
+            // run as the invoking user instead.
+            if setup_needs_root(&args.autostart, args.desktop_shortcut) {
                 maybe_elevate("to persist system settings")?;
             }
-            return monux::setup::run(args.autostart);
+            return monux::setup::run(args.autostart, args.desktop_shortcut);
         }
         Commands::Update(args) => {
             let config_dir = monux::update::default_config_dir();
@@ -1300,6 +1316,14 @@ fn settle_after_takeover(lock: &single_instance::InstanceLock) {
         info!("Settling briefly before creating virtual devices");
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
+}
+
+/// Whether a 'monux setup' invocation must elevate: only the base set (a run
+/// with no per-user flags) persists root-owned system settings. --autostart
+/// and --desktop-shortcut manage files in the invoking user's home and must
+/// run as that user.
+fn setup_needs_root(autostart: &Option<monux::setup::Autostart>, desktop_shortcut: bool) -> bool {
+    autostart.is_none() && !desktop_shortcut
 }
 
 /// 'monux setup' persists system settings and needs root. Rather than making
@@ -1906,6 +1930,48 @@ mod tests {
         assert!(matches!(&cycle[0], Candidate::Remembered(addr) if *addr == "10.0.0.1:1213".parse().unwrap()));
         assert!(matches!(&cycle[1], Candidate::Remembered(addr) if *addr == "10.0.0.2:1213".parse().unwrap()));
         assert!(matches!(cycle[2], Candidate::Discover));
+    }
+
+    #[test]
+    fn setup_flags_parse_and_scope_elevation() {
+        // No flags: the base set, which needs root.
+        let cli = Cli::try_parse_from(["monux", "setup"]).unwrap();
+        let Commands::Setup(args) = cli.command else {
+            panic!("expected the setup command")
+        };
+        assert!(args.autostart.is_none() && !args.desktop_shortcut);
+        assert!(setup_needs_root(&args.autostart, args.desktop_shortcut));
+
+        // Either per-user flag scopes the run AND skips the sudo re-exec.
+        let cli = Cli::try_parse_from(["monux", "setup", "--desktop-shortcut"]).unwrap();
+        let Commands::Setup(args) = cli.command else {
+            panic!("expected the setup command")
+        };
+        assert!(args.autostart.is_none() && args.desktop_shortcut);
+        assert!(!setup_needs_root(&args.autostart, args.desktop_shortcut));
+
+        let cli = Cli::try_parse_from(["monux", "setup", "--autostart", "status"]).unwrap();
+        let Commands::Setup(args) = cli.command else {
+            panic!("expected the setup command")
+        };
+        assert_eq!(args.autostart, Some(monux::setup::Autostart::Status));
+        assert!(!setup_needs_root(&args.autostart, args.desktop_shortcut));
+
+        // Both per-user flags combine; still user-level.
+        let cli = Cli::try_parse_from([
+            "monux",
+            "setup",
+            "--autostart",
+            "server",
+            "--desktop-shortcut",
+        ])
+        .unwrap();
+        let Commands::Setup(args) = cli.command else {
+            panic!("expected the setup command")
+        };
+        assert_eq!(args.autostart, Some(monux::setup::Autostart::Server));
+        assert!(args.desktop_shortcut);
+        assert!(!setup_needs_root(&args.autostart, args.desktop_shortcut));
     }
 
     #[test]

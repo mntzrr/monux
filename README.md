@@ -52,6 +52,16 @@ monux setup --autostart server   # or: --autostart client
 
 This writes `~/.config/systemd/user/monux-<role>.service` and enables+starts it via `systemctl --user` (`Restart=on-failure`, 3s delay). The client service runs plain `monux client` with no address argument, so it finds the server via mDNS auto-discovery — nothing machine-specific is baked into the unit. `--autostart off` disables both services and removes the unit files. Setup is flag-scoped: any flag (like `--autostart` here) runs only that flag's actions — and `--autostart` alone doesn't even elevate, being per-user — while a bare `monux setup` applies the full machine-tuning set (and elevates via sudo). The tray indicator comes for free: the daemon auto-spawns it (see the tray-indicator section below), subject to the same `DBUS_SESSION_BUS_ADDRESS` caveat as clipboard sharing.
 
+`monux setup --autostart status` changes nothing and prints a read-only report: for each role, whether the unit file is installed, whether it is enabled and active (with the main pid and start timestamp from `systemctl --user show`), and — cross-referenced with monux's single-instance lock — whether a live daemon was autostarted or started manually, plus the unit path:
+
+```text
+server: installed, enabled, active (pid 417077 since 2026-07-25T15:28:34) — running (autostarted)
+client: not installed
+unit: ~/.config/systemd/user/monux-server.service
+```
+
+No sudo is involved — it only queries your own systemd user manager and the filesystem, and it degrades to the file/lock state (with a note) when systemctl can't answer.
+
 Check status and logs with:
 
 ```bash
@@ -239,6 +249,10 @@ The menu follows the current state: switch to local / to a specific client and p
 The indicator starts automatically with the daemon: whenever `monux server` or `monux client` runs with a desktop session bus available, it spawns `monux gui indicator` as a child process and stops it again on shutdown (opt out with `--no-indicator` or `MONUX_NO_INDICATOR=1`). If the indicator dies on its own (e.g. its tray host restarted), the daemon respawns it — a bounded few times, after which it logs how to start it manually. Only one indicator runs at a time: a manually started `monux gui indicator` takes over from the auto-spawned one (and vice versa), never a duplicate icon.
 
 You can hide the icon without stopping the daemon — the menu's **Hide tray icon**, or `monux gui tray hide` — and bring it back with `monux gui tray show` (or a manually started `monux gui indicator`); the daemon suppresses (re)spawns only until then, and a daemon restart always starts the indicator fresh. `show` refuses to override a daemon started with `--no-indicator`.
+
+`monux gui tray show` with no monux daemon running doesn't error either: it starts a *standalone* tray indicator. In that state (hollow grey `?`) the menu doubles as a launcher — **Start server** / **Start client** (via the autostart systemd unit when installed, otherwise a detached `monux <role>` spawn) and **Hide tray** (exits the standalone indicator; with a daemon, hiding goes through the control socket as before). A started daemon appears in the tray within seconds, and its own auto-spawned indicator then takes over from the standalone one.
+
+For launching the tray from your desktop's app menu there is a **monux tray** shortcut (runs `monux gui tray show`): install.sh writes it to `$XDG_DATA_HOME/applications/monux-tray.desktop` (default `~/.local/share/applications/`), `monux setup --desktop-shortcut` (re)creates it, and `monux system uninstall` removes it again.
 
 Headless sessions are detected and skipped silently by the daemon; a manually started indicator there exits with a "no D-Bus session / no tray host" error. The systemd units installed by `monux setup --autostart` get the indicator for free, since the daemon spawns it — with the same caveat as clipboard sharing: the service needs `DBUS_SESSION_BUS_ADDRESS` in the systemd user manager's environment (see the autostart caveat above), otherwise the auto-spawn is skipped.
 

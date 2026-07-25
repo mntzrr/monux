@@ -23,6 +23,9 @@
 //! - with `--autostart`, a per-user systemd service starting monux with the
 //!   graphical session (the only action that does NOT need root; it manages
 //!   the invoking user's own systemd units)
+//! - with `--desktop-shortcut`, a per-user app-menu entry launching
+//!   `monux gui tray show` (also user-level: it manages the invoking user's
+//!   own data home)
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -49,6 +52,9 @@ pub enum Autostart {
     Client,
     /// Disable and remove both services.
     Off,
+    /// Print a read-only status report for both services (installed? enabled?
+    /// running — autostarted or manually?) and change nothing.
+    Status,
 }
 
 /// The roles a service unit can run (`off` maps to no role).
@@ -67,8 +73,13 @@ impl Role {
     }
 
     fn unit_name(self) -> String {
-        format!("monux-{}.service", self.as_str())
+        unit_name_for(self.as_str())
     }
+}
+
+/// The systemd user unit file name for a daemon role ("server"/"client").
+pub(crate) fn unit_name_for(role: &str) -> String {
+    format!("monux-{}.service", role)
 }
 
 /// Content of the per-user systemd unit for a role. `%h` expands to the
@@ -106,6 +117,21 @@ impl CmdSpec {
             );
         }
         Ok(())
+    }
+
+    /// Runs the command and returns stdout REGARDLESS of exit status — for
+    /// read-only status probes, whose answer may come with a non-zero exit
+    /// (`systemctl is-enabled` answers "disabled" with exit 1). Only a spawn
+    /// failure (the program is absent) is an error.
+    fn probe(&self) -> Result<String> {
+        let output = Command::new(&self.program)
+            .args(&self.args)
+            .envs(self.env.iter().cloned())
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .with_context(|| format!("Failed to run {}: is it installed?", self.program))?;
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
     /// The equivalent command for the user to run in their own session: for a
@@ -203,36 +229,47 @@ pub(crate) fn passwd_entry(name: &str) -> Result<(PathBuf, u32, u32)> {
     ))
 }
 
-/// Resolves the autostart target user. Returns Ok(None) when there is no
-/// sensible target: running as root directly (root's user manager is not the
-/// one a desktop session uses, and autostart is per-user).
-fn resolve_autostart_target() -> Result<Option<AutostartTarget>> {
+/// Resolves the invoking user's home dir, plus the uid/gid user-visible
+/// files should be chowned to when setup runs as root via sudo (None when
+/// unprivileged: files are ours anyway). Returns Ok(None) when there is no
+/// sensible target: running as root directly (root's home is not the one a
+/// desktop session uses, and these installs are per-user). Shared by the
+/// autostart and the desktop-shortcut targets.
+fn resolve_invoking_user() -> Result<Option<(PathBuf, Option<(u32, u32)>)>> {
     let sudo_user = std::env::var("SUDO_USER").unwrap_or_default();
     if unsafe { libc::geteuid() } == 0 {
         if sudo_user.is_empty() || sudo_user == "root" {
             return Ok(None);
         }
         let (home, uid, gid) = passwd_entry(&sudo_user)?;
-        Ok(Some(AutostartTarget {
-            unit_dir: home.join(SYSTEMD_USER_UNIT_DIR),
-            systemctl: Systemctl {
-                user: Some(UserCtx {
+        Ok(Some((home, Some((uid, gid)))))
+    } else {
+        // Unprivileged (e.g. experiments): manage the current user's own
+        // files directly.
+        let home = home::home_dir().context("No home dir found")?;
+        Ok(Some((home, None)))
+    }
+}
+
+/// Resolves the autostart target user (see resolve_invoking_user).
+fn resolve_autostart_target() -> Result<Option<AutostartTarget>> {
+    let sudo_user = std::env::var("SUDO_USER").unwrap_or_default();
+    let Some((home, owner)) = resolve_invoking_user()? else {
+        return Ok(None);
+    };
+    Ok(Some(AutostartTarget {
+        unit_dir: home.join(SYSTEMD_USER_UNIT_DIR),
+        systemctl: Systemctl {
+            user: match owner {
+                Some((uid, _)) => Some(UserCtx {
                     name: sudo_user,
                     uid,
                 }),
+                None => None,
             },
-            owner: Some((uid, gid)),
-        }))
-    } else {
-        // Unprivileged (e.g. experiments): manage the current user's own
-        // service directly.
-        let home = home::home_dir().context("No home dir found")?;
-        Ok(Some(AutostartTarget {
-            unit_dir: home.join(SYSTEMD_USER_UNIT_DIR),
-            systemctl: Systemctl { user: None },
-            owner: None,
-        }))
-    }
+        },
+        owner,
+    }))
 }
 
 /// Best-effort chown (used so root-written files stay user-manageable).
@@ -337,6 +374,9 @@ fn apply_autostart(
         Autostart::Server => enable_role(Role::Server, target, failures, run),
         Autostart::Client => enable_role(Role::Client, target, failures, run),
         Autostart::Off => disable_all_roles(target, failures, run),
+        // setup_autostart intercepts Status before apply (it needs an
+        // output-capturing probe seam, not the mutation runner).
+        Autostart::Status => {}
     }
 }
 
@@ -409,6 +449,217 @@ fn disable_all_roles(
     println!("[done] autostart: monux services disabled and unit files removed");
 }
 
+/// Everything `setup --autostart status` learns about one role. The Option
+/// fields are None when the probe couldn't answer (systemctl absent or
+/// returning something unexpected); holder_pid is the single-instance lock
+/// probe (Some = a live monux of this role).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RoleStatus {
+    installed: bool,
+    enabled: Option<bool>,
+    active: Option<bool>,
+    main_pid: Option<i32>,
+    active_since: Option<String>,
+    holder_pid: Option<i32>,
+}
+
+/// Parses `systemctl --user is-enabled` stdout: Some(bool) on a definitive
+/// answer, None on anything unexpected (the report then shows "enabled?").
+fn parse_is_enabled(out: &str) -> Option<bool> {
+    match out.trim() {
+        "enabled" => Some(true),
+        "disabled" => Some(false),
+        _ => None,
+    }
+}
+
+/// Parses `systemctl --user is-active` stdout (see parse_is_enabled).
+fn parse_is_active(out: &str) -> Option<bool> {
+    match out.trim() {
+        "active" => Some(true),
+        "inactive" | "failed" => Some(false),
+        _ => None,
+    }
+}
+
+/// Parses `systemctl --user show -p MainPID,ActiveEnterTimestamp` output into
+/// (main pid, start timestamp). A 0 pid (unit never ran) and an empty
+/// timestamp count as absent. The timestamp is reformatted from systemd's
+/// "Sat 2026-07-25 15:28:34 CEST" into "2026-07-25T15:28:34"; an unexpected
+/// shape passes through unchanged.
+fn parse_show(out: &str) -> (Option<i32>, Option<String>) {
+    let mut pid = None;
+    let mut since = None;
+    for line in out.lines() {
+        if let Some(value) = line.strip_prefix("MainPID=") {
+            pid = value.trim().parse::<i32>().ok().filter(|pid| *pid > 0);
+        } else if let Some(value) = line.strip_prefix("ActiveEnterTimestamp=") {
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            since = Some(match parts.as_slice() {
+                [_weekday, date, time, _tz] => format!("{}T{}", date, time),
+                _ => value.to_string(),
+            });
+        }
+    }
+    (pid, since)
+}
+
+/// Probes one role for the status report: the unit file (filesystem), the
+/// enable/active state (systemctl, skipped for uninstalled units — they would
+/// only error) and the single-instance lock (passed in, so the probe stays
+/// testable). A systemctl that can't even spawn degrades to a note (once per
+/// report) plus the file/lock state.
+fn probe_role_status(
+    role: Role,
+    target: &AutostartTarget,
+    query: &dyn Fn(&CmdSpec) -> Result<String>,
+    holder_pid: Option<i32>,
+    notes: &mut Vec<String>,
+) -> RoleStatus {
+    let unit_path = target.unit_dir.join(role.unit_name());
+    let mut status = RoleStatus {
+        installed: unit_path.exists(),
+        holder_pid,
+        ..Default::default()
+    };
+    if !status.installed {
+        return status;
+    }
+    let mut query_once = |args: &[&str]| -> Option<String> {
+        match query(&target.systemctl.spec(args)) {
+            Ok(out) => Some(out),
+            Err(e) => {
+                let note = format!(
+                    "could not query systemctl ({:#}); reporting the unit file and the lock state only",
+                    e
+                );
+                if !notes.contains(&note) {
+                    notes.push(note);
+                }
+                None
+            }
+        }
+    };
+    status.enabled = query_once(&["is-enabled", &role.unit_name()])
+        .and_then(|out| parse_is_enabled(&out));
+    status.active =
+        query_once(&["is-active", &role.unit_name()]).and_then(|out| parse_is_active(&out));
+    // The show query (pid + start timestamp) only has something to say when
+    // the unit is actually up.
+    if status.active == Some(true) {
+        if let Some(out) =
+            query_once(&["show", "-p", "MainPID,ActiveEnterTimestamp", &role.unit_name()])
+        {
+            let (pid, since) = parse_show(&out);
+            status.main_pid = pid;
+            status.active_since = since;
+        }
+    }
+    status
+}
+
+/// One line of the report, e.g. "server: installed, enabled, active (pid
+/// 417077 since 2026-07-25T15:28:34) — running (autostarted)".
+fn render_role_status(role: Role, status: &RoleStatus) -> String {
+    let mut line = format!("{}: ", role.as_str());
+    if !status.installed {
+        line.push_str("not installed");
+        // No unit: any live daemon of this role was started by hand.
+        if let Some(pid) = status.holder_pid {
+            line.push_str(&format!(" — running (manual, pid {})", pid));
+        }
+        return line;
+    }
+    line.push_str("installed");
+    line.push_str(match status.enabled {
+        Some(true) => ", enabled",
+        Some(false) => ", disabled",
+        None => ", enabled?",
+    });
+    match status.active {
+        Some(true) => {
+            line.push_str(", active");
+            match (status.main_pid, &status.active_since) {
+                (Some(pid), Some(since)) => {
+                    line.push_str(&format!(" (pid {} since {})", pid, since))
+                }
+                (Some(pid), None) => line.push_str(&format!(" (pid {})", pid)),
+                (None, _) => {}
+            }
+        }
+        Some(false) => line.push_str(", inactive"),
+        None => line.push_str(", active?"),
+    }
+    // Cross-reference the single-instance lock to tell an autostarted daemon
+    // from a manually started one.
+    match (status.active, status.holder_pid) {
+        // systemd says the unit is up: the daemon is autostarted (the lock
+        // probe merely confirms; it can't override systemd's word).
+        (Some(true), _) => line.push_str(" — running (autostarted)"),
+        // systemd says the unit is down but a monux holds the role lock:
+        // started by hand.
+        (Some(false), Some(pid)) => {
+            line.push_str(&format!(" — running (manual, pid {})", pid))
+        }
+        (Some(false), None) => line.push_str(" — not running"),
+        // systemd couldn't answer: the lock probe alone says what's alive,
+        // without an autostarted/manual claim it can't back up.
+        (None, Some(pid)) => line.push_str(&format!(" — running (pid {})", pid)),
+        (None, None) => line.push_str(" — not running"),
+    }
+    line
+}
+
+/// Renders a unit path with the user's home as `~` (the report is for
+/// humans: ~/.config/systemd/user/monux-server.service reads better than the
+/// absolute path). unit_dir is $HOME/.config/systemd/user by construction,
+/// so its 4th ancestor (0-based 3) is the home.
+fn display_unit_path(unit_dir: &Path, path: &Path) -> String {
+    match unit_dir
+        .ancestors()
+        .nth(3)
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
+        Some(rel) => format!("~/{}", rel.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// The full `setup --autostart status` report: one line per role, then the
+/// unit path of every installed unit, then any degradation notes. Read-only:
+/// the only outside contact is the filesystem, read-only systemctl queries
+/// (through `query`, the seam that keeps tests off the real systemd) and the
+/// single-instance lock probe (`holder`).
+fn autostart_status_report(
+    target: &AutostartTarget,
+    query: &dyn Fn(&CmdSpec) -> Result<String>,
+    holder: &dyn Fn(Role) -> Option<i32>,
+) -> String {
+    let mut notes = Vec::new();
+    let mut lines = Vec::new();
+    for role in [Role::Server, Role::Client] {
+        let status = probe_role_status(role, target, query, holder(role), &mut notes);
+        lines.push(render_role_status(role, &status));
+    }
+    for role in [Role::Server, Role::Client] {
+        let unit_path = target.unit_dir.join(role.unit_name());
+        if unit_path.exists() {
+            lines.push(format!(
+                "unit: {}",
+                display_unit_path(&target.unit_dir, &unit_path)
+            ));
+        }
+    }
+    for note in notes {
+        lines.push(format!("[note] autostart: {}", note));
+    }
+    lines.join("\n")
+}
+
 fn setup_autostart(choice: Option<Autostart>, failures: &mut u32) {
     if choice.is_none() {
         // No flag: leave autostart untouched.
@@ -427,7 +678,93 @@ fn setup_autostart(choice: Option<Autostart>, failures: &mut u32) {
             return;
         }
     };
+    // Status is read-only: it never mutates systemd state, so it uses an
+    // output-capturing probe seam instead of the mutation runner.
+    if choice == Some(Autostart::Status) {
+        println!(
+            "{}",
+            autostart_status_report(
+                &target,
+                &|spec| spec.probe(),
+                &|role| crate::single_instance::live_holder(role.as_str()),
+            )
+        );
+        return;
+    }
     apply_autostart(choice, &target, failures, &mut |spec| spec.run());
+}
+
+/// The desktop entry file name, under the per-user applications dir.
+pub(crate) const DESKTOP_SHORTCUT_NAME: &str = "monux-tray.desktop";
+
+/// The applications dir for per-user desktop entries: $XDG_DATA_HOME/
+/// applications when set and absolute, else ~/.local/share/applications (the
+/// XDG base-directory-spec default; a relative value is invalid and ignored,
+/// an empty one counts as unset). `xdg_data_home` is the raw env value, a
+/// parameter so the resolution is testable.
+pub(crate) fn applications_dir_from(
+    home: &Path,
+    xdg_data_home: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    match xdg_data_home {
+        Some(dir) if Path::new(dir).is_absolute() => PathBuf::from(dir).join("applications"),
+        _ => home.join(".local").join("share").join("applications"),
+    }
+}
+
+/// Content of the desktop entry. Exec is `monux gui tray show`: with a
+/// daemon it un-hides the auto-spawned indicator, without one it starts a
+/// standalone tray (see indicator.rs). Icon is a stock freedesktop name —
+/// the repo ships no assets.
+fn desktop_shortcut_content() -> &'static str {
+    "[Desktop Entry]\nType=Application\nName=monux tray\nComment=Show the monux tray indicator (starts it when no daemon is running)\nExec=monux gui tray show\nTerminal=false\nCategories=Utility;\nIcon=input-keyboard\n"
+}
+
+/// Writes the desktop entry atomically (see atomic_write_no_follow:
+/// idempotent, and symlink-safe should the path be pre-seeded) and chowns
+/// what it creates when setup runs as root via sudo, so the file stays
+/// user-manageable.
+fn write_desktop_shortcut(path: &Path, owner: Option<(u32, u32)>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("could not create {}", parent.display()))?;
+        if let Some((uid, gid)) = owner {
+            chown_best_effort(parent, uid, gid);
+        }
+    }
+    atomic_write_no_follow(path, desktop_shortcut_content())
+        .with_context(|| format!("could not write {}", path.display()))?;
+    if let Some((uid, gid)) = owner {
+        chown_best_effort(path, uid, gid);
+    }
+    Ok(())
+}
+
+/// `--desktop-shortcut`: installs a .desktop entry so the tray can be
+/// launched from the desktop's app menu. User-level, like --autostart: it
+/// never elevates; the file lands in the invoking user's data home.
+fn setup_desktop_shortcut(failures: &mut u32) {
+    let (home, owner) = match resolve_invoking_user() {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            *failures += 1;
+            println!("[fail] desktop shortcut: no invoking user found (run setup as your user, not from a root shell)");
+            return;
+        }
+        Err(e) => {
+            *failures += 1;
+            println!("[fail] desktop shortcut: {}", e);
+            return;
+        }
+    };
+    let path = applications_dir_from(&home, std::env::var_os("XDG_DATA_HOME").as_deref())
+        .join(DESKTOP_SHORTCUT_NAME);
+    if let Err(e) = write_desktop_shortcut(&path, owner) {
+        *failures += 1;
+        println!("[fail] desktop shortcut: {}", e);
+        return;
+    }
+    println!("[done] desktop shortcut: wrote {}", path.display());
 }
 
 /// Target for net.core.{r,w}mem_max: comfortably above the 2 MiB that monux
@@ -505,14 +842,14 @@ fn sysctl_buf_conf_content() -> String {
     )
 }
 
-pub fn run(autostart: Option<Autostart>) -> Result<()> {
+pub fn run(autostart: Option<Autostart>, desktop_shortcut: bool) -> Result<()> {
     // Flag scoping: no flags means the full base set below; ANY flag scopes
     // the run to that flag's actions only.
-    let scoped = autostart.is_some();
-    // The base set persists root-owned system settings. --autostart manages a
-    // per-user systemd unit and must NOT elevate: the unit lands in the
-    // invoking user's home (main.rs skips the sudo re-exec for an
-    // --autostart-only run).
+    let scoped = autostart.is_some() || desktop_shortcut;
+    // The base set persists root-owned system settings. --autostart and
+    // --desktop-shortcut manage per-user files and must NOT elevate: they
+    // land in the invoking user's home (main.rs skips the sudo re-exec for
+    // a run scoped to those flags).
     let needs_root = !scoped;
     if needs_root && unsafe { libc::geteuid() } != 0 {
         // Reaching here non-root means auto-elevation was opted out of
@@ -534,6 +871,14 @@ pub fn run(autostart: Option<Autostart>) -> Result<()> {
         setup_qos_marking(&mut failures);
     }
     setup_autostart(autostart, &mut failures);
+    if desktop_shortcut {
+        setup_desktop_shortcut(&mut failures);
+    }
+
+    // A status report changes nothing: no summary footer.
+    if autostart == Some(Autostart::Status) && !desktop_shortcut {
+        return Ok(());
+    }
 
     println!();
     if failures > 0 {
@@ -1160,5 +1505,290 @@ mod tests {
         // The symlink's old target is untouched, and no temp file lingers.
         assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "precious");
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn status_parsing() {
+        assert_eq!(parse_is_enabled("enabled\n"), Some(true));
+        assert_eq!(parse_is_enabled("disabled\n"), Some(false));
+        assert_eq!(parse_is_enabled("static\n"), None);
+        assert_eq!(parse_is_enabled(""), None);
+        assert_eq!(parse_is_active("active\n"), Some(true));
+        assert_eq!(parse_is_active("inactive\n"), Some(false));
+        assert_eq!(parse_is_active("failed\n"), Some(false));
+        assert_eq!(parse_is_active("activating\n"), None);
+        let (pid, since) = parse_show(
+            "MainPID=417077\nActiveEnterTimestamp=Sat 2026-07-25 15:28:34 CEST\n",
+        );
+        assert_eq!(pid, Some(417077));
+        assert_eq!(since.as_deref(), Some("2026-07-25T15:28:34"));
+        // A unit that never ran: pid 0 and an empty timestamp are absent.
+        let (pid, since) = parse_show("MainPID=0\nActiveEnterTimestamp=\n");
+        assert_eq!(pid, None);
+        assert_eq!(since, None);
+        // An unexpected timestamp shape passes through unchanged.
+        let (_, since) = parse_show("MainPID=1\nActiveEnterTimestamp=weird\n");
+        assert_eq!(since.as_deref(), Some("weird"));
+    }
+
+    #[test]
+    fn status_rendering_matrix() {
+        // Nothing installed, nothing running.
+        assert_eq!(
+            render_role_status(Role::Client, &RoleStatus::default()),
+            "client: not installed"
+        );
+        // Not installed, but a manually started daemon holds the lock.
+        let status = RoleStatus {
+            holder_pid: Some(4242),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_role_status(Role::Server, &status),
+            "server: not installed — running (manual, pid 4242)"
+        );
+        // Installed and enabled, unit down, nothing running.
+        let status = RoleStatus {
+            installed: true,
+            enabled: Some(true),
+            active: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_role_status(Role::Server, &status),
+            "server: installed, enabled, inactive — not running"
+        );
+        // Installed, unit down, but a manual daemon holds the lock.
+        let status = RoleStatus {
+            installed: true,
+            enabled: Some(false),
+            active: Some(false),
+            holder_pid: Some(4242),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_role_status(Role::Server, &status),
+            "server: installed, disabled, inactive — running (manual, pid 4242)"
+        );
+        // systemctl unavailable: unknowns render as ?, the lock probe still
+        // speaks — without an autostarted/manual claim it can't back up.
+        let status = RoleStatus {
+            installed: true,
+            holder_pid: Some(4242),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_role_status(Role::Server, &status),
+            "server: installed, enabled?, active? — running (pid 4242)"
+        );
+        // Active per systemd: autostarted regardless of the lock probe.
+        let status = RoleStatus {
+            installed: true,
+            enabled: Some(true),
+            active: Some(true),
+            main_pid: Some(417077),
+            active_since: Some("2026-07-25T15:28:34".to_string()),
+            holder_pid: None,
+        };
+        assert_eq!(
+            render_role_status(Role::Server, &status),
+            "server: installed, enabled, active (pid 417077 since 2026-07-25T15:28:34) — running (autostarted)"
+        );
+        // Active without the show details: no pid/since parenthetical.
+        let status = RoleStatus {
+            installed: true,
+            active: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_role_status(Role::Server, &status),
+            "server: installed, enabled?, active — running (autostarted)"
+        );
+    }
+
+    #[test]
+    fn status_report_installed_active_server_only() {
+        // A home-shaped unit dir so the unit path renders with '~'.
+        let tmp = tempfile::tempdir().unwrap();
+        let unit_dir = tmp.path().join("home/user/.config/systemd/user");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::write(
+            unit_dir.join("monux-server.service"),
+            unit_content(Role::Server),
+        )
+        .unwrap();
+        let target = test_target(&unit_dir);
+        // Fabricated systemctl: the server unit is enabled and active.
+        let query = |spec: &CmdSpec| -> Result<String> {
+            Ok(match spec.manual_line().as_str() {
+                "systemctl --user is-enabled monux-server.service" => "enabled\n".to_string(),
+                "systemctl --user is-active monux-server.service" => "active\n".to_string(),
+                "systemctl --user show -p MainPID,ActiveEnterTimestamp monux-server.service" => {
+                    "MainPID=417077\nActiveEnterTimestamp=Sat 2026-07-25 15:28:34 CEST\n"
+                        .to_string()
+                }
+                other => panic!("unexpected query: {}", other),
+            })
+        };
+        // The lock probe: a live server daemon (the unit's pid), no client.
+        let holder = |role: Role| match role {
+            Role::Server => Some(417077),
+            Role::Client => None,
+        };
+        let report = autostart_status_report(&target, &query, &holder);
+        let expected = [
+            "server: installed, enabled, active (pid 417077 since 2026-07-25T15:28:34) — running (autostarted)",
+            "client: not installed",
+            "unit: ~/.config/systemd/user/monux-server.service",
+        ]
+        .join("\n");
+        assert_eq!(report, expected);
+        // The golden report, for eyeballing with --nocapture.
+        println!("{}", report);
+    }
+
+    #[test]
+    fn status_report_no_units_at_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = test_target(tmp.path());
+        // systemctl is never queried for units that aren't installed.
+        let query = |spec: &CmdSpec| -> Result<String> {
+            panic!("unexpected query: {}", spec.manual_line())
+        };
+        let holder = |_: Role| None;
+        let report = autostart_status_report(&target, &query, &holder);
+        assert_eq!(report, "server: not installed\nclient: not installed");
+    }
+
+    #[test]
+    fn status_report_degrades_when_systemctl_is_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = test_target(tmp.path());
+        for role in [Role::Server, Role::Client] {
+            std::fs::write(tmp.path().join(role.unit_name()), unit_content(role)).unwrap();
+        }
+        let query = |_: &CmdSpec| -> Result<String> { bail!("systemctl not found") };
+        let holder = |role: Role| match role {
+            Role::Server => Some(4242),
+            Role::Client => None,
+        };
+        let report = autostart_status_report(&target, &query, &holder);
+        let unit = |role: Role| tmp.path().join(role.unit_name()).display().to_string();
+        let expected = [
+            "server: installed, enabled?, active? — running (pid 4242)".to_string(),
+            "client: installed, enabled?, active? — not running".to_string(),
+            format!("unit: {}", unit(Role::Server)),
+            format!("unit: {}", unit(Role::Client)),
+            // Both roles hit the same spawn failure; the note prints once.
+            "[note] autostart: could not query systemctl (systemctl not found); reporting the unit file and the lock state only".to_string(),
+        ]
+        .join("\n");
+        assert_eq!(report, expected);
+    }
+
+    #[test]
+    fn status_queries_are_read_only_and_skip_show_when_inactive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = test_target(tmp.path());
+        for role in [Role::Server, Role::Client] {
+            std::fs::write(tmp.path().join(role.unit_name()), unit_content(role)).unwrap();
+        }
+        let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let rec = asked.clone();
+        let query = move |spec: &CmdSpec| -> Result<String> {
+            rec.borrow_mut().push(spec.manual_line());
+            Ok("disabled\n".to_string())
+        };
+        let holder = |_: Role| None;
+        let report = autostart_status_report(&target, &query, &holder);
+        // "disabled" parses as enabled:false and active:None; the show query
+        // (pid/timestamp) only runs for an ACTIVE unit, so it never appears.
+        assert_eq!(
+            *asked.borrow(),
+            vec![
+                "systemctl --user is-enabled monux-server.service".to_string(),
+                "systemctl --user is-active monux-server.service".to_string(),
+                "systemctl --user is-enabled monux-client.service".to_string(),
+                "systemctl --user is-active monux-client.service".to_string(),
+            ]
+        );
+        assert!(report.contains("server: installed, disabled, active? — not running"));
+        assert!(report.contains("client: installed, disabled, active? — not running"));
+    }
+
+    #[test]
+    fn display_unit_path_uses_tilde_under_home() {
+        let home = Path::new("/home/user");
+        let unit_dir = home.join(SYSTEMD_USER_UNIT_DIR);
+        let unit = unit_dir.join("monux-server.service");
+        assert_eq!(
+            display_unit_path(&unit_dir, &unit),
+            "~/.config/systemd/user/monux-server.service"
+        );
+        // A unit dir NOT shaped like $HOME/.config/systemd/user (tests use
+        // plain tempdirs) falls back to the absolute path.
+        let plain = Path::new("/tmp/x");
+        assert_eq!(
+            display_unit_path(plain, &plain.join("monux-server.service")),
+            "/tmp/x/monux-server.service"
+        );
+    }
+
+    #[test]
+    fn desktop_shortcut_content_is_a_valid_entry() {
+        let content = desktop_shortcut_content();
+        assert_eq!(
+            content,
+            "[Desktop Entry]\nType=Application\nName=monux tray\nComment=Show the monux tray indicator (starts it when no daemon is running)\nExec=monux gui tray show\nTerminal=false\nCategories=Utility;\nIcon=input-keyboard\n"
+        );
+        // Every line is a key=value under the one section header.
+        let mut lines = content.lines();
+        assert_eq!(lines.next(), Some("[Desktop Entry]"));
+        for line in lines {
+            assert!(line.contains('='), "bad desktop entry line: {}", line);
+        }
+    }
+
+    #[test]
+    fn applications_dir_resolution_honors_xdg_data_home() {
+        let home = Path::new("/home/user");
+        // Unset: the spec default under home.
+        assert_eq!(
+            applications_dir_from(home, None),
+            PathBuf::from("/home/user/.local/share/applications")
+        );
+        // An absolute $XDG_DATA_HOME takes precedence.
+        assert_eq!(
+            applications_dir_from(home, Some(std::ffi::OsStr::new("/data"))),
+            PathBuf::from("/data/applications")
+        );
+        // Empty and relative values are invalid per spec: ignored.
+        assert_eq!(
+            applications_dir_from(home, Some(std::ffi::OsStr::new(""))),
+            PathBuf::from("/home/user/.local/share/applications")
+        );
+        assert_eq!(
+            applications_dir_from(home, Some(std::ffi::OsStr::new("relative/data"))),
+            PathBuf::from("/home/user/.local/share/applications")
+        );
+    }
+
+    #[test]
+    fn desktop_shortcut_write_is_atomic_and_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("applications")
+            .join(DESKTOP_SHORTCUT_NAME);
+        // The applications dir is created; the content lands as built.
+        write_desktop_shortcut(&path, None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            desktop_shortcut_content()
+        );
+        // A second write replaces without error (idempotent), leaving no
+        // temp files behind.
+        write_desktop_shortcut(&path, None).unwrap();
+        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
     }
 }

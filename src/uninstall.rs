@@ -15,7 +15,8 @@
 //!    must not swap its own process image mid-flight);
 //! 4. the per-user autostart units `monux setup --autostart` installed are
 //!    disabled and removed (otherwise systemd retries the deleted binary at
-//!    every login);
+//!    every login), and the desktop shortcut `--desktop-shortcut` / install.sh
+//!    wrote is removed from the user's data home;
 //! 5. the running binary itself plus stale copies are removed (self-delete is
 //!    fine on Linux: the file unlinks while the process keeps running);
 //! 6. ~/.config/monux is removed, only if the user said yes.
@@ -144,6 +145,10 @@ struct Plan {
     /// Where the per-user autostart units 'monux setup --autostart' writes
     /// live (home-relative), checked at execution time.
     autostart_unit_dir: PathBuf,
+    /// The desktop shortcut 'monux setup --desktop-shortcut' / install.sh
+    /// writes ($XDG_DATA_HOME honored, see setup::applications_dir_from),
+    /// removed at execution time when present.
+    desktop_shortcut: PathBuf,
     /// Where the 'mx' alias symlink lives (home-relative), checked at
     /// execution time.
     alias_dir: PathBuf,
@@ -167,10 +172,17 @@ fn plan(home: &Path, current_exe: &Path) -> Plan {
         current_exe,
         &system_paths,
         Path::new("/usr/local/bin/monux"),
+        std::env::var_os("XDG_DATA_HOME").as_deref(),
     )
 }
 
-fn plan_impl(home: &Path, current_exe: &Path, system_paths: &[PathBuf], usr_local: &Path) -> Plan {
+fn plan_impl(
+    home: &Path,
+    current_exe: &Path,
+    system_paths: &[PathBuf],
+    usr_local: &Path,
+    xdg_data_home: Option<&std::ffi::OsStr>,
+) -> Plan {
     let mut root_owned: Vec<PathBuf> = system_paths
         .iter()
         .filter(|p| p.exists())
@@ -202,6 +214,8 @@ fn plan_impl(home: &Path, current_exe: &Path, system_paths: &[PathBuf], usr_loca
         user_binaries,
         config_dir: config_dir.is_dir().then_some(config_dir),
         autostart_unit_dir: home.join(setup::SYSTEMD_USER_UNIT_DIR),
+        desktop_shortcut: setup::applications_dir_from(home, xdg_data_home)
+            .join(setup::DESKTOP_SHORTCUT_NAME),
         alias_dir: home.join(".local").join("bin"),
         remove_config: false,
     }
@@ -263,6 +277,17 @@ fn execute(plan: &Plan) {
     remove_qos_marking();
     remove_hotspot_profile();
     remove_autostart_units(&plan.autostart_unit_dir, &mut systemctl_user);
+
+    // The desktop shortcut (user-level file, no sudo; absence is fine).
+    match fs::remove_file(&plan.desktop_shortcut) {
+        Ok(()) => println!("Removed {}", plan.desktop_shortcut.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => println!(
+            "note: couldn't remove {}: {}",
+            plan.desktop_shortcut.display(),
+            e
+        ),
+    }
 
     for path in &plan.user_binaries {
         match fs::remove_file(path) {
@@ -631,6 +656,7 @@ mod tests {
             &exe,
             &system_paths,
             &tmp.path().join("usr-local-monux"),
+            None,
         );
         assert_eq!(
             plan.root_owned,
@@ -646,7 +672,7 @@ mod tests {
         write_file(&exe, b"binary");
         let link = tmp.path().join("usr-local-monux");
         std::os::unix::fs::symlink(&exe, &link).unwrap();
-        let plan = plan_impl(&tmp.path().join("home"), &exe, &[], &link);
+        let plan = plan_impl(&tmp.path().join("home"), &exe, &[], &link, None);
         assert_eq!(plan.root_owned, vec![link]);
     }
 
@@ -657,7 +683,7 @@ mod tests {
         write_file(&exe, b"binary");
         let copy = tmp.path().join("usr-local-monux");
         write_file(&copy, b"binary");
-        let plan = plan_impl(&tmp.path().join("home"), &exe, &[], &copy);
+        let plan = plan_impl(&tmp.path().join("home"), &exe, &[], &copy, None);
         assert_eq!(plan.root_owned, vec![copy]);
     }
 
@@ -668,7 +694,7 @@ mod tests {
         write_file(&exe, b"binary");
         let unrelated = tmp.path().join("usr-local-monux");
         write_file(&unrelated, b"some other tool");
-        let plan = plan_impl(&tmp.path().join("home"), &exe, &[], &unrelated);
+        let plan = plan_impl(&tmp.path().join("home"), &exe, &[], &unrelated, None);
         assert!(plan.root_owned.is_empty());
     }
 
@@ -682,6 +708,7 @@ mod tests {
             &exe,
             &[],
             &tmp.path().join("usr-local-monux"),
+            None,
         );
         assert!(plan.root_owned.is_empty());
     }
@@ -697,7 +724,7 @@ mod tests {
         write_file(&foreign, b"binary");
         let link = tmp.path().join("usr-local-monux");
         std::os::unix::fs::symlink(&foreign, &link).unwrap();
-        let plan = plan_impl(&tmp.path().join("home"), &exe, &[], &link);
+        let plan = plan_impl(&tmp.path().join("home"), &exe, &[], &link, None);
         assert!(plan.root_owned.is_empty());
     }
 
@@ -712,7 +739,7 @@ mod tests {
         // (dangling), e.g. after the binary was removed by hand.
         let link = tmp.path().join("usr-local-monux");
         std::os::unix::fs::symlink(home.join(".local/bin/monux"), &link).unwrap();
-        let plan = plan_impl(&home, &exe, &[], &link);
+        let plan = plan_impl(&home, &exe, &[], &link, None);
         assert_eq!(plan.root_owned, vec![link]);
     }
 
@@ -771,7 +798,7 @@ mod tests {
         write_file(&cargo_monux, b"old");
         write_file(&local_nikau, b"old");
         // ~/.cargo/bin/nikau deliberately absent.
-        let plan = plan_impl(&home, &exe, &[], &tmp.path().join("usr-local-monux"));
+        let plan = plan_impl(&home, &exe, &[], &tmp.path().join("usr-local-monux"), None);
         assert_eq!(plan.user_binaries, vec![exe, cargo_monux, local_nikau]);
     }
 
@@ -782,9 +809,31 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let exe = tmp.path().join("usr-local-monux");
         write_file(&exe, b"binary");
-        let plan = plan_impl(&tmp.path().join("home"), &exe, &[], &exe);
+        let plan = plan_impl(&tmp.path().join("home"), &exe, &[], &exe, None);
         assert_eq!(plan.root_owned, vec![exe]);
         assert!(plan.user_binaries.is_empty());
+    }
+
+    #[test]
+    fn desktop_shortcut_path_honors_xdg_data_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let exe = tmp.path().join("monux");
+        write_file(&exe, b"binary");
+        let usr_local = tmp.path().join("usr-local-monux");
+        // Default: ~/.local/share/applications/monux-tray.desktop.
+        let plan = plan_impl(&home, &exe, &[], &usr_local, None);
+        assert_eq!(
+            plan.desktop_shortcut,
+            home.join(".local/share/applications/monux-tray.desktop")
+        );
+        // $XDG_DATA_HOME (absolute) takes precedence.
+        let xdg = tmp.path().join("xdg-data");
+        let plan = plan_impl(&home, &exe, &[], &usr_local, Some(xdg.as_os_str()));
+        assert_eq!(
+            plan.desktop_shortcut,
+            xdg.join("applications/monux-tray.desktop")
+        );
     }
 
     #[test]
@@ -794,13 +843,13 @@ mod tests {
         let exe = tmp.path().join("monux");
         write_file(&exe, b"binary");
         let missing_usr_local = tmp.path().join("usr-local-monux");
-        let plan = plan_impl(&home, &exe, &[], &missing_usr_local);
+        let plan = plan_impl(&home, &exe, &[], &missing_usr_local, None);
         assert_eq!(plan.config_dir, None);
         assert!(!plan.remove_config);
 
         let config_dir = home.join(".config").join("monux");
         fs::create_dir_all(&config_dir).unwrap();
-        let plan = plan_impl(&home, &exe, &[], &missing_usr_local);
+        let plan = plan_impl(&home, &exe, &[], &missing_usr_local, None);
         assert_eq!(plan.config_dir, Some(config_dir));
     }
 

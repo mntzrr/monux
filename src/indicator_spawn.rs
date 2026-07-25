@@ -132,22 +132,50 @@ impl RespawnPolicy {
     }
 }
 
-/// Spawns the indicator as a child of this daemon: our own binary with
-/// `gui indicator`. stdin is /dev/null; stdout/stderr are inherited so
-/// the indicator's log lines fold into the daemon's log.
-fn spawn_indicator() -> Result<Child> {
-    let exe = std::env::current_exe()
-        .context("Failed to find our own executable for spawning the tray indicator")?;
-    // An auto-update may have replaced the binary on disk while we run;
-    // Linux then reports our exe as "<path> (deleted)" (see main.rs).
-    let exe = exe.to_string_lossy().trim_end_matches(" (deleted)").to_string();
-    Command::new(exe)
-        .args(["gui", "indicator"])
+/// Our own executable's path, cleaned of the " (deleted)" suffix Linux
+/// reports when an auto-update replaced the binary on disk (see main.rs).
+pub(crate) fn own_exe() -> Result<String> {
+    let exe =
+        std::env::current_exe().context("Failed to find our own executable for respawning")?;
+    Ok(exe.to_string_lossy().trim_end_matches(" (deleted)").to_string())
+}
+
+/// Builds the spawn command for the tray indicator: our own binary with
+/// `gui indicator`, stdin null, stdout/stderr inherited so the indicator's
+/// log lines fold into the spawning process's log.
+fn indicator_command() -> Result<Command> {
+    let mut cmd = Command::new(own_exe()?);
+    cmd.args(["gui", "indicator"])
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    Ok(cmd)
+}
+
+/// Spawns the indicator as a child of this daemon: our own binary with
+/// `gui indicator`.
+fn spawn_indicator() -> Result<Child> {
+    indicator_command()?
         .spawn()
         .context("Failed to spawn the tray indicator")
+}
+
+/// Spawns the indicator detached, for `monux gui tray show` when no daemon
+/// is running (the standalone tray then doubles as a launcher — see
+/// indicator.rs). Same spawn shape as spawn_indicator, but unsupervised: the
+/// CLI exits right after, the indicator is orphaned onto init and takes over
+/// the single-instance indicator lock. Refuses in headless sessions — the
+/// indicator would only die instantly, after the CLI already reported success.
+pub fn spawn_standalone() -> Result<()> {
+    if !has_desktop_session() {
+        bail!(
+            "no D-Bus session bus: the indicator needs a desktop session running a StatusNotifierItem host (waybar, KDE Plasma, ...)"
+        );
+    }
+    indicator_command()?
+        .spawn()
+        .context("Failed to spawn the tray indicator")?;
+    Ok(())
 }
 
 /// SIGTERMs the indicator child (its default disposition exits it cleanly)
@@ -556,6 +584,24 @@ async fn monitor_loop(shared: Arc<Mutex<Shared>>, shutdown: Arc<AtomicBool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indicator_command_shape_is_shared_by_both_spawn_paths() {
+        // Supervised (daemon) and standalone (tray show) spawns use the same
+        // command: our own exe (sans a stale " (deleted)" suffix) + gui
+        // indicator, stdin null, output inherited.
+        let cmd = indicator_command().unwrap();
+        let exe = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .trim_end_matches(" (deleted)")
+            .to_string();
+        assert_eq!(cmd.get_program(), std::ffi::OsStr::new(&exe));
+        assert_eq!(
+            cmd.get_args().collect::<Vec<_>>(),
+            [std::ffi::OsStr::new("gui"), std::ffi::OsStr::new("indicator")]
+        );
+    }
 
     #[test]
     fn veto_opted_out_by_flag_or_env() {

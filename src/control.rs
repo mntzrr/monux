@@ -133,7 +133,7 @@ impl Role {
         }
     }
 
-    fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Role::Server => "server",
             Role::Client => "client",
@@ -918,6 +918,11 @@ pub fn daemon_cli(request: &str, ok_message: &str, socket: Option<&Path>) -> Res
 /// client's, exactly like status discovery; `socket` overrides) and returns
 /// the text to print. The daemon's error string propagates — e.g. the
 /// refusal to override a --no-indicator daemon on show.
+///
+/// A `show` that finds no daemon on the DEFAULT discovery path doesn't
+/// error: it spawns a standalone indicator instead (its not-running menu
+/// doubles as a launcher — see indicator.rs). hide, and any explicit
+/// --socket that doesn't answer, keep erroring (see tray_decision).
 pub fn tray_cli(hide: bool, socket: Option<&Path>) -> Result<String> {
     let candidates: Vec<PathBuf> = match socket {
         Some(path) => vec![path.to_path_buf()],
@@ -925,20 +930,58 @@ pub fn tray_cli(hide: bool, socket: Option<&Path>) -> Result<String> {
     };
     let action = if hide { "hide" } else { "show" };
     let request = format!(r#"{{"cmd":"indicator","action":"{}"}}"#, action);
-    let (path, raw) = query_first(&candidates, &request)?;
-    let response: RawResponse = serde_json::from_str(&raw)
-        .with_context(|| format!("Malformed response from {}: {}", path.display(), raw))?;
-    if !response.ok {
-        bail!(
-            "The daemon reported an error: {}",
-            response.error.unwrap_or_default()
-        );
+    let result = query_first(&candidates, &request);
+    match (tray_decision(hide, socket.is_some(), result.is_ok()), result) {
+        (TrayDecision::Unhide, Ok((path, raw))) => {
+            let response: RawResponse = serde_json::from_str(&raw)
+                .with_context(|| format!("Malformed response from {}: {}", path.display(), raw))?;
+            if !response.ok {
+                bail!(
+                    "The daemon reported an error: {}",
+                    response.error.unwrap_or_default()
+                );
+            }
+            Ok(if hide {
+                "Tray indicator hidden (no respawns until 'monux gui tray show' or a daemon restart)".to_string()
+            } else {
+                "Tray indicator shown".to_string()
+            })
+        }
+        (TrayDecision::Standalone, Err(_)) => {
+            crate::indicator_spawn::spawn_standalone()?;
+            Ok("Tray indicator shown (standalone; no monux daemon running)".to_string())
+        }
+        (TrayDecision::Error, Err(e)) => Err(e),
+        // tray_decision agrees with the query outcome by construction.
+        _ => unreachable!("tray_decision disagrees with the query outcome"),
     }
-    Ok(if hide {
-        "Tray indicator hidden (no respawns until 'monux gui tray show' or a daemon restart)".to_string()
+}
+
+/// What `monux gui tray hide|show` does with the socket-discovery outcome
+/// (pure, so the matrix is testable without sockets): an answering daemon
+/// takes the hide/show command as today; with no daemon answering, a `show`
+/// on the default discovery path spawns a standalone indicator, while hide,
+/// and any explicit --socket, keep erroring — the daemon they name must
+/// exist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrayDecision {
+    /// A daemon answered: the socket command went through (or its error did).
+    Unhide,
+    /// No daemon on the default path: spawn a standalone indicator.
+    Standalone,
+    /// Propagate the query error.
+    Error,
+}
+
+fn tray_decision(hide: bool, explicit_socket: bool, daemon_answered: bool) -> TrayDecision {
+    if daemon_answered {
+        return TrayDecision::Unhide;
+    }
+    if !hide && !explicit_socket {
+        TrayDecision::Standalone
     } else {
-        "Tray indicator shown".to_string()
-    })
+        TrayDecision::Error
+    }
 }
 
 /// Sends `request` to the first candidate socket that answers, returning the
@@ -1367,6 +1410,22 @@ mod tests {
         task.abort();
         let _ = task.await;
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn tray_decision_matrix() {
+        // A daemon answered: the hide/show command goes through, as today.
+        assert_eq!(tray_decision(true, false, true), TrayDecision::Unhide);
+        assert_eq!(tray_decision(false, false, true), TrayDecision::Unhide);
+        assert_eq!(tray_decision(false, true, true), TrayDecision::Unhide);
+        // No daemon: 'show' on the default discovery path spawns a
+        // standalone indicator...
+        assert_eq!(tray_decision(false, false, false), TrayDecision::Standalone);
+        // ...but hide (there is nothing to hide from) and any explicit
+        // --socket (the user named the daemon they meant) keep erroring.
+        assert_eq!(tray_decision(true, false, false), TrayDecision::Error);
+        assert_eq!(tray_decision(false, true, false), TrayDecision::Error);
+        assert_eq!(tray_decision(true, true, false), TrayDecision::Error);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

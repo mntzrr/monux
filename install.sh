@@ -78,6 +78,28 @@ else
     echo "Alias: mx -> monux"
 fi
 
+# Desktop shortcut: 'monux tray' in the app menu runs 'monux gui tray show'
+# (with no daemon running it starts a standalone tray). $XDG_DATA_HOME
+# honored (absolute paths only, per the base-directory spec), default
+# ~/.local/share.
+data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+case "$data_home" in
+    /*) ;;
+    *) data_home="$HOME/.local/share" ;;
+esac
+mkdir -p "$data_home/applications"
+cat > "$data_home/applications/monux-tray.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=monux tray
+Comment=Show the monux tray indicator (starts it when no daemon is running)
+Exec=monux gui tray show
+Terminal=false
+Categories=Utility;
+Icon=input-keyboard
+EOF
+echo "Desktop shortcut: $data_home/applications/monux-tray.desktop"
+
 # 'sudo monux ...' (e.g. 'sudo monux setup') fails with "command not found"
 # because sudo resets PATH to secure_path, which excludes ~/.local/bin.
 # /usr/local/bin is in secure_path, so link the binary there too (needs sudo).
