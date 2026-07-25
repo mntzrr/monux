@@ -198,10 +198,10 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
                         rotation.set_client(fingerprint).await;
                     }
                     Event::PauseToggle => {
-                        rotation.toggle_pause().await;
+                        rotation.toggle_pause("pause chord").await;
                     }
                     Event::SetPaused(paused) => {
-                        rotation.set_paused(paused).await;
+                        rotation.set_paused(paused, "control socket").await;
                     }
                 }
             },

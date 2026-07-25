@@ -1567,19 +1567,22 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// forwarded to clients and rotation switches (including SIGUSR1/SIGUSR2)
     /// are ignored; clipboard sharing continues untouched. Resuming re-grabs
     /// per the current rotation state: keyboards always, mice iff a client is
-    /// current.
-    pub async fn toggle_pause(&mut self) {
+    /// current. `source` names the trigger ("pause chord", "control socket")
+    /// in the log line and the notification, so an unexpected pause is
+    /// identifiable after the fact.
+    pub async fn toggle_pause(&mut self, source: &'static str) {
         if self.paused {
             self.paused = false;
             self.broadcast_grab_state();
             info!(
-                "Input resumed: devices re-grabbed per rotation state ({})",
+                "Input resumed (via {}): devices re-grabbed per rotation state ({})",
+                source,
                 match self.current_client {
                     Some(endpoint) => format!("switched to {}", endpoint),
                     None => "local machine".to_string(),
                 }
             );
-            notify_switch("monux resumed");
+            notify_switch(&format!("monux resumed ({})", source));
         } else {
             // Run the held-key cleanup on the current target FIRST so nothing
             // sticks: the chord's modifier presses were already forwarded to
@@ -1594,8 +1597,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             self.motion_history.clear();
             self.paused = true;
             self.broadcast_grab_state();
-            info!("Input paused: all devices ungrabbed (clipboard sharing continues); resume via the pause chord (if configured), the tray, or 'monux daemon resume'");
-            notify_switch("monux paused");
+            info!("Input paused (via {}): all devices ungrabbed (clipboard sharing continues); resume via the pause chord (if configured), the tray, or 'monux daemon resume'", source);
+            notify_switch(&format!("monux paused ({})", source));
         }
     }
 
@@ -1603,9 +1606,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// via Event::SetPaused). Idempotent, unlike the pause chord's toggle:
     /// asking for the state already in effect is a no-op, so a GUI can send
     /// the command matching the state it wants without reading status first.
-    pub async fn set_paused(&mut self, paused: bool) {
+    pub async fn set_paused(&mut self, paused: bool, source: &'static str) {
         if self.paused != paused {
-            self.toggle_pause().await;
+            self.toggle_pause(source).await;
         }
     }
 
@@ -4797,7 +4800,7 @@ mod tests {
             .clipboard_update_source(None, vec!["text/plain".to_string()], 1024)
             .await
             .unwrap();
-        rotation.toggle_pause().await;
+        rotation.toggle_pause("test").await;
         // Step outside the rate-limit window: this second refresh comes
         // microseconds after the first and would be skipped by design (see
         // diagnostics_refresh_is_rate_limited).
@@ -4810,10 +4813,10 @@ mod tests {
 
         // set_paused (control socket) is idempotent, unlike the chord's toggle.
         let released = rotation.output_handler.released;
-        rotation.set_paused(true).await;
+        rotation.set_paused(true, "test").await;
         assert!(rotation.paused);
         assert_eq!(rotation.output_handler.released, released);
-        rotation.set_paused(false).await;
+        rotation.set_paused(false, "test").await;
         assert!(!rotation.paused);
 
         // The wire JSON uses the documented, tray-stable field names (the
@@ -4860,7 +4863,7 @@ mod tests {
         assert!(!diagnostics.server_state().unwrap().paused);
 
         // A refresh inside the window is skipped, even though state changed.
-        rotation.toggle_pause().await;
+        rotation.toggle_pause("test").await;
         rotation.update_diagnostics();
         assert!(!diagnostics.server_state().unwrap().paused);
 
@@ -4885,7 +4888,7 @@ mod tests {
 
         // Pause: the held-key cleanup runs on the current (local) target FIRST,
         // then the broadcast ungrabs both device classes.
-        rotation.toggle_pause().await;
+        rotation.toggle_pause("test").await;
         assert!(rotation.paused);
         assert_eq!(rotation.output_handler.released, 1);
         let state = *grab_rx.borrow();
@@ -4903,7 +4906,7 @@ mod tests {
 
         // Resume: re-grab per the rotation state — keyboard grabbed, mouse
         // still passing through (no client is current).
-        rotation.toggle_pause().await;
+        rotation.toggle_pause("test").await;
         assert!(!rotation.paused);
         let state = *grab_rx.borrow();
         assert!(!state.paused);
@@ -4922,12 +4925,12 @@ mod tests {
 
         // Pause while a client is current: the mouse class ungrabs too (pause
         // wins over client_active), and resume re-grabs it (client current).
-        rotation.toggle_pause().await;
+        rotation.toggle_pause("test").await;
         let state = *grab_rx.borrow();
         assert!(state.paused && state.client_active);
         assert!(!class_grabbed(DeviceClass::Keyboard, &state));
         assert!(!class_grabbed(DeviceClass::Toggled, &state));
-        rotation.toggle_pause().await;
+        rotation.toggle_pause("test").await;
         let state = *grab_rx.borrow();
         assert!(class_grabbed(DeviceClass::Keyboard, &state));
         assert!(class_grabbed(DeviceClass::Toggled, &state));
@@ -4935,7 +4938,7 @@ mod tests {
         // Pause again, then the client drops (client removals funnel through
         // set_and_grab_current_client): the devices must stay ungrabbed, not
         // "re-grab for the local machine".
-        rotation.toggle_pause().await;
+        rotation.toggle_pause("test").await;
         rotation.set_and_grab_current_client(None).await;
         let state = *grab_rx.borrow();
         assert!(state.paused && !state.client_active);
@@ -4948,7 +4951,7 @@ mod tests {
     async fn paused_server_drops_input_without_forwarding_or_emitting() {
         let (dir, mut rotation, _grab_rx) = pause_rotation("pause-input").await;
         rotation.current_client = Some("127.0.0.1:1234".parse().unwrap());
-        rotation.toggle_pause().await;
+        rotation.toggle_pause("test").await;
 
         // Input seen while paused (monux keeps listening for the resume chord)
         // is counted as physical but neither forwarded nor emitted locally.
@@ -5145,7 +5148,7 @@ mod tests {
         let endpoint: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         rotation.current_client = Some(endpoint);
         rotation.liveness.insert(endpoint, LivenessState::new());
-        rotation.set_paused(true).await;
+        rotation.set_paused(true, "test").await;
 
         // The current client goes silent past the miss limit while paused:
         // rotation switches are suspended (see prev_client), so the detector
@@ -5159,7 +5162,7 @@ mod tests {
 
         // After resume the same staleness fires the detector on the next
         // (on-time) tick: the switch happens then, not during the pause.
-        rotation.set_paused(false).await;
+        rotation.set_paused(false, "test").await;
         rotation.ping_tick().await;
         assert_eq!(rotation.current_client, None);
         assert!(rotation.liveness[&endpoint].silenced_since.is_some());
@@ -5175,7 +5178,7 @@ mod tests {
         // Input is local because the client silenced (automatic re-activation
         // is armed), then the user pauses.
         rotation.silenced_endpoint = Some(endpoint);
-        rotation.set_paused(true).await;
+        rotation.set_paused(true, "test").await;
         let released = rotation.output_handler.released;
 
         // The client answers again and meets the recovery bar while paused:
@@ -5197,7 +5200,7 @@ mod tests {
         // attempt enters the switch funnel and runs the held-key release,
         // which a fabricated endpoint then fails out of — see
         // liveness_manual_local_choice_wins_over_auto_recovery).
-        rotation.set_paused(false).await;
+        rotation.set_paused(false, "test").await;
         rotation.liveness.insert(
             endpoint,
             silenced_state(Duration::from_secs(10), REACTIVATE_PONGS - 1),
