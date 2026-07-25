@@ -814,24 +814,29 @@ fn resolve_goto(clients: &[(SocketAddr, &str)], fingerprint: &str) -> GotoResolu
 /// The --edge-map directions a client sits beyond: every direction whose
 /// target resolves to the client's fingerprint against the LIVE client list —
 /// the same resolution semantics as the edge switch itself (auto / fingerprint
-/// prefix / hostname; see edge::resolve_edge_target). Unresolvable targets
-/// (e.g. `auto` with two clients connected) simply yield no EdgeInfo for that
-/// direction. A free function so the matching is testable: ClientInfo embeds
-/// quinn handles and can't be fabricated in a unit test.
+/// prefix / hostname; see edge::resolve_edge_target). Monitor qualifiers are
+/// irrelevant here: the wire carries directions only, so a client beyond
+/// "bottom@eDP-1" is beyond "bottom". Unresolvable targets (e.g. `auto` with
+/// two clients connected) simply yield no EdgeInfo for that direction. A free
+/// function so the matching is testable: ClientInfo embeds quinn handles and
+/// can't be fabricated in a unit test.
 fn edge_info_directions(
     map: &edge::EdgeMap,
     clients: &[(SocketAddr, String)],
     fingerprint: &str,
     resolve_host: &dyn Fn(&str) -> Vec<IpAddr>,
 ) -> Vec<event::Direction> {
-    map.targets
-        .iter()
-        .filter(|(_, target)| {
+    // The BTreeSet dedups (one direction can have both a qualified and an
+    // unqualified entry) and keeps the result in direction order.
+    map.entries()
+        .filter(|(_, _, target)| {
             edge::resolve_edge_target(target, clients, resolve_host)
                 .map(|resolved| resolved == fingerprint)
                 .unwrap_or(false)
         })
-        .map(|(direction, _)| *direction)
+        .map(|(direction, _, _)| direction)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -4160,6 +4165,25 @@ mod tests {
         );
         // The other client matches nothing ('auto' is ambiguous with two).
         assert!(edge_info_directions(&map, &clients, "aaaa1111", &resolver).is_empty());
+    }
+
+    #[test]
+    fn edge_info_treats_qualifiers_as_their_direction() {
+        // A monitor-qualified entry advertises its plain direction: the wire
+        // carries no geometry, the qualifier only pins the local zone.
+        let clients = edge_client_entries(&[("10.0.0.1:9000", "aaaa1111")]);
+        let map = edge_map_of(&["right@eDP-1=auto"]);
+        assert_eq!(
+            edge_info_directions(&map, &clients, "aaaa1111", &no_ips),
+            vec![event::Direction::Right]
+        );
+        // A qualified and an unqualified entry for one direction resolving
+        // to the same client still advertise the direction once.
+        let map = edge_map_of(&["right@eDP-1=auto,right=auto"]);
+        assert_eq!(
+            edge_info_directions(&map, &clients, "aaaa1111", &no_ips),
+            vec![event::Direction::Right]
+        );
     }
 
     #[test]

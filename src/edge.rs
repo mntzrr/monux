@@ -89,22 +89,101 @@ impl std::fmt::Display for EdgeTarget {
 /// Parsed --edge-map: which client sits beyond which screen edge.
 #[derive(Clone, Debug, Default)]
 pub struct EdgeMap {
+    /// Unqualified entries ("bottom=auto"): apply to every output's exposed
+    /// segments in that direction, except where a qualified entry for the
+    /// same direction claims one output.
     pub targets: BTreeMap<Direction, EdgeTarget>,
+    /// Monitor-qualified entries ("bottom@eDP-1=auto"), keyed by (direction,
+    /// qualifier): the qualifier matches an output by name (the default) or
+    /// by serial, model, or description when the compositor reports them
+    /// (see qualifier_matches). The entry applies to every matching
+    /// output's exposed segments in that direction, overriding the
+    /// unqualified entry there. A direction with ONLY qualified entries
+    /// leaves the other outputs' edges in that direction inert.
+    pub qualified: BTreeMap<(Direction, String), EdgeTarget>,
+}
+
+impl EdgeMap {
+    /// The target for one output's exposed segment in a direction: the
+    /// qualified entry matching that output first, then the unqualified
+    /// one. When several qualified entries match the same output (its name
+    /// and its model, say), the first in (direction, qualifier) order wins.
+    fn target_for(&self, direction: Direction, output: &OutputRect) -> Option<&EdgeTarget> {
+        self.qualified
+            .iter()
+            .find(|((dir, qualifier), _)| *dir == direction && qualifier_matches(qualifier, output))
+            .map(|(_, target)| target)
+            .or_else(|| self.targets.get(&direction))
+    }
+
+    /// Every entry as (direction, monitor qualifier, target) — unqualified
+    /// entries first (ascending by direction), then qualified ones
+    /// (ascending by direction, then monitor name).
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (Direction, Option<&str>, &EdgeTarget)> {
+        self.targets
+            .iter()
+            .map(|(dir, target)| (*dir, None, target))
+            .chain(
+                self.qualified
+                    .iter()
+                    .map(|((dir, monitor), target)| (*dir, Some(monitor.as_str()), target)),
+            )
+    }
+
+    /// Every mapped direction, qualified or not (may repeat).
+    fn directions(&self) -> impl Iterator<Item = Direction> + '_ {
+        self.targets
+            .keys()
+            .copied()
+            .chain(self.qualified.keys().map(|(dir, _)| *dir))
+    }
+
+    /// No entries at all (parse_edge_map rejects such maps).
+    fn is_empty(&self) -> bool {
+        self.targets.is_empty() && self.qualified.is_empty()
+    }
 }
 
 /// Parses the repeatable, comma-separated --edge-map values
-/// ("right=auto", "left=aa11bb,top=laptop") into an EdgeMap.
+/// ("right=auto", "bottom@eDP-1=auto", "left=aa11bb,top=laptop") into an
+/// EdgeMap. A direction may carry a monitor qualifier
+/// ("<direction>@<monitor>=<target>"): the entry then applies only to the
+/// exposed segments of the matching output(s) in that direction and
+/// overrides an unqualified entry for the same direction there. The
+/// qualifier matches an output by name or — when the compositor reports
+/// them — by serial, model, or description (see qualifier_matches). It may
+/// contain whitespace (descriptions do — "DELL U2720Q"); it is split on
+/// ',' and the first '=' and '@' only, so a literal comma, '=', or '@' in
+/// a description can't be written — prefer the serial or model form.
 pub fn parse_edge_map(specs: &[String]) -> Result<EdgeMap> {
     let mut map = EdgeMap::default();
     for spec in specs {
         for part in spec.split(',') {
             let part = part.trim();
-            let (dir, target) = part.split_once('=').with_context(|| {
+            let (lhs, target) = part.split_once('=').with_context(|| {
                 format!(
-                    "invalid --edge-map entry '{}': expected <direction>=<target>",
+                    "invalid --edge-map entry '{}': expected <direction>[@<monitor>]=<target>",
                     part
                 )
             })?;
+            let (dir, monitor) = match lhs.split_once('@') {
+                Some((dir, monitor)) => {
+                    let monitor = monitor.trim();
+                    if monitor.is_empty()
+                        || monitor
+                            .chars()
+                            .any(|c| c == '@' || c == '=' || c == ',')
+                    {
+                        bail!(
+                            "invalid --edge-map entry '{}': invalid monitor qualifier '{}'",
+                            part,
+                            monitor
+                        );
+                    }
+                    (dir, Some(monitor.to_string()))
+                }
+                None => (lhs, None),
+            };
             let dir = Direction::parse(dir.trim())?;
             let target = target.trim();
             if target.is_empty() {
@@ -115,12 +194,23 @@ pub fn parse_edge_map(specs: &[String]) -> Result<EdgeMap> {
             } else {
                 EdgeTarget::Named(target.to_string())
             };
-            if map.targets.insert(dir, target).is_some() {
-                bail!("duplicate direction '{}' in --edge-map", dir.as_str());
+            let replaced = match &monitor {
+                Some(monitor) => map.qualified.insert((dir, monitor.clone()), target),
+                None => map.targets.insert(dir, target),
+            };
+            if replaced.is_some() {
+                match monitor {
+                    Some(monitor) => bail!(
+                        "duplicate direction '{}' for monitor '{}' in --edge-map",
+                        dir.as_str(),
+                        monitor
+                    ),
+                    None => bail!("duplicate direction '{}' in --edge-map", dir.as_str()),
+                }
             }
         }
     }
-    if map.targets.is_empty() {
+    if map.is_empty() {
         bail!("--edge-map requires at least one direction=target entry");
     }
     Ok(map)
@@ -132,12 +222,16 @@ pub fn parse_edge_map(specs: &[String]) -> Result<EdgeMap> {
 /// here rather than a runtime resolution failure.
 pub fn parse_client_edge_map(specs: &[String]) -> Result<EdgeMap> {
     let map = parse_edge_map(specs)?;
-    for (dir, target) in &map.targets {
+    for (dir, monitor, target) in map.entries() {
         if *target != EdgeTarget::Auto {
+            let edge = match monitor {
+                Some(monitor) => format!("{}@{}", dir.as_str(), monitor),
+                None => dir.as_str().to_string(),
+            };
             bail!(
                 "invalid --edge-map target '{}' for the {} edge: on a client the only valid target is 'auto' (the server)",
                 target,
-                dir.as_str()
+                edge
             );
         }
     }
@@ -150,10 +244,67 @@ pub fn parse_client_edge_map(specs: &[String]) -> Result<EdgeMap> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OutputRect {
     pub name: String,
+    /// The persistent identifiers the compositor reports (Hyprland: the
+    /// manufacturer, model, serial, and their composite description — "Dell
+    /// Inc. DELL U2720Q 83JLZ23"), empty when it reports none. Unlike the
+    /// name, which can change across compositor restarts or GPU changes,
+    /// these identify the physical monitor — --edge-map @qualifiers match
+    /// them too (see qualifier_matches).
+    pub make: String,
+    pub model: String,
+    pub serial: String,
+    pub description: String,
     pub x: i32,
     pub y: i32,
     pub width: i32,
     pub height: i32,
+}
+
+/// Whether a --edge-map @qualifier names this output: the output name (the
+/// default, always available), or one of the persistent identifiers when the
+/// compositor reports them (serial, model, or description — `make` alone is
+/// too ambiguous to match on; the description embeds it). Exact string
+/// match; an empty identifier never matches.
+fn qualifier_matches(qualifier: &str, output: &OutputRect) -> bool {
+    qualifier == output.name
+        || (!output.serial.is_empty() && qualifier == output.serial)
+        || (!output.model.is_empty() && qualifier == output.model)
+        || (!output.description.is_empty() && qualifier == output.description)
+}
+
+/// The outputs of the layout a qualifier matches (see qualifier_matches) —
+/// several with identical models (apply the zone to all of them, and warn),
+/// none for a typo or an unplugged monitor.
+fn matching_outputs<'a>(qualifier: &str, layout: &'a [OutputRect]) -> Vec<&'a OutputRect> {
+    layout
+        .iter()
+        .filter(|output| qualifier_matches(qualifier, output))
+        .collect()
+}
+
+/// How an output is shown in logs and warnings: the name, plus the
+/// persistent identity in brackets when reported — the description, or a
+/// synthesized make/model/serial composite when there is no description —
+/// so users can see what to put in an --edge-map @qualifier.
+fn output_identifiers(output: &OutputRect) -> String {
+    let identity = if !output.description.is_empty() {
+        output.description.clone()
+    } else {
+        [
+            output.make.as_str(),
+            output.model.as_str(),
+            output.serial.as_str(),
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<&str>>()
+        .join(" ")
+    };
+    if identity.is_empty() {
+        output.name.clone()
+    } else {
+        format!("{} [{}]", output.name, identity)
+    }
 }
 
 /// A contiguous exposed piece of one output's boundary: no other output
@@ -347,8 +498,16 @@ fn parse_monitors_json(json: &str) -> Result<Vec<OutputRect>> {
             .as_f64()
             .filter(|s| *s > 0.0)
             .unwrap_or(1.0);
+        // The persistent identifiers (see OutputRect) are optional: a
+        // compositor reporting none degrades silently to name-only
+        // qualifier matching.
+        let get_str = |key: &str| -> String { monitor[key].as_str().unwrap_or("").to_string() };
         outputs.push(OutputRect {
             name,
+            make: get_str("make"),
+            model: get_str("model"),
+            serial: get_str("serial"),
+            description: get_str("description"),
             x: x as i32,
             y: y as i32,
             width: (width as f64 / scale).round() as i32,
@@ -634,9 +793,8 @@ impl ResolveCache {
 /// target may still be a fingerprint prefix (matched locally first); the
 /// harmless background lookup for those just fills an unread cache entry.
 fn hostname_targets(map: &EdgeMap) -> Vec<String> {
-    map.targets
-        .values()
-        .filter_map(|target| match target {
+    map.entries()
+        .filter_map(|(_, _, target)| match target {
             EdgeTarget::Named(name) => Some(name.clone()),
             EdgeTarget::Auto => None,
         })
@@ -710,6 +868,9 @@ pub(crate) const EDGE_TRIGGER_PX: i32 = 0;
 struct EdgeZone {
     direction: Direction,
     output: String,
+    /// The edge-map entry this zone fires (a direction can map different
+    /// targets per monitor via qualified entries).
+    target: EdgeTarget,
     /// The edge line: the output's first (left/top) or last (right/bottom)
     /// pixel column/row on that side.
     edge: i32,
@@ -749,17 +910,23 @@ fn edge_fraction(zone: &EdgeZone, x: i32, y: i32) -> f64 {
 }
 
 /// Turns a layout into trigger zones for the mapped directions: exposed
-/// segments only, corner dead zones applied.
+/// segments only, corner dead zones applied. A segment gets a zone only when
+/// an entry covers it: a qualified entry matching the segment's output
+/// (see qualifier_matches) first, then the unqualified entry for the
+/// direction — so a qualified-only direction leaves the other outputs'
+/// segments in that direction inert, and a qualifier matching several
+/// outputs zones all of them.
 fn edge_zones(map: &EdgeMap, layout: &[OutputRect]) -> Vec<EdgeZone> {
     let mut zones = Vec::new();
     for segment in exposed_segments(layout) {
-        if !map.targets.contains_key(&segment.direction) {
-            continue;
-        }
-        let Some(segment) = trim_corner_dead_zones(segment) else {
+        let Some(output) = layout.iter().find(|o| o.name == segment.output) else {
             continue;
         };
-        let Some(output) = layout.iter().find(|o| o.name == segment.output) else {
+        let Some(target) = map.target_for(segment.direction, output) else {
+            continue;
+        };
+        let target = target.clone();
+        let Some(segment) = trim_corner_dead_zones(segment) else {
             continue;
         };
         let edge = match segment.direction {
@@ -771,12 +938,62 @@ fn edge_zones(map: &EdgeMap, layout: &[OutputRect]) -> Vec<EdgeZone> {
         zones.push(EdgeZone {
             direction: segment.direction,
             output: segment.output,
+            target,
             edge,
             start: segment.start,
             len: segment.len,
         });
     }
     zones
+}
+
+/// Warns about qualifiers that match NO output (a typo, or a monitor
+/// currently unplugged — such entries never produce a zone) or SEVERAL
+/// (the zone applies to all of them; suggest the serial to pick one).
+/// `warned` carries qualifier → match count at the last warning across the
+/// periodic layout re-queries, so an unchanged situation stays quiet, but
+/// a qualifier that recovers (the monitor is plugged in, or the duplicate
+/// is removed) and breaks again reports again.
+fn warn_qualifier_issues(map: &EdgeMap, layout: &[OutputRect], warned: &mut BTreeMap<String, usize>) {
+    let qualifiers: BTreeSet<&str> = map
+        .qualified
+        .keys()
+        .map(|(_, qualifier)| qualifier.as_str())
+        .collect();
+    for qualifier in qualifiers {
+        let matches = matching_outputs(qualifier, layout);
+        match matches.len() {
+            1 => {
+                warned.remove(qualifier);
+            }
+            n if warned.get(qualifier) == Some(&n) => {}
+            0 => {
+                warn!(
+                    "edge-map: no output matching '{}' in the current layout (outputs: {})",
+                    qualifier,
+                    layout
+                        .iter()
+                        .map(output_identifiers)
+                        .collect::<Vec<String>>()
+                        .join(", ")
+                );
+                warned.insert(qualifier.to_string(), 0);
+            }
+            n => {
+                warn!(
+                    "edge-map: '{}' matches {} outputs ({}); use the serial to pick one",
+                    qualifier,
+                    n,
+                    matches
+                        .iter()
+                        .map(|output| output.name.as_str())
+                        .collect::<Vec<&str>>()
+                        .join(", ")
+                );
+                warned.insert(qualifier.to_string(), n);
+            }
+        }
+    }
 }
 
 /// Logs the trigger zones, one per line — or the warning that --edge-map
@@ -929,9 +1146,11 @@ async fn run_inner(
         "Screen-edge switching enabled (dwell {:?}, cooldown {:?}): {}",
         dwell,
         REARM_COOLDOWN,
-        map.targets
-            .iter()
-            .map(|(dir, target)| format!("{}={}", dir.as_str(), target))
+        map.entries()
+            .map(|(dir, monitor, target)| match monitor {
+                Some(monitor) => format!("{}@{}={}", dir.as_str(), monitor, target),
+                None => format!("{}={}", dir.as_str(), target),
+            })
             .collect::<Vec<String>>()
             .join(", ")
     );
@@ -941,6 +1160,10 @@ async fn run_inner(
     std::thread::spawn(move || run_cursor_poller(poller_socket, pos_tx));
     let mut zones = edge_zones(&map, &layout);
     log_zones(&zones);
+    // Qualifiers matching no or several outputs warn on change only (see
+    // warn_qualifier_issues).
+    let mut qualifier_warnings = BTreeMap::new();
+    warn_qualifier_issues(&map, &layout, &mut qualifier_warnings);
     let mut current_layout = layout;
 
     // Per-direction state: the debouncer turns polled edge contact into
@@ -957,11 +1180,10 @@ async fn run_inner(
         latched: bool,
     }
     let mut dirs: HashMap<Direction, DirState> = map
-        .targets
-        .keys()
+        .directions()
         .map(|dir| {
             (
-                *dir,
+                dir,
                 DirState {
                     timer: DwellTimer::new(dwell, REARM_COOLDOWN),
                     debounce: EdgeDebounce::new(),
@@ -1052,6 +1274,7 @@ async fn run_inner(
                             log_layout(&new_layout);
                             zones = edge_zones(&map, &new_layout);
                             log_zones(&zones);
+                            warn_qualifier_issues(&map, &new_layout, &mut qualifier_warnings);
                             current_layout = new_layout;
                             // Contact states measured against the old layout's
                             // zones are meaningless under the new one.
@@ -1111,7 +1334,24 @@ async fn run_inner(
                                 .expect("server mode always carries the client list")
                                 .borrow()
                                 .clone();
-                            let target = map.targets[dir].clone();
+                            // The zone under the cursor decides the target:
+                            // qualified entries can map one direction to
+                            // different targets per monitor, and a
+                            // qualified-only direction has no unqualified
+                            // entry at all.
+                            let target = last_pos.and_then(|(x, y)| {
+                                zones
+                                    .iter()
+                                    .find(|zone| zone.direction == *dir && zone_contains(zone, x, y))
+                                    .map(|zone| zone.target.clone())
+                            });
+                            let Some(target) = target else {
+                                // A deadline arms only after polls, so a
+                                // position always exists here — but without
+                                // a zone there is no target to resolve.
+                                debug!("Edge switch via {} edge skipped: no zone under the cursor", dir.as_str());
+                                continue;
+                            };
                             // resolve_hostname does blocking getaddrinfo — run
                             // it off the async executor (only 2 worker threads;
                             // one may already be blockable by cert prompts).
@@ -1161,13 +1401,14 @@ async fn run_inner(
     }
 }
 
-/// Logs the monitor layout in one line.
+/// Logs the monitor layout in one line, with each output's identifiers
+/// (see output_identifiers) so --edge-map @qualifiers are discoverable.
 fn log_layout(layout: &[OutputRect]) {
     info!(
         "Screen-edge switching: monitor layout: {}",
         layout
             .iter()
-            .map(|o| format!("{} {}x{}@({},{})", o.name, o.width, o.height, o.x, o.y))
+            .map(|o| format!("{} {}x{}@({},{})", output_identifiers(o), o.width, o.height, o.x, o.y))
             .collect::<Vec<String>>()
             .join(", ")
     );
@@ -1186,17 +1427,21 @@ fn log_edge_resolutions(
 ) {
     resolve_cache.queue_map_refresh(map);
     let resolver = resolve_cache.resolver();
-    for (dir, target) in &map.targets {
+    for (dir, monitor, target) in map.entries() {
+        let edge = match monitor {
+            Some(monitor) => format!("{}@{}", dir.as_str(), monitor),
+            None => dir.as_str().to_string(),
+        };
         match resolve_edge_target(target, clients, &resolver) {
             Ok(fingerprint) => info!(
                 "Screen-edge switching: {} edge → client {} (target '{}')",
-                dir.as_str(),
+                edge,
                 fingerprint,
                 target
             ),
             Err(e) => warn!(
                 "Screen-edge switching: {} edge target '{}' is not resolvable right now: {}",
-                dir.as_str(),
+                edge,
                 target,
                 e
             ),
@@ -1211,10 +1456,36 @@ mod tests {
     fn rect(name: &str, x: i32, y: i32, width: i32, height: i32) -> OutputRect {
         OutputRect {
             name: name.to_string(),
+            make: String::new(),
+            model: String::new(),
+            serial: String::new(),
+            description: String::new(),
             x,
             y,
             width,
             height,
+        }
+    }
+
+    /// An output with the persistent identifiers Hyprland reports (see
+    /// OutputRect), for the qualifier-matching tests.
+    fn rect_id(
+        name: &str,
+        make: &str,
+        model: &str,
+        serial: &str,
+        description: &str,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> OutputRect {
+        OutputRect {
+            make: make.to_string(),
+            model: model.to_string(),
+            serial: serial.to_string(),
+            description: description.to_string(),
+            ..rect(name, x, y, width, height)
         }
     }
 
@@ -1384,6 +1655,34 @@ mod tests {
     }
 
     #[test]
+    fn monitors_json_reads_the_persistent_identifiers() {
+        let json = r#"[
+            {"name": "eDP-1", "x": 0, "y": 0, "width": 1920, "height": 1080, "scale": 1.0,
+             "make": "Dell Inc.", "model": "DELL U2720Q", "serial": "83JLZ23",
+             "description": "Dell Inc. DELL U2720Q 83JLZ23"},
+            {"name": "DP-3", "x": 1920, "y": 0, "width": 1920, "height": 1080, "scale": 1.0}
+        ]"#;
+        let outputs = parse_monitors_json(json).unwrap();
+        assert_eq!(
+            outputs[0],
+            rect_id(
+                "eDP-1",
+                "Dell Inc.",
+                "DELL U2720Q",
+                "83JLZ23",
+                "Dell Inc. DELL U2720Q 83JLZ23",
+                0,
+                0,
+                1920,
+                1080
+            )
+        );
+        // A compositor reporting no identifiers degrades to empty strings
+        // (name-only qualifier matching; see qualifier_matches).
+        assert_eq!(outputs[1], rect("DP-3", 1920, 0, 1920, 1080));
+    }
+
+    #[test]
     fn corner_dead_zones_trim_both_ends() {
         let segment = EdgeSegment {
             direction: Direction::Right,
@@ -1528,6 +1827,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn edge_map_hostnames_include_qualified_targets() {
+        // Qualified Named targets resolve exactly like unqualified ones:
+        // hostname resolution ignores the qualifier.
+        let map = parse_edge_map(&["left@eDP-1=laptop,bottom=desk,right=auto".to_string()]).unwrap();
+        // Unqualified entries first (direction order), then qualified ones.
+        assert_eq!(
+            hostname_targets(&map),
+            vec!["desk".to_string(), "laptop".to_string()]
+        );
+    }
+
     /// Miss-then-hit: a cache miss resolves to "unresolvable" for that pass;
     /// the queued refresh fills the cache and the NEXT pass resolves. (No
     /// runtime here, so the refresh runs inline — see queue_refresh.)
@@ -1668,6 +1979,84 @@ mod tests {
     }
 
     #[test]
+    fn edge_map_parses_qualified_entries() {
+        // Qualified alone: lands in the qualified map, no unqualified entry.
+        let map = parse_edge_map(&["bottom@eDP-1=auto".to_string()]).unwrap();
+        assert!(map.targets.is_empty());
+        assert_eq!(
+            map.qualified[&(Direction::Bottom, "eDP-1".to_string())],
+            EdgeTarget::Auto
+        );
+
+        // Mixed forms: a qualified and an unqualified entry for one
+        // direction coexist, and one direction can be qualified on several
+        // monitors.
+        let map = parse_edge_map(&[
+            "bottom@eDP-1=aa11bb,bottom=laptop".to_string(),
+            "left@eDP-1=desk,left@DP-3=auto".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            map.targets[&Direction::Bottom],
+            EdgeTarget::Named("laptop".to_string())
+        );
+        assert_eq!(
+            map.qualified[&(Direction::Bottom, "eDP-1".to_string())],
+            EdgeTarget::Named("aa11bb".to_string())
+        );
+        assert_eq!(
+            map.qualified[&(Direction::Left, "eDP-1".to_string())],
+            EdgeTarget::Named("desk".to_string())
+        );
+        assert_eq!(
+            map.qualified[&(Direction::Left, "DP-3".to_string())],
+            EdgeTarget::Auto
+        );
+
+        // Whitespace around the '@' and '=' is trimmed.
+        let map = parse_edge_map(&["bottom @eDP-1 = auto".to_string()]).unwrap();
+        assert_eq!(
+            map.qualified[&(Direction::Bottom, "eDP-1".to_string())],
+            EdgeTarget::Auto
+        );
+    }
+
+    #[test]
+    fn edge_map_rejects_bad_qualifiers() {
+        // Duplicate (direction, monitor) pair.
+        assert!(parse_edge_map(&["bottom@eDP-1=auto,bottom@eDP-1=laptop".to_string()]).is_err());
+        // ... across repeatable flags too.
+        assert!(parse_edge_map(&[
+            "bottom@eDP-1=auto".to_string(),
+            "bottom@eDP-1=auto".to_string()
+        ])
+        .is_err());
+        // Empty qualifier.
+        assert!(parse_edge_map(&["bottom@=auto".to_string()]).is_err());
+        assert!(parse_edge_map(&["bottom@ =auto".to_string()]).is_err());
+        // A second '@' in the qualifier (a description containing a literal
+        // '@' — or ',' or '=' — can't be written; use the serial or model).
+        assert!(parse_edge_map(&["bottom@eDP@1=auto".to_string()]).is_err());
+        // Qualifier without a target, or without a direction.
+        assert!(parse_edge_map(&["bottom@eDP-1".to_string()]).is_err());
+        assert!(parse_edge_map(&["@eDP-1=auto".to_string()]).is_err());
+    }
+
+    #[test]
+    fn edge_map_qualifier_keeps_inner_whitespace() {
+        // Descriptions contain spaces; the qualifier is split on ',' and
+        // the first '=' and '@' only, never on whitespace.
+        let map = parse_edge_map(&["bottom@Dell Inc. DELL U2720Q 83JLZ23=auto".to_string()]).unwrap();
+        assert_eq!(
+            map.qualified[&(
+                Direction::Bottom,
+                "Dell Inc. DELL U2720Q 83JLZ23".to_string()
+            )],
+            EdgeTarget::Auto
+        );
+    }
+
+    #[test]
     fn client_edge_map_accepts_only_auto() {
         // 'auto' on one or several edges is fine, in both syntax forms.
         let map = parse_client_edge_map(&["left=auto".to_string()]).unwrap();
@@ -1675,10 +2064,18 @@ mod tests {
         let map = parse_client_edge_map(&["left=auto".to_string(), "top=auto,bottom=auto".to_string()])
             .unwrap();
         assert_eq!(map.targets.len(), 3);
+        // Monitor qualifiers are fine too — they pin the edge locally.
+        let map = parse_client_edge_map(&["left@eDP-1=auto".to_string()]).unwrap();
+        assert_eq!(
+            map.qualified[&(Direction::Left, "eDP-1".to_string())],
+            EdgeTarget::Auto
+        );
         // A fingerprint prefix or a hostname is a config error on the client:
         // its only peer is the server.
         assert!(parse_client_edge_map(&["left=aa11bb".to_string()]).is_err());
         assert!(parse_client_edge_map(&["left=laptop".to_string()]).is_err());
+        // ... qualified or not ...
+        assert!(parse_client_edge_map(&["left@eDP-1=laptop".to_string()]).is_err());
         // ... even mixed with a valid entry.
         assert!(parse_client_edge_map(&["left=auto,right=laptop".to_string()]).is_err());
         // The base syntax errors still apply.
@@ -1691,6 +2088,7 @@ mod tests {
         let zone = EdgeZone {
             direction: Direction::Left,
             output: "A".to_string(),
+            target: EdgeTarget::Auto,
             edge: 0,
             start: 100,
             len: 200,
@@ -1705,6 +2103,7 @@ mod tests {
         let zone = EdgeZone {
             direction: Direction::Top,
             output: "A".to_string(),
+            target: EdgeTarget::Auto,
             edge: 0,
             start: 1000,
             len: 500,
@@ -1731,6 +2130,221 @@ mod tests {
         assert_eq!(zones[0].len, 908);
         assert!(zone_contains(&zones[0], 3839, 500));
         assert!(!zone_contains(&zones[0], 3838, 500));
+    }
+
+    /// Two side-by-side 1920x1080 outputs (eDP-1 left, HDMI-A-1 right):
+    /// their top and bottom edges are each exposed on BOTH monitors.
+    fn side_by_side_layout() -> Vec<OutputRect> {
+        vec![
+            rect("eDP-1", 0, 0, 1920, 1080),
+            rect("HDMI-A-1", 1920, 0, 1920, 1080),
+        ]
+    }
+
+    #[test]
+    fn zones_unqualified_covers_every_output() {
+        let map = parse_edge_map(&["bottom=auto".to_string()]).unwrap();
+        let zones = edge_zones(&map, &side_by_side_layout());
+        let mut outputs: Vec<&str> = zones.iter().map(|zone| zone.output.as_str()).collect();
+        outputs.sort();
+        assert_eq!(outputs, vec!["HDMI-A-1", "eDP-1"]);
+        assert!(zones.iter().all(|zone| zone.target == EdgeTarget::Auto));
+    }
+
+    #[test]
+    fn zones_qualified_alone_pins_the_edge_and_leaves_the_rest_inert() {
+        // A qualified entry alone: only its own output gets a zone in that
+        // direction; the other output's bottom edge stays inert.
+        let map = parse_edge_map(&["bottom@HDMI-A-1=auto".to_string()]).unwrap();
+        let zones = edge_zones(&map, &side_by_side_layout());
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].output, "HDMI-A-1");
+        assert_eq!(zones[0].direction, Direction::Bottom);
+        assert_eq!(zones[0].target, EdgeTarget::Auto);
+    }
+
+    #[test]
+    fn zones_qualified_wins_on_its_output_unqualified_covers_the_rest() {
+        let map = parse_edge_map(&["bottom@HDMI-A-1=aa11bb,bottom=laptop".to_string()]).unwrap();
+        let zones = edge_zones(&map, &side_by_side_layout());
+        assert_eq!(zones.len(), 2);
+        assert_eq!(
+            zone_of(&zones, Direction::Bottom, "HDMI-A-1").target,
+            EdgeTarget::Named("aa11bb".to_string())
+        );
+        assert_eq!(
+            zone_of(&zones, Direction::Bottom, "eDP-1").target,
+            EdgeTarget::Named("laptop".to_string())
+        );
+    }
+
+    #[test]
+    fn zones_unknown_monitor_gets_no_zone_and_is_reported() {
+        // A qualifier matching nothing produces no zone, and the
+        // warn-on-change path (warn_qualifier_issues) records it as unknown
+        // (match count 0).
+        let map = parse_edge_map(&["bottom@eDP-9=auto".to_string()]).unwrap();
+        let layout = side_by_side_layout();
+        assert!(edge_zones(&map, &layout).is_empty());
+        assert!(matching_outputs("eDP-9", &layout).is_empty());
+        let mut warned = BTreeMap::new();
+        warn_qualifier_issues(&map, &layout, &mut warned);
+        assert_eq!(warned, BTreeMap::from([("eDP-9".to_string(), 0)]));
+        // A qualifier matching exactly one output is not reported.
+        let map = parse_edge_map(&["bottom@eDP-1=auto".to_string()]).unwrap();
+        let mut warned = BTreeMap::new();
+        warn_qualifier_issues(&map, &layout, &mut warned);
+        assert!(warned.is_empty());
+    }
+
+    #[test]
+    fn unknown_monitor_warning_tracks_the_layout() {
+        // warn_qualifier_issues carries the reported state across
+        // re-queries: still-missing is quiet, re-broken after a fix reports
+        // again.
+        let map = parse_edge_map(&["bottom@eDP-9=auto".to_string()]).unwrap();
+        let layout = side_by_side_layout();
+        let mut warned = BTreeMap::new();
+        warn_qualifier_issues(&map, &layout, &mut warned);
+        assert_eq!(warned, BTreeMap::from([("eDP-9".to_string(), 0)]));
+        // The monitor appears (plugged in): nothing left to report.
+        let mut fixed = side_by_side_layout();
+        fixed.push(rect("eDP-9", 0, 1080, 1920, 1080));
+        warn_qualifier_issues(&map, &fixed, &mut warned);
+        assert!(warned.is_empty());
+        // It disappears again: reported again.
+        warn_qualifier_issues(&map, &layout, &mut warned);
+        assert_eq!(warned, BTreeMap::from([("eDP-9".to_string(), 0)]));
+    }
+
+    /// Two side-by-side 1920x1080 outputs carrying Hyprland's persistent
+    /// identifiers (identical models — two of the same screen).
+    fn identified_layout() -> Vec<OutputRect> {
+        vec![
+            rect_id(
+                "eDP-1",
+                "Dell Inc.",
+                "DELL U2720Q",
+                "83JLZ23",
+                "Dell Inc. DELL U2720Q 83JLZ23",
+                0,
+                0,
+                1920,
+                1080,
+            ),
+            rect_id(
+                "DP-3",
+                "Dell Inc.",
+                "DELL U2720Q",
+                "9KLMN77",
+                "Dell Inc. DELL U2720Q 9KLMN77",
+                1920,
+                0,
+                1920,
+                1080,
+            ),
+        ]
+    }
+
+    #[test]
+    fn qualifier_matches_by_name_serial_model_and_description() {
+        let layout = identified_layout();
+        // The name (the default) and each persistent identifier match their
+        // own output; another output's identifier does not.
+        for (qualifier, expected) in [
+            ("eDP-1", "eDP-1"),        // name
+            ("83JLZ23", "eDP-1"),      // serial
+            ("9KLMN77", "DP-3"),       // serial
+            ("Dell Inc. DELL U2720Q 83JLZ23", "eDP-1"), // description (with spaces)
+            ("Dell Inc. DELL U2720Q 9KLMN77", "DP-3"),  // description
+        ] {
+            let matches = matching_outputs(qualifier, &layout);
+            assert_eq!(
+                matches.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(),
+                vec![expected],
+                "qualifier '{}'",
+                qualifier
+            );
+        }
+        // The shared model matches BOTH outputs (ambiguity), the shared
+        // make alone never matches (too ambiguous — it's in the
+        // description instead).
+        assert_eq!(matching_outputs("DELL U2720Q", &layout).len(), 2);
+        assert!(matching_outputs("Dell Inc.", &layout).is_empty());
+        // An empty identifier never matches: a name-only output answers
+        // only to its name.
+        let plain = side_by_side_layout();
+        assert!(qualifier_matches("eDP-1", &plain[0]));
+        assert!(!qualifier_matches("", &plain[0]));
+    }
+
+    #[test]
+    fn output_identifiers_show_name_and_persistent_identity() {
+        // The layout log and the qualifier warnings print outputs this way.
+        // Description present: used as-is (it embeds make/model/serial).
+        assert_eq!(
+            output_identifiers(&identified_layout()[0]),
+            "eDP-1 [Dell Inc. DELL U2720Q 83JLZ23]"
+        );
+        // No description: synthesized from the parts.
+        let output = rect_id("DP-3", "Dell Inc.", "DELL U2720Q", "9KLMN77", "", 0, 0, 1920, 1080);
+        assert_eq!(
+            output_identifiers(&output),
+            "DP-3 [Dell Inc. DELL U2720Q 9KLMN77]"
+        );
+        // Nothing reported: the bare name.
+        assert_eq!(output_identifiers(&rect("eDP-1", 0, 0, 1920, 1080)), "eDP-1");
+    }
+
+    #[test]
+    fn zones_qualifier_matches_persistent_identifiers() {
+        let layout = identified_layout();
+        // By serial: only that output is zoned.
+        let map = parse_edge_map(&["bottom@83JLZ23=auto".to_string()]).unwrap();
+        let zones = edge_zones(&map, &layout);
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].output, "eDP-1");
+        // By description (contains spaces): only that output is zoned.
+        let map = parse_edge_map(&["bottom@Dell Inc. DELL U2720Q 9KLMN77=auto".to_string()]).unwrap();
+        let zones = edge_zones(&map, &layout);
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].output, "DP-3");
+    }
+
+    #[test]
+    fn zones_ambiguous_qualifier_zones_all_matches_and_warns() {
+        // Two identical models: the model qualifier zones BOTH outputs and
+        // the warning path records the ambiguity (match count 2).
+        let layout = identified_layout();
+        let map = parse_edge_map(&["bottom@DELL U2720Q=auto".to_string()]).unwrap();
+        let zones = edge_zones(&map, &layout);
+        let mut outputs: Vec<&str> = zones.iter().map(|zone| zone.output.as_str()).collect();
+        outputs.sort();
+        assert_eq!(outputs, vec!["DP-3", "eDP-1"]);
+        let mut warned = BTreeMap::new();
+        warn_qualifier_issues(&map, &layout, &mut warned);
+        assert_eq!(warned, BTreeMap::from([("DELL U2720Q".to_string(), 2)]));
+        // The duplicate is unplugged: the qualifier recovers (one match).
+        let single = vec![layout[0].clone()];
+        warn_qualifier_issues(&map, &single, &mut warned);
+        assert!(warned.is_empty());
+        // Plugged back in: ambiguous again, reported again.
+        warn_qualifier_issues(&map, &layout, &mut warned);
+        assert_eq!(warned, BTreeMap::from([("DELL U2720Q".to_string(), 2)]));
+    }
+
+    #[test]
+    fn zones_name_matching_works_without_identifiers() {
+        // A compositor reporting no persistent identifiers (all fields
+        // empty) degrades silently to name-only matching — no warnings.
+        let layout = side_by_side_layout();
+        let map = parse_edge_map(&["bottom@HDMI-A-1=auto".to_string()]).unwrap();
+        let zones = edge_zones(&map, &layout);
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].output, "HDMI-A-1");
+        let mut warned = BTreeMap::new();
+        warn_qualifier_issues(&map, &layout, &mut warned);
+        assert!(warned.is_empty());
     }
 
     /// The offset multi-monitor layout from the user's setup: HDMI-A-1

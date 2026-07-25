@@ -471,10 +471,21 @@ struct ServerArgs {
     /// prefix (see the 'Added client ...' log line), a hostname, or 'auto' for
     /// exactly-one-connected-client. Multi-monitor setups expose only the outer
     /// edge segments; ~8% at each end of a segment is a corner dead zone.
-    /// The server also advertises this layout to each mapped client (protocol
-    /// v12+), so the client infers its return edge automatically — no client
-    /// --edge-map needed unless you want to override the inference.
-    #[arg(long, value_name = "direction=target")]
+    /// Pin a direction to one monitor with 'direction@monitor=target', e.g.
+    /// 'bottom@eDP-1=auto': the qualified entry wins on its monitor, an
+    /// unqualified entry for the same direction covers the others, and a
+    /// qualified entry ALONE leaves the other monitors' edges in that
+    /// direction inert. The qualifier is the output name (the default), or
+    /// the monitor's serial, model, or description when the compositor
+    /// reports them (Hyprland; see the layout log lines) — those survive
+    /// output renames across restarts, so prefer the serial or model, e.g.
+    /// '--edge-map bottom@83JLZ23=auto' (quote forms containing spaces; a
+    /// literal ',' '=' or '@' can't appear in a qualifier). A qualifier
+    /// matching several outputs (identical models) zones all of them.
+    /// The server also advertises this layout to each mapped client
+    /// (protocol v12+), so the client infers its return edge automatically —
+    /// no client --edge-map needed unless you want to override the inference.
+    #[arg(long, value_name = "direction[@monitor]=target")]
     edge_map: Option<Vec<String>>,
 
     /// How long the cursor must dwell on a mapped screen edge before the
@@ -606,11 +617,13 @@ struct ClientArgs {
     /// edge and dwelling there asks the server to take input back. Usually
     /// unnecessary: when the server maps this client to one of its edges, the
     /// client infers the opposite edge automatically — this flag overrides
-    /// that inference. Same syntax as the server's --edge-map, but the only
-    /// valid target is 'auto' (the server — a client has exactly one peer).
+    /// that inference. Same syntax as the server's --edge-map (including the
+    /// 'direction@monitor=auto' form pinning a direction to one monitor by
+    /// output name, serial, model, or description), but the only valid
+    /// target is 'auto' (the server — a client has exactly one peer).
     /// Multi-monitor setups expose only the outer edge segments; ~8% at each
     /// end of a segment is a corner dead zone.
-    #[arg(long, value_name = "direction=auto")]
+    #[arg(long, value_name = "direction[@monitor]=auto")]
     edge_map: Option<Vec<String>>,
 
     /// How long the cursor must dwell on a mapped screen edge before the

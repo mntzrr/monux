@@ -175,6 +175,15 @@ IGNORED_MIME_TYPE early return; uri-list parsing; event Display allocs;
 motion-history scratch; degraded-link transitions only; no .local.local lookup;
 neutral accept() warn labels.
 
+## Phase I — per-monitor edge-map — SHIPPED in v9.2.0
+
+`<direction>[@<monitor>]=<target>`: a monitor qualifier pins the zone to the
+matching output(s), overriding the unqualified entry there; unqualified keeps
+the all-exposed-segments behavior. The qualifier matches the output name
+(default) or, when the compositor reports them (Hyprland), the serial, model,
+or description; name-only compositors degrade silently. Unknown qualifiers and
+multi-output matches warn (on change only); the layout log prints identifiers.
+
 ## Future / on hold
 
 - **Protocol feature-negotiation** — SHIPPED in v9.0.0 (protocol v16): v16+ peers
