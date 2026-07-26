@@ -790,39 +790,52 @@ async fn client_shutdown_signal() {
     monux::mark_shutting_down();
 }
 
-fn main() -> Result<()> {
-    // Die silently on SIGPIPE like a normal Unix tool ('monux config show |
-    // head', '... | less' quit early) instead of panicking on a failed
-    // println!: Rust ignores SIGPIPE by default, which turns a closed pipe
-    // into a write error. Restoring the default disposition makes the kernel
-    // kill us, matching every other CLI.
+/// Print-and-exit CLI commands want to die silently on SIGPIPE ('monux
+/// config show | head', '... | less' quit early) instead of panicking on a
+/// failed println!: Rust ignores SIGPIPE by default, which turns a closed
+/// pipe into a write error. Restoring the default disposition makes the
+/// kernel kill us, matching every other CLI. DAEMONS (server/client/tray
+/// indicator) must NOT get this: they write to pipes that legitimately
+/// close — wayland clipboard pipes, an orphaned indicator's inherited
+/// stderr — where SIGPIPE would kill them silently (the client-daemon
+/// silent-death regression).
+fn cli_sigpipe_kill() {
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+}
+
+fn main() -> Result<()> {
     logging::init_logging();
     let cli = Cli::parse();
     // Record the exact build in the log: invaluable when diagnosing bug reports.
     info!("monux v{} starting", VERSION);
 
     // Setup/update/status/servers/config/gui/system/daemon commands don't need the
-    // devices or the async runtime.
+    // devices or the async runtime. They print to stdout and return, so they
+    // get the die-quietly-on-SIGPIPE disposition; the daemon paths below
+    // deliberately don't (see cli_sigpipe_kill).
     match &cli.command {
         Commands::Daemon(args) => match &args.command {
             DaemonCommands::Switch(args) => {
+                cli_sigpipe_kill();
                 let request = format!(r#"{{"cmd":"switch","target":"{}"}}"#, args.target);
                 let out = monux::control::daemon_cli(&request, "Switch requested", args.socket.as_deref())?;
                 println!("{}", out);
                 return Ok(());
             }
             DaemonCommands::Pause => {
+                cli_sigpipe_kill();
                 let out = monux::control::daemon_cli(r#"{"cmd":"pause"}"#, "Input paused", None)?;
                 println!("{}", out);
                 return Ok(());
             }
             DaemonCommands::Resume => {
+                cli_sigpipe_kill();
                 let out = monux::control::daemon_cli(r#"{"cmd":"resume"}"#, "Input resumed", None)?;
                 println!("{}", out);
                 return Ok(());
             }
             DaemonCommands::Restart => {
+                cli_sigpipe_kill();
                 let out = monux::control::daemon_cli(
                     r#"{"cmd":"restart"}"#,
                     "Restarting the daemon (the session will resume automatically)",
@@ -832,17 +845,20 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             DaemonCommands::Exit => {
+                cli_sigpipe_kill();
                 let out = monux::control::daemon_cli(r#"{"cmd":"exit"}"#, "Shutting down the daemon", None)?;
                 println!("{}", out);
                 return Ok(());
             }
             DaemonCommands::Update => {
+                cli_sigpipe_kill();
                 let out = monux::control::daemon_cli(r#"{"cmd":"update_now"}"#, "Update check started", None)?;
                 println!("{}", out);
                 return Ok(());
             }
         },
         Commands::Setup(args) => {
+            cli_sigpipe_kill();
             // Elevate only when the selected steps need root: the base set
             // (a no-flags run) persists root-owned system settings;
             // --autostart/--desktop-shortcut manage per-user files and must
@@ -853,6 +869,7 @@ fn main() -> Result<()> {
             return monux::setup::run(args.autostart, args.desktop_shortcut);
         }
         Commands::Update(args) => {
+            cli_sigpipe_kill();
             let config_dir = monux::update::default_config_dir();
             // Gate on the server's protocol version when this machine acts as
             // a client, so an update can't break the connection. The version
@@ -907,6 +924,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Commands::Status(args) => {
+            cli_sigpipe_kill();
             let out = monux::control::status_cli(
                 args.server,
                 args.client,
@@ -917,12 +935,14 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Commands::Servers => {
+            cli_sigpipe_kill();
             // Display-only: reads mDNS advertisements and the remembered
             // store; never connects to anything (no probes, no handshake).
             println!("{}", monux::servers::listing(&init_config_dir()?));
             return Ok(());
         }
         Commands::Config(args) => {
+            cli_sigpipe_kill();
             let action = match &args.command {
                 None | Some(ConfigCommands::Show) => monux::config::Action::Show,
                 Some(ConfigCommands::Keys { filter }) => {
@@ -953,6 +973,7 @@ fn main() -> Result<()> {
         }
         Commands::Gui(args) => match &args.command {
             GuiCommands::Tray(args) => {
+                cli_sigpipe_kill();
                 let hide = matches!(args.action, TrayAction::Hide);
                 let out = monux::control::tray_cli(hide, args.socket.as_deref())?;
                 println!("{}", out);
@@ -976,6 +997,7 @@ fn main() -> Result<()> {
         },
         Commands::System(args) => match &args.command {
             SystemCommands::Uninstall(args) => {
+                cli_sigpipe_kill();
                 return monux::uninstall::run(args.yes);
             }
         },
