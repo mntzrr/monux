@@ -949,19 +949,37 @@ impl EdgeDirectionsCache {
     }
 }
 
+/// What a Rotation is built from: the handles it owns and the tuning modes
+/// it applies. A struct rather than nine positional parameters, since the
+/// three mode fields are distinct types only by name.
+pub struct RotationConfig<O: device::output::OutputHandler> {
+    pub grab_tx: watch::Sender<device::GrabState>,
+    pub output_handler: O,
+    /// None when the server's clipboard support is disabled.
+    pub local_clipboard: Option<server::LocalClipboard>,
+    pub config_dir: PathBuf,
+    /// Self-handle for spawned tasks to report back (see Rotation::rotation_tx).
+    pub rotation_tx: mpsc::Sender<RotationEvent>,
+    pub motion_mode: MotionMode,
+    pub throttle_mode: ThrottleMode,
+    pub mode: NetworkMode,
+    pub diagnostics: Arc<DiagnosticsMirror>,
+}
+
 impl<O: device::output::OutputHandler> Rotation<O> {
-    pub async fn new(
-        grab_tx: watch::Sender<device::GrabState>,
-        output_handler: O,
-        local_clipboard: Option<server::LocalClipboard>,
-        config_dir: &Path,
-        rotation_tx: mpsc::Sender<RotationEvent>,
-        motion_mode: MotionMode,
-        throttle_mode: ThrottleMode,
-        mode: NetworkMode,
-        diagnostics: Arc<DiagnosticsMirror>,
-    ) -> Result<Self> {
-        let active_client_path = active_client_state_path(config_dir);
+    pub async fn new(config: RotationConfig<O>) -> Result<Self> {
+        let RotationConfig {
+            grab_tx,
+            output_handler,
+            local_clipboard,
+            config_dir,
+            rotation_tx,
+            motion_mode,
+            throttle_mode,
+            mode,
+            diagnostics,
+        } = config;
+        let active_client_path = active_client_state_path(&config_dir);
         let pending_resume_fingerprint = load_pending_resume(&active_client_path);
         if let Some(pending) = &pending_resume_fingerprint {
             info!(
@@ -1140,18 +1158,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
 
     pub async fn accept(&mut self, event: RotationEvent) {
         match event {
-            RotationEvent::AddClient(args) => {
-                self.add_client(
-                    args.endpoint,
-                    args.fingerprint,
-                    args.events_send,
-                    args.bulk_send,
-                    args.conn,
-                    args.conn_token,
-                    args.negotiated_version,
-                )
-                .await
-            }
+            RotationEvent::AddClient(args) => self.add_client(args).await,
             RotationEvent::RemoveClient {
                 endpoint,
                 conn_token,
@@ -1210,16 +1217,20 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
     }
 
-    async fn add_client(
-        &mut self,
-        endpoint: SocketAddr,
-        fingerprint: String,
-        events_send: SendStream,
-        bulk_send: SendStream,
-        conn: quinn::Connection,
-        conn_token: u64,
-        negotiated_version: u64,
-    ) {
+    /// Takes the AddClientArgs whole rather than destructured: the fields
+    /// travel together from the connection handler (server.rs), and spreading
+    /// them over seven positional parameters — three of them u64/SocketAddr —
+    /// only creates places to transpose them.
+    async fn add_client(&mut self, args: AddClientArgs) {
+        let AddClientArgs {
+            endpoint,
+            fingerprint,
+            events_send,
+            bulk_send,
+            conn,
+            conn_token,
+            negotiated_version,
+        } = args;
         // Dedicated writer task for this client's bulk stream: clipboard payloads
         // can be megabytes, and writing them inline would stall input forwarding
         // for the whole rotation. The task also keeps each header glued to its
@@ -3893,17 +3904,17 @@ mod tests {
             paused: false,
         });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
-        let mut rotation = Rotation::new(
+        let mut rotation = Rotation::new(RotationConfig {
             grab_tx,
-            StubOutput { written: 0, released: 0 },
-            None,
-            &dir,
+            output_handler: StubOutput { written: 0, released: 0 },
+            local_clipboard: None,
+            config_dir: dir.clone(),
             rotation_tx,
-            MotionMode::Pinned(None),
-            ThrottleMode::Pinned(None),
-            NetworkMode::Local,
-            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
-        )
+            motion_mode: MotionMode::Pinned(None),
+            throttle_mode: ThrottleMode::Pinned(None),
+            mode: NetworkMode::Local,
+            diagnostics: Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
+        })
         .await
         .unwrap();
 
@@ -3948,17 +3959,17 @@ mod tests {
             paused: false,
         });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
-        let mut rotation = Rotation::new(
+        let mut rotation = Rotation::new(RotationConfig {
             grab_tx,
-            StubOutput { written: 0, released: 0 },
-            None,
-            &dir,
+            output_handler: StubOutput { written: 0, released: 0 },
+            local_clipboard: None,
+            config_dir: dir.clone(),
             rotation_tx,
-            MotionMode::Pinned(Some(Duration::from_millis(8))),
-            ThrottleMode::Pinned(None),
-            NetworkMode::Local,
-            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
-        )
+            motion_mode: MotionMode::Pinned(Some(Duration::from_millis(8))),
+            throttle_mode: ThrottleMode::Pinned(None),
+            mode: NetworkMode::Local,
+            diagnostics: Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
+        })
         .await
         .unwrap();
 
@@ -4002,17 +4013,17 @@ mod tests {
             paused: false,
         });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
-        let mut rotation = Rotation::new(
+        let mut rotation = Rotation::new(RotationConfig {
             grab_tx,
-            StubOutput { written: 0, released: 0 },
-            None,
-            &dir,
+            output_handler: StubOutput { written: 0, released: 0 },
+            local_clipboard: None,
+            config_dir: dir.clone(),
             rotation_tx,
-            MotionMode::Pinned(None),
-            ThrottleMode::Pinned(None),
-            NetworkMode::Local,
-            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
-        )
+            motion_mode: MotionMode::Pinned(None),
+            throttle_mode: ThrottleMode::Pinned(None),
+            mode: NetworkMode::Local,
+            diagnostics: Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
+        })
         .await
         .unwrap();
 
@@ -4060,17 +4071,17 @@ mod tests {
             paused: false,
         });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
-        let mut rotation = Rotation::new(
+        let mut rotation = Rotation::new(RotationConfig {
             grab_tx,
-            StubOutput { written: 0, released: 0 },
-            None,
-            &dir,
+            output_handler: StubOutput { written: 0, released: 0 },
+            local_clipboard: None,
+            config_dir: dir.clone(),
             rotation_tx,
-            MotionMode::Pinned(None),
-            ThrottleMode::Pinned(None),
-            NetworkMode::Local,
-            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
-        )
+            motion_mode: MotionMode::Pinned(None),
+            throttle_mode: ThrottleMode::Pinned(None),
+            mode: NetworkMode::Local,
+            diagnostics: Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
+        })
         .await
         .unwrap();
 
@@ -4089,17 +4100,17 @@ mod tests {
             paused: false,
         });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
-        let mut rotation = Rotation::new(
+        let mut rotation = Rotation::new(RotationConfig {
             grab_tx,
-            StubOutput { written: 0, released: 0 },
-            None,
-            &dir,
+            output_handler: StubOutput { written: 0, released: 0 },
+            local_clipboard: None,
+            config_dir: dir.clone(),
             rotation_tx,
-            MotionMode::Pinned(None),
-            ThrottleMode::Pinned(None),
-            NetworkMode::Local,
-            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
-        )
+            motion_mode: MotionMode::Pinned(None),
+            throttle_mode: ThrottleMode::Pinned(None),
+            mode: NetworkMode::Local,
+            diagnostics: Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
+        })
         .await
         .unwrap();
 
@@ -4415,17 +4426,17 @@ mod tests {
             paused: false,
         });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
-        let mut rotation = Rotation::new(
+        let mut rotation = Rotation::new(RotationConfig {
             grab_tx,
-            StubOutput { written: 0, released: 0 },
-            None,
-            &dir,
+            output_handler: StubOutput { written: 0, released: 0 },
+            local_clipboard: None,
+            config_dir: dir.clone(),
             rotation_tx,
-            MotionMode::Pinned(None),
-            ThrottleMode::Pinned(None),
-            NetworkMode::Local,
-            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
-        )
+            motion_mode: MotionMode::Pinned(None),
+            throttle_mode: ThrottleMode::Pinned(None),
+            mode: NetworkMode::Local,
+            diagnostics: Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
+        })
         .await
         .unwrap();
 
@@ -4453,17 +4464,17 @@ mod tests {
             paused: false,
         });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
-        let mut rotation = Rotation::new(
+        let mut rotation = Rotation::new(RotationConfig {
             grab_tx,
-            StubOutput { written: 0, released: 0 },
-            None,
-            &dir,
+            output_handler: StubOutput { written: 0, released: 0 },
+            local_clipboard: None,
+            config_dir: dir.clone(),
             rotation_tx,
-            MotionMode::Pinned(None),
-            ThrottleMode::Pinned(None),
-            NetworkMode::Local,
-            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
-        )
+            motion_mode: MotionMode::Pinned(None),
+            throttle_mode: ThrottleMode::Pinned(None),
+            mode: NetworkMode::Local,
+            diagnostics: Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
+        })
         .await
         .unwrap();
 
@@ -4491,17 +4502,17 @@ mod tests {
             paused: false,
         });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
-        let mut rotation = Rotation::new(
+        let mut rotation = Rotation::new(RotationConfig {
             grab_tx,
-            StubOutput { written: 0, released: 0 },
-            None,
-            &dir,
+            output_handler: StubOutput { written: 0, released: 0 },
+            local_clipboard: None,
+            config_dir: dir.clone(),
             rotation_tx,
-            MotionMode::Pinned(None),
-            ThrottleMode::Pinned(None),
-            NetworkMode::Local,
-            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
-        )
+            motion_mode: MotionMode::Pinned(None),
+            throttle_mode: ThrottleMode::Pinned(None),
+            mode: NetworkMode::Local,
+            diagnostics: Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
+        })
         .await
         .unwrap();
 
@@ -4539,17 +4550,17 @@ mod tests {
             paused: false,
         });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
-        let rotation = Rotation::new(
+        let rotation = Rotation::new(RotationConfig {
             grab_tx,
-            StubOutput { written: 0, released: 0 },
-            None,
-            &dir,
+            output_handler: StubOutput { written: 0, released: 0 },
+            local_clipboard: None,
+            config_dir: dir.clone(),
             rotation_tx,
-            MotionMode::Pinned(None),
-            ThrottleMode::Pinned(None),
-            NetworkMode::Local,
-            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
-        )
+            motion_mode: MotionMode::Pinned(None),
+            throttle_mode: ThrottleMode::Pinned(None),
+            mode: NetworkMode::Local,
+            diagnostics: Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
+        })
         .await
         .unwrap();
         (dir, rotation)
@@ -4563,17 +4574,17 @@ mod tests {
             paused: false,
         });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
-        let rotation = Rotation::new(
+        let rotation = Rotation::new(RotationConfig {
             grab_tx,
-            StubOutput { written: 0, released: 0 },
-            None,
-            &dir,
+            output_handler: StubOutput { written: 0, released: 0 },
+            local_clipboard: None,
+            config_dir: dir.clone(),
             rotation_tx,
-            MotionMode::Adaptive,
-            ThrottleMode::Adaptive,
-            NetworkMode::Local,
-            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
-        )
+            motion_mode: MotionMode::Adaptive,
+            throttle_mode: ThrottleMode::Adaptive,
+            mode: NetworkMode::Local,
+            diagnostics: Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
+        })
         .await
         .unwrap();
         (dir, rotation)
@@ -4960,17 +4971,17 @@ mod tests {
             paused: false,
         });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
-        let rotation = Rotation::new(
+        let rotation = Rotation::new(RotationConfig {
             grab_tx,
-            StubOutput { written: 0, released: 0 },
-            None,
-            &dir,
+            output_handler: StubOutput { written: 0, released: 0 },
+            local_clipboard: None,
+            config_dir: dir.clone(),
             rotation_tx,
-            MotionMode::Pinned(None),
-            ThrottleMode::Pinned(None),
-            NetworkMode::Local,
-            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
-        )
+            motion_mode: MotionMode::Pinned(None),
+            throttle_mode: ThrottleMode::Pinned(None),
+            mode: NetworkMode::Local,
+            diagnostics: Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
+        })
         .await
         .unwrap();
         (dir, rotation, grab_rx)
@@ -5001,17 +5012,17 @@ mod tests {
         });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
         let diagnostics = Arc::new(DiagnosticsMirror::new("127.0.0.1:9999".parse().unwrap()));
-        let mut rotation = Rotation::new(
+        let mut rotation = Rotation::new(RotationConfig {
             grab_tx,
-            StubOutput { written: 0, released: 0 },
-            None,
-            &dir,
+            output_handler: StubOutput { written: 0, released: 0 },
+            local_clipboard: None,
+            config_dir: dir.clone(),
             rotation_tx,
-            MotionMode::Pinned(None),
-            ThrottleMode::Pinned(None),
-            NetworkMode::Local,
-            diagnostics.clone(),
-        )
+            motion_mode: MotionMode::Pinned(None),
+            throttle_mode: ThrottleMode::Pinned(None),
+            mode: NetworkMode::Local,
+            diagnostics: diagnostics.clone(),
+        })
         .await
         .unwrap();
 
@@ -5077,17 +5088,17 @@ mod tests {
         });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
         let diagnostics = Arc::new(DiagnosticsMirror::new("127.0.0.1:9999".parse().unwrap()));
-        let mut rotation = Rotation::new(
+        let mut rotation = Rotation::new(RotationConfig {
             grab_tx,
-            StubOutput { written: 0, released: 0 },
-            None,
-            &dir,
+            output_handler: StubOutput { written: 0, released: 0 },
+            local_clipboard: None,
+            config_dir: dir.clone(),
             rotation_tx,
-            MotionMode::Pinned(None),
-            ThrottleMode::Pinned(None),
-            NetworkMode::Local,
-            diagnostics.clone(),
-        )
+            motion_mode: MotionMode::Pinned(None),
+            throttle_mode: ThrottleMode::Pinned(None),
+            mode: NetworkMode::Local,
+            diagnostics: diagnostics.clone(),
+        })
         .await
         .unwrap();
 
@@ -5230,17 +5241,17 @@ mod tests {
             paused: false,
         });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
-        let rotation = Rotation::new(
+        let rotation = Rotation::new(RotationConfig {
             grab_tx,
-            StubOutput { written: 0, released: 0 },
-            None,
-            &dir,
+            output_handler: StubOutput { written: 0, released: 0 },
+            local_clipboard: None,
+            config_dir: dir.clone(),
             rotation_tx,
-            MotionMode::Pinned(None),
-            ThrottleMode::Pinned(None),
+            motion_mode: MotionMode::Pinned(None),
+            throttle_mode: ThrottleMode::Pinned(None),
             mode,
-            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
-        )
+            diagnostics: Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
+        })
         .await
         .unwrap();
         (dir, rotation, grab_rx)

@@ -92,22 +92,49 @@ impl PeerVersions {
     }
 }
 
+/// Everything the server events loop is wired up with: the channels it owns
+/// either end of, the tuning modes, and the optional edge-map plumbing.
+/// A struct rather than fourteen positional parameters — two `mpsc` halves of
+/// the same type sit next to each other, and swapping them compiles.
+pub struct ServerEventsLoop<O: output::OutputHandler> {
+    pub config_dir: PathBuf,
+    pub event_rx: mpsc::Receiver<Event>,
+    pub grab_tx: watch::Sender<GrabState>,
+    pub output_handler: O,
+    /// Max compressed clipboard size over the wire, and the uncompressed
+    /// ceiling that bounds what a decompression may produce.
+    pub max_clipboard_size_bytes: u64,
+    pub max_uncompressed_size_bytes: u64,
+    pub rotation_tx: mpsc::Sender<rotation::RotationEvent>,
+    pub rotation_rx: mpsc::Receiver<rotation::RotationEvent>,
+    pub motion_mode: rotation::MotionMode,
+    pub throttle_mode: rotation::ThrottleMode,
+    pub mode: transport::NetworkMode,
+    pub diagnostics: Arc<rotation::DiagnosticsMirror>,
+    /// Both None unless --edge-map is in use.
+    pub edge_client_tx: Option<watch::Sender<Vec<(SocketAddr, String)>>>,
+    pub edge_map: Option<crate::edge::EdgeMap>,
+}
+
 pub async fn run_server_events_loop<O: output::OutputHandler>(
-    config_dir: PathBuf,
-    mut event_rx: mpsc::Receiver<Event>,
-    grab_tx: watch::Sender<GrabState>,
-    output_handler: O,
-    max_clipboard_size_bytes: u64,
-    max_uncompressed_size_bytes: u64,
-    rotation_tx: mpsc::Sender<rotation::RotationEvent>,
-    mut rotation_rx: mpsc::Receiver<rotation::RotationEvent>,
-    motion_mode: rotation::MotionMode,
-    throttle_mode: rotation::ThrottleMode,
-    mode: transport::NetworkMode,
-    diagnostics: Arc<rotation::DiagnosticsMirror>,
-    edge_client_tx: Option<watch::Sender<Vec<(SocketAddr, String)>>>,
-    edge_map: Option<crate::edge::EdgeMap>,
+    args: ServerEventsLoop<O>,
 ) -> Result<()> {
+    let ServerEventsLoop {
+        config_dir,
+        mut event_rx,
+        grab_tx,
+        output_handler,
+        max_clipboard_size_bytes,
+        max_uncompressed_size_bytes,
+        rotation_tx,
+        mut rotation_rx,
+        motion_mode,
+        throttle_mode,
+        mode,
+        diagnostics,
+        edge_client_tx,
+        edge_map,
+    } = args;
     let local_clipboard = LocalClipboard::start(
         config_dir.clone(),
         rotation_tx.clone(),
@@ -115,8 +142,18 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
         max_uncompressed_size_bytes,
     ).await;
 
-    let mut rotation =
-        rotation::Rotation::new(grab_tx, output_handler, local_clipboard, &config_dir, rotation_tx, motion_mode, throttle_mode, mode, diagnostics).await?;
+    let mut rotation = rotation::Rotation::new(rotation::RotationConfig {
+        grab_tx,
+        output_handler,
+        local_clipboard,
+        config_dir: config_dir.clone(),
+        rotation_tx,
+        motion_mode,
+        throttle_mode,
+        mode,
+        diagnostics,
+    })
+    .await?;
     if let Some(tx) = edge_client_tx {
         rotation.set_edge_client_publisher(tx);
     }

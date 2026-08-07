@@ -132,42 +132,43 @@ impl DeltaScaler {
     }
 }
 
+/// Everything a client connection is configured with, as opposed to the live
+/// state it builds. Bundled rather than passed positionally: these values
+/// travel together from main through run() into Connection::new(), and a
+/// dozen positional parameters — two adjacent f64 scales among them — is a
+/// transposition the compiler cannot catch.
+///
+/// Only `server_addr` changes over a client's lifetime: the reconnect loop
+/// rewrites it as it cycles remembered servers and mDNS discovery.
+pub struct ClientConfig {
+    pub server_addr: SocketAddr,
+    pub cert_verifier: Arc<approval::MonuxCertVerification<'static>>,
+    pub max_clipboard_size_bytes: u64,
+    pub mode: transport::NetworkMode,
+    pub config_dir: std::path::PathBuf,
+    /// Pointer/scroll scaling applied on injection (see DeltaScaler).
+    pub mouse_scale: f64,
+    pub scroll_scale: f64,
+    pub control_state: Arc<crate::control::ClientStateMirror>,
+    pub throttle_mode: ThrottleMode,
+    /// An explicit --edge-map. None leaves the return edge to the server's
+    /// EdgeInfo inference (see EdgeInference).
+    pub edge_map: Option<crate::edge::EdgeMap>,
+    pub edge_dwell: Duration,
+}
+
 /// Initializes a new client connection and runs its event loop.
 /// Returns an error on connection failure or other logic error, in which case a new connection can be tried.
 pub async fn run<O: output::OutputHandler>(
-    server_addr: &SocketAddr,
-    cert_verifier: Arc<approval::MonuxCertVerification<'static>>,
-    max_clipboard_size_bytes: u64,
+    cfg: &ClientConfig,
     local_clipboard: &mut Option<client::LocalClipboard>,
     output_handler: &mut O,
-    mode: transport::NetworkMode,
-    config_dir: &std::path::Path,
-    mouse_scale: f64,
-    scroll_scale: f64,
-    control_state: Arc<crate::control::ClientStateMirror>,
-    throttle_mode: ThrottleMode,
-    edge_map: Option<crate::edge::EdgeMap>,
-    edge_dwell: Duration,
 ) -> Result<()> {
+    let server_addr = &cfg.server_addr;
     // speak_as is None normally (our bootstrap claims our own
     // PROTOCOL_VERSION); the clamp retry below claims an older server's
     // version instead.
-    let connect = |speak_as: Option<u64>| {
-        Connection::new(
-            server_addr,
-            cert_verifier.clone(),
-            max_clipboard_size_bytes,
-            mode,
-            config_dir,
-            mouse_scale,
-            scroll_scale,
-            control_state.clone(),
-            throttle_mode,
-            edge_map.is_some(),
-            edge_dwell,
-            speak_as,
-        )
-    };
+    let connect = |speak_as: Option<u64>| Connection::new(cfg, speak_as);
     let (mut client, connect_time) = match connect(None).await {
         Ok(ok) => ok,
         Err(e) => match e.downcast_ref::<ConnectionError>() {
@@ -193,13 +194,13 @@ pub async fn run<O: output::OutputHandler>(
     // Remember this server for next time: mDNS (link-local multicast) can't
     // cross routers, so a working address is worth trying before discovery
     // on later runs (see known_servers.rs).
-    if let Some(fingerprint) = cert_verifier.peer_fingerprint() {
+    if let Some(fingerprint) = cfg.cert_verifier.peer_fingerprint() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         if let Err(e) = crate::known_servers::record(
-            config_dir,
+            &cfg.config_dir,
             *server_addr,
             &fingerprint,
             client.server_hostname.as_deref(),
@@ -219,11 +220,11 @@ pub async fn run<O: output::OutputHandler>(
     );
     // The link monitor's thresholds assume a LAN; a --www connection
     // legitimately exceeds them, so it only runs in Local mode.
-    if mode == transport::NetworkMode::Local {
+    if cfg.mode == transport::NetworkMode::Local {
         task::spawn(monitor_link(
             client.conn().clone(),
             client.throttle_cell.clone(),
-            throttle_mode,
+            cfg.throttle_mode,
         ));
     }
     // Screen-edge switching back to the server: either an explicit --edge-map
@@ -232,9 +233,9 @@ pub async fn run<O: output::OutputHandler>(
     // runs per connection and queues the edge-crossing fraction here; the
     // step loop turns it into a SwitchRequest on the events stream. Dropping
     // the receiver (connection teardown) quiets it.
-    if let Some(map) = edge_map {
+    if let Some(map) = cfg.edge_map.clone() {
         let (request_tx, request_rx) = mpsc::unbounded_channel::<f64>();
-        task::spawn(crate::edge::run_client(map, edge_dwell, request_tx));
+        task::spawn(crate::edge::run_client(map, cfg.edge_dwell, request_tx));
         client.switch_request_rx = Some(request_rx);
     }
     loop {
@@ -420,20 +421,24 @@ impl Connection {
     /// `speak_as` is what our version bootstrap claims: None for our own
     /// PROTOCOL_VERSION, Some(v) on the clamp retry against an older server
     /// (which refuses our real version on sight; see run).
-    async fn new(
-        server_addr: &SocketAddr,
-        cert_verifier: Arc<approval::MonuxCertVerification<'static>>,
-        max_clipboard_size_bytes: u64,
-        mode: transport::NetworkMode,
-        config_dir: &std::path::Path,
-        mouse_scale: f64,
-        scroll_scale: f64,
-        control_state: Arc<crate::control::ClientStateMirror>,
-        throttle_mode: ThrottleMode,
-        edge_map_explicit: bool,
-        edge_dwell: Duration,
-        speak_as: Option<u64>,
-    ) -> Result<(Self, Instant)> {
+    async fn new(cfg: &ClientConfig, speak_as: Option<u64>) -> Result<(Self, Instant)> {
+        let ClientConfig {
+            server_addr,
+            cert_verifier,
+            max_clipboard_size_bytes,
+            mode,
+            config_dir,
+            mouse_scale,
+            scroll_scale,
+            control_state,
+            throttle_mode,
+            edge_dwell,
+            ..
+        } = cfg;
+        let (max_clipboard_size_bytes, mode, edge_dwell) =
+            (*max_clipboard_size_bytes, *mode, *edge_dwell);
+        // An explicit --edge-map wins over the server's EdgeInfo inference.
+        let edge_map_explicit = cfg.edge_map.is_some();
         let bind_addr: SocketAddr = match server_addr {
             SocketAddr::V4(_) => "0.0.0.0:0".parse().expect("Failed to parse 0.0.0.0:0"),
             SocketAddr::V6(_) => "[::]:0".parse().expect("Failed to parse [::]:0"),
@@ -515,8 +520,7 @@ impl Connection {
             Some(negotiated) => negotiated,
             None => {
                 if speak_as == shared::PROTOCOL_VERSION
-                    && server_version < shared::PROTOCOL_VERSION
-                    && server_version >= shared::MIN_SPEAKABLE_VERSION
+                    && (shared::MIN_SPEAKABLE_VERSION..shared::PROTOCOL_VERSION).contains(&server_version)
                 {
                     // Older but speakable: the caller retries clamped to it.
                     return Err(ConnectionError::ServerOlder { server_version }.into());
@@ -637,8 +641,8 @@ impl Connection {
                 output_write_failing: false,
                 fresh_activation: true,
                 pending_deactivate: false,
-                scaler: DeltaScaler::new(mouse_scale, scroll_scale),
-                control_state,
+                scaler: DeltaScaler::new(*mouse_scale, *scroll_scale),
+                control_state: control_state.clone(),
                 switch_request_rx: None,
                 edge_inference: EdgeInference::new(edge_map_explicit),
                 edge_dwell,

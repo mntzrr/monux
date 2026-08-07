@@ -1464,34 +1464,35 @@ fn main() -> Result<()> {
                 Some(pause_shortcut)
             };
             rt.block_on(async {
-                server(
+                server(ServerDaemonArgs {
                     config_dir,
-                    SocketAddr::new(listen, port),
-                    args.shortcut
+                    listen_addr: SocketAddr::new(listen, port),
+                    keys_next: args
+                        .shortcut
                         .as_deref()
                         .unwrap_or(monux::config::DEFAULT_SHORTCUT),
-                    Some(
+                    keys_prev: Some(
                         args.shortcut_prev
                             .as_deref()
                             .unwrap_or(monux::config::DEFAULT_SHORTCUT_PREV),
                     ),
-                    args.shortcut_goto.take().unwrap_or(vec![]),
-                    pause_shortcut,
-                    args.device.take().unwrap_or(vec![]),
-                    args.exit_secs,
+                    keys_goto: args.shortcut_goto.take().unwrap_or_default(),
+                    keys_pause: pause_shortcut,
+                    device_filters: args.device.take().unwrap_or_default(),
+                    exit_secs: args.exit_secs,
                     verifier,
                     max_clipboard_size_bytes,
                     mode,
                     motion_mode,
                     throttle_mode,
                     edge_map,
-                    Duration::from_millis(
+                    edge_dwell: Duration::from_millis(
                         args.edge_dwell_ms
                             .unwrap_or(monux::config::DEFAULT_EDGE_DWELL_MS),
                     ),
                     auto_update,
                     auto_indicator,
-                )
+                })
                 .await
             })?;
         }
@@ -1586,7 +1587,7 @@ fn main() -> Result<()> {
                 None => None,
             };
             rt.block_on(async {
-                client(
+                client(ClientDaemonArgs {
                     config_dir,
                     initial_addr,
                     verifier,
@@ -1596,13 +1597,13 @@ fn main() -> Result<()> {
                     scroll_scale,
                     throttle_mode,
                     edge_map,
-                    Duration::from_millis(
+                    edge_dwell: Duration::from_millis(
                         args.edge_dwell_ms
                             .unwrap_or(monux::config::DEFAULT_EDGE_DWELL_MS),
                     ),
                     auto_update,
                     auto_indicator,
-                )
+                })
                 .await
             })?;
         }
@@ -1733,13 +1734,18 @@ fn init_config_dir() -> Result<PathBuf> {
     Ok(new_dir)
 }
 
-async fn server(
+/// The server daemon's startup inputs, resolved from flags and the config
+/// file. A struct rather than seventeen positional parameters: four of them
+/// are `Option<&str>`/`bool` in a row, which is exactly where a transposed
+/// argument compiles and then misbehaves at runtime.
+struct ServerDaemonArgs<'a> {
     config_dir: PathBuf,
     listen_addr: SocketAddr,
-    keys_next: &str,
-    keys_prev: Option<&str>,
+    /// Switch chords: next, previous, the per-target gotos, and pause.
+    keys_next: &'a str,
+    keys_prev: Option<&'a str>,
     keys_goto: Vec<String>,
-    keys_pause: Option<&str>,
+    keys_pause: Option<&'a str>,
     device_filters: Vec<Regex>,
     exit_secs: Option<u32>,
     verifier: Arc<approval::MonuxCertVerification<'static>>,
@@ -1751,7 +1757,28 @@ async fn server(
     edge_dwell: Duration,
     auto_update: bool,
     auto_indicator: bool,
-) -> Result<()> {
+}
+
+async fn server(args: ServerDaemonArgs<'_>) -> Result<()> {
+    let ServerDaemonArgs {
+        config_dir,
+        listen_addr,
+        keys_next,
+        keys_prev,
+        keys_goto,
+        keys_pause,
+        device_filters,
+        exit_secs,
+        verifier,
+        max_clipboard_size_bytes,
+        mode,
+        motion_mode,
+        throttle_mode,
+        edge_map,
+        edge_dwell,
+        auto_update,
+        auto_indicator,
+    } = args;
     // Try to set up virtual devices up-front - exit early if we can't access uinput
     let mut output_handler = output::uinput::VirtualUInputDevices::new()
         .context("Failed to create virtual devices for output, possible solutions:
@@ -1846,15 +1873,15 @@ async fn server(
 
     let rotation_tx2 = rotation_tx.clone();
     let mut server_events_handle = task::spawn(async move {
-        server::run_server_events_loop(
+        server::run_server_events_loop(server::ServerEventsLoop {
             config_dir,
             event_rx,
-            grab_tx2,
+            grab_tx: grab_tx2,
             output_handler,
             // Max compressed clipboard size over the wire
             max_clipboard_size_bytes,
             // Max uncompressed clipboard size, just in case
-            10 * max_clipboard_size_bytes,
+            max_uncompressed_size_bytes: 10 * max_clipboard_size_bytes,
             rotation_tx,
             rotation_rx,
             motion_mode,
@@ -1863,7 +1890,7 @@ async fn server(
             diagnostics,
             edge_client_tx,
             edge_map,
-        )
+        })
         .await
     });
     // Shared handle to the connections loop's QUIC endpoint, published once
@@ -2075,8 +2102,12 @@ async fn draw_candidate(
     }
 }
 
-async fn client(
+/// The client daemon's startup inputs that aren't part of a connection's own
+/// configuration (see client::ClientConfig, which this builds).
+struct ClientDaemonArgs {
     config_dir: PathBuf,
+    /// The address to try first; None puts the reconnect loop in discovery
+    /// mode (remembered servers, then mDNS).
     initial_addr: Option<SocketAddr>,
     verifier: Arc<approval::MonuxCertVerification<'static>>,
     max_clipboard_size_bytes: u64,
@@ -2088,7 +2119,23 @@ async fn client(
     edge_dwell: Duration,
     auto_update: bool,
     auto_indicator: bool,
-) -> Result<()> {
+}
+
+async fn client(args: ClientDaemonArgs) -> Result<()> {
+    let ClientDaemonArgs {
+        config_dir,
+        initial_addr,
+        verifier,
+        max_clipboard_size_bytes,
+        mode,
+        mouse_scale,
+        scroll_scale,
+        throttle_mode,
+        edge_map,
+        edge_dwell,
+        auto_update,
+        auto_indicator,
+    } = args;
     // Try to set up virtual devices up-front - exit early if we can't access uinput
     let mut output_handler = output::uinput::VirtualUInputDevices::new()
         .context("Failed to create virtual devices for output, possible solutions:
@@ -2149,25 +2196,32 @@ async fn client(
     let shutdown = client_shutdown_signal();
     tokio::pin!(shutdown);
 
+    // Everything a connection is configured with, built once. Only
+    // server_addr changes as the loop cycles candidates.
+    let mut connection_config = client::ClientConfig {
+        server_addr: connect_addr,
+        cert_verifier: verifier.clone(),
+        max_clipboard_size_bytes,
+        mode,
+        config_dir: config_dir.clone(),
+        mouse_scale,
+        scroll_scale,
+        control_state: control_state.clone(),
+        throttle_mode,
+        edge_map,
+        edge_dwell,
+    };
+
     loop {
         info!("Connecting to server: {}", connect_addr);
         control_state.set_server(connect_addr);
+        connection_config.server_addr = connect_addr;
         let connected_at = Instant::now();
         tokio::select! {
             run_result = client::run(
-                &connect_addr,
-                verifier.clone(),
-                max_clipboard_size_bytes,
+                &connection_config,
                 &mut local_clipboard,
                 &mut output_handler,
-                mode,
-                &config_dir,
-                mouse_scale,
-                scroll_scale,
-                control_state.clone(),
-                throttle_mode,
-                edge_map.clone(),
-                edge_dwell,
             ) => {
                 // client::run only returns on failure (its loop never exits otherwise).
                 if let Err(e) = run_result {
