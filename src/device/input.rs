@@ -290,6 +290,51 @@ async fn read_device_or_grab_events(
     }
 }
 
+/// Hard ceiling on events collected between SYN_REPORTs, purely as a
+/// runaway guard. A batch is one evdev frame, and splitting a frame is
+/// destructive for the multitouch protocol — a frame carries a slot's whole
+/// state, so a split (and the synthetic SYN it implies) can strand the
+/// client's touch state mid-gesture. Real frames stay far below this: a
+/// laptop touchpad measured here emits at most 8 events per frame with one
+/// finger down, and a five-finger frame is a small multiple of that. The old
+/// value of 32 sat inside that multi-finger range.
+const MAX_BATCH_EVENTS: usize = 256;
+
+/// What to do with an incoming event: flush the pending batch, process the
+/// event into it, or both.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BatchStep {
+    /// A SYN_REPORT: it ends the frame and carries nothing to collect.
+    FlushOnly,
+    /// The batch hit MAX_BATCH_EVENTS: flush it, then collect this event
+    /// into the fresh batch. It must NOT be dropped — losing an
+    /// ABS_MT_SLOT or ABS_MT_TRACKING_ID mid-frame silently reassigns every
+    /// following axis value to the wrong touch slot on the client.
+    FlushThenProcess,
+    /// The common case: collect into the pending batch.
+    Process,
+}
+
+impl BatchStep {
+    fn flushes(self) -> bool {
+        matches!(self, BatchStep::FlushOnly | BatchStep::FlushThenProcess)
+    }
+
+    fn processes(self) -> bool {
+        matches!(self, BatchStep::FlushThenProcess | BatchStep::Process)
+    }
+}
+
+fn batch_step(event_type: EventType, pending: usize) -> BatchStep {
+    if event_type == EventType::SYNCHRONIZATION {
+        BatchStep::FlushOnly
+    } else if pending >= MAX_BATCH_EVENTS {
+        BatchStep::FlushThenProcess
+    } else {
+        BatchStep::Process
+    }
+}
+
 async fn handle_input_event(
     stream: &mut EventStream,
     c: &mut HandlerConfig,
@@ -298,11 +343,11 @@ async fn handle_input_event(
     input_events_batch: &mut Vec<event::InputEvent>,
     combo_events_batch: &mut Vec<Event>,
 ) {
-    // 32 limit: Just in case, avoid the risk of collecting queued events forever.
-    //            In practice we should only be collecting 2-3 events between syncs.
-    if event.event_type() == EventType::SYNCHRONIZATION
-        || (input_events_batch.len() + combo_events_batch.len()) >= 32
-    {
+    let step = batch_step(
+        event.event_type(),
+        input_events_batch.len() + combo_events_batch.len(),
+    );
+    if step.flushes() {
         // Flush events to be handled by the client as a group
         if !input_events_batch.is_empty() {
             let event = Event::Input(InputBatch {
@@ -331,7 +376,8 @@ async fn handle_input_event(
                 }
             }
         }
-    } else {
+    }
+    if step.processes() {
         // Check whether this event completes a key combo, which creates an additional event.
         // No short-circuit: Ensure that all combo_states have a chance to be updated
         let mut any_consume = false;
@@ -501,6 +547,43 @@ mod tests {
     use super::*;
     use evdev::AbsoluteAxisCode;
     use std::collections::BTreeMap;
+
+    /// A SYN_REPORT ends the frame and is not itself collected; an ordinary
+    /// event is collected.
+    #[test]
+    fn a_sync_flushes_and_an_event_collects() {
+        assert_eq!(
+            batch_step(EventType::SYNCHRONIZATION, 4),
+            BatchStep::FlushOnly
+        );
+        assert_eq!(batch_step(EventType::ABSOLUTE, 4), BatchStep::Process);
+        assert_eq!(batch_step(EventType::KEY, 0), BatchStep::Process);
+    }
+
+    /// The runaway guard flushes but still collects the event that tripped
+    /// it. Dropping it (the old behavior) silently deleted one event from
+    /// every over-long frame — an ABS_MT_SLOT or ABS_MT_TRACKING_ID among
+    /// them reassigns the rest of the frame to the wrong touch slot.
+    #[test]
+    fn the_batch_cap_never_drops_the_event_that_tripped_it() {
+        assert_eq!(
+            batch_step(EventType::ABSOLUTE, MAX_BATCH_EVENTS),
+            BatchStep::FlushThenProcess
+        );
+        assert!(batch_step(EventType::ABSOLUTE, MAX_BATCH_EVENTS).processes());
+        assert_eq!(
+            batch_step(EventType::ABSOLUTE, MAX_BATCH_EVENTS - 1),
+            BatchStep::Process
+        );
+    }
+
+    /// The cap must clear a real multitouch frame: measured touchpad frames
+    /// run to 8 events with one finger down, so a five-finger frame plus
+    /// button and timestamp events stays well inside it.
+    #[test]
+    fn the_batch_cap_clears_real_multitouch_frames() {
+        assert!(MAX_BATCH_EVENTS >= 128, "a multi-finger frame must not split");
+    }
 
     fn device_info_with_dims(dims: &[(u16, (i32, i32))]) -> util::DeviceInfo {
         util::DeviceInfo {

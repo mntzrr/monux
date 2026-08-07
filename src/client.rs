@@ -28,6 +28,33 @@ use crate::notify;
 /// output ticks over time with no drift. Remainders are per-axis: X, Y, and
 /// each wheel axis accumulate independently. Applied ONLY here, on the client
 /// injection path — the server's local re-emit (rotation.rs) stays 1:1.
+/// Whether this frame must be written on its own rather than coalesced with
+/// its neighbours.
+///
+/// The server sends one message per evdev frame, and the output handler
+/// emits exactly one SYN_REPORT per write() — so every frame merged into one
+/// write() is delivered to the local compositor as a SINGLE frame. Relative
+/// input survives that: deltas sum, and key events are independent. Absolute
+/// input does not. The multitouch protocol is frame-based, so merging makes
+/// the last value of each axis win: a stroke whose touch-down and lift land
+/// in the same network chunk collapses into one frame ending at
+/// ABS_MT_TRACKING_ID=-1 with BTN_TOUCH=0 — a touch that never happened, and
+/// no pointer motion at all (verified by replaying a captured stroke both
+/// ways into an identical virtual touchpad: per-frame moved the cursor,
+/// merged moved nothing). Touchpads report at a few hundred Hz, so writing
+/// their frames individually costs nothing; the coalescing that matters for
+/// an 8kHz mouse is untouched.
+fn frame_needs_own_syn(events: &[event::InputEvent]) -> bool {
+    events.iter().any(|event| {
+        let type_ = event
+            .inputi32
+            .as_ref()
+            .map(|e| e.type_)
+            .or_else(|| event.inputf64.as_ref().map(|e| e.type_));
+        type_ == Some(evdev::EventType::ABSOLUTE.0)
+    })
+}
+
 struct DeltaScaler {
     mouse_scale: f64,
     scroll_scale: f64,
@@ -950,7 +977,26 @@ impl Connection {
                     // Pointer/scroll scaling (--mouse-scale/--scroll-scale)
                     // applies here, just before injection.
                     self.scaler.apply(&mut events);
-                    pending_input.append(&mut events);
+                    if frame_needs_own_syn(&events) {
+                        // An absolute/multitouch frame must keep its own
+                        // SYN_REPORT boundary (see frame_needs_own_syn).
+                        // Flush what's queued first so ordering holds, then
+                        // write this frame on its own.
+                        if !pending_input.is_empty() {
+                            Self::note_output_result(
+                                &mut self.output_write_failing,
+                                output_handler
+                                    .write(std::mem::take(&mut pending_input))
+                                    .await,
+                            );
+                        }
+                        Self::note_output_result(
+                            &mut self.output_write_failing,
+                            output_handler.write(events).await,
+                        );
+                    } else {
+                        pending_input.append(&mut events);
+                    }
                 }
                 event::ServerEvent::ClipboardTypes(types) => {
                     // Preserve ordering: apply queued input before handling this.
@@ -1637,6 +1683,55 @@ mod tests {
             }),
             inputf64: None,
         }
+    }
+
+    fn abs(code: u16, value: i32) -> event::InputEvent {
+        event::InputEvent {
+            inputi32: Some(event::InputI32 {
+                type_: evdev::EventType::ABSOLUTE.0,
+                code,
+                value,
+            }),
+            inputf64: None,
+        }
+    }
+
+    fn abs_scaled(code: u16, value: f64) -> event::InputEvent {
+        event::InputEvent {
+            inputi32: None,
+            inputf64: Some(event::InputF64 {
+                type_: evdev::EventType::ABSOLUTE.0,
+                code,
+                value,
+            }),
+        }
+    }
+
+    /// A touchpad frame keeps its own SYN_REPORT; mouse and keyboard frames
+    /// stay coalescable. Merging absolute frames collapses a whole touch into
+    /// one frame, which the compositor reads as no touch at all.
+    #[test]
+    fn absolute_frames_are_not_coalesced() {
+        let mt_position_x = evdev::AbsoluteAxisCode::ABS_MT_POSITION_X.0;
+        assert!(frame_needs_own_syn(&[abs(mt_position_x, 4338)]));
+        // Scaled continuous axes travel as inputf64 and must count too.
+        assert!(frame_needs_own_syn(&[abs_scaled(mt_position_x, 0.5)]));
+        // A real touchpad frame: buttons alongside the absolute axes.
+        assert!(frame_needs_own_syn(&[
+            abs(evdev::AbsoluteAxisCode::ABS_MT_TRACKING_ID.0, -1),
+            rel(REL_X, 0),
+        ]));
+        // Relative and key frames keep the batching that matters at 8kHz.
+        assert!(!frame_needs_own_syn(&[rel(REL_X, 3), rel(REL_Y, -2)]));
+        assert!(!frame_needs_own_syn(&[event::InputEvent {
+            inputi32: Some(event::InputI32 {
+                type_: KEY,
+                code: 30,
+                value: 1
+            }),
+            inputf64: None,
+        }]));
+        assert!(!frame_needs_own_syn(&[]));
     }
 
     /// Feeds `events` through the scaler one event at a time (per-event batches
