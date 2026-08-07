@@ -1055,7 +1055,6 @@ async fn client_shutdown_signal() {
     monux::mark_shutting_down();
 }
 
-/// Print-and-exit CLI commands want to die silently on SIGPIPE ('monux
 /// Which rendering `monux diagnostics` was asked for. The default depends on
 /// where the bundle is going: printing to a terminal wants plain text,
 /// copying wants markdown, since a copied bundle is on its way to the issue
@@ -1072,6 +1071,7 @@ fn diagnostics_format(args: &DiagnosticsArgs) -> monux::diagnostics::Format {
     }
 }
 
+/// Print-and-exit CLI commands want to die silently on SIGPIPE ('monux
 /// config show | head', '... | less' quit early) instead of panicking on a
 /// failed println!: Rust ignores SIGPIPE by default, which turns a closed
 /// pipe into a write error. Restoring the default disposition makes the
