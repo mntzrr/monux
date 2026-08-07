@@ -148,12 +148,26 @@ pub fn run(
                 git(&src_dir, &["checkout", "master"])?;
             }
             info!("Pulling latest source in {}...", src_dir.display());
-            git(&src_dir, &["pull", "--ff-only"]).with_context(|| {
-                format!(
-                    "Failed to update the source checkout; delete it and retry: rm -rf {}",
-                    src_dir.display()
-                )
-            })?;
+            if git(&src_dir, &["pull", "--ff-only"]).is_err() {
+                // The pull can only fail to fast-forward if the checkout and
+                // the remote have diverged — in practice because master was
+                // force-pushed (a rewritten commit message, an amended
+                // commit), which strands every checkout that had fetched the
+                // old commits. This is a disposable cache of upstream, never
+                // a place work is done, so there is nothing to preserve:
+                // fetch and hard-reset onto the remote instead of dead-ending
+                // every future update until someone deletes the directory by
+                // hand.
+                info!(
+                    "The source checkout diverged from the remote (master was likely force-pushed); resetting it to origin/master..."
+                );
+                resync_to_remote(&src_dir).with_context(|| {
+                    format!(
+                        "Failed to update the source checkout; delete it and retry: rm -rf {}",
+                        src_dir.display()
+                    )
+                })?;
+            }
         }
     } else {
         info!("Cloning {} into {}...", repo, src_dir.display());
@@ -486,6 +500,24 @@ fn cargo_toml_version(manifest: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Forces the source checkout onto the remote's master, discarding whatever
+/// local history diverged from it. The recovery path for a force-pushed
+/// upstream, where `pull --ff-only` refuses and would otherwise block every
+/// future update (see the pull site). Safe to be this blunt: the checkout is
+/// a cache of upstream that monux clones itself and only ever reads.
+///
+/// A shallow clone (the default for latest-only updates) can't be reset onto
+/// commits it never fetched, so the fetch deepens it first.
+fn resync_to_remote(src_dir: &Path) -> Result<()> {
+    if git_output(src_dir, &["rev-parse", "--is-shallow-repository"])? == "true" {
+        git(src_dir, &["fetch", "--unshallow"])?;
+    } else {
+        git(src_dir, &["fetch"])?;
+    }
+    git(src_dir, &["reset", "--hard", "origin/master"])?;
+    Ok(())
 }
 
 /// Whether the source checkout is on a detached HEAD (a '--to' install
@@ -1138,6 +1170,43 @@ mod tests {
 
     fn test_repo(dir: &Path) {
         test_git(dir, &["-c", "init.defaultBranch=master", "init"]);
+    }
+
+    /// A force-pushed upstream (a rewritten or amended commit) leaves every
+    /// checkout that fetched the old commits unable to fast-forward, which
+    /// used to fail the update and keep failing until someone deleted the
+    /// directory by hand. The checkout must resync onto the remote instead.
+    #[test]
+    fn a_force_pushed_remote_resyncs_instead_of_stranding_the_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote");
+        let checkout = tmp.path().join("checkout");
+        std::fs::create_dir_all(&remote).unwrap();
+        test_repo(&remote);
+        test_commit_version(&remote, "1.0.0");
+        // A non-bare remote can't take a push to its checked-out branch.
+        test_git(&remote, &["config", "receive.denyCurrentBranch", "ignore"]);
+        test_git(
+            tmp.path(),
+            &["clone", &remote.to_string_lossy(), &checkout.to_string_lossy()],
+        );
+        let old = test_git(&checkout, &["rev-parse", "HEAD"]);
+
+        // Upstream rewrites that commit: same content, new sha.
+        test_git(&remote, &["commit", "--amend", "-m", "v1.0.0 (reworded)"]);
+        let rewritten = test_git(&remote, &["rev-parse", "HEAD"]);
+        assert_ne!(old, rewritten);
+
+        // The checkout now has a history the remote no longer has, so a
+        // fast-forward pull is impossible — the state users were left in.
+        test_git(&checkout, &["fetch"]);
+        assert!(git(&checkout, &["pull", "--ff-only"]).is_err());
+
+        resync_to_remote(&checkout).unwrap();
+
+        assert_eq!(test_git(&checkout, &["rev-parse", "HEAD"]), rewritten);
+        // And an ordinary pull works again afterwards.
+        assert!(git(&checkout, &["pull", "--ff-only"]).is_ok());
     }
 
     #[test]
