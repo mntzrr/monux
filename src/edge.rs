@@ -1620,19 +1620,48 @@ mod tests {
 
     /// The fallback's real target: with no HYPRLAND_INSTANCE_SIGNATURE to go
     /// by (an autostarted daemon's situation), the discovered socket must be
-    /// the live compositor's — it answers a monitors query. Runs only under a
-    /// running Hyprland; elsewhere there is nothing to discover.
+    /// one that actually answers a monitors query — past the leftovers of a
+    /// compositor that crashed, and through hyprland_query's write, shutdown
+    /// of the write half, then read-to-EOF sequence, which is what tells the
+    /// compositor the request is complete.
+    ///
+    /// Against a stub compositor rather than the session's own: this ran only
+    /// under a live Hyprland before, which meant it was skipped in CI and on
+    /// a console-only box, and — worse — a stale instance directory left by a
+    /// crashed compositor made discovery succeed and the connect fail, so the
+    /// test reported a bug in the daemon when the fault was in the
+    /// environment. That leftover is now the case being tested rather than
+    /// the thing breaking the test. Parsing is covered separately (see
+    /// monitors_json_applies_scale_and_skips_disabled).
     #[test]
     fn a_discovered_instance_socket_answers_queries() {
-        let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
-            return;
-        };
-        let hypr_dir = PathBuf::from(runtime_dir).join("hypr");
-        let Ok(socket) = newest_hyprland_instance(&hypr_dir) else {
-            return;
-        };
+        let tmp = tempfile::tempdir().unwrap();
+        let hypr_dir = tmp.path().join("hypr");
+        // What a crashed compositor leaves behind: a socket file with
+        // nothing listening on it. Older, so the live instance outranks it.
+        hyprland_instance(&hypr_dir, "old_crashed_instance", 1_000);
+
+        let live = hypr_dir.join("live_instance");
+        std::fs::create_dir_all(&live).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(live.join(".socket.sock")).unwrap();
+        let compositor = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("the daemon connects");
+            let mut request = Vec::new();
+            // Completes only because the daemon shuts down its write half.
+            conn.read_to_end(&mut request)
+                .expect("the daemon finishes its request");
+            assert_eq!(request, b"j/monitors", "the JSON monitors request");
+            conn.write_all(
+                br#"[{"name": "DP-1", "x": 0, "y": 0, "width": 2560, "height": 1440, "scale": 1.0}]"#,
+            )
+            .expect("the reply goes out");
+        });
+
+        let socket = newest_hyprland_instance(&hypr_dir).expect("the live instance is discovered");
+        assert_eq!(socket, live.join(".socket.sock"), "the leftover was preferred");
         let layout = hyprland_layout(&socket).expect("the discovered socket answers j/monitors");
-        assert!(!layout.is_empty(), "a live Hyprland reports at least one output");
+        compositor.join().expect("the stub compositor served the query");
+        assert_eq!(layout, vec![rect("DP-1", 0, 0, 2560, 1440)]);
     }
 
     #[test]
