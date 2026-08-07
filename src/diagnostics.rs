@@ -67,12 +67,24 @@ It does NOT contain:
     MONUX_TRACE_KEYS, which logs the traced key CODES (not typed text)
   - TLS private keys, or any file outside monux's own config directory
 
+With --peer, the same facts are collected from each connected machine and
+included alongside this one's.
+
 Pass --redact to replace IP addresses, hostnames, usernames and home paths
-with placeholders before the bundle leaves this machine. Loopback addresses
-and certificate fingerprints are kept: they identify nobody, and the report
-is much harder to read without them. A hostname or username too generic to
-substitute safely (three characters or fewer, or a word the report is made
-of, like 'monux' or 'server') is left in place and called out on stderr.";
+with placeholders before the bundle leaves this machine — in the peer
+sections too, using the names each peer reports about itself. Loopback
+addresses and certificate fingerprints are kept: they identify nobody, and
+the report is much harder to read without them. A hostname or username too
+generic to substitute safely (three characters or fewer, or a word the report
+is made of, like 'monux' or 'server') is left in place and called out on
+stderr, as is a peer running a monux too old to report its names — that
+section is then scrubbed for IP addresses only.
+
+Separately from bug reports: COPYING FILES between machines sends each file's
+full source path as its name inside the transferred archive, and the
+receiving machine recreates that directory layout under its own unpack dir.
+Copying ~/Documents/tax/2025.pdf therefore tells the other machine that path.
+File CONTENTS only ever go to machines you have paired with.";
 
 /// Recent daemon log lines a `monux diagnostics` bundle asks for by default.
 /// Generous next to the socket's own default: a report is written once and
@@ -140,6 +152,19 @@ pub struct Environment {
     /// `setup --autostart status` for both roles, or None when it couldn't
     /// be probed.
     pub autostart: Option<String>,
+    /// This machine's hostname, and the user the daemon runs as.
+    ///
+    /// Carried so `--redact` can scrub a PEER's identity too. The CLI knows
+    /// its OWN hostname, username and home dir, and used to scrub only those
+    /// — but a `--peer` bundle is full of the other machine's (log targets,
+    /// unit names, `/home/<them>/...` paths), and there is no other channel
+    /// through which the CLI could learn them. Defaulted on the wire so a
+    /// daemon from before this field existed still parses (its section is
+    /// then scrubbed for IPs only, and the CLI says so).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
     /// Set when this environment describes the CLI process rather than a
     /// daemon — i.e. no daemon answered and the facts are the shell's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,12 +189,14 @@ impl Environment {
             input_group: describe_input_group(),
             clipboard_tools: describe_clipboard_tools(),
             autostart: crate::setup::autostart_status_text(),
+            hostname: hostname(),
+            username: username(),
             caveat: None,
         }
     }
 
     /// Marks this environment as the CLI's own, not a daemon's.
-    fn as_cli_fallback(mut self) -> Self {
+    fn into_cli_fallback(mut self) -> Self {
         self.caveat = Some(
             "no daemon answered — these are the facts of the 'monux diagnostics' process, \
              which may differ from a daemon's (an autostarted daemon inherits the systemd \
@@ -201,6 +228,10 @@ impl Environment {
         let mut row = |k: &str, v: &str| out.push_str(&format!("{:<18}{}\n", format!("{}:", k), v));
         row("build", &self.build);
         row("arch", &self.arch);
+        // Which machine this section describes: a two-machine report is
+        // otherwise two anonymous blocks. `--redact` replaces it like every
+        // other occurrence of the name.
+        row("hostname", self.hostname.as_deref().unwrap_or("unknown"));
         row("os", self.os.as_deref().unwrap_or("unknown"));
         row("kernel", self.kernel.as_deref().unwrap_or("unknown"));
         row("session", self.session_type.as_deref().unwrap_or("unset"));
@@ -475,7 +506,29 @@ pub fn format_bundle(bundle: &Bundle, opts: FormatOptions) -> Result<String> {
         Format::Plain => render_plain(bundle),
         Format::Markdown => render_markdown(bundle),
     };
-    Ok(if opts.redact { redact(&out) } else { out })
+    // Redaction draws on the whole bundle, not just this machine: a --peer
+    // report carries the other machine's hostname, username and home paths,
+    // and the CLI can only learn them from the peer's own Environment.
+    Ok(if opts.redact {
+        redact_names(&out, &bundle_names(bundle))
+    } else {
+        out
+    })
+}
+
+/// Every machine's identifying names in a bundle: this one's, plus each
+/// peer's. The local names come from the environment as well as from our own
+/// Environment section, so a daemon that reported none (or a CLI-fallback
+/// bundle) still scrubs this machine.
+fn bundle_names(bundle: &Bundle) -> Names {
+    let mut names = Names::local();
+    names.add(&bundle.diagnostics.environment);
+    for peer in &bundle.peers {
+        if let Ok(d) = &peer.diagnostics {
+            names.add(&d.environment);
+        }
+    }
+    names
 }
 
 /// The plain-text rendering, also what the tray's "Copy diagnostics" used to
@@ -637,8 +690,103 @@ fn longest_backtick_run(s: &str) -> usize {
 // Redaction
 // ---------------------------------------------------------------------------
 
-/// Replaces the identifying values in a bundle with placeholders: LAN IP
-/// addresses, this machine's hostname, the username and home paths.
+/// The identifying names to scrub from one bundle: this machine's, plus
+/// every peer's (each carried in its own `Environment`).
+///
+/// Collected as data rather than read from the environment at substitution
+/// time, because only the LOCAL machine's names are discoverable that way —
+/// and a `--peer` bundle's most identifying text belongs to the other
+/// machine.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Names {
+    /// Machine names, replaced with `<hostname>`.
+    hostnames: Vec<String>,
+    /// User names, replaced with `<user>`; each also implies a
+    /// `/home/<name>` path to fold to `~`.
+    usernames: Vec<String>,
+}
+
+impl Names {
+    /// This machine's names, for a redaction that has no bundle to draw on.
+    fn local() -> Self {
+        Names {
+            hostnames: hostname().into_iter().collect(),
+            usernames: username().into_iter().collect(),
+        }
+    }
+
+    fn add(&mut self, env: &Environment) {
+        if let Some(host) = &env.hostname {
+            self.hostnames.push(host.clone());
+        }
+        if let Some(user) = &env.username {
+            self.usernames.push(user.clone());
+        }
+    }
+
+    /// (name, placeholder) pairs to substitute, dropping the names that would
+    /// damage the report more than they protect (see is_unsubstitutable) and
+    /// de-duplicating. A name that is both a hostname and a username on some
+    /// machine is scrubbed once, as a hostname.
+    fn substitutions(&self) -> Vec<(&str, &'static str)> {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut out = Vec::new();
+        for (names, placeholder) in [
+            (&self.hostnames, "<hostname>"),
+            (&self.usernames, "<user>"),
+        ] {
+            for name in names {
+                if is_unsubstitutable(name) || seen.contains(&name.as_str()) {
+                    continue;
+                }
+                seen.push(name);
+                out.push((name.as_str(), placeholder));
+            }
+        }
+        out
+    }
+
+    /// Home directories to fold to `~`, longest first so a nested path can't
+    /// be half-replaced. The local home dir is known exactly; a peer's is
+    /// reconstructed from its username, which covers the ordinary
+    /// `/home/<user>` layout (an unusual one simply keeps its path, and the
+    /// username pass still scrubs the name inside it).
+    fn home_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = home::home_dir()
+            .and_then(|h| h.to_str().map(str::to_string))
+            .filter(|h| h.len() > 1)
+            .into_iter()
+            .collect();
+        for user in &self.usernames {
+            if is_unsubstitutable(user) {
+                continue;
+            }
+            let path = format!("/home/{}", user);
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+        paths.sort_by_key(|p| std::cmp::Reverse(p.len()));
+        paths
+    }
+
+    /// The names that had to be left in place (see is_unsubstitutable), so
+    /// the CLI can say so rather than let the user believe everything was
+    /// scrubbed.
+    fn skipped(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for name in self.hostnames.iter().chain(self.usernames.iter()) {
+            if is_unsubstitutable(name) && !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+        out
+    }
+}
+
+/// Replaces the identifying values in text with placeholders, using only
+/// THIS machine's names. Peer-aware redaction goes through
+/// [`format_bundle`], which collects every machine's names first.
 ///
 /// Deliberately kept: loopback and wildcard addresses (`127.0.0.1`,
 /// `0.0.0.0`, `::1`) carry no identity and reading a state dump without them
@@ -649,6 +797,11 @@ fn longest_backtick_run(s: &str) -> usize {
 /// guarantee about arbitrary text — which is why the bundle is shown to the
 /// user rather than uploaded anywhere.
 pub fn redact(text: &str) -> String {
+    redact_names(text, &Names::local())
+}
+
+/// The substitution pass itself, over an explicit set of names (see [`Names`]).
+fn redact_names(text: &str, names: &Names) -> String {
     use regex::Regex;
     use std::sync::OnceLock;
     static IPV4: OnceLock<Regex> = OnceLock::new();
@@ -684,18 +837,13 @@ pub fn redact(text: &str) -> String {
         })
         .into_owned();
 
-    // Home paths before the username: /home/alice must become ~ rather than
+    // Home paths before the usernames: /home/alice must become ~ rather than
     // /home/<user>, and the bare-username pass would otherwise get there first.
-    if let Some(home) = home::home_dir().and_then(|h| h.to_str().map(str::to_string)) {
-        if home.len() > 1 {
-            out = out.replace(&home, "~");
-        }
+    for home in names.home_paths() {
+        out = out.replace(&home, "~");
     }
-    for name in [hostname(), username()].into_iter().flatten() {
-        if is_unsubstitutable(&name) {
-            continue;
-        }
-        out = replace_whole_words(&out, &name, if_hostname_placeholder(&name));
+    for (name, placeholder) in names.substitutions() {
+        out = replace_whole_words(&out, name, placeholder);
         // mDNS presents the same name with a .local suffix.
         out = out.replace(&format!("{}.local", name), "<hostname>.local");
     }
@@ -729,27 +877,33 @@ fn is_unsubstitutable(name: &str) -> bool {
     name.len() < 3 || RESERVED.contains(&name.to_ascii_lowercase().as_str())
 }
 
-/// The names `--redact` had to leave alone on this machine (see
-/// [`is_unsubstitutable`]), so the CLI can say so rather than let the user
-/// believe everything was scrubbed.
-pub fn redaction_skips() -> Vec<String> {
-    [hostname(), username()]
-        .into_iter()
-        .flatten()
-        .filter(|name| is_unsubstitutable(name))
+/// The names `--redact` had to leave alone across a whole bundle — this
+/// machine's and every peer's (see [`is_unsubstitutable`]) — so the CLI can
+/// say so rather than let the user believe everything was scrubbed.
+pub fn redaction_skips(bundle: &Bundle) -> Vec<String> {
+    bundle_names(bundle).skipped()
+}
+
+/// Whether any peer in this bundle predates the hostname/username fields, so
+/// its section could only be scrubbed for IP addresses. Reported by the CLI:
+/// silently under-redacting is exactly the failure `--redact` exists to
+/// prevent.
+pub fn peers_missing_redaction_names(bundle: &Bundle) -> Vec<String> {
+    bundle
+        .peers
+        .iter()
+        .filter(|peer| {
+            peer.diagnostics
+                .as_ref()
+                .is_ok_and(|d| d.environment.is_reported() && d.environment.hostname.is_none())
+        })
+        .map(|peer| peer.label.clone())
         .collect()
 }
 
 /// Addresses kept verbatim through redaction: they identify nobody, and a
 /// state dump reads much better with them intact.
 const KEPT_ADDRS: [&str; 4] = ["127.0.0.1", "0.0.0.0", "255.255.255.255", "::1"];
-
-fn if_hostname_placeholder(name: &str) -> &'static str {
-    match hostname().as_deref() {
-        Some(h) if h == name => "<hostname>",
-        _ => "<user>",
-    }
-}
 
 /// Replaces `needle` only where it stands as a whole word, so a username that
 /// happens to be a substring of an unrelated identifier survives.
@@ -994,13 +1148,26 @@ pub fn run_cli(opts: &CliOptions) -> Result<String> {
         },
     )?;
     if opts.redact {
-        let skipped = redaction_skips();
+        let skipped = redaction_skips(&bundle);
         if !skipped.is_empty() {
             eprintln!(
                 "note: --redact left {} in place — {} too generic to substitute without \
                  mangling the report (see 'monux diagnostics --privacy')",
                 skipped.join(" and "),
                 if skipped.len() == 1 { "it is" } else { "they are" }
+            );
+        }
+        // A peer too old to report its own names can only be scrubbed for IP
+        // addresses. Say so: quietly under-redacting is the failure --redact
+        // exists to prevent.
+        let unnamed = peers_missing_redaction_names(&bundle);
+        if !unnamed.is_empty() {
+            eprintln!(
+                "note: --redact scrubbed IP addresses only for {} — {} runs a monux from before \
+                 peers reported their hostname, so its hostname, username and home paths remain. \
+                 Update that machine, or run 'monux diagnostics --redact' on it directly.",
+                unnamed.join(" and "),
+                if unnamed.len() == 1 { "it" } else { "they" }
             );
         }
     }
@@ -1310,7 +1477,7 @@ fn offline_diagnostics(role: Role, why: &anyhow::Error) -> Diagnostics {
             why
         ),
         recent_logs: Vec::new(),
-        environment: Environment::collect().as_cli_fallback(),
+        environment: Environment::collect().into_cli_fallback(),
     }
 }
 
@@ -1458,6 +1625,122 @@ mod tests {
         assert_eq!(replace_whole_words("none here", "alice", "<user>"), "none here");
     }
 
+    /// A peer bundle whose Environment names the other machine, for the
+    /// peer-redaction tests below.
+    fn peer_fixture(label: &str, hostname: Option<&str>, username: Option<&str>) -> control::PeerDiagnostics {
+        let mut d = diagnostics_fixture();
+        d.role = "client".to_string();
+        d.environment.hostname = hostname.map(str::to_string);
+        d.environment.username = username.map(str::to_string);
+        d.state_dump = "switch=active".to_string();
+        d.recent_logs = vec![format!(
+            "INFO monux: config at /home/{}/.config/monux on {}",
+            username.unwrap_or("someone"),
+            hostname.unwrap_or("somebox")
+        )];
+        control::PeerDiagnostics {
+            label: label.to_string(),
+            diagnostics: Ok(d),
+        }
+    }
+
+    /// The gap this fixes: `--redact` used to scrub only the LOCAL machine's
+    /// hostname, username and home paths, so a `--peer` bundle published the
+    /// other machine's verbatim while PRIVACY_NOTE promised otherwise. The
+    /// names now travel with each peer's Environment.
+    #[test]
+    fn redaction_scrubs_a_peers_identity_too() {
+        let mut bundle = bundle_fixture();
+        bundle.peers = vec![peer_fixture("aa11bb22 @ 10.0.0.5:1213", Some("thinkpad"), Some("bob"))];
+        let out = format_bundle(
+            &bundle,
+            FormatOptions {
+                format: Format::Plain,
+                redact: true,
+            },
+        )
+        .unwrap();
+
+        assert!(!out.contains("thinkpad"), "the peer's hostname survived: {}", out);
+        assert!(!out.contains("bob"), "the peer's username survived: {}", out);
+        // The peer's home path folds to ~ like the local one, rather than
+        // leaking the username through the path after the name pass.
+        assert!(!out.contains("/home/bob"), "{}", out);
+        assert!(out.contains("~/.config/monux"), "{}", out);
+        assert!(out.contains("<hostname>"), "{}", out);
+        // The peer's IP was already scrubbed before this change; still is.
+        assert!(!out.contains("10.0.0.5"), "{}", out);
+        // Nothing is owed for the PEER: both its names are substitutable, and
+        // it reported them. (The skip list can still name the machine running
+        // this test, whose hostname we don't control.)
+        let skipped = redaction_skips(&bundle);
+        assert!(!skipped.contains(&"thinkpad".to_string()), "{:?}", skipped);
+        assert!(!skipped.contains(&"bob".to_string()), "{:?}", skipped);
+        assert!(peers_missing_redaction_names(&bundle).is_empty());
+    }
+
+    /// A peer running a monux from before the names were on the wire can only
+    /// be scrubbed for IPs. That must be REPORTED, not silently under-done.
+    #[test]
+    fn a_peer_without_reported_names_is_called_out() {
+        let mut bundle = bundle_fixture();
+        bundle.peers = vec![peer_fixture("aa11bb22 @ 10.0.0.5:1213", None, None)];
+        assert_eq!(
+            peers_missing_redaction_names(&bundle),
+            vec!["aa11bb22 @ 10.0.0.5:1213".to_string()]
+        );
+        // A peer that DOES report them is not called out.
+        let mut named = bundle_fixture();
+        named.peers = vec![peer_fixture("cc33 @ 10.0.0.6:1213", Some("desk-01"), Some("carol"))];
+        assert!(peers_missing_redaction_names(&named).is_empty());
+    }
+
+    /// A peer whose hostname is one of the words the report is structurally
+    /// made of gets the same protection the local machine has always had:
+    /// left in place, and named on the way out.
+    #[test]
+    fn a_peers_unsubstitutable_name_is_reported_not_mangled() {
+        let mut bundle = bundle_fixture();
+        bundle.peers = vec![peer_fixture("aa11 @ 10.0.0.5:1213", Some("monux"), Some("bo"))];
+        let skipped = redaction_skips(&bundle);
+        assert!(skipped.contains(&"monux".to_string()), "{:?}", skipped);
+        assert!(skipped.contains(&"bo".to_string()), "{:?}", skipped);
+        // ...and the report is still readable: log targets survive intact.
+        let out = format_bundle(
+            &bundle,
+            FormatOptions {
+                format: Format::Plain,
+                redact: true,
+            },
+        )
+        .unwrap();
+        assert!(out.contains("INFO monux:"), "{}", out);
+    }
+
+    /// Two machines, two sets of names, one pass: each is replaced with the
+    /// placeholder for the role it played, and a name that is both a hostname
+    /// and a username is scrubbed once.
+    #[test]
+    fn names_dedupe_and_keep_their_placeholders() {
+        let names = Names {
+            hostnames: vec!["desk-01".to_string(), "laptop".to_string()],
+            usernames: vec!["laptop".to_string(), "carol".to_string()],
+        };
+        assert_eq!(
+            names.substitutions(),
+            vec![
+                ("desk-01", "<hostname>"),
+                ("laptop", "<hostname>"),
+                ("carol", "<user>"),
+            ]
+        );
+        // Home paths are reconstructed per username, longest first so a
+        // nested path can't be half-replaced.
+        let homes = names.home_paths();
+        assert!(homes.contains(&"/home/carol".to_string()), "{:?}", homes);
+        assert!(homes.windows(2).all(|w| w[0].len() >= w[1].len()), "{:?}", homes);
+    }
+
     #[test]
     fn redaction_applies_to_a_formatted_bundle() {
         let mut bundle = bundle_fixture();
@@ -1505,7 +1788,7 @@ mod tests {
 
     #[test]
     fn the_cli_fallback_environment_is_labelled() {
-        let env = Environment::collect().as_cli_fallback();
+        let env = Environment::collect().into_cli_fallback();
         assert!(env.render().starts_with("note: no daemon answered"));
     }
 
