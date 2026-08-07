@@ -113,19 +113,22 @@ fn create_socket(bind_addr: SocketAddr, mode: NetworkMode) -> Result<std::net::U
     // Helper that closes the fd on error paths before we wrap it in UdpSocket.
     let close_fd = || unsafe { libc::close(fd) };
 
-    let apply_socket_opts = || -> Result<()> {
+    // Every option here is an optimization, not a requirement: a kernel that
+    // refuses one warns and the socket still works, so nothing in this block
+    // can fail the bind.
+    let apply_socket_opts = || {
         setsockopt(
             fd,
             libc::SOL_SOCKET,
             libc::SO_SNDBUF,
             &SOCKET_BUF_SIZE,
-        )?;
+        );
         setsockopt(
             fd,
             libc::SOL_SOCKET,
             libc::SO_RCVBUF,
             &SOCKET_BUF_SIZE,
-        )?;
+        );
         // The kernel silently clamps these to net.core.{w,r}mem_max (~208 KiB
         // on a stock system), inviting drops during clipboard bursts. Verify
         // what we actually got and point at the fix if clamped.
@@ -138,7 +141,7 @@ fn create_socket(bind_addr: SocketAddr, mode: NetworkMode) -> Result<std::net::U
                 libc::SOL_SOCKET,
                 libc::SO_PRIORITY,
                 &SOCKET_PRIORITY,
-            )?;
+            );
             // SO_PRIORITY=6 is monux's WMM mark: the local WiFi driver maps
             // skb->priority 6 onto 802.11 UP 6, i.e. the voice access category
             // (AC_VO), on this machine's own egress link — no privileges
@@ -150,13 +153,9 @@ fn create_socket(bind_addr: SocketAddr, mode: NetworkMode) -> Result<std::net::U
             // needs netfilter instead (see README, "RTT spikes and degraded
             // links").
         }
-        Ok(())
     };
 
-    if let Err(e) = apply_socket_opts() {
-        close_fd();
-        return Err(e);
-    }
+    apply_socket_opts();
 
     // Bind using libc so that we keep control of the fd until the UdpSocket takes ownership.
     let bind_ret = match bind_addr {
@@ -211,12 +210,10 @@ fn create_socket(bind_addr: SocketAddr, mode: NetworkMode) -> Result<std::net::U
     Ok(unsafe { std::net::UdpSocket::from_raw_fd(fd) })
 }
 
-fn setsockopt<T>(
-    fd: libc::c_int,
-    level: libc::c_int,
-    opt: libc::c_int,
-    value: &T,
-) -> Result<()> {
+/// Applies one socket option, warning if the kernel refuses it. Infallible by
+/// design: every option monux sets is a latency optimization the socket works
+/// without, so a refusal must not fail the bind (see create_socket).
+fn setsockopt<T>(fd: libc::c_int, level: libc::c_int, opt: libc::c_int, value: &T) {
     let ret = unsafe {
         libc::setsockopt(
             fd,
@@ -230,7 +227,6 @@ fn setsockopt<T>(
         let err = std::io::Error::last_os_error();
         warn!("setsockopt(level={}, opt={}) failed: {}", level, opt, err);
     }
-    Ok(())
 }
 
 /// Warns if the kernel clamped a socket buffer below the requested size.

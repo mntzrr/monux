@@ -264,7 +264,17 @@ pub fn live_holder(kind: &str) -> Option<i32> {
     // crashed without flock-release being an issue — flock auto-releases on
     // process death — but the pid file survived). flock works on a read-only
     // fd, so this handles the cross-user case too.
-    match fs::OpenOptions::new().read(true).open(&path) {
+    //
+    // O_NOFOLLOW for the same reason acquire() refuses a symlink up front:
+    // the lock dir is world-writable /tmp, so the path is only worth trusting
+    // when it is the regular file we put there. This probe only reads, but a
+    // planted symlink could still make it report the wrong role for the
+    // machine — which is what decides whether the update gate applies.
+    match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+    {
         Ok(f) => {
             if try_lock(&f) {
                 let _ = rustix::fs::flock(&f, rustix::fs::FlockOperation::Unlock);

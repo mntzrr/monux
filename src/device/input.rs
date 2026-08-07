@@ -31,7 +31,20 @@ const GRAB_QUIESCENT_POLL: Duration = Duration::from_millis(50);
 /// press+release pairs. Falls back to grabbing anyway (with a loud log) after
 /// GRAB_QUIESCENT_TIMEOUT, e.g. when a key is stuck held in the kernel because
 /// a wireless dongle lost a release packet.
-async fn grab_keyboard_when_quiescent(stream: &mut EventStream, device_info: &mut util::DeviceInfo) {
+///
+/// Returns whether the grab landed. A failure is handed back to the caller's
+/// ordinary retry path (see apply_grab_transition) rather than retried in a
+/// loop here: this runs inside the device task's select, so looping would
+/// stop the task servicing anything else — a pause request could not ungrab,
+/// and the events piling up unread in the device's buffer would be read back
+/// AFTER the grab finally landed and forwarded to a client, even though the
+/// local system had already processed them ungrabbed. Yielding instead lets
+/// those events be read and dropped as the ungrabbed input they are (see
+/// Rotation::send_input_events).
+async fn grab_keyboard_when_quiescent(
+    stream: &mut EventStream,
+    device_info: &mut util::DeviceInfo,
+) -> bool {
     let start = std::time::Instant::now();
     loop {
         let held: Vec<u16> = match stream.device().get_key_state() {
@@ -63,18 +76,9 @@ async fn grab_keyboard_when_quiescent(stream: &mut EventStream, device_info: &mu
         );
         time::sleep(GRAB_QUIESCENT_POLL).await;
     }
-    // Don't read events until the grab succeeds. Without the grab, events
-    // would leak through to the local system while also being routed onwards
-    // by monux. Another process (e.g. a stale monux server) may hold the grab
-    // temporarily, so keep retrying.
-    while !handle_grab_event(stream, device_info, GrabEvent::Grab) {
-        warn!(
-            "Failed to grab {:?}, retrying in {:?}",
-            stream.device().name().unwrap_or("(Unnamed device)"),
-            GRAB_RETRY_INTERVAL
-        );
-        time::sleep(GRAB_RETRY_INTERVAL).await;
-    }
+    // Another process (e.g. a stale monux server) may hold the grab
+    // temporarily; the caller retries on GRAB_RETRY_INTERVAL.
+    handle_grab_event(stream, device_info, GrabEvent::Grab)
 }
 
 pub struct InputHandler {
@@ -172,8 +176,8 @@ pub(crate) fn class_grabbed(class: DeviceClass, state: &GrabState) -> bool {
 /// Drives the device toward the target grab state, returning Some(target) when
 /// the transition failed and must be retried (see GRAB_RETRY_INTERVAL).
 /// Grabbing a KEYBOARD waits for the device to become quiescent first (see
-/// grab_keyboard_when_quiescent) — that helper retries the grab itself until
-/// it succeeds, so a keyboard grab never lands on the retry path here.
+/// grab_keyboard_when_quiescent); a failure there takes the same retry path
+/// as any other, so the device task stays responsive meanwhile.
 async fn apply_grab_transition(
     stream: &mut EventStream,
     device_info: &mut util::DeviceInfo,
@@ -181,8 +185,7 @@ async fn apply_grab_transition(
     target: bool,
 ) -> Option<bool> {
     let ok = if target && class == DeviceClass::Keyboard {
-        grab_keyboard_when_quiescent(stream, device_info).await;
-        true
+        grab_keyboard_when_quiescent(stream, device_info).await
     } else {
         handle_grab_event(
             stream,
@@ -470,7 +473,7 @@ fn handle_grab_event(
                 return false;
             }
             device_info.is_grabbed = true;
-            return true;
+            true
         }
         GrabEvent::Ungrab => {
             info!(
@@ -496,7 +499,7 @@ fn handle_grab_event(
                 return false;
             }
             device_info.is_grabbed = false;
-            return true;
+            true
         }
     }
 }
@@ -583,7 +586,7 @@ mod tests {
     /// button and timestamp events stays well inside it.
     #[test]
     fn the_batch_cap_clears_real_multitouch_frames() {
-        assert!(MAX_BATCH_EVENTS >= 128, "a multi-finger frame must not split");
+        const { assert!(MAX_BATCH_EVENTS >= 128, "a multi-finger frame must not split") };
     }
 
     fn device_info_with_dims(dims: &[(u16, (i32, i32))]) -> util::DeviceInfo {

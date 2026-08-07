@@ -443,6 +443,11 @@ fn acquire_update_lock(src_dir: &Path) -> Result<UpdateLock> {
     // too since umask may restrict the create mode.
     let file = std::fs::OpenOptions::new()
         .create(true)
+        // Explicitly NOT truncating: nothing ever reads this file's contents
+        // (flock on the open file description is the whole mechanism), and
+        // truncating a file another updater currently holds would be a write
+        // to a file we do not own yet.
+        .truncate(false)
         .write(true)
         .mode(0o666)
         .open(&path)

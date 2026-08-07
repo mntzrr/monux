@@ -782,7 +782,7 @@ impl Connection {
                     self.next_fetch_id = self.next_fetch_id.wrapping_add(1);
                     let msg = bulk::ClientBulk::ClipboardRequest(bulk::ClientClipboardRequest{
                         requested_type: &local_fetch_request.requested_type,
-                        max_size_bytes: self.max_clipboard_size_bytes as u64,
+                        max_size_bytes: self.max_clipboard_size_bytes,
                         request_id,
                     });
                     let serializedmsg = postcard::to_stdvec_cobs(&msg)

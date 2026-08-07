@@ -1028,7 +1028,10 @@ async fn serve_connection(stream: tokio::net::UnixStream, handler: Arc<Handler>)
         if n == 0 {
             return Ok(()); // peer closed
         }
-        if line.len() > MAX_REQUEST_LINE + 1 || !line.ends_with('\n') {
+        // The take() above admits one byte past the cap so an over-long line
+        // is detectable rather than silently truncated; the line itself must
+        // still fit, terminator included.
+        if line.len() > MAX_REQUEST_LINE || !line.ends_with('\n') {
             return Err(anyhow!("request line exceeds {} bytes", MAX_REQUEST_LINE));
         }
         let (response, post_action) = match serde_json::from_str::<Request>(line.trim()) {

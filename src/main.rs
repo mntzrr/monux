@@ -1098,7 +1098,11 @@ fn main() -> Result<()> {
         Commands::Daemon(args) => match &args.command {
             DaemonCommands::Switch(args) => {
                 cli_sigpipe_kill();
-                let request = format!(r#"{{"cmd":"switch","target":"{}"}}"#, args.target);
+                // Built through serde rather than format!: the target is
+                // arbitrary user input, and a quote or backslash in it would
+                // otherwise produce a malformed request line.
+                let request =
+                    serde_json::json!({"cmd": "switch", "target": args.target}).to_string();
                 let out = monux::control::daemon_cli(&request, "Switch requested", args.socket.as_deref())?;
                 println!("{}", out);
                 return Ok(());
@@ -1691,10 +1695,13 @@ fn maybe_elevate(reason: &str) -> Result<()> {
     let exe = std::env::current_exe()
         .context("Failed to find our own executable for sudo re-exec")?;
     info!("Re-executing with sudo {} (MONUX_NO_ELEVATE=1 to opt out)...", reason);
+    // args_os, not args: the latter panics on non-UTF-8 argv, and a --device
+    // regex or an --edge-map monitor description can carry anything the shell
+    // passed us (see reexec_after_update, which already does this).
     let status = std::process::Command::new("sudo")
         .arg("-E")
         .arg(&exe)
-        .args(std::env::args().skip(1))
+        .args(std::env::args_os().skip(1))
         .status()
         .context("Failed to re-exec with sudo")?;
     std::process::exit(status.code().unwrap_or(1));

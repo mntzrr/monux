@@ -3155,11 +3155,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 // it too would double every event (seen as double pointer
                 // input while a mouse grab keeps failing — e.g. a foreign
                 // process holding the grab — or during the re-grab window on
-                // resume). Keyboards can't reach this arm ungrabbed: their
-                // grab failure blocks the reader task until the grab lands
-                // (grab_keyboard_when_quiescent), and the paused case
-                // returned above. This input belongs to the local system
-                // exclusively; drop it.
+                // resume). Keyboards reach this arm too, while a grab of
+                // theirs is still being retried (see apply_grab_transition).
+                // This input belongs to the local system exclusively; drop it.
                 keytrace_route(&batch.events, "ungrabbed drop (client active)");
                 trace!(
                     "Dropping {} ungrabbed input events while client {} is active (grab pending or failing; the local system already has them)",

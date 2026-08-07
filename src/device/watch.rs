@@ -28,10 +28,16 @@ pub async fn watch_loop<H: handles::DeviceHandler>(
     virtual_nodes: Vec<PathBuf>,
 ) -> Result<()> {
     // Start watch for new and removed devices BEFORE scanning current devices.
+    // Unbounded deliberately: these events are rare (a hotplug, a monux
+    // restart's virtual-device churn) and tiny, while DROPPING one is not
+    // recoverable — a missed Created leaves a keyboard unwatched until the
+    // next replug, and a missed Deleted leaks its reader task. A bounded
+    // channel could only offer backpressure the notify callback cannot apply
+    // (it is a sync callback on the inotify thread, so it must try_send).
     let (device_event_tx, mut device_event_rx): (
-        mpsc::Sender<DeviceEvent>,
-        mpsc::Receiver<DeviceEvent>,
-    ) = mpsc::channel(32);
+        mpsc::UnboundedSender<DeviceEvent>,
+        mpsc::UnboundedReceiver<DeviceEvent>,
+    ) = mpsc::unbounded_channel();
     let mut watcher = notify::RecommendedWatcher::new(
         move |res: Result<notify::Event, notify::Error>| match res {
             Ok(event) => send_device_events(event, &device_event_tx),
@@ -74,7 +80,7 @@ pub async fn watch_loop<H: handles::DeviceHandler>(
 
 async fn handle_device_event<H: handles::DeviceHandler>(
     device_handles: &mut handles::DeviceHandles<H>,
-    device_filters: &Vec<Regex>,
+    device_filters: &[Regex],
     virtual_nodes: &[PathBuf],
     event: DeviceEvent,
 ) {
@@ -217,7 +223,7 @@ fn compatible_device(d: &Device, path: &Path, device_info: &util::DeviceInfo) ->
 }
 
 fn matches_filters(
-    name_filters: &Vec<Regex>,
+    name_filters: &[Regex],
     device: &Device,
     path: &Path,
     device_info: &util::DeviceInfo,
@@ -233,8 +239,8 @@ fn matches_filters(
     let is_match = !matches.is_empty();
     if !is_match {
         util::log_device_info(
-            &device,
-            &path,
+            device,
+            path,
             device_info,
             "Ignoring device that doesn't match --device name filters",
             true,
@@ -243,27 +249,29 @@ fn matches_filters(
     is_match
 }
 
-fn send_device_events(event: notify::Event, device_event_tx: &mpsc::Sender<DeviceEvent>) {
+fn send_device_events(event: notify::Event, device_event_tx: &mpsc::UnboundedSender<DeviceEvent>) {
     match event.kind {
         notify::EventKind::Create(notify::event::CreateKind::File) => {
             debug!("File created: {:?}", event);
             for path in event.paths {
-                if let Err(e) = device_event_tx.try_send(DeviceEvent {
+                // The only failure left on an unbounded channel is a closed
+                // receiver: the watch loop is gone, i.e. we are shutting down.
+                if let Err(e) = device_event_tx.send(DeviceEvent {
                     kind: DeviceEventKind::Created,
                     path,
                 }) {
-                    warn!("Failed to queue device create event: {:?}", e);
+                    debug!("Dropping device create event (watch loop gone): {:?}", e);
                 }
             }
         }
         notify::EventKind::Remove(notify::event::RemoveKind::File) => {
             debug!("File deleted: {:?}", event);
             for path in event.paths {
-                if let Err(e) = device_event_tx.try_send(DeviceEvent {
+                if let Err(e) = device_event_tx.send(DeviceEvent {
                     kind: DeviceEventKind::Deleted,
                     path,
                 }) {
-                    warn!("Failed to queue device delete event: {:?}", e);
+                    debug!("Dropping device delete event (watch loop gone): {:?}", e);
                 }
             }
         }
