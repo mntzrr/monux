@@ -606,7 +606,7 @@ impl Connection {
         // The pacing cell starts at the Normal-tier rate; monitor_link
         // rewrites it as the measured link tier changes (adaptive fidelity).
         let throttle_cell = throttle::shared_throttle(crate::rotation::effective_throttle_mbps(
-            &throttle_mode,
+            throttle_mode,
             Tier::Normal,
         ));
         throttle::spawn_bulk_writer(
@@ -1324,7 +1324,7 @@ impl Connection {
                             // that faces the same local condition.
                             warn!("Got a clipboard fetch from the server but have no local clipboard; serving empty");
                             let msg = bulk::ClientBulk::ClipboardHeader(bulk::ClientClipboardHeader {
-                                requested_type: &c.requested_type,
+                                requested_type: c.requested_type,
                                 data_type: None,
                                 content_len_bytes: 0,
                                 request_client: c.request_client,
@@ -1389,7 +1389,7 @@ impl Connection {
                         }
                         let msg = bulk::ClientBulk::ClipboardHeader(bulk::ClientClipboardHeader {
                             requested_type: &requested_type,
-                            data_type: data_type.as_ref().map(|t| t.as_str()),
+                            data_type: data_type.as_deref(),
                             content_len_bytes: local_clipboard_data.len() as u64,
                             request_client,
                             request_id,

@@ -60,7 +60,7 @@ fn parse_goto(keys_goto: &str) -> Result<KeyCombo> {
             keys_goto
         );
     }
-    let keys = split.get(0).expect("entry_split has len=2");
+    let keys = split.first().expect("entry_split has len=2");
     let fingerprint_prefix = split.get(1).expect("entry_split has len=2").to_string();
     parse_action(keys, Event::SwitchTo(fingerprint_prefix))
 }
@@ -83,7 +83,7 @@ fn parse_action(keys: &str, action: Event) -> Result<KeyCombo> {
         } else {
             // Didn't find 'KEY_<X>', try just '<X>' for things like 'BTN_0'
             keys.push(
-                KeyCode::from_str(format!("{}", keyname).as_str())
+                KeyCode::from_str(keyname.to_string().as_str())
                     .map_err(|e| anyhow!("Unsupported key '{}': Tried KEY_{} and {}, see list of available keys at https://docs.rs/evdev/latest/evdev/struct.KeyCode.html (error: {:?})", keyname_orig, keyname, keyname, e))?,
             );
         }
@@ -208,7 +208,7 @@ impl ComboState {
                 return Some(idx);
             }
         }
-        return None;
+        None
     }
 
     /// Number of keys in this combo. Used to pick the most specific chord when

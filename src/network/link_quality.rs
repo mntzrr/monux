@@ -42,6 +42,12 @@ pub struct LinkQuality {
     good_streak: u32,
 }
 
+impl Default for LinkQuality {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LinkQuality {
     pub fn new() -> Self {
         LinkQuality {

@@ -126,6 +126,12 @@ pub struct RespawnPolicy {
     respawns: u32,
 }
 
+impl Default for RespawnPolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RespawnPolicy {
     pub fn new() -> Self {
         RespawnPolicy { respawns: 0 }

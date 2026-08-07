@@ -1177,7 +1177,7 @@ fn attach_tail(doc: &mut toml_edit::DocumentMut, section: &str, block: &str) {
         .position(|name| name == section)
         .and_then(|i| sections.get(i + 1));
     match next {
-        Some(name) if doc.get(name).map_or(false, |i| i.is_table()) => {
+        Some(name) if doc.get(name).is_some_and(|i| i.is_table()) => {
             let table = doc
                 .get_mut(name)
                 .and_then(|i| i.as_table_mut())
@@ -1476,7 +1476,7 @@ pub fn revert_value(path: &Path, key: &str, to: Option<&str>) -> Result<RevertOu
     let present = doc
         .get(section)
         .and_then(|i| i.as_table())
-        .map_or(false, |t| t.contains_value(spec.flag));
+        .is_some_and(|t| t.contains_value(spec.flag));
     let stack = key_stack(&doc, spec);
     if stack.is_empty() {
         bail!("no history for '{}' — nothing to revert to", key);
@@ -1697,7 +1697,7 @@ pub fn did_you_mean(key: &str) -> Option<&'static str> {
     let mut best: Option<(&str, usize)> = None;
     for spec in REGISTRY {
         let d = levenshtein(key, spec.key);
-        if d <= 3 && best.map_or(true, |(_, bd)| d < bd) {
+        if d <= 3 && best.is_none_or(|(_, bd)| d < bd) {
             best = Some((spec.key, d));
         }
     }

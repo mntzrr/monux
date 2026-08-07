@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{self, prelude::*, IsTerminal};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -165,7 +165,7 @@ impl<'a> MonuxCertVerification<'a> {
     pub fn new(
         splash_label: &str,
         approved_cert_fingerprints: Vec<String>,
-        config_dir: &PathBuf,
+        config_dir: &Path,
         allow_interactive_prompts: bool,
     ) -> Result<Arc<Self>> {
         let (our_cert, our_privkey) = certs::load_keypair(splash_label, config_dir)
@@ -184,7 +184,7 @@ impl<'a> MonuxCertVerification<'a> {
             )
         }
         Ok(Arc::new(MonuxCertVerification {
-            config_dir: config_dir.clone(),
+            config_dir: config_dir.to_path_buf(),
             our_cert,
             our_privkey,
             approved_cert_fingerprints,
@@ -687,14 +687,14 @@ mod tests {
         MonuxCertVerification::new(
             "test",
             vec![],
-            &dir.to_path_buf(),
+            dir,
             allow_interactive_prompts,
         )
         .expect("failed to construct verifier")
     }
 
     fn peer_cert(dir: &std::path::Path) -> rustls_pki_types::CertificateDer<'static> {
-        certs::load_keypair("peer", &dir.to_path_buf())
+        certs::load_keypair("peer", dir)
             .expect("couldn't generate peer keypair")
             .0
     }
@@ -951,7 +951,7 @@ mod tests {
         let verifier = MonuxCertVerification::new(
             "test",
             vec![their_fingerprint.clone()],
-            &dir.path().to_path_buf(),
+            dir.path(),
             false,
         )
         .expect("failed to construct verifier");

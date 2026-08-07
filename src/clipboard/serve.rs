@@ -44,14 +44,18 @@ pub struct SharedClipboardReader {
     negative_ttl: Duration,
 }
 
+/// A cached successful serve: the cache epoch it was read under, the
+/// requested mime type, the payload, and the data type it was converted to.
+/// The payload is Arc'd: retry bursts from clipboard managers are the hits
+/// this cache exists for, and a Vec clone would memcpy the whole (potentially
+/// tens of MB) payload per request.
+type ServedEntry = (u64, String, Arc<[u8]>, Option<String>);
+
 struct Inner {
     reader: Box<dyn ClipboardReader>,
-    /// (cache epoch, requested_type, content, data_type) of the last
-    /// successful serve. Single slot: requests within a burst are for the
-    /// same clipboard. The payload is Arc'd: retry bursts from clipboard
-    /// managers are the hits this cache exists for, and a Vec clone would
-    /// memcpy the whole (potentially tens of MB) payload per request.
-    last_served: Option<(u64, String, Arc<[u8]>, Option<String>)>,
+    /// The last successful serve. Single slot: requests within a burst are
+    /// for the same clipboard.
+    last_served: Option<ServedEntry>,
     /// (cache epoch, requested_type, when) of the last failed or empty serve.
     /// A matching request within NEGATIVE_SERVE_CACHE_TTL gets an empty
     /// answer without re-reading; an epoch bump (clipboard changed) or a TTL

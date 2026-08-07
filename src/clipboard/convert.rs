@@ -74,7 +74,7 @@ pub async fn write(
     max_uncompressed_size_bytes: u64,
     requested_type: &str,
     data_type: &str,
-    config_dir: &PathBuf,
+    config_dir: &Path,
 ) -> Result<Vec<u8>> {
     debug!("Converting clipboard data from data_type={} to requested_type={}", data_type, requested_type);
     match (requested_type, data_type) {
@@ -86,7 +86,7 @@ pub async fn write(
             .await?
         }
         (PATHS_TARGET_GNOME, MONUX_COPIED_FILES_DATATYPE) => {
-            let config_dir = config_dir.clone();
+            let config_dir = config_dir.to_path_buf();
             let paths = task::spawn_blocking(move || {
                 unpack_zip_payload(buf, max_uncompressed_size_bytes, &config_dir)
             })
@@ -94,7 +94,7 @@ pub async fn write(
             write_gnome_file_paths(paths)
         }
         (PATHS_TARGET_URIS, MONUX_COPIED_FILES_DATATYPE) => {
-            let config_dir = config_dir.clone();
+            let config_dir = config_dir.to_path_buf();
             let paths = task::spawn_blocking(move || {
                 unpack_zip_payload(buf, max_uncompressed_size_bytes, &config_dir)
             })
@@ -256,7 +256,7 @@ static UNPACK_DIR_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 fn unpack_zip_payload(
     zipdata: Vec<u8>,
     mut max_uncompressed_size_bytes: u64,
-    config_dir: &PathBuf,
+    config_dir: &Path,
 ) -> Result<Vec<PathBuf>> {
     // Use a unique temp directory per unpack rather than wiping a shared one:
     // two unpacks may run at the same time.
@@ -295,7 +295,7 @@ fn unpack_zip_payload(
             bail!("Invalid path for file: {}", zipfile.name());
         }
         if let Some(parent) = destpath.parent() {
-            std::fs::create_dir_all(&parent).with_context(|| {
+            std::fs::create_dir_all(parent).with_context(|| {
                 format!("Failed to create temp directory: {}", parent.display())
             })?;
         }
@@ -321,7 +321,7 @@ fn build_zip_payload(file_uri_strs: Vec<&str>, max_compressed_size_bytes: u64) -
         if files_to_zip.len() >= MAX_ZIP_ENTRIES {
             bail!("Too many files in clipboard: exceeding limit of {}", MAX_ZIP_ENTRIES);
         }
-        let uri = url::Url::parse(&uri_str)?;
+        let uri = url::Url::parse(uri_str)?;
         let path = uri
             .to_file_path()
             .map_err(|_e| anyhow!("Invalid file entry: {}", uri))?;
@@ -622,7 +622,7 @@ mod tests {
             GENEROUS_CAP,
             paths_target,
             &data_type.unwrap(),
-            &unpack_root.path().to_path_buf(),
+            unpack_root.path(),
         )
         .await
         .unwrap();
@@ -680,7 +680,7 @@ mod tests {
         )
         .unwrap();
         let unpack_root = tempfile::tempdir().unwrap();
-        let paths = unpack_zip_payload(zip, GENEROUS_CAP, &unpack_root.path().to_path_buf())
+        let paths = unpack_zip_payload(zip, GENEROUS_CAP, unpack_root.path())
             .unwrap();
         assert_eq!(paths.len(), 1);
         assert_eq!(std::fs::read(&paths[0]).unwrap(), b"a");
@@ -699,7 +699,7 @@ mod tests {
         )
         .unwrap();
         let unpack_root = tempfile::tempdir().unwrap();
-        let paths = unpack_zip_payload(zip, GENEROUS_CAP, &unpack_root.path().to_path_buf())
+        let paths = unpack_zip_payload(zip, GENEROUS_CAP, unpack_root.path())
             .unwrap();
         assert_eq!(paths.len(), 2);
     }
@@ -718,7 +718,7 @@ mod tests {
         ] {
             let zip = read_uri_file_paths(payload.into_bytes(), GENEROUS_CAP).unwrap();
             let unpack_root = tempfile::tempdir().unwrap();
-            let paths = unpack_zip_payload(zip, GENEROUS_CAP, &unpack_root.path().to_path_buf())
+            let paths = unpack_zip_payload(zip, GENEROUS_CAP, unpack_root.path())
                 .unwrap();
             assert_eq!(paths.len(), 2);
         }
@@ -777,7 +777,7 @@ mod tests {
             ("/absolute/path.txt", b"absolute"),
             ("ok.txt", b"fine"),
         ]);
-        let paths = unpack_zip_payload(zip, GENEROUS_CAP, &unpack_root.path().to_path_buf())
+        let paths = unpack_zip_payload(zip, GENEROUS_CAP, unpack_root.path())
             .unwrap();
 
         // Every entry was unpacked INSIDE the temp dir: the Normal-components
@@ -811,7 +811,7 @@ mod tests {
         // all: it would unpack onto the unpack dir itself, so it is rejected.
         let zip = build_test_zip(&[("..", b"evil"), ("ok.txt", b"fine")]);
         assert!(
-            unpack_zip_payload(zip, GENEROUS_CAP, &unpack_root.path().to_path_buf()).is_err()
+            unpack_zip_payload(zip, GENEROUS_CAP, unpack_root.path()).is_err()
         );
     }
 
@@ -822,12 +822,12 @@ mod tests {
         let unpack_root = tempfile::tempdir().unwrap();
         let big = vec![b'x'; 1000];
         let zip = build_test_zip(&[("big.txt", &big)]);
-        assert!(unpack_zip_payload(zip, 100, &unpack_root.path().to_path_buf()).is_err());
+        assert!(unpack_zip_payload(zip, 100, unpack_root.path()).is_err());
 
         // The cap is cumulative across entries.
         let unpack_root = tempfile::tempdir().unwrap();
         let zip = build_test_zip(&[("a.txt", &big[..100]), ("b.txt", &big[..100])]);
-        assert!(unpack_zip_payload(zip, 150, &unpack_root.path().to_path_buf()).is_err());
+        assert!(unpack_zip_payload(zip, 150, unpack_root.path()).is_err());
     }
 
     #[tokio::test]

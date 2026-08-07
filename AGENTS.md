@@ -24,6 +24,10 @@ policy was adopted.
 
 - `cargo build --release` must finish with zero warnings; `cargo test`
   green before committing.
+- `cargo clippy --all-targets -- -D warnings` must be clean too. The tree
+  was brought to zero on 2026-08-07; keeping it there is far cheaper than
+  the next cleanup. Where a lint is genuinely wrong for the code, add a
+  targeted `#[allow]` with a comment saying why — never a blanket allow.
 - Commit messages: no line wrapping; one idea per paragraph via multiple
   `-m` flags.
 - `PLAN.md` tracks the multi-phase improvement plan and its per-phase

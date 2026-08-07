@@ -229,13 +229,18 @@ pub(crate) fn passwd_entry(name: &str) -> Result<(PathBuf, u32, u32)> {
     ))
 }
 
+/// Where a per-user install goes: the invoking user's home dir, plus the
+/// uid/gid the files should be chowned to when setup runs as root via sudo
+/// (None when unprivileged — the files are ours anyway).
+type InvokingUser = (PathBuf, Option<(u32, u32)>);
+
 /// Resolves the invoking user's home dir, plus the uid/gid user-visible
 /// files should be chowned to when setup runs as root via sudo (None when
 /// unprivileged: files are ours anyway). Returns Ok(None) when there is no
 /// sensible target: running as root directly (root's home is not the one a
 /// desktop session uses, and these installs are per-user). Shared by the
 /// autostart and the desktop-shortcut targets.
-fn resolve_invoking_user() -> Result<Option<(PathBuf, Option<(u32, u32)>)>> {
+fn resolve_invoking_user() -> Result<Option<InvokingUser>> {
     let sudo_user = std::env::var("SUDO_USER").unwrap_or_default();
     if unsafe { libc::geteuid() } == 0 {
         if sudo_user.is_empty() || sudo_user == "root" {
@@ -260,13 +265,10 @@ fn resolve_autostart_target() -> Result<Option<AutostartTarget>> {
     Ok(Some(AutostartTarget {
         unit_dir: home.join(SYSTEMD_USER_UNIT_DIR),
         systemctl: Systemctl {
-            user: match owner {
-                Some((uid, _)) => Some(UserCtx {
+            user: owner.map(|(uid, _)| UserCtx {
                     name: sudo_user,
                     uid,
                 }),
-                None => None,
-            },
         },
         owner,
     }))
@@ -1331,11 +1333,11 @@ mod tests {
         }
     }
 
+    /// The shared log a recording executor appends to.
+    type Recorded = std::rc::Rc<std::cell::RefCell<Vec<CmdSpec>>>;
+
     /// An executor that records every command instead of running it.
-    fn recording_executor() -> (
-        std::rc::Rc<std::cell::RefCell<Vec<CmdSpec>>>,
-        impl FnMut(&CmdSpec) -> Result<()>,
-    ) {
+    fn recording_executor() -> (Recorded, impl FnMut(&CmdSpec) -> Result<()>) {
         let recorded = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let rec = recorded.clone();
         let run = move |spec: &CmdSpec| -> Result<()> {

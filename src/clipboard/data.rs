@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
@@ -35,7 +35,7 @@ pub async fn fetch_clipboard_data(
     fetch_data_tx: &mpsc::Sender<ClipboardFetch>,
     requested_type: &str,
     max_uncompressed_size_bytes: u64,
-    config_dir: &PathBuf,
+    config_dir: &Path,
 ) -> Option<ClipboardData> {
     debug!("Fetching clipboard with type {}", requested_type);
     let (fetch_result_tx, fetch_result_rx) = oneshot::channel();

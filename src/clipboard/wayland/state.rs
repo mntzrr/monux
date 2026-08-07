@@ -72,7 +72,7 @@ impl State {
         // Just scan the seats for the first match (has the requested mime type).
         // Keep it simple until/unless we know we need multi-seat support.
         let mut found: Option<data_control::Offer> = None;
-        for (_seat, data) in self.seats.iter() {
+        for data in self.seats.values() {
             if let Some(offer_data) = &data.regular_offer {
                 if offer_data.mime_types.contains(mime_type) {
                     found = Some(offer_data.offer.clone());
@@ -245,7 +245,6 @@ impl_dispatch_offer!(State, |state: &mut Self, offer: data_control::Offer, event
             mime_types.push(mime_type.clone());
         } else {
             error!("No offer->types mapping found for offer/Offer event: {:?}", event);
-            return;
-        };
+        }
     }
 });

@@ -352,11 +352,7 @@ fn collect_server_protocol_versions(daemon: &ServiceDaemon) -> Result<Vec<u64>> 
         .into_iter()
         .collect();
     let mut versions = BTreeSet::new();
-    loop {
-        let remaining = match deadline.checked_duration_since(Instant::now()) {
-            Some(remaining) => remaining,
-            None => break,
-        };
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
         match receiver.recv_timeout(remaining) {
             Ok(ServiceEvent::ServiceResolved(resolved)) => {
                 match protocol_version_of(resolved.get_properties()) {

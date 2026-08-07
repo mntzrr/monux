@@ -110,7 +110,7 @@ impl DeviceInfo {
         if let Some(abs_axes) = device.supported_absolute_axes() {
             if let Ok(state) = device.get_abs_state() {
                 // clippy recommends this ugly way to get a loop counter
-                for (i, s) in (0_u16..).zip(state.into_iter()) {
+                for (i, s) in (0_u16..).zip(state) {
                     let type_ = AbsoluteAxisCode::from_index(i as usize);
                     if abs_axes.contains(type_) && axis_scale_type(type_) != AxisScale::Invalid {
                         dims.insert(i, (s.minimum, s.maximum));

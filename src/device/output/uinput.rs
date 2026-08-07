@@ -394,19 +394,11 @@ impl VirtualUInputDevices {
         routed.extend(events.iter().filter_map(|event| {
             if let Some(e) = &event.inputf64 {
                 let evdev_event = e.to_evdev(SCALED_DIM_MIN, SCALED_DIM_MAX);
-                if let Some(dest) = self.route_event(evdev_event, class) {
-                    Some((evdev_event, dest))
-                } else {
-                    None
-                }
+                self.route_event(evdev_event, class).map(|dest| (evdev_event, dest))
             } else if let Some(e) = &event.inputi32 {
                 let evdev_event = e.to_evdev();
                 check_discrete_axis_range(&evdev_event);
-                if let Some(dest) = self.route_event(evdev_event, class) {
-                    Some((evdev_event, dest))
-                } else {
-                    None
-                }
+                self.route_event(evdev_event, class).map(|dest| (evdev_event, dest))
             } else {
                 warn!("Event missing either an i32 or an f64 value: {}", event);
                 None
@@ -565,7 +557,7 @@ impl VirtualUInputDevices {
                 events.len(),
                 events
                     .iter()
-                    .map(|e| util::log_event(e))
+                    .map(util::log_event)
                     .collect::<Vec<String>>()
             );
             emit_events(&mut self.keyboard_device, &events)?;
@@ -580,7 +572,7 @@ impl VirtualUInputDevices {
                 events.len(),
                 events
                     .iter()
-                    .map(|e| util::log_event(e))
+                    .map(util::log_event)
                     .collect::<Vec<String>>()
             );
             emit_events(&mut self.mouse_device, &events)?;
@@ -595,7 +587,7 @@ impl VirtualUInputDevices {
                 events.len(),
                 events
                     .iter()
-                    .map(|e| util::log_event(e))
+                    .map(util::log_event)
                     .collect::<Vec<String>>()
             );
             emit_events(&mut self.touchpad_device, &events)?;
@@ -642,17 +634,17 @@ impl VirtualUInputDevices {
                 keyboard_events.len(),
                 keyboard_events
                     .iter()
-                    .map(|e| util::log_event(e))
+                    .map(util::log_event)
                     .collect::<Vec<String>>(),
                 mouse_events.len(),
                 mouse_events
                     .iter()
-                    .map(|e| util::log_event(e))
+                    .map(util::log_event)
                     .collect::<Vec<String>>(),
                 touchpad_events.len(),
                 touchpad_events
                     .iter()
-                    .map(|e| util::log_event(e))
+                    .map(util::log_event)
                     .collect::<Vec<String>>(),
             );
             if !keyboard_events.is_empty() {
@@ -699,14 +691,17 @@ pub fn keyboard(
     Ok((device, keys, misc))
 }
 
-pub fn mouse(
-    pid: u32,
-) -> Result<(
+/// A freshly built virtual device plus the capability sets it advertises,
+/// which route_event matches incoming events against. `A` is the axis kind
+/// the device claims (relative for the mouse, absolute for the touchpad).
+type BuiltDevice<A> = (
     uinput::VirtualDevice,
     AttributeSet<KeyCode>,
     AttributeSet<MiscCode>,
-    AttributeSet<RelativeAxisCode>,
-)> {
+    AttributeSet<A>,
+);
+
+pub fn mouse(pid: u32) -> Result<BuiltDevice<RelativeAxisCode>> {
     // Only the button blocks a mouse actually has: misc (BTN_0..BTN_9),
     // the mouse buttons themselves, and the wheel buttons.
     //
@@ -827,14 +822,7 @@ fn check_discrete_axis_range(event: &evdev::InputEvent) {
     }
 }
 
-pub fn touchpad(
-    pid: u32,
-) -> Result<(
-    uinput::VirtualDevice,
-    AttributeSet<KeyCode>,
-    AttributeSet<MiscCode>,
-    AttributeSet<AbsoluteAxisCode>,
-)> {
+pub fn touchpad(pid: u32) -> Result<BuiltDevice<AbsoluteAxisCode>> {
     let mut props = AttributeSet::<evdev::PropType>::new();
     // Doesn't seem to be required, but real touchpads have it:
     props.insert(evdev::PropType::BUTTONPAD);
@@ -960,7 +948,7 @@ mod tests {
     /// compositor quietly ignores.
     #[test]
     fn btn_code_ranges_agree_with_the_evdev_names() {
-        for code in 1..libc::KEY_MAX as u16 {
+        for code in 1..libc::KEY_MAX {
             let named_btn = format!("{:?}", KeyCode::new(code)).starts_with("BTN_");
             assert_eq!(
                 in_ranges(BTN_CODE_RANGES, code),
@@ -1031,13 +1019,11 @@ mod tests {
         let syn_report = evdev::SynchronizationCode::SYN_REPORT.0;
         let mt_x = evdev::AbsoluteAxisCode::ABS_MT_POSITION_X.0;
 
-        let batch = vec![
-            ev(abs, mt_x, 100),
+        let batch = [ev(abs, mt_x, 100),
             ev(syn, syn_report, 0),
             ev(abs, mt_x, 200),
             ev(syn, syn_report, 0),
-            ev(abs, mt_x, 300),
-        ];
+            ev(abs, mt_x, 300)];
         let frames: Vec<&[event::InputEvent]> = batch
             .split(is_frame_separator)
             .filter(|f| !f.is_empty())
@@ -1056,7 +1042,7 @@ mod tests {
     fn an_unseparated_batch_stays_one_frame() {
         let rel = evdev::EventType::RELATIVE.0;
         let rel_x = evdev::RelativeAxisCode::REL_X.0;
-        let batch = vec![ev(rel, rel_x, 3), ev(rel, rel_x, 4)];
+        let batch = [ev(rel, rel_x, 3), ev(rel, rel_x, 4)];
 
         let frames: Vec<&[event::InputEvent]> = batch
             .split(is_frame_separator)

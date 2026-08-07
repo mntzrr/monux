@@ -487,7 +487,7 @@ pub enum ClipboardRequestSource {
     Remote(SocketAddr),
 }
 
-impl<'a> std::fmt::Display for ClipboardRequestSource {
+impl std::fmt::Display for ClipboardRequestSource {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             ClipboardRequestSource::Local(_) => f.write_str("Local"),
@@ -1926,7 +1926,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
 
         // Figure out where the requested clipboard can be found
-        if let Some(clipboard_source) = target.source.clone() {
+        if let Some(clipboard_source) = target.source {
             // A client has the clipboard: route request to them.
             // Request ids correlate a response with its request. A plain
             // per-originator counter is enough: the goal is
@@ -2122,7 +2122,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 }
                 let msg = bulk::ServerBulk::ClipboardHeader(bulk::ServerClipboardHeader {
                     requested_type: &requested_type,
-                    data_type: data_type.as_ref().map(|t| t.as_str()),
+                    data_type: data_type.as_deref(),
                     content_len_bytes: content.len() as u64,
                     request_id,
                 });
@@ -2228,7 +2228,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             // Send to specified remote client (assuming it's still available etc...)
             let msg = bulk::ServerBulk::ClipboardHeader(bulk::ServerClipboardHeader {
                 requested_type: &data.requested_type,
-                data_type: data.data_type.as_ref().map(|t| t.as_str()),
+                data_type: data.data_type.as_deref(),
                 content_len_bytes: data.bytes.len() as u64,
                 request_id,
             });
@@ -2982,7 +2982,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             return;
         }
         self.motion_dirty = false;
-        let (dx, dy, source_count) = std::mem::replace(&mut self.pending_motion, (0, 0, 0));
+        let (dx, dy, source_count) = std::mem::take(&mut self.pending_motion);
         let endpoint = match self.current_client {
             Some(c) => c,
             // Switched away meanwhile; the pending deltas are moot.
@@ -3299,7 +3299,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                     &serializedmsg
                 );
                 if let Err(e) = events_send
-                    .write_all(&serializedmsg)
+                    .write_all(serializedmsg)
                     .await
                     .context("Failed to send serialized message")
                 {
@@ -3449,7 +3449,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         self.edge_info_sent.remove(endpoint);
         // Always refetch the idx to avoid issues if there was an await in which the client was
         // removed behind our back.
-        match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
+        match self.clients.binary_search_by(|c| c.endpoint.cmp(endpoint)) {
             Ok(idx) => {
                 self.clients.remove(idx);
                 // Drop the source's debounce entry too: reconnects arrive with

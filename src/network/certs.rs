@@ -1,13 +1,13 @@
 use std::fs;
 use std::io::{self, prelude::*};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-pub fn load_known_certs(config_dir: &PathBuf) -> Result<Vec<rustls_pki_types::CertificateDer<'static>>> {
+pub fn load_known_certs(config_dir: &Path) -> Result<Vec<rustls_pki_types::CertificateDer<'static>>> {
     let mut certs = vec![];
     for path in fs::read_dir(init_known_certs_dir(config_dir)?)? {
         let path = path?;
@@ -38,7 +38,7 @@ fn splash(label: &str, fingerprint: &str) {
 
 pub fn load_keypair<'a>(
     splash_label: &str,
-    config_dir: &PathBuf,
+    config_dir: &Path,
 ) -> Result<(rustls_pki_types::CertificateDer<'a>, rustls_pki_types::PrivateKeyDer<'a>)> {
     let file_path = config_dir.join("private.pem");
     if file_path.is_file() {
@@ -61,7 +61,7 @@ fn read_existing_keypair<'a>(
     file_path: &PathBuf,
 ) -> Result<(rustls_pki_types::CertificateDer<'a>, rustls_pki_types::PrivateKeyDer<'a>)> {
     let mut reader =
-        io::BufReader::new(fs::File::open(&file_path).with_context(|| {
+        io::BufReader::new(fs::File::open(file_path).with_context(|| {
             format!("Failed to open keypair file: {}", file_path.display())
         })?);
     let mut cert: Option<rustls_pki_types::CertificateDer> = None;
@@ -69,7 +69,7 @@ fn read_existing_keypair<'a>(
     for item in rustls_pemfile::read_all(&mut reader) {
         match item.with_context(|| format!("Failed to read keypair file: {}", file_path.display()))? {
             rustls_pemfile::Item::X509Certificate(filecert) => {
-                cert = Some(rustls_pki_types::CertificateDer::from(filecert));
+                cert = Some(filecert);
             }
             rustls_pemfile::Item::Pkcs8Key(filekey) => {
                 key = Some(rustls_pki_types::PrivateKeyDer::from(filekey));
@@ -102,14 +102,14 @@ fn write_new_keypair<'a>(
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(&file_path)
+        .open(file_path)
         .with_context(|| {
             format!(
                 "Failed to open keypair file for writing: {}",
                 file_path.display()
             )
         })?;
-    ensure_permissions(&file_path, 0o600).with_context(|| {
+    ensure_permissions(file_path, 0o600).with_context(|| {
         format!(
             "Failed to set permissions on keypair file: {}",
             file_path.display()
@@ -140,7 +140,7 @@ pub fn fingerprint(cert: &rustls_pki_types::CertificateDer) -> String {
 pub fn write_approved_cert(
     cert: &rustls_pki_types::CertificateDer,
     fingerprint: &str,
-    config_dir: &PathBuf,
+    config_dir: &Path,
 ) -> Result<()> {
     let file_path = init_known_certs_dir(config_dir)
         .context("Failed to init known_certs dir")?
@@ -180,13 +180,13 @@ fn load_cert<'a>(file_path: PathBuf) -> Result<rustls_pki_types::CertificateDer<
         rustls_pemfile::read_one(&mut reader)
             .with_context(|| format!("Failed to read cert file: {}", file_path.display()))?
     {
-        Ok(rustls_pki_types::CertificateDer::from(filecert))
+        Ok(filecert)
     } else {
         bail!("Public certificate not found in {}", file_path.display());
     }
 }
 
-fn init_known_certs_dir(config_dir: &PathBuf) -> Result<PathBuf> {
+fn init_known_certs_dir(config_dir: &Path) -> Result<PathBuf> {
     let dir_path = config_dir.join("known_certs");
     fs::create_dir_all(&dir_path)
         .with_context(|| format!("Failed to ensure certs dir exists: {}", dir_path.display()))?;
@@ -219,9 +219,9 @@ mod tests {
     fn can_write_read_keys() {
         let dir = tempfile::tempdir().unwrap();
         // This should automatically write a new keypair
-        let (cert1, privkey1) = load_keypair("foo", &dir.path().to_path_buf()).expect("couldn't load");
+        let (cert1, privkey1) = load_keypair("foo", dir.path()).expect("couldn't load");
         // This should read the existing keypair
-        let (cert2, privkey2) = load_keypair("foo", &dir.path().to_path_buf()).expect("couldn't load");
+        let (cert2, privkey2) = load_keypair("foo", dir.path()).expect("couldn't load");
         // The results should match
         assert!(fingerprint(&cert1) == fingerprint(&cert2));
         assert!(cert1 == cert2);

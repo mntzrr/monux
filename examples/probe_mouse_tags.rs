@@ -64,7 +64,7 @@ fn keys_from(ranges: &[std::ops::RangeInclusive<u16>]) -> AttributeSet<KeyCode> 
 fn main() -> anyhow::Result<()> {
     // (a) today's set: every BTN_* except BTN_TOOL_*.
     let mut current = AttributeSet::<KeyCode>::new();
-    for code in 1..libc::KEY_MAX as u16 {
+    for code in 1..libc::KEY_MAX {
         let key = KeyCode::new(code);
         let name = format!("{:?}", key);
         if name.starts_with("BTN_") && !name.starts_with("BTN_TOOL_") {

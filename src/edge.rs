@@ -1659,19 +1659,23 @@ mod tests {
         }
     }
 
+    /// The persistent identifiers Hyprland reports for an output, in the
+    /// order OutputRect declares them: make, model, serial, description.
+    /// Grouped so they can't be transposed against each other in a call —
+    /// four adjacent &str parameters all accept each other's values.
+    type Identifiers<'a> = (&'a str, &'a str, &'a str, &'a str);
+
     /// An output with the persistent identifiers Hyprland reports (see
     /// OutputRect), for the qualifier-matching tests.
     fn rect_id(
         name: &str,
-        make: &str,
-        model: &str,
-        serial: &str,
-        description: &str,
+        identifiers: Identifiers<'_>,
         x: i32,
         y: i32,
         width: i32,
         height: i32,
     ) -> OutputRect {
+        let (make, model, serial, description) = identifiers;
         OutputRect {
             make: make.to_string(),
             model: model.to_string(),
@@ -1859,10 +1863,7 @@ mod tests {
             outputs[0],
             rect_id(
                 "eDP-1",
-                "Dell Inc.",
-                "DELL U2720Q",
-                "83JLZ23",
-                "Dell Inc. DELL U2720Q 83JLZ23",
+                ("Dell Inc.", "DELL U2720Q", "83JLZ23", "Dell Inc. DELL U2720Q 83JLZ23"),
                 0,
                 0,
                 1920,
@@ -2415,10 +2416,7 @@ mod tests {
         vec![
             rect_id(
                 "eDP-1",
-                "Dell Inc.",
-                "DELL U2720Q",
-                "83JLZ23",
-                "Dell Inc. DELL U2720Q 83JLZ23",
+                ("Dell Inc.", "DELL U2720Q", "83JLZ23", "Dell Inc. DELL U2720Q 83JLZ23"),
                 0,
                 0,
                 1920,
@@ -2426,10 +2424,7 @@ mod tests {
             ),
             rect_id(
                 "DP-3",
-                "Dell Inc.",
-                "DELL U2720Q",
-                "9KLMN77",
-                "Dell Inc. DELL U2720Q 9KLMN77",
+                ("Dell Inc.", "DELL U2720Q", "9KLMN77", "Dell Inc. DELL U2720Q 9KLMN77"),
                 1920,
                 0,
                 1920,
@@ -2479,7 +2474,7 @@ mod tests {
             "eDP-1 [Dell Inc. DELL U2720Q 83JLZ23]"
         );
         // No description: synthesized from the parts.
-        let output = rect_id("DP-3", "Dell Inc.", "DELL U2720Q", "9KLMN77", "", 0, 0, 1920, 1080);
+        let output = rect_id("DP-3", ("Dell Inc.", "DELL U2720Q", "9KLMN77", ""), 0, 0, 1920, 1080);
         assert_eq!(
             output_identifiers(&output),
             "DP-3 [Dell Inc. DELL U2720Q 9KLMN77]"

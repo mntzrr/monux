@@ -1,4 +1,4 @@
-use std::io::{Cursor, Error, ErrorKind, IoSlice, Result, Seek, SeekFrom, Write};
+use std::io::{Cursor, Error, IoSlice, Result, Seek, SeekFrom, Write};
 
 /// A wrapper around Cursor that checks the underlying buffer isn't exceeding a max size.
 /// This is specifically needed to avoid borrow checker issues around being able to check the buf size.
@@ -36,8 +36,7 @@ impl Write for LimitedCursor {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         let length = self.inner.position() + buf.len() as u64;
         if length > self.limit {
-            return Err(Error::new(
-                ErrorKind::Other,
+            return Err(Error::other(
                 format!(
                     "Write of {} bytes at position {} would exceed size limit {}",
                     buf.len(),
@@ -77,9 +76,8 @@ where
     }
 
     fn check_limit(&mut self, len: u64) -> Result<()> {
-        if len as u64 > self.limit {
-            return Err(Error::new(
-                ErrorKind::Other,
+        if len > self.limit {
+            return Err(Error::other(
                 format!(
                     "Write of {} bytes would exceed size limit {}",
                     len, self.limit

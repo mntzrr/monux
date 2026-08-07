@@ -18,18 +18,17 @@
 //! # Icon colors (the dot is a programmatically generated ARGB pixmap — SNI
 //! supports pixmaps, so no icon-theme lookup is involved)
 //!
-//! - GREEN:  input is local — server with current_target "local" and no
-//!           degradation; client connected but not owning input
-//! - BLUE:   input is on a client — server with current_target set to a
-//!           client addr; client that currently owns the server's input
-//!           (active)
-//! - GREY:   the server is paused
-//! - RED:    the link is degraded. Precisely, for v1:
-//!           - server role: any connected client with rtt_ms > 50
-//!             (DEGRADED_RTT_MS)
-//!           - client role: connected == false
-//!           RED outranks GREY — a degraded link is a problem worth seeing
-//!           even while paused.
+//! - GREEN: input is local — server with current_target "local" and no
+//!   degradation; client connected but not owning input
+//! - BLUE: input is on a client — server with current_target set to a client
+//!   addr; client that currently owns the server's input (active)
+//! - GREY: the server is paused
+//! - RED: the link is degraded. Precisely, for v1:
+//!   - server role: any connected client with rtt_ms > 50 (DEGRADED_RTT_MS)
+//!   - client role: connected == false
+//!
+//!   RED outranks GREY — a degraded link is a problem worth seeing even while
+//!   paused.
 //! - Unknown (no daemon answers): a hollow grey "?" instead of the dot.
 //!
 //! The tooltip carries the details ("monux: input on 192.168.1.102", per-client
@@ -519,7 +518,7 @@ fn question_pixmap(size: i32, rgb: (u8, u8, u8)) -> Vec<u8> {
             }
             for dy in 0..SCALE {
                 for dx in 0..SCALE {
-                    let x = origin_x + col as i32 * SCALE + dx;
+                    let x = origin_x + col * SCALE + dx;
                     let y = origin_y + row as i32 * SCALE + dy;
                     let i = ((y * size + x) * 4) as usize;
                     data[i] = 0xff;

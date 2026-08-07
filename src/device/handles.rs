@@ -61,9 +61,9 @@ impl<H: DeviceHandler> DeviceHandles<H> {
         }
     }
 
-    pub(crate) fn add(&mut self, path: &PathBuf, device: Device) -> Result<()> {
+    pub(crate) fn add(&mut self, path: &Path, device: Device) -> Result<()> {
         let device_info = util::DeviceInfo::new(&device, false);
-        util::log_device_info(&device, &path, &device_info, "Listening to device", true);
+        util::log_device_info(&device, path, &device_info, "Listening to device", true);
         let supports_any_keys = supports_any_keys(&device, &self.all_combo_keys);
         if supports_any_keys {
             debug!(
@@ -91,9 +91,9 @@ impl<H: DeviceHandler> DeviceHandles<H> {
         )?;
         let displaced = match class {
             device::DeviceClass::Keyboard => {
-                self.always_grabbed_devices.insert(path.clone(), join_handle)
+                self.always_grabbed_devices.insert(path.to_path_buf(), join_handle)
             }
-            device::DeviceClass::Toggled => self.toggled_devices.insert(path.clone(), join_handle),
+            device::DeviceClass::Toggled => self.toggled_devices.insert(path.to_path_buf(), join_handle),
         };
         if let Some(old) = displaced {
             debug!("Aborting displaced reader task for device {}", path.display());

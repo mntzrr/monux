@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -111,7 +111,7 @@ fn fetch_sync(
     mime_type: &str,
     fetch_data_tx: &mpsc::Sender<data::ClipboardFetch>,
     max_uncompressed_size_bytes: u64,
-    config_dir: &PathBuf,
+    config_dir: &Path,
     serve_runtime: &tokio::runtime::Runtime,
 ) -> Option<data::ClipboardData> {
     serve_runtime.block_on(data::fetch_clipboard_data(

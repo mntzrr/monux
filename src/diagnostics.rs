@@ -1262,11 +1262,9 @@ fn prepare_issue(text: &str, title: Option<&str>, d: &Diagnostics, path: &Path) 
             NEW_ISSUE_URL
         )),
     }
-    out.push_str(&format!(
-        "\nReview it before sending — it contains this machine's hostname and LAN addresses. \
+    out.push_str("\nReview it before sending — it contains this machine's hostname and LAN addresses. \
          Re-run with --redact to replace them, or --privacy for the full list of what a report \
-         carries.\n"
-    ));
+         carries.\n");
     out
 }
 
