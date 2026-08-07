@@ -497,7 +497,18 @@ struct DiagnosticsArgs {
     lines: usize,
 
     /// How far back to read the systemd journal (a journalctl --since value)
-    #[arg(long, value_name = "when", default_value = monux::diagnostics::DEFAULT_JOURNAL_SINCE, help_heading = H_CONTENT)]
+    ///
+    /// allow_hyphen_values is load-bearing: journalctl's relative windows all
+    /// start with a minus ('-30min', '-2h'), which clap would otherwise treat
+    /// as an unknown flag — so every explicit value failed while the
+    /// identical default worked.
+    #[arg(
+        long,
+        value_name = "when",
+        allow_hyphen_values = true,
+        default_value = monux::diagnostics::DEFAULT_JOURNAL_SINCE,
+        help_heading = H_CONTENT
+    )]
     since: String,
 
     /// Skip the journal entirely
@@ -2280,6 +2291,28 @@ mod tests {
     fn servers_command_parses() {
         let cli = Cli::try_parse_from(["monux", "servers"]).unwrap();
         assert!(matches!(cli.command, Commands::Servers));
+    }
+
+    #[test]
+    fn diagnostics_since_accepts_journalctl_relative_windows() {
+        // Every relative journalctl window starts with a minus, which clap
+        // reads as a flag unless the arg allows hyphen values. The default
+        // never exercised this, so only explicit values broke.
+        for window in ["-2min", "-30min", "-2h", "-1day"] {
+            let cli = Cli::try_parse_from(["monux", "diagnostics", "--since", window])
+                .unwrap_or_else(|e| panic!("--since {} must parse: {}", window, e));
+            let Commands::Diagnostics(args) = cli.command else {
+                panic!("expected the diagnostics command");
+            };
+            assert_eq!(args.since, window);
+        }
+        // Absolute timestamps keep working.
+        let cli =
+            Cli::try_parse_from(["monux", "diagnostics", "--since", "2026-08-07 14:00:00"]).unwrap();
+        let Commands::Diagnostics(args) = cli.command else {
+            panic!("expected the diagnostics command");
+        };
+        assert_eq!(args.since, "2026-08-07 14:00:00");
     }
 
     #[test]
