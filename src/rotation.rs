@@ -1197,7 +1197,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 self.note_client_heard(endpoint).await;
             }
             RotationEvent::RequestPeerDiagnostics(args) => {
-                let pending = self.request_peer_diagnostics(args.lines).await;
+                let pending = self.request_peer_diagnostics(args.lines);
                 // The requester gone (it timed out, or the CLI hung up) is
                 // not an error: the report simply proceeds without peers.
                 if args.reply.send(pending).is_err() {
@@ -3316,26 +3316,35 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// entry per client for the requester to await.
     ///
     /// Every client produces an entry, including the ones that can't answer:
-    /// a peer skipped for being too old, or one whose queue was full, is
-    /// EVIDENCE. Dropping it would make a two-machine report quietly look
-    /// like a one-machine setup.
-    async fn request_peer_diagnostics(&mut self, lines: u32) -> Vec<PendingPeer> {
+    /// a peer skipped for being too old, or one whose queue wouldn't take the
+    /// request, is EVIDENCE. Dropping it would make a two-machine report
+    /// quietly look like a one-machine setup.
+    ///
+    /// Deliberately NOT routed through send_bulk: that path drops a client
+    /// whose queue won't take a frame, which is right for clipboard routing
+    /// (both sides would otherwise disagree about who owns the clipboard) and
+    /// wrong here. The queue holds bulk::BULK_QUEUE_CAPACITY frames and the
+    /// writer sleeps BETWEEN them while pacing a large transfer (see
+    /// network::throttle), so a full queue is an ordinary state during a
+    /// multi-megabyte clipboard copy — and filing a bug report must never be
+    /// the thing that severs the connection it is about. The client side
+    /// already says exactly this about the answering direction (client.rs).
+    fn request_peer_diagnostics(&self, lines: u32) -> Vec<PendingPeer> {
         let hub = crate::control::peer_diagnostics_hub();
-        let clients: Vec<(SocketAddr, String, u64)> = self
-            .clients
-            .iter()
-            .map(|c| (c.endpoint, c.fingerprint.clone(), c.negotiated_version))
-            .collect();
-        let mut pending = Vec::with_capacity(clients.len());
-        for (endpoint, fingerprint, negotiated_version) in clients {
-            let label = format!("{} @ {}", fingerprint_prefix(&fingerprint), endpoint);
-            if !shared::supports_peer_diagnostics(negotiated_version) {
+        let mut pending = Vec::with_capacity(self.clients.len());
+        for client in &self.clients {
+            let label = format!(
+                "{} @ {}",
+                fingerprint_prefix(&client.fingerprint),
+                client.endpoint
+            );
+            if !shared::supports_peer_diagnostics(client.negotiated_version) {
                 pending.push(PendingPeer {
                     label,
                     waiting: Err(format!(
                         "runs protocol v{}, which predates peer diagnostics (v{}); \
                          update that machine, or run 'monux diagnostics' on it directly",
-                        negotiated_version,
+                        client.negotiated_version,
                         shared::PROTOCOL_VERSION_PEER_DIAGNOSTICS
                     )),
                     request_id: None,
@@ -3347,27 +3356,22 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 request_id,
                 lines,
             });
-            match self.send_bulk(&endpoint, msg, None).await {
-                Ok(true) => pending.push(PendingPeer {
+            let queued = match postcard::to_stdvec_cobs(&msg) {
+                Ok(bytes) => queue_diagnostics_frame(&client.bulk_tx, bytes),
+                Err(e) => Err(format!("its request could not be serialized: {:?}", e)),
+            };
+            match queued {
+                Ok(()) => pending.push(PendingPeer {
                     label,
                     waiting: Ok(rx),
                     request_id: Some(request_id),
                 }),
-                // send_bulk already logged and, for a failed queue, removed
-                // the client; the report records that it couldn't be asked.
-                Ok(false) => {
+                Err(reason) => {
+                    debug!("Not asking {} for diagnostics: {}", client.endpoint, reason);
                     hub.cancel(request_id);
                     pending.push(PendingPeer {
                         label,
-                        waiting: Err("the connection dropped before the request went out".to_string()),
-                        request_id: None,
-                    });
-                }
-                Err(e) => {
-                    hub.cancel(request_id);
-                    pending.push(PendingPeer {
-                        label,
-                        waiting: Err(format!("the request could not be sent: {:#}", e)),
+                        waiting: Err(reason),
                         request_id: None,
                     });
                 }
@@ -3641,6 +3645,28 @@ where
     send.write_all(&serializedmsg)
         .await
         .context("Failed to send serialized message")
+}
+
+/// Queues one serialized diagnostics frame on a client's bulk writer,
+/// mapping a queue that won't take it to the reason the bug report records
+/// for that peer. Never drops the client (see request_peer_diagnostics).
+///
+/// A free function over the queue handle so the policy is testable:
+/// ClientInfo embeds quinn handles and can't be fabricated in a unit test.
+fn queue_diagnostics_frame(
+    bulk_tx: &mpsc::Sender<Vec<u8>>,
+    bytes: Vec<u8>,
+) -> std::result::Result<(), String> {
+    bulk_tx.try_send(bytes).map_err(|e| match e {
+        // The common case, and the reason this path exists: the writer is
+        // pacing a large clipboard transfer and hasn't drained the queue yet.
+        mpsc::error::TrySendError::Full(_) => "its bulk queue is busy — a large clipboard \
+             transfer is probably in flight; retry the report once it finishes"
+            .to_string(),
+        mpsc::error::TrySendError::Closed(_) => {
+            "its bulk stream is gone (the connection is tearing down)".to_string()
+        }
+    })
 }
 
 /// Compares two clipboard mime-type lists as sets (order- and
@@ -4861,6 +4887,42 @@ mod tests {
             vec!["two".to_string()]
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A bug report must never be the thing that severs the connection it is
+    /// about. The clipboard paths drop a client whose bulk queue won't take a
+    /// frame (both sides would otherwise disagree about the clipboard owner);
+    /// the diagnostics path must instead record the refusal as that peer's
+    /// entry and leave the client connected. The queue is small
+    /// (BULK_QUEUE_CAPACITY) and the writer sleeps between frames while
+    /// pacing a large transfer, so "full" is an ordinary state mid-copy.
+    #[test]
+    fn a_busy_bulk_queue_does_not_cost_the_client_its_connection() {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(bulk::BULK_QUEUE_CAPACITY);
+        // A queue with room takes the frame.
+        assert!(queue_diagnostics_frame(&tx, vec![1, 2, 3]).is_ok());
+        // Fill it: the writer is pacing a transfer and hasn't drained.
+        for _ in 1..bulk::BULK_QUEUE_CAPACITY {
+            queue_diagnostics_frame(&tx, vec![0; 16]).expect("queue still has room");
+        }
+        let err = queue_diagnostics_frame(&tx, vec![0; 16])
+            .expect_err("a full queue must refuse the frame");
+        assert!(
+            err.contains("busy") && err.contains("clipboard"),
+            "the report should name the cause: {}",
+            err
+        );
+        // ...and the queue is intact: nothing was torn down, and the frames
+        // already queued are still there for the writer to drain.
+        assert_eq!(rx.try_recv().expect("the first frame survives"), vec![1, 2, 3]);
+
+        // A closed queue (the writer task is gone) reads differently, so a
+        // report can tell a busy peer from a departing one.
+        let (closed_tx, closed_rx) = mpsc::channel::<Vec<u8>>(bulk::BULK_QUEUE_CAPACITY);
+        drop(closed_rx);
+        let err = queue_diagnostics_frame(&closed_tx, vec![0; 16])
+            .expect_err("a closed queue must refuse the frame");
+        assert!(err.contains("gone"), "unexpected reason: {}", err);
     }
 
     #[test]
