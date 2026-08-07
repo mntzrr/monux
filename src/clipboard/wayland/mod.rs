@@ -1,4 +1,5 @@
 mod common;
+pub mod connect;
 mod data_control;
 pub mod reader;
 mod state;

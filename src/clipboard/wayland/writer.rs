@@ -13,7 +13,7 @@ use tracing::{debug, error, trace, warn};
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_seat;
-use wayland_client::{event_created_child, Connection, Dispatch, EventQueue};
+use wayland_client::{event_created_child, Dispatch, EventQueue};
 
 use crate::clipboard::{ClipboardWriter as ClipboardWriterTrait, data};
 use crate::clipboard::wayland::{common, state};
@@ -359,7 +359,7 @@ fn write_paste_fd(fd: std::os::fd::OwnedFd, bytes: &[u8]) -> io::Result<u64> {
 
 /// Connects to the wayland environment, or returns Ok(None) if wayland isn't available
 fn init_state() -> Result<(State, data_control::Manager, EventQueue<State>)> {
-    let conn = Connection::connect_to_env()?;
+    let conn = super::connect::connect()?;
     let (globals, queue) = registry_queue_init::<State>(&conn)?;
     let qh = queue.handle();
 

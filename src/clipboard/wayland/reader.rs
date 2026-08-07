@@ -12,10 +12,10 @@ use rustix::fs::{fcntl_setfl, OFlags};
 use tokio::task;
 use tracing::{debug, trace, warn};
 use wayland_client::globals::registry_queue_init;
-use wayland_client::{Connection, DispatchError, EventQueue};
+use wayland_client::{DispatchError, EventQueue};
 
 use crate::clipboard::{CLIPBOARD_TIMEOUT_SECS, ClipboardReader as ClipboardReaderTrait, limited};
-use crate::clipboard::wayland::{common, state};
+use crate::clipboard::wayland::{common, connect, state};
 
 /// Retrieves clipboard data from other applications on the system.
 /// Watches clipboard mime types, and reads clipboard data.
@@ -57,7 +57,7 @@ impl ReaderConn {
         if matches!(self, ReaderConn::Dead) {
             *self = ReaderConn::Live(
                 ReaderInner::connect()
-                    .context("Failed to rebuild the Wayland clipboard connection after the compositor died")?,
+                    .context("Failed to rebuild the Wayland clipboard connection (compositor down, or not up yet)")?,
             );
         }
         match self {
@@ -161,9 +161,21 @@ where
 }
 
 impl ClipboardReader {
+    /// Builds the reader, starting Dead when no compositor is reachable yet
+    /// rather than failing: a daemon autostarted at login runs before the
+    /// compositor exists, and ReaderConn rebuilds on the first fetch once one
+    /// appears (see ReaderConn). Failing here instead disabled clipboard
+    /// sharing for the whole session.
     pub fn new() -> Result<Self> {
-        Ok(Self{
-            slot: Arc::new(BlockingSlot::new(ReaderConn::Live(ReaderInner::connect()?))),
+        let conn = match ReaderInner::connect() {
+            Ok(inner) => ReaderConn::Live(inner),
+            Err(e) => {
+                debug!("Clipboard reader starting without a compositor connection, will connect on demand: {:#}", e);
+                ReaderConn::Dead
+            }
+        };
+        Ok(Self {
+            slot: Arc::new(BlockingSlot::new(conn)),
         })
     }
 }
@@ -173,7 +185,7 @@ impl ReaderInner {
     /// and initial state. Used by ClipboardReader::new and by the rebuild
     /// after a compositor restart (see ReaderConn).
     fn connect() -> Result<Self> {
-        let conn = Connection::connect_to_env().context("Couldn't reach Wayland compositor socket")?;
+        let conn = connect::connect().context("Couldn't reach Wayland compositor socket")?;
         let (globals, mut queue) = registry_queue_init::<state::State>(&conn)
             .context("Failed to init Wayland registry queue")?;
         let qh = queue.handle();
@@ -394,7 +406,7 @@ mod tests {
     /// headless.)
     #[test]
     fn dead_reader_stays_dead_until_a_rebuild_succeeds() {
-        if Connection::connect_to_env().is_ok() {
+        if connect::connect().is_ok() {
             return;
         }
         let mut conn = ReaderConn::Dead;

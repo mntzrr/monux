@@ -3,11 +3,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use wayland_client::globals::registry_queue_init;
-use wayland_client::Connection;
 
-use crate::clipboard::wayland::{common, state};
+use crate::clipboard::wayland::{common, connect, state};
 
 /// Maximum backoff between reconnect attempts.
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(10);
@@ -20,35 +19,84 @@ const READY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Task that listens for updates to the clipboard types (local cut or copy).
 /// Sends out an event when an update occurs, indicating a new clipboard is available.
-/// If wayland is unavailable, this returns Ok(None).
+/// An unreachable compositor is not a failure — the watcher keeps retrying in
+/// the background (see the reconnect loop). Ok(None), which disables clipboard
+/// sharing, is now reserved for a watcher thread that never reports readiness.
 pub fn start(
     regular_types_tx: Option<watch::Sender<Vec<String>>>,
 ) -> Result<Option<()>> {
-    // Initial availability probe: if wayland isn't reachable at all, there's
-    // nothing to reconnect to. A compositor crash later is handled by the
-    // reconnect loop in the spawned thread.
-    if Connection::connect_to_env().is_err() {
-        warn!("Disabling wayland clipboard support: Failed to connect to wayland");
+    // The one case that still disables sharing up front: an explicitly empty
+    // WAYLAND_DISPLAY, the documented opt-out. Retrying it would spin a
+    // thread forever against a compositor we were told to ignore.
+    if connect::opted_out() {
+        warn!("Wayland clipboard support disabled: WAYLAND_DISPLAY is set to the empty string");
         return Ok(None);
     }
 
+    // No initial availability probe: an unreachable compositor is a state to
+    // wait out, not a reason to disable sharing for the process lifetime. A
+    // daemon autostarted with the systemd user manager starts at login,
+    // before the compositor exists — probing there and giving up left every
+    // autostarted daemon without clipboard sharing until it was restarted by
+    // hand. The reconnect loop below picks the compositor up whenever it
+    // appears (first start, or a crash and restart later).
     let (thread_ready_tx, thread_ready_rx) = std::sync::mpsc::sync_channel(1);
     let _ = std::thread::spawn(move || {
         let mut backoff = Duration::from_secs(1);
         let mut signalled_ready = false;
+        // Only the first error of a streak is a warning: while the compositor
+        // stays away (a headless server, or a login screen that never gets
+        // one) the loop retries every MAX_RECONNECT_BACKOFF forever, and
+        // warning each time would bury the log in thousands of daily lines.
+        let mut reported_failure = false;
         loop {
-            match connect_and_watch(&regular_types_tx, &thread_ready_tx, &mut signalled_ready) {
+            let mut connected = false;
+            match connect_and_watch(
+                &regular_types_tx,
+                &thread_ready_tx,
+                &mut signalled_ready,
+                &mut connected,
+            ) {
                 WatchOutcome::Unavailable => {
+                    // Reachable compositor, but no clipboard protocol or no
+                    // seat. Usually permanent (a compositor without
+                    // data-control), but it also covers the moment before a
+                    // starting compositor has advertised its seat — and
+                    // giving up there would silently cost the session its
+                    // clipboard sharing. Retry at the slow rate instead: one
+                    // connect per MAX_RECONNECT_BACKOFF costs nothing, and
+                    // logging it once keeps the log quiet.
+                    if !reported_failure {
+                        warn!("Wayland clipboard unavailable: no data-control protocol or no seat. Retrying every {:?}", MAX_RECONNECT_BACKOFF);
+                        reported_failure = true;
+                    }
                     if !signalled_ready {
+                        signalled_ready = true;
                         let _ = thread_ready_tx.send(());
                     }
-                    return;
+                    std::thread::sleep(MAX_RECONNECT_BACKOFF);
+                    backoff = MAX_RECONNECT_BACKOFF;
                 }
                 WatchOutcome::Error(e) => {
-                    warn!(
-                        "Wayland clipboard type watcher error, reconnecting in {:?}: {}",
-                        backoff, e
-                    );
+                    // A cycle that did connect is a fresh failure, not a
+                    // continuing one: start over from the short backoff and
+                    // let it warn again.
+                    if connected {
+                        backoff = Duration::from_secs(1);
+                        reported_failure = false;
+                    }
+                    if reported_failure {
+                        debug!(
+                            "Wayland clipboard type watcher still unavailable, retrying in {:?}: {}",
+                            backoff, e
+                        );
+                    } else {
+                        warn!(
+                            "Wayland clipboard not reachable, retrying in {:?} — sharing starts as soon as a compositor is: {}. If monux runs under sudo, start it with 'sudo -E' to keep the session environment (WAYLAND_DISPLAY, XDG_RUNTIME_DIR)",
+                            backoff, e
+                        );
+                        reported_failure = true;
+                    }
                     if !signalled_ready {
                         signalled_ready = true;
                         let _ = thread_ready_tx.send(());
@@ -94,12 +142,13 @@ fn connect_and_watch(
     regular_types_tx: &Option<watch::Sender<Vec<String>>>,
     thread_ready_tx: &std::sync::mpsc::SyncSender<()>,
     signalled_ready: &mut bool,
+    connected: &mut bool,
 ) -> WatchOutcome {
-    let conn = match Connection::connect_to_env() {
+    let conn = match connect::connect() {
         Ok(conn) => conn,
         Err(e) => {
             return WatchOutcome::Error(
-                anyhow::anyhow!("Failed to connect to wayland: {}", e),
+                anyhow::anyhow!("Failed to connect to wayland: {:#}", e),
             );
         }
     };
@@ -134,6 +183,7 @@ fn connect_and_watch(
         return WatchOutcome::Error(e);
     }
     info!("Wayland clipboard type watcher connected");
+    *connected = true;
     // Report readiness on the first successful connect as well (see the fn
     // docs): start()'s recv unblocks here, on Unavailable, or on first Error.
     if !*signalled_ready {

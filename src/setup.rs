@@ -410,7 +410,7 @@ fn enable_role(
         role.unit_name()
     );
     println!(
-        "[note] autostart: clipboard sharing in the service needs the session environment (WAYLAND_DISPLAY/DISPLAY/XDG_RUNTIME_DIR/DBUS) imported into the systemd user manager — Hyprland handles this when launched via UWSM or with its systemd integration. See README.md for details."
+        "[note] autostart: clipboard sharing works without WAYLAND_DISPLAY in the service (the socket is found in XDG_RUNTIME_DIR, and a compositor that isn't up yet is retried), but the tray indicator needs DBUS_SESSION_BUS_ADDRESS imported into the systemd user manager — Hyprland handles that when launched via UWSM or with its systemd integration. See README.md for details."
     );
 }
 
@@ -1748,7 +1748,6 @@ mod tests {
         );
     }
 
-    #[test]
     #[test]
     fn ensure_desktop_shortcut_creates_only_when_missing() {
         let tmp = tempfile::tempdir().unwrap();

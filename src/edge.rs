@@ -415,16 +415,130 @@ fn trim_corner_dead_zones(segment: EdgeSegment) -> Option<EdgeSegment> {
 
 /// The Hyprland IPC socket
 /// ($XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket.sock), the
-/// same channel hyprctl uses. Errors when not running under Hyprland.
+/// same channel hyprctl uses — falling back to the newest instance found in
+/// the runtime dir when the signature is absent or stale (see
+/// socket_path_in). Errors when no live instance is reachable.
 fn hyprland_socket_path() -> Result<PathBuf> {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-        .context("XDG_RUNTIME_DIR is not set (no wayland session?)")?;
-    let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
-        .context("HYPRLAND_INSTANCE_SIGNATURE is not set (not running under Hyprland)")?;
-    Ok(PathBuf::from(runtime_dir)
-        .join("hypr")
-        .join(signature)
-        .join(".socket.sock"))
+    let runtime_dir = PathBuf::from(
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|dir| !dir.is_empty())
+            .context("XDG_RUNTIME_DIR is not set (no wayland session?)")?,
+    );
+    let signature =
+        std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").filter(|signature| !signature.is_empty());
+    socket_path_in(&runtime_dir.join("hypr"), signature.as_deref())
+}
+
+/// Resolves the instance socket under `hypr_dir` (the env-free half of
+/// hyprland_socket_path, so the fallbacks are testable).
+fn socket_path_in(hypr_dir: &Path, signature: Option<&std::ffi::OsStr>) -> Result<PathBuf> {
+    if let Some(signature) = signature {
+        let from_signature = hypr_dir.join(signature).join(".socket.sock");
+        // The signature is only worth trusting while its socket is there: a
+        // daemon outlives compositor restarts, and every restart mints a new
+        // signature, so the inherited one goes stale — following it then
+        // would poll a socket no compositor is behind.
+        if from_signature.exists() {
+            return Ok(from_signature);
+        }
+    }
+    // No usable signature. A daemon autostarted with the systemd user
+    // manager never gets one at all (the manager starts before the
+    // compositor, and a later import-environment doesn't reach services
+    // already running). The instance directory is right there in the runtime
+    // dir, so find it instead of declaring this "not running under Hyprland".
+    newest_hyprland_instance(hypr_dir).with_context(|| {
+        format!(
+            "no live Hyprland instance in {} (HYPRLAND_INSTANCE_SIGNATURE unset or stale)",
+            hypr_dir.display()
+        )
+    })
+}
+
+/// A socket path to move to when `current` has stopped working: the newest
+/// live instance, if it isn't the one already in use. Hyprland restarts
+/// under a running daemon (a compositor crash, or a deliberate restart)
+/// leave the old path dead forever, which used to strand screen-edge
+/// switching silently until monux itself was restarted.
+fn rebound_hyprland_socket(current: &Path) -> Option<PathBuf> {
+    hyprland_socket_path()
+        .ok()
+        .filter(|resolved| resolved != current)
+}
+
+/// The IPC socket of the most recently started Hyprland instance under
+/// `hypr_dir`. Newest wins: stale instance directories survive a crash, and
+/// on the rare box running two instances the fresh one is the better guess.
+fn newest_hyprland_instance(hypr_dir: &Path) -> Result<PathBuf> {
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(hypr_dir)
+        .with_context(|| format!("Failed to read {}", hypr_dir.display()))?
+        .flatten()
+    {
+        let socket = entry.path().join(".socket.sock");
+        let mtime = match std::fs::metadata(&socket) {
+            // Instance directories carry no useful timestamp of their own;
+            // the socket's does, and a missing socket also rules out the
+            // leftover directory of an instance that's gone.
+            Ok(metadata) => metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+            Err(_) => continue,
+        };
+        if newest.as_ref().is_none_or(|(best, _)| mtime > *best) {
+            newest = Some((mtime, socket));
+        }
+    }
+    newest
+        .map(|(_, socket)| socket)
+        .context("no Hyprland instance socket found")
+}
+
+/// How long the edge manager waits between attempts while Hyprland isn't
+/// reachable yet (see wait_for_hyprland).
+const HYPRLAND_WAIT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Resolves the Hyprland IPC socket and queries the initial monitor layout,
+/// waiting for the compositor instead of giving up on it. An edge manager
+/// only runs when the user configured an edge map, so "Hyprland isn't there
+/// yet" is a state to wait out: a daemon autostarted with the systemd user
+/// manager starts at login, before the compositor exists, and giving up
+/// there left screen-edge switching dead for the whole session (the same
+/// startup order that used to kill clipboard sharing, see
+/// clipboard::wayland::connect). Only ever returns once Hyprland answers;
+/// the caller's task is dropped with the daemon.
+async fn wait_for_hyprland() -> (PathBuf, Vec<OutputRect>) {
+    // Only the first failure of a streak warns: the retry is silent
+    // afterwards so a machine that never gets Hyprland doesn't fill the log.
+    let mut reported = false;
+    loop {
+        match hyprland_socket_path() {
+            Ok(socket) => {
+                let socket_for_layout = socket.clone();
+                match tokio::task::spawn_blocking(move || hyprland_layout(&socket_for_layout)).await {
+                    Ok(Ok(layout)) if !layout.is_empty() => return (socket, layout),
+                    Ok(Ok(_)) => report_hyprland_wait(&mut reported, "Hyprland reports no outputs"),
+                    Ok(Err(e)) => report_hyprland_wait(&mut reported, &format!("{:#}", e)),
+                    Err(e) => {
+                        report_hyprland_wait(&mut reported, &format!("layout query panicked: {:#}", e))
+                    }
+                }
+            }
+            Err(e) => report_hyprland_wait(&mut reported, &format!("{:#}", e)),
+        }
+        tokio::time::sleep(HYPRLAND_WAIT_INTERVAL).await;
+    }
+}
+
+/// Logs one wait reason: a warning for the first of a streak, debug after.
+fn report_hyprland_wait(reported: &mut bool, reason: &str) {
+    if *reported {
+        debug!("Screen-edge switching still waiting for Hyprland: {}", reason);
+        return;
+    }
+    warn!(
+        "Screen-edge switching waiting for Hyprland (retrying every {:?}): {}",
+        HYPRLAND_WAIT_INTERVAL, reason
+    );
+    *reported = true;
 }
 
 /// Runs one command against Hyprland's IPC socket: connect, send the
@@ -835,9 +949,15 @@ fn parse_cursorpos(reply: &str) -> Result<(i32, i32)> {
 /// manager; a failed query is logged at debug and retried after
 /// POLL_FAILURE_BACKOFF. Runs on its own thread (blocking socket IO) and
 /// ends when the edge manager is gone (server shutting down).
-fn run_cursor_poller(socket: PathBuf, pos_tx: mpsc::UnboundedSender<(i32, i32)>) {
+///
+/// A failing poll also looks for a newer Hyprland instance and follows it
+/// (see rebound_hyprland_socket), so a compositor restart resumes edge
+/// switching instead of leaving the poller talking to a dead socket. The
+/// path is shared with the manager's layout requery, which follows along.
+fn run_cursor_poller(socket: Arc<Mutex<PathBuf>>, pos_tx: mpsc::UnboundedSender<(i32, i32)>) {
     loop {
-        match cursor_position(&socket) {
+        let path = socket.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        match cursor_position(&path) {
             Ok(pos) => {
                 if pos_tx.send(pos).is_err() {
                     return;
@@ -849,6 +969,13 @@ fn run_cursor_poller(socket: PathBuf, pos_tx: mpsc::UnboundedSender<(i32, i32)>)
                     "Screen-edge cursor poll failed ({:#}), retrying in {:?}",
                     e, POLL_FAILURE_BACKOFF
                 );
+                if let Some(rebound) = rebound_hyprland_socket(&path) {
+                    info!(
+                        "Screen-edge switching following the new Hyprland instance at {}",
+                        rebound.display()
+                    );
+                    *socket.lock().unwrap_or_else(|e| e.into_inner()) = rebound;
+                }
                 std::thread::sleep(POLL_FAILURE_BACKOFF);
             }
         }
@@ -1117,31 +1244,13 @@ async fn run_inner(
     mut clients_rx: Option<watch::Receiver<Vec<(SocketAddr, String)>>>,
 ) {
     // The socket path is resolved once here, at manager start, instead of on
-    // every 40ms cursor poll (the env vars it derives from are fixed for the
-    // lifetime of the session).
-    let socket = match hyprland_socket_path() {
-        Ok(socket) => socket,
-        Err(e) => {
-            warn!("Screen-edge switching disabled: {:#}", e);
-            return;
-        }
-    };
-    let socket_for_layout = socket.clone();
-    let layout = match tokio::task::spawn_blocking(move || hyprland_layout(&socket_for_layout)).await {
-        Ok(Ok(layout)) if !layout.is_empty() => layout,
-        Ok(Ok(_)) => {
-            warn!("Screen-edge switching disabled: Hyprland reports no outputs");
-            return;
-        }
-        Ok(Err(e)) => {
-            warn!("Screen-edge switching disabled: {:#}", e);
-            return;
-        }
-        Err(e) => {
-            warn!("Screen-edge switching disabled: layout query panicked: {:#}", e);
-            return;
-        }
-    };
+    // every 40ms cursor poll (what it derives from is fixed for the lifetime
+    // of the session).
+    let (socket, layout) = wait_for_hyprland().await;
+    // Shared with the cursor poller, which re-resolves it across compositor
+    // restarts (see run_cursor_poller); the layout requery below follows the
+    // same path so both talk to the live instance.
+    let socket = Arc::new(Mutex::new(socket));
     info!(
         "Screen-edge switching enabled (dwell {:?}, cooldown {:?}): {}",
         dwell,
@@ -1266,7 +1375,7 @@ async fn run_inner(
                 return;
             }
             _ = requery.tick() => {
-                let socket_for_requery = socket.clone();
+                let socket_for_requery = socket.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 match tokio::task::spawn_blocking(move || hyprland_layout(&socket_for_requery)).await {
                     Ok(Ok(new_layout)) if !new_layout.is_empty() => {
                         if new_layout != current_layout {
@@ -1452,6 +1561,89 @@ fn log_edge_resolutions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
+
+    /// An instance dir holding a socket with the given mtime, as the runtime
+    /// dir looks while an instance is alive.
+    fn hyprland_instance(hypr_dir: &Path, signature: &str, mtime_secs: u64) {
+        let dir = hypr_dir.join(signature);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join(".socket.sock");
+        std::fs::write(&socket, "").unwrap();
+        let mtime = std::time::UNIX_EPOCH + Duration::from_secs(mtime_secs);
+        std::fs::File::options()
+            .write(true)
+            .open(&socket)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+    }
+
+    /// A signature naming a live instance is used as-is; one left over from
+    /// a restarted compositor is dropped for the instance that's actually
+    /// there (the daemon-outlives-Hyprland case).
+    #[test]
+    fn a_stale_signature_falls_back_to_the_live_instance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hypr_dir = tmp.path().join("hypr");
+        hyprland_instance(&hypr_dir, "live_instance", 2_000);
+
+        assert_eq!(
+            socket_path_in(&hypr_dir, Some(OsStr::new("live_instance"))).unwrap(),
+            hypr_dir.join("live_instance").join(".socket.sock")
+        );
+        assert_eq!(
+            socket_path_in(&hypr_dir, Some(OsStr::new("gone_with_the_old_session"))).unwrap(),
+            hypr_dir.join("live_instance").join(".socket.sock")
+        );
+        // Nothing live at all: an error, so the caller keeps waiting.
+        std::fs::remove_dir_all(hypr_dir.join("live_instance")).unwrap();
+        assert!(socket_path_in(&hypr_dir, Some(OsStr::new("live_instance"))).is_err());
+    }
+
+    /// The signature-less fallback picks the live instance, not a stale
+    /// directory left behind by an earlier one.
+    #[test]
+    fn the_newest_hyprland_instance_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hypr_dir = tmp.path().join("hypr");
+        hyprland_instance(&hypr_dir, "old_crashed_instance", 1_000);
+        hyprland_instance(&hypr_dir, "live_instance", 2_000);
+        // A leftover directory whose socket is gone is not a candidate.
+        std::fs::create_dir_all(hypr_dir.join("socketless_instance")).unwrap();
+
+        assert_eq!(
+            newest_hyprland_instance(&hypr_dir).unwrap(),
+            hypr_dir.join("live_instance").join(".socket.sock")
+        );
+    }
+
+    /// The fallback's real target: with no HYPRLAND_INSTANCE_SIGNATURE to go
+    /// by (an autostarted daemon's situation), the discovered socket must be
+    /// the live compositor's — it answers a monitors query. Runs only under a
+    /// running Hyprland; elsewhere there is nothing to discover.
+    #[test]
+    fn a_discovered_instance_socket_answers_queries() {
+        let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
+            return;
+        };
+        let hypr_dir = PathBuf::from(runtime_dir).join("hypr");
+        let Ok(socket) = newest_hyprland_instance(&hypr_dir) else {
+            return;
+        };
+        let layout = hyprland_layout(&socket).expect("the discovered socket answers j/monitors");
+        assert!(!layout.is_empty(), "a live Hyprland reports at least one output");
+    }
+
+    #[test]
+    fn no_hyprland_instance_is_an_error_not_a_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hypr_dir = tmp.path().join("hypr");
+        // Missing dir (no Hyprland ever), then an empty one (all gone).
+        assert!(newest_hyprland_instance(&hypr_dir).is_err());
+        std::fs::create_dir_all(&hypr_dir).unwrap();
+        assert!(newest_hyprland_instance(&hypr_dir).is_err());
+    }
 
     fn rect(name: &str, x: i32, y: i32, width: i32, height: i32) -> OutputRect {
         OutputRect {
