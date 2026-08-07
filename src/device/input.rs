@@ -359,6 +359,7 @@ async fn handle_input_event(
                     Vec::with_capacity(input_events_batch.capacity()),
                 ),
                 is_grabbed: device_info.is_grabbed,
+                class: device_info.class,
             });
             if let Err(e) = c.event_tx.send(event).await {
                 warn!("Error sending input events for routing: {:?}", e);
@@ -589,6 +590,7 @@ mod tests {
         util::DeviceInfo {
             dims: BTreeMap::from_iter(dims.iter().copied()),
             is_grabbed: false,
+            class: crate::msgs::event::DeviceClass::Touchpad,
         }
     }
 

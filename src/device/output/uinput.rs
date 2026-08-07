@@ -173,7 +173,16 @@ impl VirtualUInputDevices {
         .collect()
     }
 
-    fn route_event(&self, event: evdev::InputEvent) -> Option<EventDest> {
+    /// Where an event should be emitted. `class` is the source device's
+    /// class when the sender tagged the frame (protocol v17+): it settles
+    /// destinations that the capability sets leave ambiguous, since a mouse
+    /// and a touchpad necessarily share codes like BTN_LEFT. Without it the
+    /// ambiguity falls back to a count heuristic over the frame.
+    fn route_event(
+        &self,
+        event: evdev::InputEvent,
+        class: Option<event::DeviceClass>,
+    ) -> Option<EventDest> {
         match event.destructure() {
             EventSummary::Key(_evt, code, _val) => {
                 if self.keyboard_keys.contains(code) {
@@ -181,7 +190,13 @@ impl VirtualUInputDevices {
                 } else if self.mouse_keys.contains(code) {
                     // mouse_keys and touchpad_keys have a lot of BTN_* key overlap
                     if self.touchpad_keys.contains(code) {
-                        Some(EventDest::MouseOrTouchpad)
+                        match class {
+                            // The sender told us which device this came from,
+                            // so the overlap isn't ambiguous at all.
+                            Some(event::DeviceClass::Touchpad) => Some(EventDest::Touchpad),
+                            Some(event::DeviceClass::Mouse) => Some(EventDest::Mouse),
+                            _ => Some(EventDest::MouseOrTouchpad),
+                        }
                     } else {
                         Some(EventDest::Mouse)
                     }
@@ -323,13 +338,63 @@ impl OutputHandler for VirtualUInputDevices {
     }
 
     async fn write(&mut self, events: Vec<event::InputEvent>) -> Result<()> {
+        // Every write emits exactly one SYN_REPORT per device, so a write is
+        // one evdev frame. A caller that has several frames to deliver can
+        // therefore pass them in one call by separating them with an
+        // explicit SYN_REPORT, and each arrives as its own frame — the
+        // multitouch protocol is frame-based, and merging frames collapses a
+        // whole touch into one the compositor reads as no touch at all.
+        // Without this split the boundary would depend on callers making one
+        // call per frame, which is invisible to break and silently kills
+        // touchpad forwarding.
+        for frame in events.split(is_frame_separator) {
+            if frame.is_empty() {
+                continue;
+            }
+            self.write_frame(frame, None).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_classed(
+        &mut self,
+        class: event::DeviceClass,
+        events: Vec<event::InputEvent>,
+    ) -> Result<()> {
+        for frame in events.split(is_frame_separator) {
+            if frame.is_empty() {
+                continue;
+            }
+            self.write_frame(frame, Some(class)).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether this event is a SYN_REPORT, the evdev frame terminator (see
+/// VirtualUInputDevices::write).
+fn is_frame_separator(event: &event::InputEvent) -> bool {
+    event.inputi32.as_ref().is_some_and(|e| {
+        e.type_ == evdev::EventType::SYNCHRONIZATION.0
+            && e.code == evdev::SynchronizationCode::SYN_REPORT.0
+    })
+}
+
+impl VirtualUInputDevices {
+    /// Writes one frame: routes its events to the virtual devices and emits
+    /// them, each device's share terminated by a single SYN_REPORT.
+    async fn write_frame(
+        &mut self,
+        events: &[event::InputEvent],
+        class: Option<event::DeviceClass>,
+    ) -> Result<()> {
         // Pre-size to the incoming batch: batches arrive at up to 8kHz, so a
         // collect-grown Vec (doublings from empty) is per-call churn.
         let mut routed: Vec<(evdev::InputEvent, EventDest)> = Vec::with_capacity(events.len());
         routed.extend(events.iter().filter_map(|event| {
             if let Some(e) = &event.inputf64 {
                 let evdev_event = e.to_evdev(SCALED_DIM_MIN, SCALED_DIM_MAX);
-                if let Some(dest) = self.route_event(evdev_event) {
+                if let Some(dest) = self.route_event(evdev_event, class) {
                     Some((evdev_event, dest))
                 } else {
                     None
@@ -337,7 +402,7 @@ impl OutputHandler for VirtualUInputDevices {
             } else if let Some(e) = &event.inputi32 {
                 let evdev_event = e.to_evdev();
                 check_discrete_axis_range(&evdev_event);
-                if let Some(dest) = self.route_event(evdev_event) {
+                if let Some(dest) = self.route_event(evdev_event, class) {
                     Some((evdev_event, dest))
                 } else {
                     None
@@ -642,14 +707,24 @@ pub fn mouse(
     AttributeSet<MiscCode>,
     AttributeSet<RelativeAxisCode>,
 )> {
+    // Only the button blocks a mouse actually has: misc (BTN_0..BTN_9),
+    // the mouse buttons themselves, and the wheel buttons.
+    //
+    // Claiming every BTN_* (the previous behavior) made udev classify this
+    // device as neither a mouse nor a joystick — measured here as a bare
+    // `ID_INPUT=1 ID_INPUT_KEY=1`, with no ID_INPUT_MOUSE — because the
+    // gamepad and joystick blocks it claimed outvote the mouse evidence.
+    // libinput then can't apply pointer-acceleration or scroll settings to
+    // it, and per-device compositor config never matches it. Claiming the
+    // gamepad or joystick block alone is worse still: udev tags the device
+    // ID_INPUT_JOYSTICK, which libinput ignores outright.
+    //
+    // A side benefit: BTN_TOUCH is no longer claimed here, so a touch
+    // release can't be routed to the mouse (route_event only had a batch's
+    // event counts to break that tie, and a tie went to the mouse).
     let mut keys = AttributeSet::<KeyCode>::new();
-    for code in 1..libc::KEY_MAX {
-        let key = KeyCode::new(code);
-        // HACK: Include only BTN_* keys, and exclude BTN_TOOL_* or else the mouse is ignored.
-        let key_name = format!("{:?}", key);
-        if key_name.starts_with("BTN_") && !key_name.starts_with("BTN_TOOL_") {
-            keys.insert(key);
-        }
+    for code in MOUSE_BUTTON_RANGES.iter().flat_map(|range| range.clone()) {
+        keys.insert(KeyCode::new(code));
     }
 
     // Claim ALL axes. The mouse will be ignored if it claims keys that aren't relevant to claimed axes.
@@ -670,6 +745,44 @@ pub fn mouse(
 
     Ok((device, keys, misc, axes))
 }
+
+/// The contiguous `BTN_*` blocks of linux/input-event-codes.h: misc buttons,
+/// mouse buttons, joystick, gamepad, digitizer/tool, wheel, the gamepad
+/// d-pad, and the "trigger happy" block. Used to decide which key codes the
+/// virtual devices advertise.
+///
+/// These were previously derived by formatting every code with `{:?}` and
+/// testing the string for a `BTN_` prefix, which made the capabilities of
+/// both virtual devices depend on the evdev crate's Debug output: a renamed
+/// variant upstream would silently change what the devices claim, and the
+/// symptom — a device the compositor quietly ignores — gives no hint where
+/// to look. The code ranges are the kernel's ABI and don't move. An
+/// equivalence test pins the two definitions together.
+/// The blocks are not contiguous: the kernel leaves unassigned gaps (0x12c
+/// through 0x12e in the joystick block, everything past BTN_TRIGGER_HAPPY40),
+/// and those codes have no BTN_ name, so they were never claimed before
+/// either. The equivalence test below holds the list to exactly that.
+const BTN_CODE_RANGES: &[std::ops::RangeInclusive<u16>] = &[
+    0x100..=0x109, // BTN_MISC     .. BTN_9
+    0x110..=0x117, // BTN_MOUSE    .. BTN_TASK
+    0x120..=0x12b, // BTN_JOYSTICK .. BTN_BASE6
+    0x12f..=0x12f, // BTN_DEAD (past the 0x12c-0x12e gap)
+    0x130..=0x13e, // BTN_GAMEPAD  .. BTN_THUMBR
+    0x140..=0x148, // BTN_DIGI     .. BTN_TOOL_QUINTTAP
+    0x14a..=0x14f, // BTN_TOUCH    .. BTN_TOOL_QUADTAP (0x149 BTN_STYLUS3 is
+    // unnamed by our evdev version, so it was never claimed)
+    0x150..=0x151, // BTN_WHEEL    .. BTN_GEAR_UP
+    0x220..=0x223, // BTN_DPAD_UP  .. BTN_DPAD_RIGHT
+    0x2c0..=0x2e7, // BTN_TRIGGER_HAPPY1 .. BTN_TRIGGER_HAPPY40
+];
+
+/// The button blocks the virtual mouse claims: misc, mouse, wheel. Kept
+/// narrow so udev tags the device ID_INPUT_MOUSE (see mouse()).
+const MOUSE_BUTTON_RANGES: &[std::ops::RangeInclusive<u16>] = &[
+    0x100..=0x109, // BTN_MISC  .. BTN_9
+    0x110..=0x117, // BTN_MOUSE .. BTN_TASK
+    0x150..=0x151, // BTN_WHEEL .. BTN_GEAR_UP
+];
 
 /// The discrete absolute axes (those util::axis_scale_type returns
 /// AxisScale::Discrete for) advertised by the virtual touchpad, with their
@@ -728,20 +841,19 @@ pub fn touchpad(
     // Required for movement events to be recognized:
     props.insert(evdev::PropType::POINTER);
 
+    // Most BTN_* keys, or the device won't work. The exceptions are the pen
+    // and stylus codes: with any of them present, libinput classifies this
+    // as an ID_INPUT_TABLET rather than an ID_INPUT_TOUCHPAD. (Check with
+    // "sudo libinput record /dev/input/eventNN".)
+    const BTN_TOOL_PEN: u16 = 0x140;
+    const BTN_STYLUS: u16 = 0x14b;
+    const BTN_STYLUS2: u16 = 0x14c;
     let mut keys = AttributeSet::<KeyCode>::new();
-    for code in 1..libc::KEY_MAX {
-        let key = KeyCode::new(code);
-        // HACK: Limit to only (most) BTN_* keys or else the device won't work.
-        let key_name = format!("{:?}", key);
-        if key_name.starts_with("BTN_")
-        // If one of these keys is present, libinput will classify the device as an ID_INPUT_TABLET,
-        // rather than as an ID_INPUT_TOUCHPAD. See also: "sudo libinput record /dev/input/eventNN"
-            && key_name != "BTN_TOOL_PEN"
-            && key_name != "BTN_STYLUS"
-            && key_name != "BTN_STYLUS2"
-        {
-            keys.insert(key);
+    for code in BTN_CODE_RANGES.iter().flat_map(|range| range.clone()) {
+        if matches!(code, BTN_TOOL_PEN | BTN_STYLUS | BTN_STYLUS2) {
+            continue;
         }
+        keys.insert(KeyCode::new(code));
     }
 
     let mut misc = AttributeSet::<MiscCode>::new();
@@ -834,6 +946,132 @@ fn abs_axis(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn in_ranges(ranges: &[std::ops::RangeInclusive<u16>], code: u16) -> bool {
+        ranges.iter().any(|range| range.contains(&code))
+    }
+
+    /// Pins BTN_CODE_RANGES to the evdev crate's own naming, which is what
+    /// the previous `format!("{:?}", key).starts_with("BTN_")` test used.
+    /// The ranges are the kernel ABI and don't move, but if a future evdev
+    /// version names a code we don't cover (or stops naming one we do), this
+    /// fails loudly here instead of silently changing what the virtual
+    /// devices advertise — a change whose only symptom is a device the
+    /// compositor quietly ignores.
+    #[test]
+    fn btn_code_ranges_agree_with_the_evdev_names() {
+        for code in 1..libc::KEY_MAX as u16 {
+            let named_btn = format!("{:?}", KeyCode::new(code)).starts_with("BTN_");
+            assert_eq!(
+                in_ranges(BTN_CODE_RANGES, code),
+                named_btn,
+                "code {:#x} ({:?}): ranges and evdev naming disagree",
+                code,
+                KeyCode::new(code)
+            );
+        }
+    }
+
+    /// The virtual mouse claims pointer buttons only. Claiming the gamepad
+    /// or joystick blocks costs it its ID_INPUT_MOUSE tag (measured: udev
+    /// then reports a bare ID_INPUT_KEY, or ID_INPUT_JOYSTICK, which
+    /// libinput ignores outright).
+    #[test]
+    fn the_virtual_mouse_claims_pointer_buttons_only() {
+        for claimed in [
+            KeyCode::BTN_LEFT,
+            KeyCode::BTN_RIGHT,
+            KeyCode::BTN_MIDDLE,
+            KeyCode::BTN_SIDE,
+            KeyCode::BTN_EXTRA,
+            KeyCode::BTN_FORWARD,
+            KeyCode::BTN_BACK,
+            KeyCode::BTN_TASK,
+        ] {
+            assert!(
+                in_ranges(MOUSE_BUTTON_RANGES, claimed.0),
+                "the mouse must claim {:?}",
+                claimed
+            );
+        }
+        for rejected in [
+            KeyCode::BTN_TOUCH,        // a touch release must reach the touchpad
+            KeyCode::BTN_TOOL_FINGER,  // tool reports belong to the touchpad
+            KeyCode::BTN_SOUTH,        // gamepad block: costs ID_INPUT_MOUSE
+            KeyCode::BTN_TRIGGER,      // joystick block: udev tags it a joystick
+        ] {
+            assert!(
+                !in_ranges(MOUSE_BUTTON_RANGES, rejected.0),
+                "the mouse must not claim {:?}",
+                rejected
+            );
+        }
+        // Every mouse button is a BTN_* code.
+        for range in MOUSE_BUTTON_RANGES {
+            for code in range.clone() {
+                assert!(in_ranges(BTN_CODE_RANGES, code), "{:#x} is not a BTN_ code", code);
+            }
+        }
+    }
+
+    fn ev(type_: u16, code: u16, value: i32) -> event::InputEvent {
+        event::InputEvent {
+            inputi32: Some(event::InputI32 { type_, code, value }),
+            inputf64: None,
+        }
+    }
+
+    /// A batch carrying several frames separated by SYN_REPORT is split back
+    /// into those frames, so each is emitted with its own terminator. The
+    /// separators themselves are consumed: write emits one per frame.
+    #[test]
+    fn a_batch_splits_back_into_its_frames() {
+        let abs = evdev::EventType::ABSOLUTE.0;
+        let syn = evdev::EventType::SYNCHRONIZATION.0;
+        let syn_report = evdev::SynchronizationCode::SYN_REPORT.0;
+        let mt_x = evdev::AbsoluteAxisCode::ABS_MT_POSITION_X.0;
+
+        let batch = vec![
+            ev(abs, mt_x, 100),
+            ev(syn, syn_report, 0),
+            ev(abs, mt_x, 200),
+            ev(syn, syn_report, 0),
+            ev(abs, mt_x, 300),
+        ];
+        let frames: Vec<&[event::InputEvent]> = batch
+            .split(is_frame_separator)
+            .filter(|f| !f.is_empty())
+            .collect();
+
+        assert_eq!(frames.len(), 3, "each SYN_REPORT ends a frame");
+        for (frame, expected) in frames.iter().zip([100, 200, 300]) {
+            assert_eq!(frame.len(), 1);
+            assert_eq!(frame[0].inputi32.as_ref().unwrap().value, expected);
+        }
+    }
+
+    /// A batch with no separators is one frame — the coalesced relative
+    /// motion path, where merging is lossless and saves syscalls at 8kHz.
+    #[test]
+    fn an_unseparated_batch_stays_one_frame() {
+        let rel = evdev::EventType::RELATIVE.0;
+        let rel_x = evdev::RelativeAxisCode::REL_X.0;
+        let batch = vec![ev(rel, rel_x, 3), ev(rel, rel_x, 4)];
+
+        let frames: Vec<&[event::InputEvent]> = batch
+            .split(is_frame_separator)
+            .filter(|f| !f.is_empty())
+            .collect();
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].len(), 2);
+        // Only SYN_REPORT separates; other synchronization codes do not.
+        assert!(!is_frame_separator(&ev(
+            evdev::EventType::SYNCHRONIZATION.0,
+            evdev::SynchronizationCode::SYN_DROPPED.0,
+            0
+        )));
+    }
 
     #[test]
     fn repeat_coalescer_collapses_backlog_bursts() {

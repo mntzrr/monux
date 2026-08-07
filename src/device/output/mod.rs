@@ -12,6 +12,16 @@ pub const VIRTUAL_DEVICE_NAME_PREFIX: &str = "monux virtual";
 pub trait OutputHandler {
     async fn write(&mut self, event: Vec<event::InputEvent>) -> Result<()>;
 
+    /// Writes a frame whose source device class is known (protocol v17+),
+    /// which settles destinations that event codes alone leave ambiguous —
+    /// a mouse and a touchpad both have BTN_LEFT. A handler that doesn't
+    /// distinguish devices forwards this to write.
+    async fn write_classed(
+        &mut self,
+        class: event::DeviceClass,
+        events: Vec<event::InputEvent>,
+    ) -> Result<()>;
+
     /// Releases all keys/buttons currently held on the output devices.
     /// Used to avoid stuck keys when the input stream ends or moves to another machine.
     async fn release_all(&mut self) -> Result<()>;

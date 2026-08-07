@@ -37,14 +37,46 @@ pub enum ServerEvent<'a> {
     /// applies. Appended variant (protocol v13).
     EdgeInfoRevoke { direction: Direction },
 
-    /// DEPRECATED (protocol v14): credentials of the server's 'monux-direct'
-    /// WiFi hotspot. The hotspot feature was removed in v10.0.0 — nothing
-    /// constructs this variant anymore, and receivers must ignore it (a
-    /// not-yet-updated v14–v16 peer can still send it during the transition).
-    /// The variant stays at this exact position with this exact payload to
-    /// keep the wire format stable; it will be dropped at the next
-    /// PROTOCOL_VERSION bump.
-    HotspotInfo { ssid: String, psk: String },
+    /// Input events for the client's virtual devices, tagged with the class
+    /// of the device they came from (protocol v17; see
+    /// shared::sends_device_class). Supersedes Input for v17+ pairs.
+    ///
+    /// Takes wire index 6, freed by dropping the deprecated HotspotInfo
+    /// variant in the same release that introduced this one — safe precisely
+    /// because both landed together: no released build has ever encoded
+    /// either variant at this index. The only peers that still CONSTRUCT a
+    /// hotspot message are pre-v10.0.0 builds with the feature in use, and
+    /// they cannot be paired with without also predating this variant.
+    ///
+    /// Without the tag, the client has to infer which virtual device an
+    /// event belongs to from which device's capability set contains the
+    /// event's code — and the sets necessarily overlap (both a mouse and a
+    /// touchpad have BTN_LEFT), so overlapping codes were resolved by a
+    /// count heuristic over the batch. The source device's class is known on
+    /// the server and settles it exactly.
+    ClassedInput {
+        class: DeviceClass,
+        events: Vec<InputEvent>,
+    },
+}
+
+/// What kind of device a forwarded input frame came from, so the client can
+/// route it to the matching virtual device (see ServerEvent::ClassedInput).
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum DeviceClass {
+    Keyboard,
+    Mouse,
+    Touchpad,
+}
+
+impl std::fmt::Display for DeviceClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(match self {
+            DeviceClass::Keyboard => "keyboard",
+            DeviceClass::Mouse => "mouse",
+            DeviceClass::Touchpad => "touchpad",
+        })
+    }
 }
 
 impl<'a> std::fmt::Display for ServerEvent<'a> {
@@ -60,10 +92,8 @@ impl<'a> std::fmt::Display for ServerEvent<'a> {
             ServerEvent::EdgeInfoRevoke { direction } => {
                 write!(f, "EdgeInfoRevoke(direction={})", direction.as_str())
             }
-            ServerEvent::HotspotInfo { ssid, .. } => {
-                // Never print the passphrase, even in a Display impl used for
-                // trace logging: the SSID alone identifies the message.
-                write!(f, "HotspotInfo(ssid={})", ssid)
+            ServerEvent::ClassedInput { class, events } => {
+                write!(f, "ClassedInput({}, {:?})", class, events)
             }
         }
     }
@@ -443,16 +473,25 @@ mod tests {
     }
 
     #[test]
-    fn hotspot_info_roundtrip_without_leaking_psk_to_display() {
-        // Pins the wire shape of the DEPRECATED HotspotInfo variant (see its
-        // doc comment): it must keep (de)serializing identically until the
-        // next protocol bump drops it, and Display never prints the psk.
-        let msg = ServerEvent::HotspotInfo {
-            ssid: "monux-direct-box".to_string(),
-            psk: "sekrit123".to_string(),
-        };
-        assert!(!format!("{}", msg).contains("sekrit123"));
-        assert_cobs_roundtrip!(ServerEvent, msg);
+    fn classed_input_roundtrips_for_every_class() {
+        // The v17 frame (see ServerEvent::ClassedInput), which took the wire
+        // index freed by dropping the deprecated HotspotInfo variant.
+        for class in [DeviceClass::Keyboard, DeviceClass::Mouse, DeviceClass::Touchpad] {
+            assert_cobs_roundtrip!(
+                ServerEvent,
+                ServerEvent::ClassedInput {
+                    class,
+                    events: vec![InputEvent {
+                        inputi32: Some(InputI32 {
+                            type_: 3,
+                            code: 53,
+                            value: 4338,
+                        }),
+                        inputf64: None,
+                    }],
+                }
+            );
+        }
     }
 
     #[test]

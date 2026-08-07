@@ -71,6 +71,35 @@ pub fn axis_scale_type(axis: AbsoluteAxisCode) -> AxisScale {
 pub struct DeviceInfo {
     pub dims: BTreeMap<u16, (i32, i32)>,
     pub is_grabbed: bool,
+    /// What kind of device this is, forwarded with each frame so the client
+    /// routes it to the matching virtual device (see device_class).
+    pub class: crate::msgs::event::DeviceClass,
+}
+
+/// Classifies a device for the wire (see DeviceInfo::class).
+///
+/// Touchpads and touchscreens report absolute positions, so an absolute X
+/// axis is the giveaway — checked first, because such devices usually
+/// advertise relative axes and buttons as well. A relative pointer is a
+/// mouse. Everything else is treated as a keyboard: that is the class whose
+/// virtual device claims the ordinary key codes, and it is where an
+/// unclassifiable device's key events are most likely to be usable.
+pub fn device_class(device: &Device) -> crate::msgs::event::DeviceClass {
+    use crate::msgs::event::DeviceClass;
+    let has_abs_position = device.supported_absolute_axes().is_some_and(|axes| {
+        axes.contains(AbsoluteAxisCode::ABS_X) || axes.contains(AbsoluteAxisCode::ABS_MT_POSITION_X)
+    });
+    if has_abs_position {
+        return DeviceClass::Touchpad;
+    }
+    let has_rel_position = device.supported_relative_axes().is_some_and(|axes| {
+        axes.contains(evdev::RelativeAxisCode::REL_X)
+            || axes.contains(evdev::RelativeAxisCode::REL_Y)
+    });
+    if has_rel_position {
+        return DeviceClass::Mouse;
+    }
+    DeviceClass::Keyboard
 }
 
 impl DeviceInfo {
@@ -89,7 +118,11 @@ impl DeviceInfo {
                 }
             }
         }
-        DeviceInfo { dims, is_grabbed }
+        DeviceInfo {
+            dims,
+            is_grabbed,
+            class: device_class(device),
+        }
     }
 }
 

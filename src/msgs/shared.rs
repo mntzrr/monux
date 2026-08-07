@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 /// The protocol version exchanged between client and server on each stream.
 /// This is compared on initial connection between client and server.
 /// If the event/bulk definitions change, then this should change.
-pub const PROTOCOL_VERSION: u64 = 16;
+pub const PROTOCOL_VERSION: u64 = 17;
 
 /// The first protocol version whose peers can negotiate: two v16+ peers
 /// connect at min(their, our) and each side only uses features the negotiated
@@ -36,7 +36,10 @@ pub fn negotiate(theirs: u64, ours: u64) -> Option<u64> {
 /// the feature and its name, for degraded-set logging when a pair negotiates
 /// down (see [`features_above`]). v16 itself is the negotiation machinery —
 /// no new wire feature rides it.
-const FEATURES: &[(u64, &str)] = &[(15, "server hostname in handshake")];
+const FEATURES: &[(u64, &str)] = &[
+    (15, "server hostname in handshake"),
+    (17, "input device class"),
+];
 
 /// The features a version misses out on: every feature newer than `v`,
 /// oldest first. Logged as the degraded set when a pair negotiates below our
@@ -58,6 +61,21 @@ pub fn disabled_features(v: u64) -> String {
     } else {
         names.join(", ")
     }
+}
+
+/// The protocol version that introduced the device class on input frames:
+/// the server tags each forwarded frame with the class of the device it came
+/// from, so the client routes it to the matching virtual device instead of
+/// inferring the destination from which device's capability set happens to
+/// contain the event's code (see uinput::route_event).
+pub const PROTOCOL_VERSION_DEVICE_CLASS: u64 = 17;
+
+/// Whether the server tags input frames with their device class: only when
+/// the pair's NEGOTIATED version is v17+. An older client has no variant for
+/// it and would fail to deserialize the frame, so those pairs keep the
+/// untagged frame and the client's capability-based inference.
+pub fn sends_device_class(negotiated: u64) -> bool {
+    negotiated >= PROTOCOL_VERSION_DEVICE_CLASS
 }
 
 /// The protocol version that introduced the server-hostname frame: right
@@ -167,19 +185,50 @@ mod tests {
 
     #[test]
     fn features_above_content() {
-        // v16 rides no new wire feature: nothing is newer than v15 yet.
-        assert_eq!(features_above(15), vec![]);
-        assert_eq!(features_above(16), vec![]);
+        // Nothing is newer than our own version.
+        assert_eq!(features_above(17), vec![]);
         assert_eq!(features_above(u64::MAX), vec![]);
-        // Below v15 the hostname frame is missing.
-        assert_eq!(features_above(14), vec![(15, "server hostname in handshake")]);
-        assert_eq!(features_above(0), vec![(15, "server hostname in handshake")]);
+        // v16 rode no wire feature of its own, so a pair that lands on v15 or
+        // v16 misses exactly the v17 device class.
+        assert_eq!(features_above(15), vec![(17, "input device class")]);
+        assert_eq!(features_above(16), vec![(17, "input device class")]);
+        // Below v15 the hostname frame is missing too, oldest first.
+        assert_eq!(
+            features_above(14),
+            vec![
+                (15, "server hostname in handshake"),
+                (17, "input device class")
+            ]
+        );
+        assert_eq!(
+            features_above(0),
+            vec![
+                (15, "server hostname in handshake"),
+                (17, "input device class")
+            ]
+        );
+    }
+
+    /// The class tag rides v17: a pair that negotiated lower must keep
+    /// sending the untagged frame, which every peer understands.
+    #[test]
+    fn device_class_gate_follows_the_negotiated_version() {
+        assert!(sends_device_class(PROTOCOL_VERSION));
+        assert!(sends_device_class(17));
+        assert!(sends_device_class(u64::MAX));
+        assert!(!sends_device_class(16));
+        assert!(!sends_device_class(15));
+        assert!(!sends_device_class(0));
     }
 
     #[test]
     fn disabled_features_list_for_logs() {
-        assert_eq!(disabled_features(15), "nothing");
-        assert_eq!(disabled_features(14), "server hostname in handshake");
+        assert_eq!(disabled_features(17), "nothing");
+        assert_eq!(disabled_features(15), "input device class");
+        assert_eq!(
+            disabled_features(14),
+            "server hostname in handshake, input device class"
+        );
     }
 
     #[test]

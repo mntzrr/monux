@@ -69,6 +69,10 @@ pub fn key_traced(code: u16) -> bool {
 pub struct InputBatch {
     pub events: Vec<event::InputEvent>,
     pub is_grabbed: bool,
+    /// The class of the device the frame came from, forwarded to the client
+    /// so it routes the frame to the matching virtual device instead of
+    /// guessing from event codes (see event::ServerEvent::ClassedInput).
+    pub class: event::DeviceClass,
 }
 
 #[derive(Clone, Debug)]

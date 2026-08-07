@@ -17,7 +17,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::clipboard::{CLIPBOARD_SERVE_TIMEOUT_SECS, data, server};
 use crate::device;
 use crate::edge;
-use crate::msgs::{bulk, event};
+use crate::msgs::{bulk, event, shared};
 use crate::network::link_quality::{LinkQuality, Tier};
 use crate::network::throttle::{self, SharedThrottle};
 use crate::network::transport::NetworkMode;
@@ -152,6 +152,9 @@ struct ClientInfo {
     /// When this client was added; published as connected_since_secs in the
     /// control socket's status (control.rs).
     connected_at: Instant,
+    /// The protocol version this pair negotiated, so the send path only uses
+    /// frames this client understands (see shared::sends_device_class).
+    negotiated_version: u64,
 }
 
 /// Keeps track of the most recently disconnected client,
@@ -348,6 +351,9 @@ pub struct AddClientArgs {
     pub conn: quinn::Connection,
     /// Token of the accepted connection (see ClientInfo::conn_token).
     pub conn_token: u64,
+    /// Protocol version negotiated with this client (see
+    /// ClientInfo::negotiated_version).
+    pub negotiated_version: u64,
 }
 
 /// Outcome of a pointer-motion datagram send attempt.
@@ -1088,6 +1094,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                     args.bulk_send,
                     args.conn,
                     args.conn_token,
+                    args.negotiated_version,
                 )
                 .await
             }
@@ -1149,6 +1156,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         bulk_send: SendStream,
         conn: quinn::Connection,
         conn_token: u64,
+        negotiated_version: u64,
     ) {
         // Dedicated writer task for this client's bulk stream: clipboard payloads
         // can be megabytes, and writing them inline would stall input forwarding
@@ -1200,6 +1208,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             datagrams_ok: true,
             conn_token,
             connected_at: Instant::now(),
+            negotiated_version,
         };
         // Clients stay sorted by endpoint as an arbitrary consistent order across
         // sessions. An identical endpoint can already be present when a reconnect
@@ -2652,7 +2661,13 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 counts.forwarded,
                 counts.forwarded as f64 / secs
             ),
-            None => info!(
+            // Input staying on the local machine is the resting state, and
+            // grabbed keyboards emit locally the whole time you type — so at
+            // INFO this line alone accounts for the overwhelming majority of
+            // a normal day's log, burying the lines worth finding when
+            // something goes wrong. Forwarding (above) and pausing stay at
+            // INFO: those say where your input actually went.
+            None => debug!(
                 "Input status: local ({}): {} events in, {} emitted locally ({:.1}/s)",
                 grab,
                 counts.physical,
@@ -3028,6 +3043,17 @@ impl<O: device::output::OutputHandler> Rotation<O> {
 
     /// Sends an event to the currently active client, removing it if sending fails.
     /// If no client is active, this does nothing.
+    /// Whether this client negotiated a version that understands
+    /// class-tagged input frames. Unknown clients (never added, or already
+    /// removed) fall back to the untagged frame: the older form is
+    /// understood by every peer.
+    fn client_speaks_device_class(&self, endpoint: &SocketAddr) -> bool {
+        self.clients
+            .iter()
+            .find(|client| client.endpoint == *endpoint)
+            .is_some_and(|client| shared::sends_device_class(client.negotiated_version))
+    }
+
     async fn send_event_to_remote_client(&mut self, msg: event::ServerEvent<'_>) -> Result<()> {
         let current_client = match self.current_client {
             Some(client) => client,
@@ -3130,8 +3156,18 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             // is not guaranteed — but the common case (click after motion on
             // the same path) works well enough in practice.
             self.flush_pending_motion().await;
-            self.send_event_to_remote_client(event::ServerEvent::Input(events))
-                .await?;
+            // Tag the frame with its source device's class for clients that
+            // understand it; a client negotiated below v17 has no variant for
+            // it and gets the untagged frame (see shared::sends_device_class).
+            let msg = if self.client_speaks_device_class(&endpoint) {
+                event::ServerEvent::ClassedInput {
+                    class: batch.class,
+                    events,
+                }
+            } else {
+                event::ServerEvent::Input(events)
+            };
+            self.send_event_to_remote_client(msg).await?;
             self.status_counts.forwarded += event_count;
             Ok(())
         } else if batch.is_grabbed {
@@ -3690,6 +3726,13 @@ mod tests {
             self.written += events.len();
             Ok(())
         }
+        async fn write_classed(
+            &mut self,
+            _class: event::DeviceClass,
+            events: Vec<event::InputEvent>,
+        ) -> Result<()> {
+            self.write(events).await
+        }
     }
 
     #[tokio::test]
@@ -3720,6 +3763,7 @@ mod tests {
                 i32_event(evdev::EventType::KEY.0, 28, 0),
             ],
             is_grabbed: true,
+            class: event::DeviceClass::Mouse,
         };
         rotation.send_input_events(batch).await.unwrap();
         assert_eq!(rotation.status_counts.physical, 2);
@@ -3732,6 +3776,7 @@ mod tests {
         let batch = device::InputBatch {
             events: vec![i32_event(evdev::EventType::RELATIVE.0, 0, 5)],
             is_grabbed: false,
+            class: event::DeviceClass::Mouse,
         };
         rotation.send_input_events(batch).await.unwrap();
         assert_eq!(rotation.status_counts.physical, 3);
@@ -3780,6 +3825,7 @@ mod tests {
                 .send_input_events(device::InputBatch {
                     events: vec![i32_event(rel, rel_x, dx), i32_event(rel, rel_y, dy)],
                     is_grabbed: true,
+                    class: event::DeviceClass::Mouse,
                 })
                 .await
                 .unwrap();
@@ -3830,6 +3876,7 @@ mod tests {
             .send_input_events(device::InputBatch {
                 events: vec![i32_event(evdev::EventType::RELATIVE.0, 0, 5)],
                 is_grabbed: false,
+                class: event::DeviceClass::Mouse,
             })
             .await
             .unwrap();
@@ -3847,6 +3894,7 @@ mod tests {
             .send_input_events(device::InputBatch {
                 events: vec![i32_event(evdev::EventType::RELATIVE.0, 0, 5)],
                 is_grabbed: true,
+                class: event::DeviceClass::Mouse,
             })
             .await
             .unwrap();
@@ -4962,6 +5010,7 @@ mod tests {
                     i32_event(evdev::EventType::KEY.0, 28, 0),
                 ],
                 is_grabbed: false,
+                class: event::DeviceClass::Mouse,
             })
             .await
             .unwrap();

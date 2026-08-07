@@ -680,6 +680,78 @@ impl Connection {
         }
     }
 
+    /// Writes the queued input frames, if any, and clears the queue. Uses
+    /// the queued frames' device class when they carried one, so the routing
+    /// is as precise on the flush as it was when the frames arrived.
+    /// Associated function for the same reason as note_output_result.
+    async fn flush_pending_input<O: output::OutputHandler>(
+        output_handler: &mut O,
+        output_write_failing: &mut bool,
+        pending: &mut Vec<event::InputEvent>,
+        pending_class: &mut Option<event::DeviceClass>,
+    ) {
+        let class = pending_class.take();
+        if pending.is_empty() {
+            return;
+        }
+        let events = std::mem::take(pending);
+        let result = match class {
+            Some(class) => output_handler.write_classed(class, events).await,
+            None => output_handler.write(events).await,
+        };
+        Self::note_output_result(output_write_failing, result);
+    }
+
+    /// Queues one input frame for injection, or writes it immediately when
+    /// it must keep its own frame boundary.
+    ///
+    /// Coalescing several frames into one write is what keeps an 8kHz mouse
+    /// cheap — relative deltas sum and key events are independent, so the
+    /// merge is lossless. Absolute input is different: the multitouch
+    /// protocol is frame-based, so a merge makes the last value of each axis
+    /// win and can collapse an entire touch into one frame the compositor
+    /// reads as no touch at all. Those frames are written on their own.
+    /// Frames from different devices never merge either: their events would
+    /// interleave into one frame, and the queue can only carry one class.
+    async fn queue_input<O: output::OutputHandler>(
+        &mut self,
+        output_handler: &mut O,
+        pending: &mut Vec<event::InputEvent>,
+        pending_class: &mut Option<event::DeviceClass>,
+        class: Option<event::DeviceClass>,
+        mut events: Vec<event::InputEvent>,
+    ) {
+        let own_frame =
+            class == Some(event::DeviceClass::Touchpad) || frame_needs_own_syn(&events);
+        if own_frame {
+            // Flush what's queued first so ordering holds.
+            Self::flush_pending_input(
+                output_handler,
+                &mut self.output_write_failing,
+                pending,
+                pending_class,
+            )
+            .await;
+            let result = match class {
+                Some(class) => output_handler.write_classed(class, events).await,
+                None => output_handler.write(events).await,
+            };
+            Self::note_output_result(&mut self.output_write_failing, result);
+            return;
+        }
+        if !pending.is_empty() && *pending_class != class {
+            Self::flush_pending_input(
+                output_handler,
+                &mut self.output_write_failing,
+                pending,
+                pending_class,
+            )
+            .await;
+        }
+        *pending_class = class;
+        pending.append(&mut events);
+    }
+
     /// Performs a step of the client event loop, returning an error if the connection should be retried.
     async fn step<O: output::OutputHandler>(
         &mut self,
@@ -846,6 +918,10 @@ impl Connection {
         // into a single write per wake, so a burst of queued messages costs one
         // uinput write batch instead of one per message.
         let mut pending_input: Vec<event::InputEvent> = Vec::new();
+        // The device class the queued frames came from, carried so the flush
+        // can route them as precisely as the frames arrived. Frames of
+        // different classes never share a queue (see queue_input).
+        let mut pending_class: Option<event::DeviceClass> = None;
         while offset < self.event_bytes.len() {
             // A partial frame (no COBS terminator yet) is kept for the next chunk.
             if !shared::has_complete_cobs_frame(&self.event_bytes[offset..]) {
@@ -889,14 +965,13 @@ impl Connection {
             match msg {
                 event::ServerEvent::Switch(e) => {
                     // Preserve ordering: apply queued input before handling this.
-                    if !pending_input.is_empty() {
-                        Self::note_output_result(
-                            &mut self.output_write_failing,
-                            output_handler
-                                .write(std::mem::take(&mut pending_input))
-                                .await,
-                        );
-                    }
+                    Self::flush_pending_input(
+                        output_handler,
+                        &mut self.output_write_failing,
+                        &mut pending_input,
+                        &mut pending_class,
+                    )
+                    .await;
                     info!(
                         "This client is {}",
                         if e.enabled { "active" } else { "inactive" }
@@ -972,42 +1047,43 @@ impl Connection {
                         }
                     }
                 }
+                // Untagged input frame: a server negotiated below v17, so
+                // the destination device is inferred from event codes.
                 event::ServerEvent::Input(mut events) => {
                     // User input events: coalesced and written after the loop.
                     // Pointer/scroll scaling (--mouse-scale/--scroll-scale)
                     // applies here, just before injection.
                     self.scaler.apply(&mut events);
-                    if frame_needs_own_syn(&events) {
-                        // An absolute/multitouch frame must keep its own
-                        // SYN_REPORT boundary (see frame_needs_own_syn).
-                        // Flush what's queued first so ordering holds, then
-                        // write this frame on its own.
-                        if !pending_input.is_empty() {
-                            Self::note_output_result(
-                                &mut self.output_write_failing,
-                                output_handler
-                                    .write(std::mem::take(&mut pending_input))
-                                    .await,
-                            );
-                        }
-                        Self::note_output_result(
-                            &mut self.output_write_failing,
-                            output_handler.write(events).await,
-                        );
-                    } else {
-                        pending_input.append(&mut events);
-                    }
+                    self.queue_input(
+                        output_handler,
+                        &mut pending_input,
+                        &mut pending_class,
+                        None,
+                        events,
+                    )
+                    .await;
+                }
+                // Class-tagged input frame (protocol v17+).
+                event::ServerEvent::ClassedInput { class, mut events } => {
+                    self.scaler.apply(&mut events);
+                    self.queue_input(
+                        output_handler,
+                        &mut pending_input,
+                        &mut pending_class,
+                        Some(class),
+                        events,
+                    )
+                    .await;
                 }
                 event::ServerEvent::ClipboardTypes(types) => {
                     // Preserve ordering: apply queued input before handling this.
-                    if !pending_input.is_empty() {
-                        Self::note_output_result(
-                            &mut self.output_write_failing,
-                            output_handler
-                                .write(std::mem::take(&mut pending_input))
-                                .await,
-                        );
-                    }
+                    Self::flush_pending_input(
+                        output_handler,
+                        &mut self.output_write_failing,
+                        &mut pending_input,
+                        &mut pending_class,
+                    )
+                    .await;
                     // Receiving types announcement from server (following recent activation)
                     // Announce the types to the local clipboard for local apps to see, and clear any prior types from local apps.
                     if let Some(local_clipboard) = &mut local_clipboard {
@@ -1088,20 +1164,16 @@ impl Connection {
                         ),
                     }
                 }
-                // DEPRECATED (protocol v14; the hotspot feature was removed
-                // in v10.0.0): a not-yet-updated server may still advertise
-                // its hotspot credentials — ignore them. The variant keeps
-                // its wire position until the next protocol bump.
-                event::ServerEvent::HotspotInfo { .. } => {}
             }
             offset += consumed;
         }
-        if !pending_input.is_empty() {
-            Self::note_output_result(
-                &mut self.output_write_failing,
-                output_handler.write(pending_input).await,
-            );
-        }
+        Self::flush_pending_input(
+            output_handler,
+            &mut self.output_write_failing,
+            &mut pending_input,
+            &mut pending_class,
+        )
+        .await;
         // Retain any unconsumed partial frame for the next chunk.
         self.event_bytes.drain(..offset);
         Ok(())

@@ -106,7 +106,12 @@ fn probe_session_bus_env() -> bool {
 }
 
 fn probe_user_bus_socket() -> bool {
-    Path::new(&format!("/run/user/{}/bus", unsafe { libc::geteuid() })).exists()
+    Path::new(&user_bus_socket_path()).exists()
+}
+
+/// The systemd-standard per-user session bus socket.
+fn user_bus_socket_path() -> String {
+    format!("/run/user/{}/bus", unsafe { libc::geteuid() })
 }
 
 /// The bounded-respawn decision, factored out of the supervisor loop for
@@ -153,7 +158,31 @@ fn indicator_command() -> Result<Command> {
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    if let Some(address) = derived_session_bus_address() {
+        // has_desktop_session() accepts a session found by its socket alone,
+        // but the child then inherits an environment with no address to
+        // connect to and exits instantly ("no D-Bus session") — burning the
+        // respawn budget for a session that is in fact right there. That is
+        // the autostart case: a daemon started before the compositor never
+        // gets DBUS_SESSION_BUS_ADDRESS, and a later import-environment
+        // doesn't reach it. Pass the address we probed.
+        cmd.env("DBUS_SESSION_BUS_ADDRESS", address);
+    }
     Ok(cmd)
+}
+
+/// The session bus address to hand a child when our own environment lacks
+/// one but the standard per-user socket exists (see probe_user_bus_socket).
+/// None when the environment already carries an address (inherit it) or when
+/// there is no socket to point at.
+fn derived_session_bus_address() -> Option<String> {
+    if probe_session_bus_env() {
+        return None;
+    }
+    let path = user_bus_socket_path();
+    Path::new(&path)
+        .exists()
+        .then(|| format!("unix:path={}", path))
 }
 
 /// Spawns the indicator as a child of this daemon: our own binary with

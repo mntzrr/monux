@@ -541,6 +541,7 @@ async fn handle_connection(
                 bulk_send,
                 conn: conn.clone(),
                 conn_token,
+                negotiated_version: negotiated,
             },
         ))
         .await?;
@@ -825,6 +826,12 @@ mod tests {
         "127.0.0.1:12345".parse().unwrap()
     }
 
+    /// A version that is genuinely refused, for the refusal paths below.
+    /// PROTOCOL_VERSION - 1 no longer qualifies: from v16 on, versions
+    /// negotiate, so the version right below ours is accepted and the pair
+    /// simply runs degraded. Only a pre-negotiation version is refused.
+    const REFUSED_VERSION: u64 = shared::PROTOCOL_VERSION_NEGOTIATION - 2;
+
     #[test]
     fn matching_version_passes_and_records() {
         let mut pv = PeerVersions::default();
@@ -835,7 +842,7 @@ mod tests {
     #[test]
     fn older_version_refuses_with_rate_limited_log() {
         let mut pv = PeerVersions::default();
-        let old = shared::PROTOCOL_VERSION - 1;
+        let old = REFUSED_VERSION;
         assert!(pv.check(addr(), old).is_err());
         assert!(pv.last_refusal_log.contains_key(&addr().ip()));
         // A second refusal inside the window is not logged again.
@@ -864,7 +871,7 @@ mod tests {
     #[test]
     fn upgrade_is_noted_on_reconnect() {
         let mut pv = PeerVersions::default();
-        let old = shared::PROTOCOL_VERSION - 1;
+        let old = REFUSED_VERSION;
         // Refused while old, then comes back matching: the upgrade note fires.
         assert!(pv.check(addr(), old).is_err());
         assert!(pv.check(addr(), shared::PROTOCOL_VERSION).is_ok());
@@ -876,7 +883,7 @@ mod tests {
     #[test]
     fn ephemeral_port_reconnect_matches_same_ip() {
         let mut pv = PeerVersions::default();
-        let old = shared::PROTOCOL_VERSION - 1;
+        let old = REFUSED_VERSION;
         // Refuse from port A.
         let port_a: SocketAddr = "10.0.0.1:50000".parse().unwrap();
         assert!(pv.check(port_a, old).is_err());

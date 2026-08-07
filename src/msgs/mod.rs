@@ -22,8 +22,8 @@ mod golden_tests {
     /// The update gate keys on the protocol version: bumping it must be a
     /// conscious red test (and per AGENTS.md a MAJOR crate version bump).
     #[test]
-    fn protocol_version_is_16() {
-        assert_eq!(shared::PROTOCOL_VERSION, 16);
+    fn protocol_version_is_17() {
+        assert_eq!(shared::PROTOCOL_VERSION, 17);
     }
 
     #[test]
@@ -101,17 +101,27 @@ mod golden_tests {
     }
 
     #[test]
-    fn golden_server_event_hotspot_info() {
-        // DEPRECATED variant (protocol v14; the hotspot feature was removed
-        // in v10.0.0, see event.rs): variant index 6 followed by the two
-        // length-prefixed strings (ssid, psk). The golden bytes stay pinned
-        // so the wire format cannot shift before the variant is dropped at
-        // the next protocol bump.
-        let msg = event::ServerEvent::HotspotInfo {
-            ssid: "ap".to_string(),
-            psk: "pw".to_string(),
-        };
-        assert_eq!(cobs_hex(&msg), "080602617002707700");
+    fn golden_server_event_classed_input() {
+        // Pins the class-tagged input frame's encoding (protocol v17): a
+        // shift here means a v17 peer misreads the frame. The leading 06 is
+        // the wire index, freed by dropping the deprecated HotspotInfo
+        // variant in this same release — both landed together, so no
+        // released build ever encoded either variant here (see event.rs).
+        // The trailing byte before the terminator is the class.
+        assert_eq!(
+            cobs_hex(&event::ServerEvent::ClassedInput {
+                class: event::DeviceClass::Mouse,
+                events: vec![],
+            }),
+            "0306010100"
+        );
+        assert_eq!(
+            cobs_hex(&event::ServerEvent::ClassedInput {
+                class: event::DeviceClass::Touchpad,
+                events: vec![],
+            }),
+            "0306020100"
+        );
     }
 
     #[test]
