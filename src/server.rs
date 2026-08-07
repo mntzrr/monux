@@ -12,6 +12,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::clipboard::data::ClipboardData;
 use crate::clipboard::server::LocalClipboard;
+use crate::control;
 use crate::device::{output, Event, GrabState};
 use crate::msgs::{bulk, event, shared};
 use crate::network::{approval, transport};
@@ -760,6 +761,20 @@ async fn handle_bulk_messages(
                         },
                     ))
                     .await?;
+            }
+            bulk::ClientBulk::DiagnosticsResponse(d) => {
+                // Hand the answer to whichever control-socket task is waiting
+                // on this id (see control::PeerDiagnosticsHub). A malformed
+                // or declined bundle is recorded as this peer's failure, not
+                // treated as a protocol violation: a bug report must never
+                // cost the user their connection.
+                let reply = match (d.json, d.error) {
+                    (Some(json), _) => serde_json::from_str::<control::Diagnostics>(json)
+                        .map_err(|e| format!("sent a bundle that could not be parsed: {}", e)),
+                    (None, Some(error)) => Err(error.to_string()),
+                    (None, None) => Err("sent an empty response".to_string()),
+                };
+                control::peer_diagnostics_hub().complete(d.request_id, reply);
             }
             bulk::ClientBulk::ClipboardHeader(c) => {
                 if c.content_len_bytes > max_clipboard_size_bytes {

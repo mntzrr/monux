@@ -20,6 +20,32 @@ use monux::{client, clipboard, discovery, logging, rotation, server, single_inst
 /// Version string including the git revision (see build.rs).
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("MONUX_GIT_SHA"));
 
+/// Help section headings, shared so every subcommand groups its flags the same
+/// way: a reader who learned the layout on 'server --help' knows it everywhere.
+const H_SWITCHING: &str = "Switching";
+const H_EDGES: &str = "Screen edges";
+const H_NETWORK: &str = "Network";
+const H_TUNING: &str = "Tuning";
+const H_DAEMON: &str = "Daemon behavior";
+const H_TARGET: &str = "Which daemon";
+const H_OUTPUT: &str = "Output";
+const H_CONTENT: &str = "Bundle contents";
+
+/// Help colors: headings, flag names, and value placeholders each get their own
+/// style, so a dense --help reads as a table rather than a paragraph. Colors are
+/// dropped automatically when stdout is not a terminal (clap's own detection).
+fn help_styles() -> clap::builder::Styles {
+    use clap::builder::styling::{AnsiColor, Effects};
+    clap::builder::Styles::styled()
+        .header(AnsiColor::Green.on_default() | Effects::BOLD)
+        .usage(AnsiColor::Green.on_default() | Effects::BOLD)
+        .literal(AnsiColor::Cyan.on_default() | Effects::BOLD)
+        .placeholder(AnsiColor::Cyan.on_default())
+        .valid(AnsiColor::Green.on_default())
+        .invalid(AnsiColor::Yellow.on_default() | Effects::BOLD)
+        .error(AnsiColor::Red.on_default() | Effects::BOLD)
+}
+
 #[derive(Parser)]
 #[command(
     author,
@@ -30,12 +56,20 @@ const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("MONUX_GIT_SH
         env!("CARGO_PKG_DESCRIPTION"),
         monux::msgs::shared::PROTOCOL_VERSION
     ),
+    styles = help_styles(),
+    after_help = "\
+Examples:
+  monux server      # machine with the physical keyboard/mouse
+  monux client      # each machine to control (mDNS auto-discovery)
+  monux status      # live state of the running daemon
+
+Run 'monux <command> --help' for the full reference on any command.",
     after_long_help = "\
-EXAMPLES:
-    monux server      # machine with the physical keyboard/mouse
-    monux client      # each machine to control (mDNS auto-discovery)
-    monux status      # live state of the running daemon
-    monux update      # update to the latest version from GitHub"
+Examples:
+  monux server      # machine with the physical keyboard/mouse
+  monux client      # each machine to control (mDNS auto-discovery)
+  monux status      # live state of the running daemon
+  monux update      # update to the latest version from GitHub"
 )]
 #[command(propagate_version = true)]
 struct Cli {
@@ -49,11 +83,11 @@ enum Commands {
     ///
     /// The machine with the physical input devices; clients connect to it.
     #[command(after_long_help = "\
-EXAMPLES:
-    monux server
-    monux server --edge-map bottom=auto    # switch input at the bottom screen edge
-    monux server --www                     # conservative tuning for the public internet
-    monux server --fingerprints aa11bbcc   # pre-approve a client (no approval prompt)")]
+Examples:
+  monux server
+  monux server --edge-map bottom=auto    # switch input at the bottom screen edge
+  monux server --www                     # conservative tuning for the public internet
+  monux server --fingerprints aa11bbcc   # pre-approve a client (no approval prompt)")]
     Server(ServerArgs),
 
     /// Runs a Monux client
@@ -61,11 +95,11 @@ EXAMPLES:
     /// A machine to be controlled; connects to the given server, or discovers
     /// it on the LAN via mDNS when no host is given.
     #[command(after_long_help = "\
-EXAMPLES:
-    monux client                     # discover the server via mDNS
-    monux client 192.168.1.187       # connect directly
-    monux client --www kvm.example.com
-    monux client --mouse-scale 0.5   # compensate DPI/sensitivity differences")]
+Examples:
+  monux client                     # discover the server via mDNS
+  monux client 192.168.1.187       # connect directly
+  monux client --www kvm.example.com
+  monux client --mouse-scale 0.5   # compensate DPI/sensitivity differences")]
     Client(ClientArgs),
 
     /// Optimizes this machine for local KVM, persisting machine-local settings
@@ -77,11 +111,11 @@ EXAMPLES:
     /// systemd unit and '--desktop-shortcut' a per-user app-menu entry, both
     /// WITHOUT elevating.
     #[command(after_long_help = "\
-EXAMPLES:
-    monux setup                        # apply everything (elevates via sudo)
-    monux setup --autostart server     # only install the login service (no sudo)
-    monux setup --autostart status     # report the autostart state (no sudo, read-only)
-    monux setup --desktop-shortcut     # install the app-menu tray shortcut (no sudo)")]
+Examples:
+  monux setup                        # apply everything (elevates via sudo)
+  monux setup --autostart server     # only install the login service (no sudo)
+  monux setup --autostart status     # report the autostart state (no sudo, read-only)
+  monux setup --desktop-shortcut     # install the app-menu tray shortcut (no sudo)")]
     Setup(SetupArgs),
 
     /// Updates monux to the latest version from GitHub, rebuilding from source
@@ -93,12 +127,12 @@ EXAMPLES:
     /// server first — and pins auto-update so it never undoes the downgrade;
     /// a plain update lifts the pin.
     #[command(after_long_help = "\
-EXAMPLES:
-    monux update                # update to the latest version (also lifts a downgrade pin)
-    monux update --force        # rebuild even if up to date, bypassing the protocol gate
-    monux update --to 8.3.0     # downgrade to a released version (pins auto-update)
-    monux update --to 5b4c00e   # downgrade to a commit
-    monux update --rollback     # return to the previously installed build")]
+Examples:
+  monux update                # update to the latest version (also lifts a downgrade pin)
+  monux update --force        # rebuild even if up to date, bypassing the protocol gate
+  monux update --to 8.3.0     # downgrade to a released version (pins auto-update)
+  monux update --to 5b4c00e   # downgrade to a commit
+  monux update --rollback     # return to the previously installed build")]
     Update(UpdateArgs),
 
     /// Prints the live state of the running monux daemon (server or client)
@@ -108,11 +142,34 @@ EXAMPLES:
     /// fingerprint prefixes and resolved edge directions (the reference for
     /// configuring --edge-map), clipboard owner, update availability.
     #[command(after_long_help = "\
-EXAMPLES:
-    monux status              # server socket first, then the client's
-    monux status --json       # machine-readable raw response
-    monux status --server     # restrict to one role (or --client)")]
+Examples:
+  monux status              # server socket first, then the client's
+  monux status --json       # machine-readable raw response
+  monux status --server     # restrict to one role (or --client)")]
     Status(StatusArgs),
+
+    /// Collects a bug-report bundle: daemon state, logs, journal, environment
+    ///
+    /// Everything a monux bug report needs, in one paste: the daemon's state
+    /// dump and recent log lines, the systemd unit's journal, and the
+    /// environment the daemon runs in (kernel, session, /dev/uinput
+    /// permissions, autostart state). With no daemon running it still reports
+    /// the environment and the journal — which is where the answer lives for
+    /// "monux won't start" and "monux crashed".
+    ///
+    /// --privacy prints exactly what a bundle contains, and --redact strips
+    /// IP addresses, hostnames, usernames and home paths before it leaves the
+    /// machine.
+    #[command(after_long_help = "\
+Examples:
+  monux diagnostics                  # read it here
+  monux diagnostics --copy           # issue-ready markdown, on the clipboard
+  monux diagnostics --issue          # ...plus the command that files it on GitHub
+  monux diagnostics --redact --issue # ...with IPs and hostnames stripped first
+  monux diagnostics --peer           # include the connected clients' side (server)
+  monux diagnostics --privacy        # what a bundle contains, before you paste it
+  monux diagnostics record           # capture a live reproduction to a file")]
+    Diagnostics(DiagnosticsArgs),
 
     /// Lists the servers visible on the LAN and remembered from past connects
     ///
@@ -124,19 +181,19 @@ EXAMPLES:
     /// address visible via both shows once, as mdns. Every printed field is
     /// a valid connect target for 'monux client'.
     #[command(after_long_help = "\
-EXAMPLES:
-    monux servers                  # what's out there, what do I remember
-    monux client 192.168.1.187     # connect by address
-    monux client myhost            # connect by remembered/mDNS name
-    monux client aabbccdd          # connect by fingerprint prefix")]
+Examples:
+  monux servers                  # what's out there, what do I remember
+  monux client 192.168.1.187     # connect by address
+  monux client myhost            # connect by remembered/mDNS name
+  monux client aabbccdd          # connect by fingerprint prefix")]
     Servers,
 
     /// Desktop GUI integration: the tray indicator and its visibility
     #[command(after_long_help = "\
-EXAMPLES:
-    monux gui indicator    # run the tray icon (usually auto-spawned by the daemon)
-    monux gui tray hide    # hide the icon without stopping the daemon
-    monux gui tray show    # bring it back — or start a standalone tray when no daemon runs")]
+Examples:
+  monux gui indicator    # run the tray icon (usually auto-spawned by the daemon)
+  monux gui tray hide    # hide the icon without stopping the daemon
+  monux gui tray show    # bring it back — or start a standalone tray when no daemon runs")]
     Gui(GuiArgs),
 
     /// Manages the persistent configuration (~/.config/monux/config.toml)
@@ -146,34 +203,34 @@ EXAMPLES:
     /// explicit CLI flag always beats the config file, which beats the
     /// built-in default. Daemons read the file once at startup.
     #[command(after_long_help = "\
-EXAMPLES:
-    monux config                             # effective values and their source
-    monux config keys edge                   # the key reference, filtered
-    monux config set server.port 4321        # persist a value (validated like --port)
-    monux config set server.edge-map right=auto left=aa11bb
-    monux config unset client.mouse-scale    # revert to the built-in default
-    monux config edit                        # edit in $EDITOR, validated on save
-    monux config history server.shortcut     # previous values, newest first
-    monux config revert server.shortcut      # restore the previous value (undoable)")]
+Examples:
+  monux config                             # effective values and their source
+  monux config keys edge                   # the key reference, filtered
+  monux config set server.port 4321        # persist a value (validated like --port)
+  monux config set server.edge-map right=auto left=aa11bb
+  monux config unset client.mouse-scale    # revert to the built-in default
+  monux config edit                        # edit in $EDITOR, validated on save
+  monux config history server.shortcut     # previous values, newest first
+  monux config revert server.shortcut      # restore the previous value (undoable)")]
     Config(ConfigArgs),
 
     /// Manages a running monux daemon through its control socket
     ///
     /// Switching input between machines, pausing, restarting, and more.
     #[command(after_long_help = "\
-EXAMPLES:
-    monux daemon switch next    # or prev / local / a client fingerprint prefix
-    monux daemon pause          # ungrab everything (raw local input)
-    monux daemon resume
-    monux daemon restart        # graceful restart into the installed binary
-    monux daemon exit           # graceful stop")]
+Examples:
+  monux daemon switch next    # or prev / local / a client fingerprint prefix
+  monux daemon pause          # ungrab everything (raw local input)
+  monux daemon resume
+  monux daemon restart        # graceful restart into the installed binary
+  monux daemon exit           # graceful stop")]
     Daemon(DaemonArgs),
 
     /// Destructive operations: removing monux from this machine
     #[command(after_long_help = "\
-EXAMPLES:
-    monux system uninstall           # interactive confirmation
-    monux system uninstall --yes     # no prompt (for scripts)")]
+Examples:
+  monux system uninstall           # interactive confirmation
+  monux system uninstall --yes     # no prompt (for scripts)")]
     System(SystemArgs),
 }
 
@@ -205,22 +262,26 @@ struct ConfigArgs {
 
 #[derive(Subcommand)]
 enum ConfigCommands {
-    /// Shows the effective configuration: every key with its value and whether
-    /// it came from the config file or the built-in default (the default when
-    /// no action is given)
+    /// Shows the effective configuration [default action]
+    ///
+    /// Every key with its value and whether it came from the config file or
+    /// the built-in default.
     Show,
 
-    /// Lists all config keys with a one-line description, the expected value
-    /// syntax, and the built-in default; keys introduced after the baseline
-    /// are annotated (new in vX.Y)
+    /// Lists every config key with its syntax and default
+    ///
+    /// One line of description per key, the expected value syntax, and the
+    /// built-in default; keys introduced after the baseline are annotated
+    /// (new in vX.Y).
     Keys {
         /// Only list keys whose name or description contains this substring
         filter: Option<String>,
     },
 
-    /// Sets a config key, or prints the key's reference card when no value is
-    /// given. Values are validated with the same parsers as the flags before
-    /// anything is written; repeatable (array) keys take multiple values
+    /// Sets a config key (no value: print the key's reference card)
+    ///
+    /// Values are validated with the same parsers as the flags before
+    /// anything is written; repeatable (array) keys take multiple values.
     Set {
         /// The full key name: server.<flag> or client.<flag>
         key: String,
@@ -234,30 +295,36 @@ enum ConfigCommands {
         key: String,
     },
 
-    /// Opens the config file in $EDITOR (fallback: vi) and installs the result
-    /// only when it validates, crontab-style
+    /// Edits the config file in $EDITOR, installing it only if it validates
+    ///
+    /// Falls back to vi, and keeps the previous file on a failed validation —
+    /// crontab-style.
     Edit,
 
-    /// Checks the config file without changing it: unknown keys (with
-    /// did-you-mean suggestions and the exact 'unset' cleanup lines) and
-    /// invalid values, with line numbers
+    /// Checks the config file without changing it
+    ///
+    /// Reports unknown keys (with did-you-mean suggestions and the exact
+    /// 'unset' cleanup lines) and invalid values, with line numbers.
     Validate,
 
-    /// Shows the value history of a key (or of every key that has one): the
-    /// current value and the stack of previous values with timestamps,
-    /// newest first — the preview of what 'revert' restores. Every set,
-    /// unset, edit, and revert banks the replaced value as a '# was:'
-    /// comment above the key (at most 5 per key)
+    /// Shows a key's previous values, newest first
+    ///
+    /// The current value and the stack of previous values with timestamps —
+    /// the preview of what 'revert' restores. Every set, unset, edit, and
+    /// revert banks the replaced value as a '# was:' comment above the key
+    /// (at most 5 per key). Omit the key to list every key that has history.
     History {
-        /// The full key name: server.<flag> or client.<flag>; omit to list
-        /// every key that has history
+        /// The full key name: server.<flag> or client.<flag>
+        ///
+        /// Omit it to list every key that has history.
         key: Option<String>,
     },
 
-    /// Restores a key's previous value from its history: the newest entry
-    /// (or the one matching --to) is re-validated and set, banking the
-    /// current value — a revert is itself undoable. Recreates the key line
-    /// when the key was unset
+    /// Restores a key's previous value from its history
+    ///
+    /// The newest entry (or the one matching --to) is re-validated and set,
+    /// banking the current value — a revert is itself undoable. Recreates the
+    /// key line when the key was unset.
     Revert {
         /// The full key name: server.<flag> or client.<flag>
         key: String,
@@ -269,26 +336,34 @@ enum ConfigCommands {
 
 #[derive(Subcommand)]
 enum DaemonCommands {
-    /// Switches input to the next or previous client, the local machine, or a
-    /// client fingerprint prefix
+    /// Switches input to another machine
+    ///
+    /// The target is the next or previous client, the local machine, or a
+    /// client fingerprint prefix.
     Switch(DaemonSwitchArgs),
 
-    /// Pauses input handling: all devices ungrabbed (raw local input), the
-    /// daemon keeps listening. Resume with 'monux daemon resume'
+    /// Pauses input handling, leaving the daemon listening
+    ///
+    /// All devices are ungrabbed, so the local machine gets raw input. Resume
+    /// with 'monux daemon resume'.
     Pause,
 
     /// Resumes input handling after a pause
     Resume,
 
-    /// Gracefully restarts the daemon into the installed binary (the session
-    /// resumes automatically)
+    /// Gracefully restarts the daemon into the installed binary
+    ///
+    /// The session resumes automatically.
     Restart,
 
-    /// Gracefully stops the daemon (clients reconnect on its next start)
+    /// Gracefully stops the daemon
+    ///
+    /// Clients reconnect on its next start.
     Exit,
 
-    /// Wakes the background update check immediately instead of waiting for
-    /// the daily tick
+    /// Wakes the background update check immediately
+    ///
+    /// Instead of waiting for the daily tick.
     Update,
 }
 
@@ -306,8 +381,7 @@ enum GuiCommands {
     /// auto-spawned one — only one indicator runs at a time.
     Indicator,
 
-    /// Hides or restores the tray indicator; 'show' without a daemon starts
-    /// a standalone one
+    /// Hides or restores the tray indicator
     ///
     /// 'hide' SIGTERMs the daemon's spawned indicator and suppresses respawns
     /// (the daemon itself keeps running), 'show' spawns it again. The hidden
@@ -345,8 +419,10 @@ struct DaemonSwitchArgs {
     #[arg(value_name = "target")]
     target: String,
 
-    /// Query this explicit control socket path instead of the default
-    /// $XDG_RUNTIME_DIR/monux/{server,client}.sock locations
+    /// Query this explicit control socket path
+    ///
+    /// Instead of the default $XDG_RUNTIME_DIR/monux/{server,client}.sock
+    /// locations.
     #[arg(long, value_name = "path")]
     socket: Option<PathBuf>,
 }
@@ -354,32 +430,161 @@ struct DaemonSwitchArgs {
 #[derive(Args)]
 struct StatusArgs {
     /// Query the server daemon's socket only
-    #[arg(long, conflicts_with = "client")]
+    #[arg(long, conflicts_with = "client", help_heading = H_TARGET)]
     server: bool,
 
     /// Query the client daemon's socket only
-    #[arg(long)]
+    #[arg(long, help_heading = H_TARGET)]
     client: bool,
 
-    /// Query this explicit control socket path instead of the default
-    /// $XDG_RUNTIME_DIR/monux/{server,client}.sock locations
-    #[arg(long, value_name = "path")]
+    /// Query this explicit control socket path
+    ///
+    /// Instead of the default $XDG_RUNTIME_DIR/monux/{server,client}.sock
+    /// locations.
+    #[arg(long, value_name = "path", help_heading = H_TARGET)]
     socket: Option<PathBuf>,
 
     /// Print the daemon's raw JSON response instead of a human-readable summary
-    #[arg(long)]
+    #[arg(long, help_heading = H_OUTPUT)]
     json: bool,
 }
 
 #[derive(Args)]
+struct DiagnosticsArgs {
+    /// Capture a live reproduction instead of a snapshot (see 'record --help')
+    #[command(subcommand)]
+    command: Option<DiagnosticsCommands>,
+
+    /// Query the server daemon's socket only
+    #[arg(long, conflicts_with = "client", help_heading = H_TARGET)]
+    server: bool,
+
+    /// Query the client daemon's socket only
+    #[arg(long, help_heading = H_TARGET)]
+    client: bool,
+
+    /// Query this explicit control socket path
+    ///
+    /// Instead of the default $XDG_RUNTIME_DIR/monux/{server,client}.sock
+    /// locations.
+    #[arg(long, value_name = "path", help_heading = H_TARGET)]
+    socket: Option<PathBuf>,
+
+    /// Copy the bundle to the clipboard (as markdown) instead of printing it
+    #[arg(long, help_heading = H_OUTPUT)]
+    copy: bool,
+
+    /// Render as issue-ready markdown [default with --copy]
+    #[arg(long, conflicts_with_all = ["plain", "json"], help_heading = H_OUTPUT)]
+    markdown: bool,
+
+    /// Render as plain text [default when printing]
+    #[arg(long, conflicts_with = "json", help_heading = H_OUTPUT)]
+    plain: bool,
+
+    /// Print the bundle as raw JSON
+    #[arg(long, help_heading = H_OUTPUT)]
+    json: bool,
+
+    /// Strip IPs, hostnames, usernames and home paths
+    ///
+    /// Replaces them with placeholders before the bundle leaves this machine.
+    #[arg(long, help_heading = H_OUTPUT)]
+    redact: bool,
+
+    /// Recent daemon log lines to include
+    #[arg(long, value_name = "n", default_value_t = monux::diagnostics::DEFAULT_LOG_LINES, help_heading = H_CONTENT)]
+    lines: usize,
+
+    /// How far back to read the systemd journal (a journalctl --since value)
+    #[arg(long, value_name = "when", default_value = monux::diagnostics::DEFAULT_JOURNAL_SINCE, help_heading = H_CONTENT)]
+    since: String,
+
+    /// Skip the journal entirely
+    #[arg(long, conflicts_with = "since", help_heading = H_CONTENT)]
+    no_journal: bool,
+
+    /// Also fetch connected clients' bundles (server only)
+    ///
+    /// So one paste covers both sides of the link.
+    #[arg(long, help_heading = H_CONTENT)]
+    peer: bool,
+
+    /// Prepare a ready-to-file GitHub issue
+    ///
+    /// Writes the report to a file, copies it to the clipboard, and prints
+    /// the command that files it. Never posts anything by itself: filing is
+    /// publishing, so you review and send.
+    #[arg(long, conflicts_with = "copy", help_heading = H_OUTPUT)]
+    issue: bool,
+
+    /// Title for the issue prepared by --issue
+    ///
+    /// A placeholder to edit is used when this is omitted.
+    #[arg(long, value_name = "text", requires = "issue", help_heading = H_OUTPUT)]
+    title: Option<String>,
+
+    /// Print what a bundle contains — and never contains — then exit
+    #[arg(long, help_heading = H_CONTENT)]
+    privacy: bool,
+}
+
+#[derive(Subcommand)]
+enum DiagnosticsCommands {
+    /// Records a live reproduction to a file, until Ctrl-C
+    ///
+    /// Runs monux with verbose logging and captures everything to a file.
+    ///
+    /// For bugs a snapshot can't show — an input freeze, a dead key, a stall
+    /// under load. Start it, reproduce the problem, press Ctrl-C: the capture
+    /// file it prints is what to attach to the report.
+    #[command(after_long_help = "\
+Examples:
+  monux diagnostics record                  # capture a server reproduction
+  monux diagnostics record --client         # ...of the client daemon
+  monux diagnostics record --keys 28,42     # also trace these key codes (28 = Enter)
+  monux diagnostics record --trace          # everything, including QUIC internals")]
+    Record(RecordArgs),
+}
+
+#[derive(Args)]
+struct RecordArgs {
+    /// Record the client daemon instead of the server
+    #[arg(long)]
+    client: bool,
+
+    /// Key codes to trace through the input pipeline, comma-separated
+    ///
+    /// For example 28 = Enter. Every stage that sees them logs a KEYTRACE line.
+    #[arg(long, value_name = "codes")]
+    keys: Option<String>,
+
+    /// Log at trace level (very verbose, includes QUIC internals)
+    #[arg(long)]
+    trace: bool,
+
+    /// Write the capture here instead of a generated path under $TMPDIR
+    #[arg(long, value_name = "path")]
+    out: Option<PathBuf>,
+
+    /// Arguments to pass through to the daemon being recorded
+    #[arg(trailing_var_arg = true, value_name = "daemon args")]
+    args: Vec<String>,
+}
+
+#[derive(Args)]
 struct TrayArgs {
-    /// 'hide' removes the tray icon (the daemon keeps running), 'show' restores it —
-    /// or starts a standalone tray when no daemon runs
+    /// Whether to remove or restore the tray icon
+    ///
+    /// 'hide' removes the tray icon (the daemon keeps running), 'show'
+    /// restores it — or starts a standalone tray when no daemon runs.
     #[arg(value_enum, value_name = "hide|show")]
     action: TrayAction,
 
-    /// Send the command to this explicit control socket path instead of the
-    /// default $XDG_RUNTIME_DIR/monux/{server,client}.sock locations
+    /// Send the command to this explicit control socket path
+    ///
+    /// Instead of the default $XDG_RUNTIME_DIR/monux/{server,client}.sock
+    /// locations.
     #[arg(long, value_name = "path")]
     socket: Option<PathBuf>,
 }
@@ -392,6 +597,8 @@ enum TrayAction {
 
 #[derive(Args)]
 struct SetupArgs {
+    /// Manage the login service (no sudo) [default: leave it alone]
+    ///
     /// Also (de)activate autostart via a per-user systemd service: 'server' or
     /// 'client' writes ~/.config/systemd/user/monux-<role>.service and
     /// enables+starts it (client runs without an address, using mDNS
@@ -402,90 +609,46 @@ struct SetupArgs {
     #[arg(long, value_enum, value_name = "server|client|status|off")]
     autostart: Option<monux::setup::Autostart>,
 
-    /// Also install a desktop shortcut ('monux tray' in the app menu) that
-    /// runs 'monux gui tray show': writes
+    /// Install the 'monux tray' app-menu shortcut (no sudo)
+    ///
+    /// The shortcut runs 'monux gui tray show': writes
     /// ~/.local/share/applications/monux-tray.desktop (XDG_DATA_HOME
     /// honored). User-level, like --autostart: no elevation.
     #[arg(long)]
     desktop_shortcut: bool,
 }
 
+// Every flag below opens with a one-line summary, then a blank line, then the
+// detail. clap shows only the first paragraph for '-h' and the whole comment for
+// '--help', so that split is what keeps '-h' a scannable table.
 #[derive(Args)]
 struct ServerArgs {
-    /// Keyboard shortcut for switching to the next client in the rotation
-    /// (default: leftshift,leftalt,r)
-    #[arg(long, alias = "shortcut-next", value_name = "key1,key2,key3")]
+    /// Chord that switches to the next client [default: leftshift,leftalt,r]
+    #[arg(long, alias = "shortcut-next", value_name = "key1,key2,key3", help_heading = H_SWITCHING)]
     shortcut: Option<String>,
 
-    /// Keyboard shortcut for switching to the previous client in the rotation
-    /// (default: leftalt,p)
-    #[arg(long, value_name = "key1,key2,key3")]
+    /// Chord that switches to the previous client [default: leftalt,p]
+    #[arg(long, value_name = "key1,key2,key3", help_heading = H_SWITCHING)]
     shortcut_prev: Option<String>,
 
-    /// Keyboard shortcut for switching directly to a client by its fingerprint prefix,
-    /// or to the server for an empty fingerprint
-    #[arg(long, value_name = "key1,key2,key3=[fingerprint-prefix]")]
+    /// Chord that switches straight to one client, by fingerprint prefix
+    ///
+    /// An empty fingerprint targets the server itself. Repeatable, one chord
+    /// per target.
+    #[arg(long, value_name = "key1,key2,key3=[fingerprint-prefix]", help_heading = H_SWITCHING)]
     shortcut_goto: Option<Vec<String>>,
 
-    /// Keyboard shortcut for pausing/resuming input handling. While paused,
-    /// ALL input devices (keyboards included) are ungrabbed so the local
-    /// machine gets raw input with monux's re-emit out of the way (games,
-    /// raw-input apps); press the chord again to resume. Disabled unless set
-    /// (e.g. '--pause-shortcut leftshift,leftalt,p').
-    #[arg(long, value_name = "key1,key2,key3")]
+    /// Chord that pauses/resumes input handling [default: disabled]
+    ///
+    /// While paused, ALL input devices (keyboards included) are ungrabbed so
+    /// the local machine gets raw input with monux's re-emit out of the way
+    /// (games, raw-input apps); press the chord again to resume. Disabled
+    /// unless set (e.g. '--pause-shortcut leftshift,leftalt,p').
+    #[arg(long, value_name = "key1,key2,key3", help_heading = H_SWITCHING)]
     pause_shortcut: Option<String>,
 
-    /// Substring or regular expression for selecting specific devices to monitor,
-    /// argument can be repeated for multiple filters
-    #[arg(long, value_name = "device-name-pattern")]
-    device: Option<Vec<Regex>>,
-
-    /// Server listen IP (default: 0.0.0.0)
-    #[arg(short = 'l', long, value_name = "ip")]
-    listen: Option<IpAddr>,
-
-    /// Server port (default: 1213)
-    #[arg(short = 'p', long, value_name = "port")]
-    port: Option<u16>,
-
-    /// Client certificate fingerprint to automatically accept without prompting (repeat for multiple fingerprints)
-    #[arg(long, alias = "fingerprints", value_name = "fingerprint")]
-    fingerprint: Option<Vec<String>>,
-
-    /// Number of seconds to wait before automatically exiting the server, to safely test configuration
-    #[arg(long, value_name = "seconds")]
-    exit_secs: Option<u32>,
-
-    /// Maximum size in KB for transferring clipboard data (default: 5MB)
-    #[arg(long, value_name = "kb")]
-    max_clipboard_size_kb: Option<u64>,
-
-    /// Use conservative tuning suitable for traversing the public internet (WWW).
-    /// The default is low-latency tuning for local networks.
-    #[arg(long, num_args = 0, default_missing_value = "true")]
-    www: Option<bool>,
-
-    /// Target rate for forwarding pointer motion, in updates per second. Motion
-    /// deltas are coalesced (summed losslessly) between updates and sent as
-    /// unreliable datagrams with recent deltas repeated, so WiFi loss neither
-    /// stalls nor misplaces the cursor. Unset (the default): adaptive — 250
-    /// normally, raised to 500 while the link is measured close and clean.
-    /// Set a number to pin the rate, or 0 to forward every event as it comes
-    /// (e.g. for gaming with a high-polling-rate mouse).
-    #[arg(long, value_name = "hz")]
-    motion_hz: Option<u32>,
-
-    /// Pace clipboard/bulk transfers to this many megabits per second. QUIC
-    /// stream priorities only order data inside the connection; the
-    /// kernel/WiFi driver queue below is FIFO, so an unthrottled multi-MB
-    /// clipboard transfer fills it and input packets behind it wait for the
-    /// whole backlog to drain (bufferbloat: RTT spikes for the duration of
-    /// the transfer). Unset (the default): adaptive — 40 normally, raised to
-    /// 160 while the link is measured close and clean. Set a number to pin
-    /// the rate (5MB takes ~1s at 40Mbps), or 0 to disable pacing.
-    #[arg(long, value_name = "mbps", value_parser = monux::config::parse_bulk_throttle)]
-    bulk_throttle_mbps: Option<f64>,
-
+    /// Switch input at a screen edge: 'right=auto', 'left=aa11bb'
+    ///
     /// Screen-edge switching (Hyprland only for now): switch input to a client
     /// when the cursor is pushed against this screen edge and dwells there.
     /// Repeatable and comma-separated: '--edge-map right=auto --edge-map left=aa11bb'
@@ -507,26 +670,92 @@ struct ServerArgs {
     /// The server also advertises this layout to each mapped client
     /// (protocol v12+), so the client infers its return edge automatically —
     /// no client --edge-map needed unless you want to override the inference.
-    #[arg(long, value_name = "direction[@monitor]=target")]
+    #[arg(long, value_name = "direction[@monitor]=target", help_heading = H_EDGES)]
     edge_map: Option<Vec<String>>,
 
-    /// How long the cursor must dwell on a mapped screen edge before the
-    /// switch fires, in milliseconds (see --edge-map; default: 250)
-    #[arg(long, value_name = "ms")]
+    /// Dwell time on the edge before the switch fires [default: 250]
+    ///
+    /// In milliseconds; see --edge-map.
+    #[arg(long, value_name = "ms", help_heading = H_EDGES)]
     edge_dwell_ms: Option<u64>,
 
-    /// Disable the automatic background update (on by default): a daily check
-    /// at low CPU priority, then an automatic restart into the new binary.
-    /// The session resumes automatically on reconnect.
-    #[arg(long, num_args = 0, default_missing_value = "true")]
+    /// Listen IP [default: 0.0.0.0]
+    #[arg(short = 'l', long, value_name = "ip", help_heading = H_NETWORK)]
+    listen: Option<IpAddr>,
+
+    /// Listen port [default: 1213]
+    #[arg(short = 'p', long, value_name = "port", help_heading = H_NETWORK)]
+    port: Option<u16>,
+
+    /// Pre-approve a client certificate fingerprint (repeatable)
+    ///
+    /// A client whose fingerprint is listed connects without the interactive
+    /// approval prompt.
+    #[arg(long, alias = "fingerprints", value_name = "fingerprint", help_heading = H_NETWORK)]
+    fingerprint: Option<Vec<String>>,
+
+    /// Tune for the public internet instead of a LAN
+    ///
+    /// Use conservative tuning suitable for traversing the public internet
+    /// (WWW). The default is low-latency tuning for local networks.
+    #[arg(long, num_args = 0, default_missing_value = "true", help_heading = H_NETWORK)]
+    www: Option<bool>,
+
+    /// Pointer motion forwarding rate [default: adaptive 250-500]
+    ///
+    /// Target rate for forwarding pointer motion, in updates per second. Motion
+    /// deltas are coalesced (summed losslessly) between updates and sent as
+    /// unreliable datagrams with recent deltas repeated, so WiFi loss neither
+    /// stalls nor misplaces the cursor. Unset (the default): adaptive — 250
+    /// normally, raised to 500 while the link is measured close and clean.
+    /// Set a number to pin the rate, or 0 to forward every event as it comes
+    /// (e.g. for gaming with a high-polling-rate mouse).
+    #[arg(long, value_name = "hz", help_heading = H_TUNING)]
+    motion_hz: Option<u32>,
+
+    /// Clipboard/bulk transfer pacing [default: adaptive 40-160]
+    ///
+    /// Pace clipboard/bulk transfers to this many megabits per second. QUIC
+    /// stream priorities only order data inside the connection; the
+    /// kernel/WiFi driver queue below is FIFO, so an unthrottled multi-MB
+    /// clipboard transfer fills it and input packets behind it wait for the
+    /// whole backlog to drain (bufferbloat: RTT spikes for the duration of
+    /// the transfer). Unset (the default): adaptive — 40 normally, raised to
+    /// 160 while the link is measured close and clean. Set a number to pin
+    /// the rate (5MB takes ~1s at 40Mbps), or 0 to disable pacing.
+    #[arg(long, value_name = "mbps", value_parser = monux::config::parse_bulk_throttle, help_heading = H_TUNING)]
+    bulk_throttle_mbps: Option<f64>,
+
+    /// Largest clipboard payload to transfer [default: 5MB]
+    #[arg(long, value_name = "kb", help_heading = H_TUNING)]
+    max_clipboard_size_kb: Option<u64>,
+
+    /// Only monitor devices matching this pattern (repeatable)
+    ///
+    /// A substring or regular expression matched against the device name;
+    /// repeat the flag for multiple filters.
+    #[arg(long, value_name = "device-name-pattern", help_heading = H_TUNING)]
+    device: Option<Vec<Regex>>,
+
+    /// Turn off the automatic background update
+    ///
+    /// The background update is on by default: a daily check at low CPU
+    /// priority, then an automatic restart into the new binary. The session
+    /// resumes automatically on reconnect.
+    #[arg(long, num_args = 0, default_missing_value = "true", help_heading = H_DAEMON)]
     no_auto_update: Option<bool>,
 
-    /// Do not auto-spawn the tray indicator (monux gui indicator) with the
-    /// daemon. By default the indicator starts once the daemon is up whenever
+    /// Do not auto-spawn the tray indicator
+    ///
+    /// By default 'monux gui indicator' starts once the daemon is up whenever
     /// a desktop session bus is available, and stops with the daemon. Can
     /// also be disabled with MONUX_NO_INDICATOR=1.
-    #[arg(long, num_args = 0, default_missing_value = "true")]
+    #[arg(long, num_args = 0, default_missing_value = "true", help_heading = H_DAEMON)]
     no_indicator: Option<bool>,
+
+    /// Exit automatically after this many seconds, to test a configuration safely
+    #[arg(long, value_name = "seconds", help_heading = H_DAEMON)]
+    exit_secs: Option<u32>,
 }
 
 impl ServerArgs {
@@ -583,49 +812,31 @@ impl ServerArgs {
 
 #[derive(Args)]
 struct ClientArgs {
-    /// Server hostname or IP. If omitted, the server is discovered on the local network via mDNS.
+    /// Server hostname or IP [default: discover via mDNS]
+    ///
+    /// If omitted, the server is discovered on the local network via mDNS.
     host: Option<String>,
 
-    /// Server port (default: 1213)
-    #[arg(short = 'p', long, value_name = "port")]
+    /// Server port [default: 1213]
+    #[arg(short = 'p', long, value_name = "port", help_heading = H_NETWORK)]
     port: Option<u16>,
 
-    /// Server certificate fingerprint to automatically accept without prompting (repeat for multiple fingerprints)
-    #[arg(long, alias = "fingerprints", value_name = "fingerprint")]
+    /// Pre-approve a server certificate fingerprint (repeatable)
+    ///
+    /// A server whose fingerprint is listed connects without the interactive
+    /// approval prompt.
+    #[arg(long, alias = "fingerprints", value_name = "fingerprint", help_heading = H_NETWORK)]
     fingerprint: Option<Vec<String>>,
 
-    /// Maximum size in KB for transferring clipboard data (default: 5MB)
-    #[arg(long, value_name = "kb")]
-    max_clipboard_size_kb: Option<u64>,
-
-    /// Use conservative tuning suitable for traversing the public internet (WWW).
-    /// The default is low-latency tuning for local networks.
-    #[arg(long, num_args = 0, default_missing_value = "true")]
+    /// Tune for the public internet instead of a LAN
+    ///
+    /// Use conservative tuning suitable for traversing the public internet
+    /// (WWW). The default is low-latency tuning for local networks.
+    #[arg(long, num_args = 0, default_missing_value = "true", help_heading = H_NETWORK)]
     www: Option<bool>,
 
-    /// Multiplier applied to pointer motion deltas before injecting them on
-    /// this machine, for compensating DPI/sensitivity differences with the
-    /// server's mouse. Sub-tick fractions are carried between events, so small
-    /// scales lose no motion over time. (default: 1.0)
-    #[arg(long, value_name = "scale", value_parser = monux::config::parse_input_scale)]
-    mouse_scale: Option<f64>,
-
-    /// Multiplier applied to scroll wheel deltas (including the hi-res wheel
-    /// axes) before injecting them on this machine. (default: 1.0)
-    #[arg(long, value_name = "scale", value_parser = monux::config::parse_input_scale)]
-    scroll_scale: Option<f64>,
-
-    /// Pace clipboard/bulk transfers to this many megabits per second. QUIC
-    /// stream priorities only order data inside the connection; the
-    /// kernel/WiFi driver queue below is FIFO, so an unthrottled multi-MB
-    /// clipboard transfer fills it and input packets behind it wait for the
-    /// whole backlog to drain (bufferbloat: RTT spikes for the duration of
-    /// the transfer). Unset (the default): adaptive — 40 normally, raised to
-    /// 160 while the link is measured close and clean. Set a number to pin
-    /// the rate (5MB takes ~1s at 40Mbps), or 0 to disable pacing.
-    #[arg(long, value_name = "mbps", value_parser = monux::config::parse_bulk_throttle)]
-    bulk_throttle_mbps: Option<f64>,
-
+    /// Return to the server at a screen edge: 'left=auto'
+    ///
     /// Switching BACK to the server by screen edge (Hyprland only for now):
     /// while this client has input, pushing the cursor against this screen
     /// edge and dwelling there asks the server to take input back. Usually
@@ -637,25 +848,61 @@ struct ClientArgs {
     /// target is 'auto' (the server — a client has exactly one peer).
     /// Multi-monitor setups expose only the outer edge segments; ~8% at each
     /// end of a segment is a corner dead zone.
-    #[arg(long, value_name = "direction[@monitor]=auto")]
+    #[arg(long, value_name = "direction[@monitor]=auto", help_heading = H_EDGES)]
     edge_map: Option<Vec<String>>,
 
-    /// How long the cursor must dwell on a mapped screen edge before the
-    /// return request fires, in milliseconds (see --edge-map; default: 250)
-    #[arg(long, value_name = "ms")]
+    /// Dwell time on the edge before the return fires [default: 250]
+    ///
+    /// In milliseconds; see --edge-map.
+    #[arg(long, value_name = "ms", help_heading = H_EDGES)]
     edge_dwell_ms: Option<u64>,
 
-    /// Disable the automatic background update (on by default): a daily check
-    /// at low CPU priority, then an automatic restart into the new binary.
-    /// The session resumes automatically on reconnect.
-    #[arg(long, num_args = 0, default_missing_value = "true")]
+    /// Scale incoming pointer motion [default: 1.0]
+    ///
+    /// Multiplier applied to pointer motion deltas before injecting them on
+    /// this machine, for compensating DPI/sensitivity differences with the
+    /// server's mouse. Sub-tick fractions are carried between events, so small
+    /// scales lose no motion over time.
+    #[arg(long, value_name = "scale", value_parser = monux::config::parse_input_scale, help_heading = H_TUNING)]
+    mouse_scale: Option<f64>,
+
+    /// Scale incoming scroll wheel deltas [default: 1.0]
+    ///
+    /// Applies to the hi-res wheel axes as well.
+    #[arg(long, value_name = "scale", value_parser = monux::config::parse_input_scale, help_heading = H_TUNING)]
+    scroll_scale: Option<f64>,
+
+    /// Clipboard/bulk transfer pacing [default: adaptive 40-160]
+    ///
+    /// Pace clipboard/bulk transfers to this many megabits per second. QUIC
+    /// stream priorities only order data inside the connection; the
+    /// kernel/WiFi driver queue below is FIFO, so an unthrottled multi-MB
+    /// clipboard transfer fills it and input packets behind it wait for the
+    /// whole backlog to drain (bufferbloat: RTT spikes for the duration of
+    /// the transfer). Unset (the default): adaptive — 40 normally, raised to
+    /// 160 while the link is measured close and clean. Set a number to pin
+    /// the rate (5MB takes ~1s at 40Mbps), or 0 to disable pacing.
+    #[arg(long, value_name = "mbps", value_parser = monux::config::parse_bulk_throttle, help_heading = H_TUNING)]
+    bulk_throttle_mbps: Option<f64>,
+
+    /// Largest clipboard payload to transfer [default: 5MB]
+    #[arg(long, value_name = "kb", help_heading = H_TUNING)]
+    max_clipboard_size_kb: Option<u64>,
+
+    /// Turn off the automatic background update
+    ///
+    /// The background update is on by default: a daily check at low CPU
+    /// priority, then an automatic restart into the new binary. The session
+    /// resumes automatically on reconnect.
+    #[arg(long, num_args = 0, default_missing_value = "true", help_heading = H_DAEMON)]
     no_auto_update: Option<bool>,
 
-    /// Do not auto-spawn the tray indicator (monux gui indicator) with the
-    /// daemon. By default the indicator starts once the daemon is up whenever
+    /// Do not auto-spawn the tray indicator
+    ///
+    /// By default 'monux gui indicator' starts once the daemon is up whenever
     /// a desktop session bus is available, and stops with the daemon. Can
     /// also be disabled with MONUX_NO_INDICATOR=1.
-    #[arg(long, num_args = 0, default_missing_value = "true")]
+    #[arg(long, num_args = 0, default_missing_value = "true", help_heading = H_DAEMON)]
     no_indicator: Option<bool>,
 }
 
@@ -705,17 +952,24 @@ impl ClientArgs {
 
 #[derive(Args)]
 struct UpdateArgs {
-    /// Rebuild and reinstall even if already up to date, and bypass the
-    /// server protocol-compatibility gate
+    /// Rebuild even if up to date, bypassing the protocol gate
+    ///
+    /// Reinstalls unconditionally and skips the server
+    /// protocol-compatibility check.
     #[arg(long)]
     force: bool,
-    /// Install a specific version or commit instead of the latest (e.g.
-    /// --to 8.3.0 or --to 5b4c00e). Pins auto-update so it never undoes the
-    /// downgrade; a plain 'monux update' lifts the pin again
-    #[arg(long, value_name = "VERSION|COMMIT", conflicts_with = "rollback")]
+
+    /// Install a specific version or commit instead of the latest
+    ///
+    /// For example '--to 8.3.0' or '--to 5b4c00e'. Pins auto-update so it
+    /// never undoes the downgrade; a plain 'monux update' lifts the pin again.
+    #[arg(long, value_name = "version|commit", conflicts_with = "rollback")]
     to: Option<String>,
-    /// Return to the build that was installed before the current one
-    /// (recorded by every install); shorthand for --to <recorded commit>
+
+    /// Return to the previously installed build
+    ///
+    /// Every install records the build it replaced; this is shorthand for
+    /// '--to <recorded commit>'.
     #[arg(long)]
     rollback: bool,
 }
@@ -791,6 +1045,22 @@ async fn client_shutdown_signal() {
 }
 
 /// Print-and-exit CLI commands want to die silently on SIGPIPE ('monux
+/// Which rendering `monux diagnostics` was asked for. The default depends on
+/// where the bundle is going: printing to a terminal wants plain text,
+/// copying wants markdown, since a copied bundle is on its way to the issue
+/// tracker. An explicit flag always wins.
+fn diagnostics_format(args: &DiagnosticsArgs) -> monux::diagnostics::Format {
+    use monux::diagnostics::Format;
+    match (args.json, args.markdown, args.plain) {
+        (true, _, _) => Format::Json,
+        (_, true, _) => Format::Markdown,
+        (_, _, true) => Format::Plain,
+        // Anything headed off this machine is headed for the issue tracker.
+        _ if args.copy || args.issue => Format::Markdown,
+        _ => Format::Plain,
+    }
+}
+
 /// config show | head', '... | less' quit early) instead of panicking on a
 /// failed println!: Rust ignores SIGPIPE by default, which turns a closed
 /// pipe into a write error. Restoring the default disposition makes the
@@ -809,8 +1079,8 @@ fn main() -> Result<()> {
     // Record the exact build in the log: invaluable when diagnosing bug reports.
     info!("monux v{} starting", VERSION);
 
-    // Setup/update/status/servers/config/gui/system/daemon commands don't need the
-    // devices or the async runtime. They print to stdout and return, so they
+    // Setup/update/status/servers/config/gui/system/daemon/diagnostics commands
+    // don't need the devices or the async runtime. They print to stdout and return, so they
     // get the die-quietly-on-SIGPIPE disposition; the daemon paths below
     // deliberately don't (see cli_sigpipe_kill).
     match &cli.command {
@@ -934,6 +1204,43 @@ fn main() -> Result<()> {
             println!("{}", out);
             return Ok(());
         }
+        Commands::Diagnostics(args) => {
+            cli_sigpipe_kill();
+            if args.privacy {
+                println!("{}", monux::diagnostics::PRIVACY_NOTE);
+                return Ok(());
+            }
+            if let Some(DiagnosticsCommands::Record(rec)) = &args.command {
+                let out = monux::diagnostics::record(&monux::diagnostics::RecordOptions {
+                    client: rec.client,
+                    keys: rec.keys.clone(),
+                    trace: rec.trace,
+                    out: rec.out.clone(),
+                    args: rec.args.clone(),
+                })?;
+                println!("{}", out);
+                return Ok(());
+            }
+            let out = monux::diagnostics::run_cli(&monux::diagnostics::CliOptions {
+                server: args.server,
+                client: args.client,
+                socket: args.socket.clone(),
+                format: diagnostics_format(args),
+                redact: args.redact,
+                copy: args.copy,
+                lines: args.lines,
+                journal_since: if args.no_journal {
+                    None
+                } else {
+                    Some(args.since.clone())
+                },
+                peer: args.peer,
+                issue: args.issue,
+                title: args.title.clone(),
+            })?;
+            println!("{}", out);
+            return Ok(());
+        }
         Commands::Servers => {
             cli_sigpipe_kill();
             // Display-only: reads mDNS advertisements and the remembered
@@ -1028,8 +1335,9 @@ fn main() -> Result<()> {
         | Commands::Config(_)
         | Commands::Gui(_)
         | Commands::System(_)
+        | Commands::Diagnostics(_)
         | Commands::Daemon(_) => {
-            unreachable!("setup/update/status/servers/config/gui/system/daemon commands are handled before runtime initialization")
+            unreachable!("setup/update/status/servers/config/gui/system/daemon/diagnostics commands are handled before runtime initialization")
         }
         Commands::Server(mut args) => {
             // The config file fills whatever the command line left unset.
@@ -1447,11 +1755,16 @@ async fn server(
     // up (see below); the guard SIGTERMs and reaps the child on every exit
     // path out of this function.
     let indicator = monux::indicator_spawn::Supervisor::new(!auto_indicator);
+    // Created here rather than beside the rotation loop below: the control
+    // socket needs a sender too (peer diagnostics reach the clients through
+    // the rotation loop), and the socket is bound first.
+    let (rotation_tx, rotation_rx) = mpsc::channel::<rotation::RotationEvent>(256);
     match monux::control::Listener::bind(monux::control::Role::Server) {
         Ok(listener) => {
             let handler = monux::control::Handler::Server(monux::control::ServerHandler {
                 state: diagnostics.clone(),
                 event_tx: event_tx.clone(),
+                rotation_tx: rotation_tx.clone(),
                 auto_update,
                 indicator: indicator.handle(),
             });
@@ -1500,7 +1813,6 @@ async fn server(
             )
     });
 
-    let (rotation_tx, rotation_rx) = mpsc::channel::<rotation::RotationEvent>(256);
     let rotation_tx2 = rotation_tx.clone();
     let mut server_events_handle = task::spawn(async move {
         server::run_server_events_loop(
@@ -1917,6 +2229,51 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn short_help_summaries_stay_one_line() {
+        // The wall-of-text guard. clap prints only a doc comment's first
+        // paragraph for '-h' and the whole thing for '--help', so a flag whose
+        // comment opens straight into prose — no short first line, no blank
+        // line after it — makes '-h' a page of paragraphs instead of a table.
+        // A summary that fits here still fits beside the flag name on one row.
+        const MAX: usize = 80;
+
+        fn check(cmd: &clap::Command, path: &str) {
+            for arg in cmd.get_arguments() {
+                let Some(help) = arg.get_help() else { continue };
+                let help = help.to_string();
+                assert!(
+                    help.len() <= MAX,
+                    "'{path}' flag --{}: the short help is {} chars (max {MAX}). Open the doc \
+                     comment with a one-line summary, then a blank line, then the detail.",
+                    arg.get_long().unwrap_or_else(|| arg.get_id().as_str()),
+                    help.len(),
+                );
+            }
+            for sub in cmd.get_subcommands() {
+                // 'help' is clap's own, and its wording is not ours to shorten.
+                if sub.get_name() == "help" {
+                    continue;
+                }
+                let path = format!("{path} {}", sub.get_name());
+                if let Some(about) = sub.get_about() {
+                    let about = about.to_string();
+                    assert!(
+                        about.len() <= MAX,
+                        "'{path}': the short description is {} chars (max {MAX}). Open the doc \
+                         comment with a one-line summary, then a blank line, then the detail.",
+                        about.len(),
+                    );
+                }
+                check(sub, &path);
+            }
+        }
+
+        // The root's own 'about' is the crate description, so it starts at the
+        // subcommands.
+        check(&Cli::command(), "monux");
     }
 
     #[test]

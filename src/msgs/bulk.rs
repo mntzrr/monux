@@ -23,6 +23,16 @@ pub enum ServerBulk<'a> {
     /// Sends requested clipboard contents to the client.
     #[serde(borrow)]
     ClipboardHeader(ServerClipboardHeader<'a>),
+
+    /// Asks the client for its own diagnostics bundle, so a bug report filed
+    /// on the server covers both machines (protocol v18; see
+    /// shared::supports_peer_diagnostics). Appended variant.
+    ///
+    /// Rides the BULK stream, not the events stream: a bundle is tens of
+    /// kilobytes, and the events stream is where input frames live. A report
+    /// that made the cursor stutter while it was collected would be a poor
+    /// trade for a report about stuttering.
+    DiagnosticsRequest(DiagnosticsRequest),
 }
 
 impl<'a> std::fmt::Display for ServerBulk<'a> {
@@ -30,6 +40,7 @@ impl<'a> std::fmt::Display for ServerBulk<'a> {
         match self {
             ServerBulk::ClipboardRequest(e) => e.fmt(f),
             ServerBulk::ClipboardHeader(e) => e.fmt(f),
+            ServerBulk::DiagnosticsRequest(e) => e.fmt(f),
         }
     }
 }
@@ -45,6 +56,11 @@ pub enum ClientBulk<'a> {
     /// Sends requested clipboard contents to the server.
     #[serde(borrow)]
     ClipboardHeader(ClientClipboardHeader<'a>),
+
+    /// Answers a ServerBulk::DiagnosticsRequest with this client's own
+    /// bundle (protocol v18). Appended variant.
+    #[serde(borrow)]
+    DiagnosticsResponse(DiagnosticsResponse<'a>),
 }
 
 impl<'a> std::fmt::Display for ClientBulk<'a> {
@@ -52,7 +68,65 @@ impl<'a> std::fmt::Display for ClientBulk<'a> {
         match self {
             ClientBulk::ClipboardRequest(e) => e.fmt(f),
             ClientBulk::ClipboardHeader(e) => e.fmt(f),
+            ClientBulk::DiagnosticsResponse(e) => e.fmt(f),
         }
+    }
+}
+
+// Diagnostics
+
+/// The server asking one client for its bug-report bundle.
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+pub struct DiagnosticsRequest {
+    /// Correlates this request with its response, like the clipboard
+    /// request/response pair above: a plain per-originator counter.
+    pub request_id: u64,
+    /// How many recent log lines the client should include.
+    pub lines: u32,
+}
+
+impl std::fmt::Display for DiagnosticsRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "DiagnosticsRequest(request_id={}, lines={})",
+            self.request_id, self.lines
+        )
+    }
+}
+
+/// A client's bundle, as the JSON of control::Diagnostics.
+///
+/// JSON rather than a wire struct on purpose: this payload is written
+/// straight into a bug report, and keeping it as the control plane's own
+/// serialization means the peer's section and the local section of a report
+/// can never drift into two different shapes. It also keeps a future field
+/// on Diagnostics from being a protocol break — the JSON simply carries it,
+/// and a reader that doesn't know the field ignores it.
+///
+/// The whole bundle travels in ONE bulk frame (no separate payload, unlike
+/// clipboard content): it is bounded by the requested line count, so the
+/// clipboard's multi-megabyte streaming machinery would be complexity with
+/// nothing to buy.
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+pub struct DiagnosticsResponse<'a> {
+    /// Copied from the request it answers.
+    pub request_id: u64,
+    /// The bundle, or None when the client declined to build one.
+    pub json: Option<&'a str>,
+    /// Why `json` is None, when it is.
+    pub error: Option<&'a str>,
+}
+
+impl<'a> std::fmt::Display for DiagnosticsResponse<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "DiagnosticsResponse(request_id={}, bytes={}, error={:?})",
+            self.request_id,
+            self.json.map(str::len).unwrap_or(0),
+            self.error
+        )
     }
 }
 

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 /// The protocol version exchanged between client and server on each stream.
 /// This is compared on initial connection between client and server.
 /// If the event/bulk definitions change, then this should change.
-pub const PROTOCOL_VERSION: u64 = 17;
+pub const PROTOCOL_VERSION: u64 = 18;
 
 /// The first protocol version whose peers can negotiate: two v16+ peers
 /// connect at min(their, our) and each side only uses features the negotiated
@@ -39,6 +39,7 @@ pub fn negotiate(theirs: u64, ours: u64) -> Option<u64> {
 const FEATURES: &[(u64, &str)] = &[
     (15, "server hostname in handshake"),
     (17, "input device class"),
+    (18, "peer diagnostics in bug reports"),
 ];
 
 /// The features a version misses out on: every feature newer than `v`,
@@ -76,6 +77,23 @@ pub const PROTOCOL_VERSION_DEVICE_CLASS: u64 = 17;
 /// untagged frame and the client's capability-based inference.
 pub fn sends_device_class(negotiated: u64) -> bool {
     negotiated >= PROTOCOL_VERSION_DEVICE_CLASS
+}
+
+/// The protocol version that introduced peer diagnostics: the server can ask
+/// each connected client for its own bug-report bundle, so one paste covers
+/// both machines (see diagnostics.rs). A KVM failure — a freeze, a dead key,
+/// a clipboard that won't cross — is a two-machine event, and correlating it
+/// used to mean asking the reporter to run a second command on the other box
+/// and hoping the clocks lined up.
+pub const PROTOCOL_VERSION_PEER_DIAGNOSTICS: u64 = 18;
+
+/// Whether a client can answer a diagnostics request: only when the pair's
+/// NEGOTIATED version is v18+. An older client has no variant for the
+/// request and would fail to deserialize the bulk frame — which would drop a
+/// working connection over a bug report, so the server skips those clients
+/// and says so in the bundle instead.
+pub fn supports_peer_diagnostics(negotiated: u64) -> bool {
+    negotiated >= PROTOCOL_VERSION_PEER_DIAGNOSTICS
 }
 
 /// The protocol version that introduced the server-hostname frame: right
@@ -186,25 +204,44 @@ mod tests {
     #[test]
     fn features_above_content() {
         // Nothing is newer than our own version.
-        assert_eq!(features_above(17), vec![]);
+        assert_eq!(features_above(18), vec![]);
         assert_eq!(features_above(u64::MAX), vec![]);
+        // A v17 pair misses only the v18 peer diagnostics.
+        assert_eq!(
+            features_above(17),
+            vec![(18, "peer diagnostics in bug reports")]
+        );
         // v16 rode no wire feature of its own, so a pair that lands on v15 or
-        // v16 misses exactly the v17 device class.
-        assert_eq!(features_above(15), vec![(17, "input device class")]);
-        assert_eq!(features_above(16), vec![(17, "input device class")]);
+        // v16 misses the v17 device class as well.
+        assert_eq!(
+            features_above(15),
+            vec![
+                (17, "input device class"),
+                (18, "peer diagnostics in bug reports")
+            ]
+        );
+        assert_eq!(
+            features_above(16),
+            vec![
+                (17, "input device class"),
+                (18, "peer diagnostics in bug reports")
+            ]
+        );
         // Below v15 the hostname frame is missing too, oldest first.
         assert_eq!(
             features_above(14),
             vec![
                 (15, "server hostname in handshake"),
-                (17, "input device class")
+                (17, "input device class"),
+                (18, "peer diagnostics in bug reports")
             ]
         );
         assert_eq!(
             features_above(0),
             vec![
                 (15, "server hostname in handshake"),
-                (17, "input device class")
+                (17, "input device class"),
+                (18, "peer diagnostics in bug reports")
             ]
         );
     }
@@ -223,12 +260,26 @@ mod tests {
 
     #[test]
     fn disabled_features_list_for_logs() {
-        assert_eq!(disabled_features(17), "nothing");
-        assert_eq!(disabled_features(15), "input device class");
+        assert_eq!(disabled_features(18), "nothing");
+        assert_eq!(disabled_features(17), "peer diagnostics in bug reports");
+        assert_eq!(
+            disabled_features(15),
+            "input device class, peer diagnostics in bug reports"
+        );
         assert_eq!(
             disabled_features(14),
-            "server hostname in handshake, input device class"
+            "server hostname in handshake, input device class, peer diagnostics in bug reports"
         );
+    }
+
+    #[test]
+    fn peer_diagnostics_are_gated_on_v18() {
+        assert!(supports_peer_diagnostics(PROTOCOL_VERSION));
+        assert!(supports_peer_diagnostics(18));
+        // A v17 pair predates the bulk variant: asking would fail its
+        // deserialization and drop a working connection.
+        assert!(!supports_peer_diagnostics(17));
+        assert!(!supports_peer_diagnostics(15));
     }
 
     #[test]

@@ -45,6 +45,7 @@ use tracing::{debug, info};
 use ksni::blocking::TrayMethods;
 
 use crate::control::{self, Diagnostics, Role, ServerState, State};
+use crate::diagnostics;
 use crate::notify::{self, Urgency};
 
 /// How often the indicator re-queries the daemon's control socket.
@@ -821,126 +822,38 @@ fn spawn_daemon(role: Role) -> Result<()> {
 
 /// Fetches the diagnostics bundle from the daemon and copies it to the
 /// desktop clipboard; returns the clipboard tool that worked.
+///
+/// Formats as markdown, matching `monux diagnostics --copy`: a bundle taken
+/// via "Copy diagnostics" is on its way to an issue tracker, so it leaves
+/// here issue-ready. Everything else — collection, journal, rendering — is
+/// the shared path in diagnostics.rs, so a tray report and a CLI report are
+/// the same report.
 fn copy_diagnostics(socket: &Path) -> Result<&'static str> {
-    let raw = control::request_line(socket, r#"{"cmd":"diagnostics"}"#)?;
+    let request = serde_json::json!({
+        "cmd": "diagnostics",
+        "lines": diagnostics::TRAY_LOG_LINES,
+    })
+    .to_string();
+    let raw = control::request_line(socket, &request)?;
     let v = parse_ok(&raw, socket)?;
-    let diagnostics: Diagnostics = serde_json::from_value(v["diagnostics"].clone())
+    let d: Diagnostics = serde_json::from_value(v["diagnostics"].clone())
         .context("The daemon returned no diagnostics")?;
-    let bundle = format_diagnostics_bundle(&diagnostics);
-    copy_to_clipboard(&bundle)
-}
-
-/// The plain-text bundle "Copy diagnostics" puts on the clipboard.
-fn format_diagnostics_bundle(d: &Diagnostics) -> String {
-    let mut out = format!(
-        "monux {} diagnostics ({} role, protocol {})\n\n== state ==\n{}\n\n== recent logs (oldest first) ==\n",
-        d.version,
-        d.role,
-        d.protocol_version,
-        d.state_dump.trim_end()
-    );
-    if d.recent_logs.is_empty() {
-        out.push_str("<no log lines captured>\n");
-    } else {
-        for line in &d.recent_logs {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
-}
-
-/// Copies `text` to the desktop clipboard, trying wl-copy (Wayland), then
-/// xclip and xsel (X11); returns the tool that worked. All three daemonize
-/// after taking the selection, so spawn + write + wait returns promptly.
-fn copy_to_clipboard(text: &str) -> Result<&'static str> {
-    const TOOLS: [(&str, &[&str]); 3] = [
-        ("wl-copy", &[]),
-        ("xclip", &["-selection", "clipboard"]),
-        ("xsel", &["--clipboard", "--input"]),
-    ];
-    for (tool, args) in TOOLS {
-        match pipe_into(tool, args, text) {
-            Ok(()) => return Ok(tool),
-            Err(e) => debug!("Indicator: {} failed: {:?}", tool, e),
-        }
-    }
-    bail!("no clipboard tool available (tried wl-copy, xclip, xsel)");
-}
-
-/// Longest we wait for a clipboard tool to exit before killing it. All three
-/// tools daemonize after taking the selection and exit in milliseconds; a
-/// wedged compositor must not freeze the tray's service thread in wait().
-const CLIPBOARD_TOOL_TIMEOUT: Duration = Duration::from_secs(5);
-
-fn pipe_into(tool: &str, args: &[&str], text: &str) -> Result<()> {
-    let mut child = Command::new(tool)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("failed to spawn {}", tool))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .expect("stdin is piped");
-    // Write on a worker thread so a wedged reader can't block the tray's
-    // service thread at the 64 KiB pipe-buffer boundary. The worker exits
-    // on write success, pipe-break (child killed), or EOF.
-    let (write_tx, write_rx) = std::sync::mpsc::channel();
-    let text = text.to_string();
-    let _worker = std::thread::spawn(move || {
-        use std::io::Write;
-        let _ = write_tx.send(stdin.write_all(text.as_bytes()));
-    });
-    match write_rx.recv_timeout(CLIPBOARD_TOOL_TIMEOUT) {
-        // Write succeeded: the pipe is closed (stdin dropped when the
-        // worker exits), so the tool sees EOF and exits in milliseconds.
-        Ok(Ok(())) => match wait_with_timeout(&mut child, CLIPBOARD_TOOL_TIMEOUT)? {
-            Some(status) if status.success() => Ok(()),
-            Some(status) => bail!("{} exited with {}", tool, status),
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("{} did not exit within {:?}", tool, CLIPBOARD_TOOL_TIMEOUT)
-            }
+    let role = control::Role::parse(&d.role)
+        .with_context(|| format!("Unknown daemon role '{}'", d.role))?;
+    let journal = diagnostics::journal_capture(role, diagnostics::DEFAULT_JOURNAL_SINCE);
+    let bundle = diagnostics::Bundle {
+        diagnostics: d,
+        journal,
+        peers: Vec::new(),
+    };
+    let text = diagnostics::format_bundle(
+        &bundle,
+        diagnostics::FormatOptions {
+            format: diagnostics::Format::Markdown,
+            redact: false,
         },
-        Ok(Err(e)) => {
-            let _ = child.wait();
-            Err(e).with_context(|| format!("failed to write to {}", tool))
-        }
-        Err(_) => {
-            // Write timed out (wedged reader): kill the child to break the
-            // pipe, which lets the leaked worker thread exit shortly after.
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "{} did not accept the clipboard data within {:?}",
-                tool,
-                CLIPBOARD_TOOL_TIMEOUT
-            )
-        }
-    }
-}
-
-/// child.wait() with a deadline: Ok(None) when it expires (the caller then
-/// kills and reaps). try_wait polling is plenty for a process that exits in
-/// milliseconds in the common case.
-fn wait_with_timeout(
-    child: &mut std::process::Child,
-    timeout: Duration,
-) -> Result<Option<std::process::ExitStatus>> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait().context("failed to poll child")? {
-            return Ok(Some(status));
-        }
-        if std::time::Instant::now() >= deadline {
-            return Ok(None);
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    )?;
+    diagnostics::copy_to_clipboard(&text)
 }
 
 /// Runs the indicator until the tray service shuts down. With no D-Bus
@@ -1281,44 +1194,6 @@ mod tests {
         assert_eq!(data[0], 0);
     }
 
-    #[test]
-    fn diagnostics_bundle_contains_everything() {
-        let d = Diagnostics {
-            version: "1.5.0".to_string(),
-            protocol_version: 8,
-            role: "server".to_string(),
-            state_dump: "rotation loop last completed an iteration 5ms ago; ...".to_string(),
-            recent_logs: vec!["INFO monux: first".to_string(), "INFO monux: last".to_string()],
-        };
-        let bundle = format_diagnostics_bundle(&d);
-        assert!(bundle.contains("monux 1.5.0 diagnostics (server role, protocol 8)"));
-        assert!(bundle.contains("== state =="));
-        assert!(bundle.contains("rotation loop last completed an iteration 5ms ago"));
-        assert!(bundle.contains("== recent logs (oldest first) =="));
-        assert!(bundle.contains("INFO monux: first\nINFO monux: last\n"));
-
-        // An empty log buffer still formats.
-        let mut d2 = d.clone();
-        d2.recent_logs = vec![];
-        assert!(format_diagnostics_bundle(&d2).contains("<no log lines captured>"));
-    }
-
-    #[test]
-    fn wait_with_timeout_returns_status_or_none_on_expiry() {
-        // A child that exits promptly: status comes back well within the
-        // timeout.
-        let mut fast = Command::new("true").spawn().unwrap();
-        let status = wait_with_timeout(&mut fast, Duration::from_secs(5)).unwrap();
-        assert!(status.expect("fast child must have exited").success());
-
-        // A child that never exits on its own: Ok(None) after the timeout,
-        // and the caller can kill + reap it.
-        let mut slow = Command::new("sleep").arg("30").spawn().unwrap();
-        let start = std::time::Instant::now();
-        let status = wait_with_timeout(&mut slow, Duration::from_millis(150)).unwrap();
-        assert!(status.is_none(), "wedged child must hit the timeout");
-        assert!(start.elapsed() < Duration::from_secs(5));
-        slow.kill().unwrap();
-        slow.wait().unwrap();
-    }
+    // Bundle formatting and the clipboard plumbing moved to diagnostics.rs,
+    // which the CLI shares; their tests moved with them.
 }

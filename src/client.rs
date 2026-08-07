@@ -1411,6 +1411,28 @@ impl Connection {
                         }
                     });
                 }
+                bulk::ServerBulk::DiagnosticsRequest(d) => {
+                    // The server is assembling a bug report and wants this
+                    // machine's side of it (protocol v18). Answering is cheap
+                    // — the bundle is built from in-memory mirrors — so it
+                    // happens inline; the reply rides the bulk queue like
+                    // clipboard content, never the events stream.
+                    let (json, error) = build_diagnostics_reply(&self.control_state, d.lines);
+                    let reply = bulk::ClientBulk::DiagnosticsResponse(bulk::DiagnosticsResponse {
+                        request_id: d.request_id,
+                        json: json.as_deref(),
+                        error: error.as_deref(),
+                    });
+                    let bytes = postcard::to_stdvec_cobs(&reply).map_err(|e| {
+                        anyhow!("Failed to serialize diagnostics response: {:?}", e)
+                    })?;
+                    // A full queue is the server not draining; the bug report
+                    // simply records this peer as unanswered, which is far
+                    // better than dropping a working connection over it.
+                    if self.bulk_tx.try_send(bytes).is_err() {
+                        warn!("Failed to queue the diagnostics response: bulk queue full or closed");
+                    }
+                }
                 bulk::ServerBulk::ClipboardHeader(c) => {
                     if c.content_len_bytes > self.max_clipboard_size_bytes {
                         // The content length from the server is bigger than what we advertised.
@@ -1472,6 +1494,39 @@ impl Connection {
 
 fn is_new_connection(connect_time: &Instant) -> bool {
     Instant::now().duration_since(*connect_time) < Duration::from_secs(5)
+}
+
+/// Largest diagnostics bundle a client will send back. The requested line
+/// count already bounds it, but the cap is what guarantees the frame stays
+/// well under shared::MAX_FRAME_BUFFER_BYTES — a peer report must not be
+/// able to trip the server's oversized-frame guard and drop the connection.
+const MAX_DIAGNOSTICS_REPLY_BYTES: usize = 256 * 1024;
+
+/// Builds this client's answer to a peer-diagnostics request: `(json, error)`,
+/// exactly one of which is Some.
+///
+/// Every failure becomes an `error` string rather than a lost response. The
+/// server is waiting on a timeout, and "the client said it couldn't build a
+/// bundle" is a far better line in a bug report than five seconds of silence
+/// that looks identical to a dead link.
+fn build_diagnostics_reply(
+    control_state: &crate::control::ClientStateMirror,
+    lines: u32,
+) -> (Option<String>, Option<String>) {
+    let diagnostics = crate::control::Diagnostics::for_client(control_state, lines as usize);
+    match serde_json::to_string(&diagnostics) {
+        Ok(json) if json.len() <= MAX_DIAGNOSTICS_REPLY_BYTES => (Some(json), None),
+        Ok(json) => (
+            None,
+            Some(format!(
+                "built a {} byte bundle, over the {} byte reply cap; ask for fewer lines, \
+                 or run 'monux diagnostics' on that machine",
+                json.len(),
+                MAX_DIAGNOSTICS_REPLY_BYTES
+            )),
+        ),
+        Err(e) => (None, Some(format!("could not serialize its bundle: {}", e))),
+    }
 }
 
 /// How often the link monitor samples the connection's QUIC path stats.

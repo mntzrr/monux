@@ -94,7 +94,7 @@ Active-session resumption survives server restarts for up to an hour (see `activ
 
 **Protocol-compatibility gate:** a client never installs a build whose protocol version its server couldn't talk to. The client records the server's protocol version at every connection, including handshakes the server refused, and `monux update` (manual or automatic) checks the new source against it before building. Servers also advertise their protocol version via mDNS, so a manual `monux update` first refreshes the record from the LAN (gating on the lowest version when several servers answer) and only falls back to the last recorded version when no server answers. If the pair couldn't talk, the update is skipped with a log message telling you to update the server first; once the server is updated, the client learns the new version via mDNS or on its next connection attempt and the gate opens by itself. `monux update --force` bypasses the gate.
 
-**Protocol negotiation:** from protocol v16 on, mixed-version pairs no longer refuse each other at the handshake: they connect at the lower of the two protocol versions, each side using only the features that version supports, and log the degraded set (e.g. `running at v16 (disabled: …)`). Peers older than v16 predate negotiation and still need an exact version match. One bridge crosses the era boundary: a v16+ client connecting to a v15 server — the oldest version it fully speaks — retries the handshake once speaking v15 ("clamping"), so a newer client keeps working against a not-yet-updated server. Updating the server first remains the safe order; the gate above still refuses pre-negotiation mismatches, and accepts any pair where both sides are v16+. Touchpad multitouch (gestures) requires protocol v9 or newer on both ends — earlier versions only forward single-touch pointer and button events. From v17 the server tags each forwarded input frame with the class of the device it came from (keyboard, mouse, touchpad), so the client routes it to the matching virtual device rather than inferring the destination from event codes that a mouse and a touchpad necessarily share; a pair that negotiates below v17 keeps the untagged frame and that inference.
+**Protocol negotiation:** from protocol v16 on, mixed-version pairs no longer refuse each other at the handshake: they connect at the lower of the two protocol versions, each side using only the features that version supports, and log the degraded set (e.g. `running at v16 (disabled: …)`). Peers older than v16 predate negotiation and still need an exact version match. One bridge crosses the era boundary: a v16+ client connecting to a v15 server — the oldest version it fully speaks — retries the handshake once speaking v15 ("clamping"), so a newer client keeps working against a not-yet-updated server. Updating the server first remains the safe order; the gate above still refuses pre-negotiation mismatches, and accepts any pair where both sides are v16+. Touchpad multitouch (gestures) requires protocol v9 or newer on both ends — earlier versions only forward single-touch pointer and button events. From v17 the server tags each forwarded input frame with the class of the device it came from (keyboard, mouse, touchpad), so the client routes it to the matching virtual device rather than inferring the destination from event codes that a mouse and a touchpad necessarily share; a pair that negotiates below v17 keeps the untagged frame and that inference. From v18 the server can ask its clients for their own diagnostics bundles (`monux diagnostics --peer`), so one bug report covers both machines; a pair that negotiates below v18 keeps working exactly as before and the client is listed in the report as too old to poll.
 
 **Downgrading:** `monux update --to <version|commit>` installs a specific build instead of the latest (e.g. `--to 8.3.0` or `--to 5b4c00e`; a version resolves to the newest commit whose Cargo.toml declares it, anything else is treated as a commit prefix). The protocol-compatibility gate applies in reverse too: the target build's protocol must be able to pair with your server, so **downgrade the server first** and let clients follow — their gate opens once they reconnect, mirroring the upgrade order (`--force` overrides). A successful downgrade writes a pin (`~/.config/monux/update-pin`): the background auto-updater then logs that it is pinned and skips every check — it never undoes a manual downgrade and never removes the pin. A plain `monux update` lifts the pin ("unpinned; updating to latest") and returns to the latest. `monux update --rollback` is shorthand for `--to <the previously installed build>` — every install records the build it replaced (`~/.config/monux/previous-version`). After a downgrade, restart the daemons to apply it: `mx daemon restart`.
 
@@ -213,7 +213,7 @@ monux status --client   # restrict to one role
 monux status --json     # machine-readable response
 ```
 
-The wire protocol is newline-delimited JSON, one request and one response per line, so any language can drive it (this is the backend of the tray indicator below). Requests: `{"cmd":"status"}`, `{"cmd":"diagnostics"}` (a troubleshooting bundle: state dump plus the daemon's recent log lines), `{"cmd":"switch","target":"next"|"prev"|"local"|<fingerprint-prefix>}`, `{"cmd":"pause"}` / `{"cmd":"resume"}` (idempotent: pausing a paused server is a no-op), `{"cmd":"update_now"}` (wakes the background update check), `{"cmd":"indicator","action":"hide"|"show"}` (hides the auto-spawned tray indicator without stopping the daemon, or restores it), `{"cmd":"restart"}` (graceful shutdown + re-exec, like after an update), `{"cmd":"exit"}`. Responses: `{"ok":true,"state":{...}}` for status, `{"ok":true,"diagnostics":{...}}` for diagnostics, `{"ok":true}` for accepted commands, `{"ok":false,"error":"..."}` on failure. The server socket serves the full set; the client socket only status/diagnostics/update_now/indicator/restart/exit — rotation and pause are server concepts. Example with socat:
+The wire protocol is newline-delimited JSON, one request and one response per line, so any language can drive it (this is the backend of the tray indicator below). Requests: `{"cmd":"status"}`, `{"cmd":"diagnostics"}` (a troubleshooting bundle: state dump, environment and the daemon's recent log lines; optional `"lines":<n>` asks for a longer log tail, and `"peer":true` makes a server also poll its connected clients), `{"cmd":"switch","target":"next"|"prev"|"local"|<fingerprint-prefix>}`, `{"cmd":"pause"}` / `{"cmd":"resume"}` (idempotent: pausing a paused server is a no-op), `{"cmd":"update_now"}` (wakes the background update check), `{"cmd":"indicator","action":"hide"|"show"}` (hides the auto-spawned tray indicator without stopping the daemon, or restores it), `{"cmd":"restart"}` (graceful shutdown + re-exec, like after an update), `{"cmd":"exit"}`. Responses: `{"ok":true,"state":{...}}` for status, `{"ok":true,"diagnostics":{...}}` for diagnostics (plus `"peers":[...]` when peers were polled and any were found), `{"ok":true}` for accepted commands, `{"ok":false,"error":"..."}` on failure. The server socket serves the full set; the client socket only status/diagnostics/update_now/indicator/restart/exit — rotation and pause are server concepts. Example with socat:
 
 ```bash
 echo '{"cmd":"pause"}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/monux/server.sock
@@ -246,7 +246,7 @@ The icon is a colored dot whose tooltip carries the details ("monux: input on 19
 - **red** — the link is degraded: any client with RTT over 50 ms (server role), or not connected to the server (client role)
 - hollow grey **?** — no monux daemon is running
 
-The menu follows the current state: switch to local / to a specific client and pause/resume (server only), per-client connection facts and clipboard owner, "Check for update now" (or "Update available: `<sha>` — update now" when the auto-updater has seen a newer commit), "Copy diagnostics" (puts a bug-report bundle — version, state dump, recent logs — on the clipboard via `wl-copy`/`xclip`/`xsel`), and "Restart monux" / "Exit monux".
+The menu follows the current state: switch to local / to a specific client and pause/resume (server only), per-client connection facts and clipboard owner, "Check for update now" (or "Update available: `<sha>` — update now" when the auto-updater has seen a newer commit), "Copy diagnostics" (puts an issue-ready bug-report bundle — version, environment, state dump, recent logs and journal — on the clipboard via `wl-copy`/`xclip`/`xsel`; the same bundle `monux diagnostics --copy` produces, see *Filing a bug report* below), and "Restart monux" / "Exit monux".
 
 The indicator starts automatically with the daemon: whenever `monux server` or `monux client` runs with a desktop session bus available, it spawns `monux gui indicator` as a child process (opt out with `--no-indicator` or `MONUX_NO_INDICATOR=1`). When the daemon shuts down, the indicator is deliberately left running: it notices the daemon is gone and falls back to the standalone launcher state below — so the tray survives daemon exits and restarts, and only disappears when you hide it (the menu's **Hide tray icon** or `monux gui tray hide`). If the indicator dies on its own (e.g. its tray host restarted), the daemon respawns it — a bounded few times, after which it logs how to start it manually. Only one indicator runs at a time: a manually started `monux gui indicator` takes over from the auto-spawned one (and vice versa), never a duplicate icon.
 
@@ -315,7 +315,41 @@ shortcut = "leftshift,leftalt,r"
 
 ## Troubleshooting
 
-If input (e.g. the Enter key) stops registering on the server machine while `monux server` runs, the server log tells you what monux sees. The first log line records the exact build (`monux v1.0.0+<sha> starting`) — always include it when reporting.
+### Filing a bug report (`monux diagnostics`)
+
+`monux diagnostics` collects everything a report needs in one paste, so you don't have to assemble it by hand:
+
+```bash
+monux diagnostics                  # read it here
+monux diagnostics --copy           # issue-ready markdown, on the clipboard
+monux diagnostics --redact --copy  # ...with IPs, hostnames and home paths stripped
+monux diagnostics --peer           # include the connected clients' side too
+monux diagnostics --privacy        # exactly what a bundle contains, before you paste it
+```
+
+A bundle carries four things: the daemon's **state dump** and **recent log lines** (from the control socket), the **journal** for its systemd unit (`--since` defaults to the last 30 minutes), and the **environment** the daemon runs in — kernel, OS, session type, desktop, `/dev/uinput` permissions, `input`-group membership and autostart state. That last part is collected *inside the daemon*, not by the CLI: an autostarted daemon's environment differs from your shell's in exactly the ways that cause bugs, so asking the shell would describe the wrong process.
+
+**With no daemon running it still works** — it reports the environment and the journal, which is where the answer lives for "monux won't start" and "monux crashed" (the in-memory log ring dies with the daemon; the journal doesn't).
+
+**Both machines in one paste:** `--peer` asks each connected client for its own bundle over the existing connection, so a report about a freeze or a clipboard that won't cross carries both sides with UTC timestamps that line up. Server-side only (a client has no peers), and it needs protocol v18+ on both ends — an older client is *reported as skipped* rather than silently omitted. Peers that don't answer within 5s are recorded as unanswered, since a silent client is usually what the report is about.
+
+**Privacy:** the bundle never contains clipboard *contents* (only the owner and MIME types) or keystrokes — unless you deliberately turn on `MONUX_TRACE_KEYS`, which logs key *codes*. It does contain your hostname, LAN IPs and certificate fingerprints; `--redact` replaces them with placeholders. Loopback addresses and fingerprints are deliberately kept (they identify nobody and the report is much harder to read without them), and a hostname too generic to substitute safely — three characters or fewer, or a word the report is made of like `monux` or `server` — is left in place and called out on stderr.
+
+### Recording a live reproduction
+
+For failures a snapshot can't explain — an input freeze, a dead key, a stall under load — record one instead:
+
+```bash
+systemctl --user stop monux-server   # the capture has to BE the daemon
+monux diagnostics record             # reproduce the problem, then Ctrl-C
+monux diagnostics record --keys 28   # ...also tracing a key (28 = Enter)
+```
+
+It runs the daemon with debug logging (`--trace` for everything, including QUIC internals), tees to a capture file while still printing to your terminal, and prints the path when you stop it. The file opens with the environment header, so it's self-describing when it arrives without the command that produced it. It refuses to start beside a daemon that is already running — two daemons fight over the input devices, and the resulting misbehaviour has nothing to do with the bug you're chasing.
+
+### Input freezes
+
+If input (e.g. the Enter key) stops registering on the server machine while `monux server` runs, the server log tells you what monux sees. The first log line records the exact build (`monux v1.0.0+<sha> starting`) — always include it when reporting, or just attach `monux diagnostics`, which records it for you.
 
 **While the freeze is happening** (switch to a TTY or SSH in):
 

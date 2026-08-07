@@ -6,12 +6,18 @@ use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::EnvFilter;
 
 /// Total log lines kept in the in-memory ring buffer (see RingBufferLayer).
-/// Bounded: older lines are dropped as new ones arrive.
-const LOG_RING_CAPACITY: usize = 200;
+/// Bounded: older lines are dropped as new ones arrive. Sized so a bug report
+/// covers minutes of a busy daemon rather than seconds — at ~150 bytes a line
+/// the whole ring costs well under 100 KB, and a report that starts after the
+/// interesting lines were evicted is worth far more than that.
+const LOG_RING_CAPACITY: usize = 500;
 
 /// Default number of ring-buffer lines served by the control socket's
 /// diagnostics command.
 pub const RECENT_LOGS_DEFAULT: usize = 50;
+
+/// Most lines a diagnostics request may ask for: the whole ring.
+pub const RECENT_LOGS_MAX: usize = LOG_RING_CAPACITY;
 
 static LOG_RING: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
 
@@ -60,6 +66,24 @@ impl tracing::field::Visit for EventVisitor {
     }
 }
 
+/// Wall-clock stamp for one ring-buffer line, in the same RFC3339 UTC format
+/// the stderr layer prints. Bug reports are read against a wall clock ("it
+/// froze around 14:32") and — for a server/client pair — against the OTHER
+/// machine's log, so an unstamped line is nearly unusable in a report.
+/// Formatting goes through the same tracing-subscriber timer as stderr, so
+/// the two renderings can't drift apart.
+fn timestamp() -> String {
+    use tracing_subscriber::fmt::format::Writer;
+    use tracing_subscriber::fmt::time::{FormatTime, SystemTime};
+    let mut buf = String::new();
+    match SystemTime.format_time(&mut Writer::new(&mut buf)) {
+        Ok(()) => buf,
+        // The timer is infallible in practice; a report with unstamped lines
+        // still beats losing the line.
+        Err(_) => "<no timestamp>".to_string(),
+    }
+}
+
 /// A tracing layer keeping the daemon's last LOG_RING_CAPACITY log lines in a
 /// global ring buffer, served by the control socket's diagnostics command
 /// (control.rs). The global EnvFilter short-circuits filtered-out events
@@ -75,14 +99,16 @@ impl<S: tracing::Subscriber> Layer<S> for RingBufferLayer {
         let metadata = event.metadata();
         let line = if visitor.fields.is_empty() {
             format!(
-                "{} {}: {}",
+                "{} {} {}: {}",
+                timestamp(),
                 metadata.level(),
                 metadata.target(),
                 visitor.message
             )
         } else {
             format!(
-                "{} {}: {} {}",
+                "{} {} {}: {} {}",
+                timestamp(),
                 metadata.level(),
                 metadata.target(),
                 visitor.message,
@@ -156,5 +182,35 @@ mod tests {
         // recent_logs honors the requested tail length.
         assert!(recent_logs(0).is_empty());
         assert!(recent_logs(1).len() <= 1);
+    }
+
+    #[test]
+    fn captured_lines_are_timestamped() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let marker = format!("ring-stamp-test-{}", std::process::id());
+        let subscriber = tracing_subscriber::registry().with(RingBufferLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("{}", marker);
+        });
+        let logs = recent_logs(RECENT_LOGS_MAX);
+        let line = logs
+            .iter()
+            .find(|l| l.contains(&marker))
+            .expect("the marker line must be captured");
+        // The stamp leads the line, before the level — an RFC3339 UTC
+        // instant, so a reader can align it with the peer machine's log.
+        let stamp = line.split(' ').next().expect("a leading field");
+        assert!(stamp.ends_with('Z'), "{}", line);
+        assert!(stamp.starts_with("20"), "{}", line);
+        assert!(stamp.contains('T'), "{}", line);
+        assert!(line.contains("INFO"), "{}", line);
+    }
+
+    #[test]
+    fn the_timestamp_renders_an_rfc3339_instant() {
+        let stamp = timestamp();
+        assert!(stamp.contains('T') && stamp.ends_with('Z'), "{}", stamp);
+        // YYYY-MM-DDTHH:MM:SS at minimum.
+        assert!(stamp.len() >= 20, "{}", stamp);
     }
 }

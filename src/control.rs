@@ -139,6 +139,15 @@ impl Role {
             Role::Client => "client",
         }
     }
+
+    /// Parses the role back out of a wire/state string.
+    pub fn parse(s: &str) -> Option<Role> {
+        match s {
+            "server" => Some(Role::Server),
+            "client" => Some(Role::Client),
+            _ => None,
+        }
+    }
 }
 
 /// The directory holding the control sockets, honoring XDG_RUNTIME_DIR (also
@@ -445,11 +454,28 @@ pub struct Request {
     pub target: Option<String>,
     /// Sub-action for commands that need one ("indicator": hide|show).
     pub action: Option<String>,
+    /// How many recent log lines "diagnostics" should return. Absent means
+    /// the default; an older daemon simply ignores the field, so a newer CLI
+    /// gets the default tail from it instead of an error.
+    pub lines: Option<usize>,
+    /// Whether "diagnostics" should also collect connected peers' bundles
+    /// (server only). Absent means no.
+    pub peer: Option<bool>,
+}
+
+/// Clamps a requested log-line count to what the ring can actually hold. A
+/// caller asking for more than exists gets everything, not an error: a bug
+/// report should never fail over a tuning knob.
+fn requested_lines(requested: Option<usize>) -> usize {
+    match requested {
+        Some(n) => n.min(crate::logging::RECENT_LOGS_MAX),
+        None => crate::logging::RECENT_LOGS_DEFAULT,
+    }
 }
 
 /// Troubleshooting bundle served by `{"cmd":"diagnostics"}` (see module docs
-/// for the schema). The tray indicator formats and copies this for bug
-/// reports.
+/// for the schema). The tray indicator and the `monux diagnostics` CLI both
+/// format this for bug reports (diagnostics.rs).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Diagnostics {
     pub version: String,
@@ -457,22 +483,38 @@ pub struct Diagnostics {
     pub role: String,
     /// SIGHUP dump string (server) or client state rendering (client).
     pub state_dump: String,
-    /// The daemon's last ~50 log lines, oldest first.
+    /// The daemon's recent log lines, oldest first (the ring in logging.rs).
     pub recent_logs: Vec<String>,
+    /// The environment THIS DAEMON runs in — deliberately collected daemon-
+    /// side: an autostarted daemon's environment differs from the invoking
+    /// shell's in exactly the ways that produce bug reports.
+    ///
+    /// Defaulted on the wire so a freshly installed CLI can still read a
+    /// daemon from before this field existed (an update installs the binary;
+    /// the running daemon restarts later).
+    #[serde(default)]
+    pub environment: crate::diagnostics::Environment,
 }
 
 impl Diagnostics {
-    fn server(mirror: &DiagnosticsMirror) -> Self {
+    fn server(mirror: &DiagnosticsMirror, lines: usize) -> Self {
         Diagnostics {
             version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: PROTOCOL_VERSION,
             role: Role::Server.as_str().to_string(),
             state_dump: mirror.state_dump(),
-            recent_logs: crate::logging::recent_logs(crate::logging::RECENT_LOGS_DEFAULT),
+            recent_logs: crate::logging::recent_logs(lines),
+            environment: crate::diagnostics::daemon_environment(),
         }
     }
 
-    fn client(mirror: &ClientStateMirror) -> Self {
+    /// This client's own bundle, for answering the server's peer-diagnostics
+    /// request (see bulk::DiagnosticsRequest).
+    pub fn for_client(mirror: &ClientStateMirror, lines: usize) -> Self {
+        Self::client(mirror, lines)
+    }
+
+    fn client(mirror: &ClientStateMirror, lines: usize) -> Self {
         Diagnostics {
             version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: PROTOCOL_VERSION,
@@ -481,9 +523,173 @@ impl Diagnostics {
                 .to_string()
                 .trim_end()
                 .to_string(),
-            recent_logs: crate::logging::recent_logs(crate::logging::RECENT_LOGS_DEFAULT),
+            recent_logs: crate::logging::recent_logs(lines),
+            environment: crate::diagnostics::daemon_environment(),
         }
     }
+}
+
+/// Longest the server waits for one client to answer a diagnostics request.
+/// A client builds its bundle from in-memory mirrors, so this only trips
+/// when the peer is wedged or the link is dead — which is very often exactly
+/// what the report is about. The wait is therefore bounded and its expiry
+/// recorded, never allowed to hold the report open.
+pub const PEER_DIAGNOSTICS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Correlates outgoing peer-diagnostics requests with the responses that
+/// arrive later, on a different task.
+///
+/// The request leaves through the rotation loop (which owns the clients'
+/// bulk queues) and the answer arrives on the per-client bulk READ task, so
+/// neither end can simply await the other. Both meet here: the requester
+/// parks on a oneshot, the reader completes it by id.
+#[derive(Default)]
+pub struct PeerDiagnosticsHub {
+    inner: Mutex<PeerDiagnosticsInner>,
+}
+
+/// The process's hub. A global for the same reason the log ring in
+/// logging.rs is one: there is exactly one server per process, and the
+/// alternative is threading an Arc through four layers of connection-
+/// handling signatures that have nothing to do with bug reports.
+pub fn peer_diagnostics_hub() -> &'static PeerDiagnosticsHub {
+    static HUB: std::sync::OnceLock<PeerDiagnosticsHub> = std::sync::OnceLock::new();
+    HUB.get_or_init(PeerDiagnosticsHub::new)
+}
+
+#[derive(Default)]
+struct PeerDiagnosticsInner {
+    next_id: u64,
+    /// Requests still awaiting an answer, by request id.
+    pending: std::collections::HashMap<u64, tokio::sync::oneshot::Sender<PeerReply>>,
+}
+
+/// What a client's bulk reader hands back for one request.
+pub type PeerReply = std::result::Result<Diagnostics, String>;
+
+impl PeerDiagnosticsHub {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a new request, returning its id and the receiver to await.
+    pub fn open(&self) -> (u64, tokio::sync::oneshot::Receiver<PeerReply>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut inner = self.inner.lock().expect("peer diagnostics hub poisoned");
+        inner.next_id += 1;
+        let id = inner.next_id;
+        inner.pending.insert(id, tx);
+        (id, rx)
+    }
+
+    /// Delivers a response. Unknown ids are dropped with a debug line rather
+    /// than an error: a request that already timed out is exactly the case,
+    /// and a late answer to it is not a fault.
+    pub fn complete(&self, id: u64, reply: PeerReply) {
+        let sender = {
+            let mut inner = self.inner.lock().expect("peer diagnostics hub poisoned");
+            inner.pending.remove(&id)
+        };
+        match sender {
+            Some(tx) => {
+                // The receiver is gone if the requester timed out first.
+                let _ = tx.send(reply);
+            }
+            None => debug!("Peer diagnostics response for unknown request {} ignored", id),
+        }
+    }
+
+    /// Forgets a request whose wait ended, so a peer that never answers
+    /// can't leak an entry per bug report.
+    pub fn cancel(&self, id: u64) {
+        let mut inner = self.inner.lock().expect("peer diagnostics hub poisoned");
+        inner.pending.remove(&id);
+    }
+}
+
+/// Asks the rotation loop to poll every connected client, then waits out the
+/// answers.
+///
+/// Every client yields exactly one entry, whatever happens to it. Silence is
+/// the outcome most worth reporting — a client that stops answering is what
+/// half these bug reports are ABOUT — so a timeout becomes a recorded
+/// failure rather than a missing section.
+async fn collect_peer_diagnostics(
+    rotation_tx: &mpsc::Sender<crate::rotation::RotationEvent>,
+    lines: usize,
+) -> Vec<PeerDiagnostics> {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let request = crate::rotation::RotationEvent::RequestPeerDiagnostics(
+        crate::rotation::PeerDiagnosticsArgs {
+            lines: lines.min(u32::MAX as usize) as u32,
+            reply: reply_tx,
+        },
+    );
+    if rotation_tx.send(request).await.is_err() {
+        return vec![PeerDiagnostics {
+            label: "peers".to_string(),
+            diagnostics: Err("the rotation loop is not accepting requests".to_string()),
+        }];
+    }
+    // The rotation loop answers as soon as it drains its queue; if it is
+    // wedged, that is itself the bug and must not hang the report.
+    let pending = match tokio::time::timeout(PEER_DIAGNOSTICS_TIMEOUT, reply_rx).await {
+        Ok(Ok(pending)) => pending,
+        Ok(Err(_)) => {
+            return vec![PeerDiagnostics {
+                label: "peers".to_string(),
+                diagnostics: Err("the rotation loop dropped the request".to_string()),
+            }]
+        }
+        Err(_) => {
+            return vec![PeerDiagnostics {
+                label: "peers".to_string(),
+                diagnostics: Err(format!(
+                    "the rotation loop did not answer within {:?} — it appears wedged, which is \
+                     itself worth reporting",
+                    PEER_DIAGNOSTICS_TIMEOUT
+                )),
+            }]
+        }
+    };
+
+    let hub = peer_diagnostics_hub();
+    let mut out = Vec::with_capacity(pending.len());
+    for peer in pending {
+        let diagnostics = match peer.waiting {
+            Err(reason) => Err(reason),
+            Ok(rx) => match tokio::time::timeout(PEER_DIAGNOSTICS_TIMEOUT, rx).await {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(_)) => Err("the connection dropped before it answered".to_string()),
+                Err(_) => {
+                    // Stop the hub from holding an entry for an answer nobody
+                    // is waiting for any more.
+                    if let Some(id) = peer.request_id {
+                        hub.cancel(id);
+                    }
+                    Err(format!("did not answer within {:?}", PEER_DIAGNOSTICS_TIMEOUT))
+                }
+            },
+        };
+        out.push(PeerDiagnostics {
+            label: peer.label,
+            diagnostics,
+        });
+    }
+    out
+}
+
+/// One peer's contribution to a bundle: its diagnostics, or why they could
+/// not be fetched. A peer that didn't answer is REPORTED rather than dropped
+/// — "the client never replied" is itself evidence, and silently omitting it
+/// would read as "there was no client".
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerDiagnostics {
+    /// How the peer is identified in the report (fingerprint prefix + addr).
+    pub label: String,
+    /// Result rather than Option so the failure travels with its reason;
+    /// serialized as `{"Ok":…}` / `{"Err":…}`.
+    pub diagnostics: std::result::Result<Diagnostics, String>,
 }
 
 /// The single response line sent back for every request.
@@ -494,6 +700,10 @@ pub struct Response {
     pub state: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<Diagnostics>,
+    /// Peer bundles, present only for a `diagnostics` request that asked for
+    /// them and a server that has peers to ask.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<PeerDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -504,6 +714,7 @@ impl Response {
             ok: true,
             state: None,
             diagnostics: None,
+            peers: Vec::new(),
             error: None,
         }
     }
@@ -513,15 +724,17 @@ impl Response {
             ok: true,
             state: serde_json::to_value(state).ok(),
             diagnostics: None,
+            peers: Vec::new(),
             error: None,
         }
     }
 
-    fn ok_diagnostics(diagnostics: Diagnostics) -> Self {
+    fn ok_diagnostics(diagnostics: Diagnostics, peers: Vec<PeerDiagnostics>) -> Self {
         Response {
             ok: true,
             state: None,
             diagnostics: Some(diagnostics),
+            peers,
             error: None,
         }
     }
@@ -531,6 +744,7 @@ impl Response {
             ok: false,
             state: None,
             diagnostics: None,
+            peers: Vec::new(),
             error: Some(error.into()),
         }
     }
@@ -558,6 +772,10 @@ pub struct ServerHandler {
     /// Commands enter the server events loop through the same channel as the
     /// hotkey/signal paths — the socket task never touches rotation state.
     pub event_tx: mpsc::Sender<Event>,
+    /// Direct line to the rotation loop, for the one command that needs to
+    /// reach the CLIENTS rather than the local input state: peer diagnostics
+    /// (only the rotation loop owns the clients' bulk queues).
+    pub rotation_tx: mpsc::Sender<crate::rotation::RotationEvent>,
     /// Whether the background auto-updater is running (update_now otherwise
     /// errors clearly instead of silently doing nothing).
     pub auto_update: bool,
@@ -593,16 +811,30 @@ impl Handler {
                 },
                 Handler::Client(h) => (Response::ok_state(State::Client(h.state.snapshot())), None),
             },
-            "diagnostics" => match self {
-                Handler::Server(h) => (
-                    Response::ok_diagnostics(Diagnostics::server(&h.state)),
-                    None,
-                ),
-                Handler::Client(h) => (
-                    Response::ok_diagnostics(Diagnostics::client(&h.state)),
-                    None,
-                ),
-            },
+            "diagnostics" => {
+                let lines = requested_lines(req.lines);
+                match self {
+                    Handler::Server(h) => {
+                        // Only a server has peers to ask.
+                        let peers = if req.peer.unwrap_or(false) {
+                            collect_peer_diagnostics(&h.rotation_tx, lines).await
+                        } else {
+                            Vec::new()
+                        };
+                        (
+                            Response::ok_diagnostics(Diagnostics::server(&h.state, lines), peers),
+                            None,
+                        )
+                    }
+                    Handler::Client(h) => (
+                        Response::ok_diagnostics(
+                            Diagnostics::client(&h.state, lines),
+                            Vec::new(),
+                        ),
+                        None,
+                    ),
+                }
+            }
             "update_now" => {
                 let auto_update = match self {
                     Handler::Server(h) => h.auto_update,
@@ -891,6 +1123,56 @@ pub fn status_cli(
     format_status(&path, &raw, json)
 }
 
+/// Fetches a daemon's diagnostics bundle over the control socket, using the
+/// same role discovery as `status_cli` (server socket first, then the
+/// client's, unless a role or an explicit socket narrows it). Returns the
+/// role that answered alongside the bundle, so the caller knows which
+/// systemd unit's journal belongs with it.
+///
+/// `peer` asks a SERVER to include its connected clients' bundles; a client
+/// daemon and older daemons ignore the flag and answer for themselves alone.
+pub fn fetch_diagnostics(
+    server: bool,
+    client: bool,
+    socket: Option<&Path>,
+    lines: usize,
+    peer: bool,
+) -> Result<(Role, Diagnostics, Vec<PeerDiagnostics>)> {
+    let candidates: Vec<PathBuf> = match (socket, server, client) {
+        (Some(path), _, _) => vec![path.to_path_buf()],
+        (None, true, false) => vec![socket_path(Role::Server)],
+        (None, false, true) => vec![socket_path(Role::Client)],
+        (None, false, false) => vec![socket_path(Role::Server), socket_path(Role::Client)],
+        (None, true, true) => bail!("--server and --client are mutually exclusive"),
+    };
+    let request = serde_json::json!({
+        "cmd": "diagnostics",
+        "lines": lines,
+        "peer": peer,
+    })
+    .to_string();
+    let (path, raw) = query_first(&candidates, &request)?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("Malformed response from {}: {}", path.display(), raw))?;
+    if parsed["ok"] != serde_json::Value::Bool(true) {
+        bail!(
+            "The daemon reported an error: {}",
+            parsed["error"].as_str().unwrap_or("unknown error")
+        );
+    }
+    let diagnostics: Diagnostics = serde_json::from_value(parsed["diagnostics"].clone())
+        .with_context(|| format!("{} returned no diagnostics bundle", path.display()))?;
+    // Peers are absent from an older daemon's response, and from any client's:
+    // no peers is a normal answer, not a malformed one.
+    let peers: Vec<PeerDiagnostics> = parsed
+        .get("peers")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let role = Role::parse(&diagnostics.role)
+        .with_context(|| format!("Unknown daemon role '{}'", diagnostics.role))?;
+    Ok((role, diagnostics, peers))
+}
+
 /// Implements the `monux daemon` management verbs: sends a daemon-management
 /// command (switch/pause/resume/restart/exit/update_now) to the control
 /// socket (server socket first, then the client's) and returns the text to
@@ -1055,6 +1337,8 @@ mod tests {
             cmd: cmd.to_string(),
             target: target.map(|t| t.to_string()),
             action: None,
+            lines: None,
+            peer: None,
         }
     }
 
@@ -1063,6 +1347,8 @@ mod tests {
             cmd: cmd.to_string(),
             target: None,
             action: action.map(|a| a.to_string()),
+            lines: None,
+            peer: None,
         }
     }
 
@@ -1079,16 +1365,27 @@ mod tests {
         handle
     }
 
-    fn server_handler(
+    fn server_handler(event_tx: mpsc::Sender<Event>, auto_update: bool) -> Handler {
+        server_handler_with_rotation(event_tx, auto_update).0
+    }
+
+    /// A server handler plus the rotation receiver its peer-diagnostics
+    /// requests land on, so a test can stand in for the rotation loop.
+    fn server_handler_with_rotation(
         event_tx: mpsc::Sender<Event>,
         auto_update: bool,
-    ) -> Handler {
-        Handler::Server(ServerHandler {
-            state: Arc::new(DiagnosticsMirror::new("127.0.0.1:1".parse().unwrap())),
-            event_tx,
-            auto_update,
-            indicator: opted_out_indicator(),
-        })
+    ) -> (Handler, mpsc::Receiver<crate::rotation::RotationEvent>) {
+        let (rotation_tx, rotation_rx) = mpsc::channel(8);
+        (
+            Handler::Server(ServerHandler {
+                state: Arc::new(DiagnosticsMirror::new("127.0.0.1:1".parse().unwrap())),
+                event_tx,
+                rotation_tx,
+                auto_update,
+                indicator: opted_out_indicator(),
+            }),
+            rotation_rx,
+        )
     }
 
     fn client_handler(auto_update: bool) -> (Handler, Arc<ClientStateMirror>) {
@@ -1571,15 +1868,203 @@ mod tests {
         assert!(diag.recent_logs.is_empty());
 
         // The wire shape is {"ok":true,"diagnostics":{...}}.
-        let v: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&Response::ok_diagnostics(diag)).unwrap())
-                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&Response::ok_diagnostics(diag, Vec::new())).unwrap(),
+        )
+        .unwrap();
         assert_eq!(v["ok"], true);
         assert!(v.get("state").is_none());
         assert!(v.get("error").is_none());
-        for key in ["version", "protocol_version", "role", "state_dump", "recent_logs"] {
+        // No peers were fetched, so the field is absent rather than empty —
+        // an older CLI parsing this response must not trip over it.
+        assert!(v.get("peers").is_none());
+        for key in [
+            "version",
+            "protocol_version",
+            "role",
+            "state_dump",
+            "recent_logs",
+            "environment",
+        ] {
             assert!(v["diagnostics"].get(key).is_some(), "missing {}", key);
         }
+    }
+
+    #[test]
+    fn a_diagnostics_request_may_ask_for_more_log_lines() {
+        // Absent means the socket default; a request is free to ask for more.
+        assert_eq!(requested_lines(None), crate::logging::RECENT_LOGS_DEFAULT);
+        assert_eq!(requested_lines(Some(10)), 10);
+        // Asking for more than the ring holds yields the whole ring, not an
+        // error: a bug report must never fail over a tuning knob.
+        assert_eq!(
+            requested_lines(Some(usize::MAX)),
+            crate::logging::RECENT_LOGS_MAX
+        );
+    }
+
+    #[test]
+    fn a_request_line_parses_without_the_newer_fields() {
+        // An older client (or a hand-written socat line) sends neither
+        // "lines" nor "peer"; both must default rather than fail the parse.
+        let req: Request = serde_json::from_str(r#"{"cmd":"diagnostics"}"#).unwrap();
+        assert_eq!(req.cmd, "diagnostics");
+        assert!(req.lines.is_none());
+        assert!(req.peer.is_none());
+
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"diagnostics","lines":200,"peer":true}"#).unwrap();
+        assert_eq!(req.lines, Some(200));
+        assert_eq!(req.peer, Some(true));
+    }
+
+    #[test]
+    fn a_diagnostics_response_parses_without_the_environment() {
+        // A freshly installed CLI talking to a daemon from before the
+        // environment field existed: the bundle parses, minus that section.
+        let raw = r#"{"version":"11.0.0","protocol_version":17,"role":"server",
+                      "state_dump":"x","recent_logs":[]}"#;
+        let d: Diagnostics = serde_json::from_str(raw).unwrap();
+        assert_eq!(d.role, "server");
+        assert_eq!(d.environment, crate::diagnostics::Environment::default());
+    }
+
+    #[tokio::test]
+    async fn a_peer_request_reaches_the_rotation_loop_and_its_answers_come_back() {
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (handler, mut rotation_rx) = server_handler_with_rotation(event_tx, false);
+
+        // Stand in for the rotation loop: answer with one reachable client
+        // and one that is too old to ask.
+        let hub = peer_diagnostics_hub();
+        let fake_rotation = tokio::spawn(async move {
+            let event = rotation_rx.recv().await.expect("a request must arrive");
+            let crate::rotation::RotationEvent::RequestPeerDiagnostics(args) = event else {
+                panic!("expected a peer diagnostics request");
+            };
+            assert_eq!(args.lines, crate::logging::RECENT_LOGS_DEFAULT as u32);
+            let (id, rx) = hub.open();
+            args.reply
+                .send(vec![
+                    crate::rotation::PendingPeer {
+                        label: "aabbccdd @ 10.0.0.5:1213".to_string(),
+                        waiting: Ok(rx),
+                        request_id: Some(id),
+                    },
+                    crate::rotation::PendingPeer {
+                        label: "eeff0011 @ 10.0.0.6:1213".to_string(),
+                        waiting: Err("runs protocol v17".to_string()),
+                        request_id: None,
+                    },
+                ])
+                .expect("the requester is still waiting");
+            // The client answers a moment later, as it would over the wire.
+            let mut answer = Diagnostics {
+                version: "12.0.0".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                role: "client".to_string(),
+                state_dump: "connected=true".to_string(),
+                recent_logs: vec!["INFO monux::client: linked".to_string()],
+                environment: Default::default(),
+            };
+            answer.state_dump = "connected=true".to_string();
+            hub.complete(id, Ok(answer));
+        });
+
+        let mut req = req("diagnostics", None);
+        req.peer = Some(true);
+        let (resp, _) = handler.dispatch(&req).await;
+        fake_rotation.await.unwrap();
+
+        assert!(resp.ok);
+        assert_eq!(resp.peers.len(), 2);
+        let reachable = &resp.peers[0];
+        assert_eq!(reachable.label, "aabbccdd @ 10.0.0.5:1213");
+        assert_eq!(
+            reachable.diagnostics.as_ref().unwrap().state_dump,
+            "connected=true"
+        );
+        // The peer that could not be asked is REPORTED, not dropped: a
+        // missing section would read as "there was no second client".
+        let skipped = &resp.peers[1];
+        assert_eq!(skipped.label, "eeff0011 @ 10.0.0.6:1213");
+        assert_eq!(skipped.diagnostics.as_ref().unwrap_err(), "runs protocol v17");
+    }
+
+    #[tokio::test]
+    async fn a_diagnostics_request_without_peer_never_asks_the_rotation_loop() {
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (handler, mut rotation_rx) = server_handler_with_rotation(event_tx, false);
+        let (resp, _) = handler.dispatch(&req("diagnostics", None)).await;
+        assert!(resp.ok);
+        assert!(resp.peers.is_empty());
+        // Nothing was sent: the plain bundle must not touch the clients.
+        assert!(rotation_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_silent_peer_is_recorded_rather_than_hanging_the_report() {
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (handler, mut rotation_rx) = server_handler_with_rotation(event_tx, false);
+        let hub = peer_diagnostics_hub();
+        let fake_rotation = tokio::spawn(async move {
+            let event = rotation_rx.recv().await.expect("a request must arrive");
+            let crate::rotation::RotationEvent::RequestPeerDiagnostics(args) = event else {
+                panic!("expected a peer diagnostics request");
+            };
+            let (id, rx) = hub.open();
+            // Never completed: the client is wedged or the link is black-holed.
+            args.reply
+                .send(vec![crate::rotation::PendingPeer {
+                    label: "aabbccdd @ 10.0.0.5:1213".to_string(),
+                    waiting: Ok(rx),
+                    request_id: Some(id),
+                }])
+                .expect("the requester is still waiting");
+            id
+        });
+
+        let mut req = req("diagnostics", None);
+        req.peer = Some(true);
+        let started = std::time::Instant::now();
+        let (resp, _) = handler.dispatch(&req).await;
+        let id = fake_rotation.await.unwrap();
+
+        assert!(resp.ok);
+        assert_eq!(resp.peers.len(), 1);
+        let err = resp.peers[0].diagnostics.as_ref().unwrap_err();
+        assert!(err.contains("did not answer"), "{}", err);
+        // Bounded by the timeout, not by the peer's willingness to answer.
+        assert!(started.elapsed() < PEER_DIAGNOSTICS_TIMEOUT * 2);
+        // And the hub kept no entry for the answer nobody awaits any more.
+        hub.complete(id, Err("late".to_string()));
+    }
+
+    #[test]
+    fn the_hub_correlates_answers_and_forgets_cancelled_requests() {
+        let hub = PeerDiagnosticsHub::new();
+        let (id_a, mut rx_a) = hub.open();
+        let (id_b, mut rx_b) = hub.open();
+        assert_ne!(id_a, id_b, "ids must not collide");
+
+        hub.complete(id_a, Err("nope".to_string()));
+        assert_eq!(rx_a.try_recv().unwrap().unwrap_err(), "nope");
+
+        // A cancelled request's answer is dropped, not misdelivered.
+        hub.cancel(id_b);
+        hub.complete(id_b, Err("late".to_string()));
+        assert!(rx_b.try_recv().is_err());
+
+        // An id that was never opened is ignored rather than panicking.
+        hub.complete(9999, Err("unknown".to_string()));
+    }
+
+    #[test]
+    fn roles_round_trip_through_their_wire_string() {
+        for role in [Role::Server, Role::Client] {
+            assert_eq!(Role::parse(role.as_str()), Some(role));
+        }
+        assert_eq!(Role::parse("nonsense"), None);
     }
 
     #[tokio::test]

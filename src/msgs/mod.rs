@@ -22,8 +22,8 @@ mod golden_tests {
     /// The update gate keys on the protocol version: bumping it must be a
     /// conscious red test (and per AGENTS.md a MAJOR crate version bump).
     #[test]
-    fn protocol_version_is_17() {
-        assert_eq!(shared::PROTOCOL_VERSION, 17);
+    fn protocol_version_is_18() {
+        assert_eq!(shared::PROTOCOL_VERSION, 18);
     }
 
     #[test]
@@ -197,5 +197,34 @@ mod golden_tests {
             request_id: 8,
         });
         assert_eq!(cobs_hex(&msg), "0d010a746578742f706c61696e0232020800");
+    }
+
+    #[test]
+    fn golden_server_bulk_diagnostics_request() {
+        let msg = bulk::ServerBulk::DiagnosticsRequest(bulk::DiagnosticsRequest {
+            request_id: 11,
+            lines: 200,
+        });
+        assert_eq!(cobs_hex(&msg), "05020bc80100");
+    }
+
+    #[test]
+    fn golden_client_bulk_diagnostics_response() {
+        let msg = bulk::ClientBulk::DiagnosticsResponse(bulk::DiagnosticsResponse {
+            request_id: 11,
+            json: Some("{}"),
+            error: None,
+        });
+        assert_eq!(cobs_hex(&msg), "07020b01027b7d0100");
+    }
+
+    #[test]
+    fn golden_client_bulk_diagnostics_response_error() {
+        let msg = bulk::ClientBulk::DiagnosticsResponse(bulk::DiagnosticsResponse {
+            request_id: 11,
+            json: None,
+            error: Some("no"),
+        });
+        assert_eq!(cobs_hex(&msg), "03020b0501026e6f00");
     }
 }

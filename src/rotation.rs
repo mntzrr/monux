@@ -120,7 +120,6 @@ const HEARTBEAT_LINK_RTT_WARN: Duration = Duration::from_millis(50);
 const DIAGNOSTICS_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Channels for communicating with a connected client.
-#[derive(Debug)]
 struct ClientInfo {
     /// The primary identifier for a client. We can have multiple clients with the same fingerprint:
     /// - When the user is sharing certificates between clients (they are free to do so)
@@ -155,6 +154,36 @@ struct ClientInfo {
     /// The protocol version this pair negotiated, so the send path only uses
     /// frames this client understands (see shared::sends_device_class).
     negotiated_version: u64,
+}
+
+/// Hand-written so the state dump stays readable — and pasteable.
+///
+/// A derived Debug expands the three quinn handles (`events_send`, `conn`,
+/// `bulk_tx`) into several KILOBYTES of connection internals per client:
+/// mutex guards, notify lists, waker slots. That noise dwarfs the fields a
+/// human actually reads, and since the dump goes into every bug report
+/// (diagnostics.rs) it was making reports too large to paste. The handles
+/// are reduced to the one fact worth reporting about them — whether the
+/// bulk queue has backed up, which is a real failure mode.
+impl std::fmt::Debug for ClientInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientInfo")
+            .field("endpoint", &self.endpoint)
+            // The prefix is what the UI, the logs and --shortcut-goto use.
+            .field("fingerprint", &fingerprint_prefix(&self.fingerprint))
+            .field("negotiated_version", &self.negotiated_version)
+            .field("datagrams_ok", &self.datagrams_ok)
+            .field("conn_token", &self.conn_token)
+            .field("connected_for_secs", &self.connected_at.elapsed().as_secs())
+            .field("bulk_queue_free", &self.bulk_tx.capacity())
+            .finish()
+    }
+}
+
+/// The leading chunk of a certificate fingerprint, as every other
+/// user-facing surface prints it.
+fn fingerprint_prefix(fingerprint: &str) -> &str {
+    &fingerprint[..fingerprint.len().min(8)]
 }
 
 /// Keeps track of the most recently disconnected client,
@@ -341,6 +370,31 @@ pub enum RotationEvent {
     /// via screen-edge detection on the client; see ClientEvent::SwitchRequest).
     /// Internal channel message only (never on the wire).
     SwitchRequest { endpoint: SocketAddr },
+    /// Ask every connected client for its diagnostics bundle, for a bug
+    /// report that covers both machines (`monux diagnostics --peer`).
+    /// Internal channel message only; the requests themselves go out as
+    /// bulk::ServerBulk::DiagnosticsRequest. Handled by the rotation loop
+    /// because only it owns the clients' bulk queues.
+    RequestPeerDiagnostics(PeerDiagnosticsArgs),
+}
+
+pub struct PeerDiagnosticsArgs {
+    /// Recent log lines to ask each client for.
+    pub lines: u32,
+    /// Carries back one entry per connected client, so the requester can
+    /// await the answers without ever touching the client list itself.
+    pub reply: tokio::sync::oneshot::Sender<Vec<PendingPeer>>,
+}
+
+/// One client the rotation loop tried to ask.
+#[derive(Debug)]
+pub struct PendingPeer {
+    /// How the client appears in the report: fingerprint prefix and address.
+    pub label: String,
+    /// The channel its answer will arrive on, or why it was never asked.
+    pub waiting: std::result::Result<tokio::sync::oneshot::Receiver<crate::control::PeerReply>, String>,
+    /// The hub id to cancel if the wait expires.
+    pub request_id: Option<u64>,
 }
 
 pub struct AddClientArgs {
@@ -1141,6 +1195,14 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             }
             RotationEvent::ClientHeardFrom { endpoint } => {
                 self.note_client_heard(endpoint).await;
+            }
+            RotationEvent::RequestPeerDiagnostics(args) => {
+                let pending = self.request_peer_diagnostics(args.lines).await;
+                // The requester gone (it timed out, or the CLI hung up) is
+                // not an error: the report simply proceeds without peers.
+                if args.reply.send(pending).is_err() {
+                    debug!("Peer diagnostics requester went away before the client list was ready");
+                }
             }
             RotationEvent::SwitchRequest { endpoint } => {
                 self.switch_request_from_client(endpoint).await;
@@ -3248,6 +3310,70 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 Ok(false)
             }
         }
+    }
+
+    /// Sends a diagnostics request to every connected client, returning one
+    /// entry per client for the requester to await.
+    ///
+    /// Every client produces an entry, including the ones that can't answer:
+    /// a peer skipped for being too old, or one whose queue was full, is
+    /// EVIDENCE. Dropping it would make a two-machine report quietly look
+    /// like a one-machine setup.
+    async fn request_peer_diagnostics(&mut self, lines: u32) -> Vec<PendingPeer> {
+        let hub = crate::control::peer_diagnostics_hub();
+        let clients: Vec<(SocketAddr, String, u64)> = self
+            .clients
+            .iter()
+            .map(|c| (c.endpoint, c.fingerprint.clone(), c.negotiated_version))
+            .collect();
+        let mut pending = Vec::with_capacity(clients.len());
+        for (endpoint, fingerprint, negotiated_version) in clients {
+            let label = format!("{} @ {}", fingerprint_prefix(&fingerprint), endpoint);
+            if !shared::supports_peer_diagnostics(negotiated_version) {
+                pending.push(PendingPeer {
+                    label,
+                    waiting: Err(format!(
+                        "runs protocol v{}, which predates peer diagnostics (v{}); \
+                         update that machine, or run 'monux diagnostics' on it directly",
+                        negotiated_version,
+                        shared::PROTOCOL_VERSION_PEER_DIAGNOSTICS
+                    )),
+                    request_id: None,
+                });
+                continue;
+            }
+            let (request_id, rx) = hub.open();
+            let msg = bulk::ServerBulk::DiagnosticsRequest(bulk::DiagnosticsRequest {
+                request_id,
+                lines,
+            });
+            match self.send_bulk(&endpoint, msg, None).await {
+                Ok(true) => pending.push(PendingPeer {
+                    label,
+                    waiting: Ok(rx),
+                    request_id: Some(request_id),
+                }),
+                // send_bulk already logged and, for a failed queue, removed
+                // the client; the report records that it couldn't be asked.
+                Ok(false) => {
+                    hub.cancel(request_id);
+                    pending.push(PendingPeer {
+                        label,
+                        waiting: Err("the connection dropped before the request went out".to_string()),
+                        request_id: None,
+                    });
+                }
+                Err(e) => {
+                    hub.cancel(request_id);
+                    pending.push(PendingPeer {
+                        label,
+                        waiting: Err(format!("the request could not be sent: {:#}", e)),
+                        request_id: None,
+                    });
+                }
+            }
+        }
+        pending
     }
 
     async fn send_bulk(

@@ -660,6 +660,20 @@ fn autostart_status_report(
     lines.join("\n")
 }
 
+/// The `setup --autostart status` report, for embedding in a diagnostics
+/// bundle (diagnostics.rs). Read-only and non-interactive, like the CLI
+/// path it shares; None when there is no autostart target to report on (a
+/// bare root shell), so the bundle can say "could not probe" rather than
+/// inventing a state.
+pub fn autostart_status_text() -> Option<String> {
+    let target = resolve_autostart_target().ok().flatten()?;
+    Some(autostart_status_report(
+        &target,
+        &|spec| spec.probe(),
+        &|role| crate::single_instance::live_holder(role.as_str()),
+    ))
+}
+
 fn setup_autostart(choice: Option<Autostart>, failures: &mut u32) {
     if choice.is_none() {
         // No flag: leave autostart untouched.
@@ -941,7 +955,7 @@ pub(crate) fn run_cmd(program: &str, args: &[&str]) -> Result<String> {
 }
 
 /// Checks `id -nG` output for group membership.
-fn groups_contain(id_ng_output: &str, group: &str) -> bool {
+pub(crate) fn groups_contain(id_ng_output: &str, group: &str) -> bool {
     id_ng_output
         .split_whitespace()
         .any(|g| g == group)
