@@ -1309,7 +1309,20 @@ fn main() -> Result<()> {
                 }
                 // One icon at all times: take over from any already-running
                 // indicator (auto-spawned or manual).
-                let _indicator_lock = single_instance::acquire("indicator")?;
+                let _indicator_lock = match single_instance::acquire("indicator") {
+                    Ok(lock) => lock,
+                    Err(e) => {
+                        // Standing down for a live indicator is an orderly
+                        // outcome, not a failure: exit with the code that
+                        // says so, so a supervising daemon parks instead of
+                        // diagnosing a crash loop (indicator_spawn.rs).
+                        if let Some(yielded) = e.downcast_ref::<single_instance::Yielded>() {
+                            info!("{}; leaving the tray to it", yielded);
+                            std::process::exit(single_instance::EXIT_YIELDED);
+                        }
+                        return Err(e);
+                    }
+                };
                 return monux::indicator::run();
             }
         },

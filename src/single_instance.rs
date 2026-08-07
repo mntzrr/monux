@@ -55,6 +55,31 @@ fn lock_path(kind: &str) -> PathBuf {
     dir.join(format!("monux-{}.lock", kind))
 }
 
+/// A deliberate stand-down: a post-update re-exec found a live instance
+/// already holding the lock and declined to take it over (see acquire).
+///
+/// Distinct from every other acquire failure because it is not a failure of
+/// this machine's setup — the tray or daemon the user wants IS running. The
+/// indicator's supervisor keys on it to park quietly rather than diagnose a
+/// crash loop.
+#[derive(Debug)]
+pub struct Yielded {
+    pub kind: String,
+}
+
+impl std::fmt::Display for Yielded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Another monux {} is already running", self.kind)
+    }
+}
+
+impl std::error::Error for Yielded {}
+
+/// The process exit code for [`Yielded`], so a supervising parent can tell a
+/// stand-down from a crash across the process boundary — the only channel a
+/// spawned child has. Distinct from 1 (any other error).
+pub const EXIT_YIELDED: i32 = 3;
+
 /// Takes the single-instance lock for `kind` ("server", "client" or
 /// "indicator").
 /// If a previous instance holds it, that instance is asked to shut down
@@ -160,7 +185,13 @@ pub fn acquire(kind: &str) -> Result<InstanceLock> {
             "Update restart found another monux {} already running; yielding to avoid a takeover ping-pong",
             kind
         );
-        bail!("Another monux {} is already running", kind);
+        // A typed error, not a bare message: an auto-spawned indicator that
+        // yields here is exiting for a HEALTHY reason (a live instance
+        // already holds the tray), and its supervisor must be able to tell
+        // that from a crash instead of spending its respawn budget on it.
+        return Err(anyhow::Error::new(Yielded {
+            kind: kind.to_string(),
+        }));
     }
     if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
         let err = std::io::Error::last_os_error();

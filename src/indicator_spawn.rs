@@ -15,14 +15,20 @@
 //!   the tray first ('monux gui tray hide') if it should die with the
 //!   daemon. The auto-update re-exec flows the same way: the old image's
 //!   orphan is taken over by the new image's spawned indicator via the
-//!   single-instance lock, so the icon never flickers out.
+//!   single-instance lock, so the icon never flickers out AND the tray ends
+//!   up on the new binary. That takeover depends on the child not inheriting
+//!   MONUX_RESTARTED (see indicator_command): with it, the new indicator
+//!   yielded to the orphan and the tray stayed on the pre-update build.
 //! - A daemon SIGKILL skips all of this: the orphaned indicator keeps
 //!   showing its "?" state until the NEXT daemon's indicator takes over via
 //!   the single-instance lock (single_instance.rs, kind "indicator"), which
 //!   also keeps a manually-started indicator from duplicating the icon.
 //! - If the indicator exits on its own (its tray host, e.g. waybar, died),
 //!   the supervisor respawns it, bounded by RespawnPolicy; after giving up it
-//!   stays down until `monux gui tray show` (or a manual indicator).
+//!   stays down until `monux gui tray show` (or a manual indicator). An exit
+//!   that merely STOOD DOWN for a live indicator (single_instance::
+//!   EXIT_YIELDED) is not a crash and costs no respawn budget — the icon the
+//!   user wants is on screen, owned by someone else.
 //!
 //! The icon can be HIDDEN without killing the daemon and SHOWN again without
 //! restarting it (control socket `{"cmd":"indicator","action":...}`, driven
@@ -157,7 +163,20 @@ fn indicator_command() -> Result<Command> {
     cmd.args(["gui", "indicator"])
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::inherit())
+        // MONUX_RESTARTED describes THIS process's lineage — "I am a
+        // post-update re-exec" — and execve preserves the environment, so a
+        // child would inherit a claim that isn't true of it.
+        //
+        // It matters here specifically: a re-exec'd daemon yields the
+        // single-instance lock rather than fighting a contender that grabbed
+        // it during the exec gap (single_instance.rs). Inherited by the
+        // indicator, that rule made the NEW image's indicator yield to the
+        // OLD image's orphan — which is the one case where taking over is the
+        // whole point, since the binary just changed. The tray then kept
+        // running the pre-update build indefinitely, and each yield was
+        // scored as a crash until the respawn budget ran out.
+        .env_remove("MONUX_RESTARTED");
     if let Some(address) = derived_session_bus_address() {
         // has_desktop_session() accepts a session found by its socket alone,
         // but the child then inherits an environment with no address to
@@ -319,10 +338,37 @@ fn show_decision(
     ShowDecision::Spawn
 }
 
-/// One monitor tick's exit observation: Some((sigterm, uptime)) when the
+/// How the supervised child died, as far as a parent can tell — which is
+/// only its wait status, so the child has to encode anything else in its
+/// exit code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildExit {
+    /// SIGTERM: a takeover via the single-instance lock, or a deliberate kill.
+    Terminated,
+    /// It stood down because a live indicator already holds the tray
+    /// (single_instance::EXIT_YIELDED). Healthy, and NOT a crash: the icon
+    /// the user wants is on screen, just owned by someone else.
+    StoodDown,
+    /// Anything else: it exited on its own, which is what respawns are for.
+    OnItsOwn,
+}
+
+/// Classifies a wait status. Signal deaths outrank exit codes (a signalled
+/// process has no exit code of its own).
+fn classify_exit(status: &std::process::ExitStatus) -> ChildExit {
+    if std::os::unix::process::ExitStatusExt::signal(status) == Some(libc::SIGTERM) {
+        return ChildExit::Terminated;
+    }
+    if status.code() == Some(crate::single_instance::EXIT_YIELDED) {
+        return ChildExit::StoodDown;
+    }
+    ChildExit::OnItsOwn
+}
+
+/// One monitor tick's exit observation: Some((how, uptime)) when the
 /// supervised child died. Hidden means supervision is dormant: the child
 /// slot is not even polled (hide() already reaped what it took out).
-fn observe_exit(shared: &mut Shared) -> Option<(bool, Duration)> {
+fn observe_exit(shared: &mut Shared) -> Option<(ChildExit, Duration)> {
     if shared.hidden {
         return None;
     }
@@ -330,9 +376,7 @@ fn observe_exit(shared: &mut Shared) -> Option<(bool, Duration)> {
         Some(Ok(Some(status))) => {
             let uptime = shared.spawned_at.elapsed();
             shared.child = None;
-            let sigterm = std::os::unix::process::ExitStatusExt::signal(&status)
-                == Some(libc::SIGTERM);
-            Some((sigterm, uptime))
+            Some((classify_exit(&status), uptime))
         }
         Some(Err(e)) => {
             // Mirror child_running: a poll error is treated as death and the
@@ -353,16 +397,29 @@ enum ExitAction {
     /// deliberate kill: it did NOT exit on its own, so don't fight it. The
     /// supervisor parks in the hidden state until show().
     TakenOver,
+    /// It stood down for a live indicator. Same parking as TakenOver, but a
+    /// different story for the log — and, crucially, no charge against the
+    /// respawn budget: respawning would only produce another stand-down, and
+    /// three of those used to end in a "keeps exiting" warning about a tray
+    /// that was working the whole time.
+    StoodDown,
     /// Crash loop exhausted the respawn budget: stay down until show().
     GiveUp,
     /// Respawn after the delay (attempt number, for the log).
     RespawnAfter { delay: Duration, attempt: u32 },
 }
 
-fn exit_action(shared: &mut Shared, sigterm: bool, uptime: Duration) -> ExitAction {
-    if sigterm {
-        shared.hidden = true;
-        return ExitAction::TakenOver;
+fn exit_action(shared: &mut Shared, exit: ChildExit, uptime: Duration) -> ExitAction {
+    match exit {
+        ChildExit::Terminated => {
+            shared.hidden = true;
+            return ExitAction::TakenOver;
+        }
+        ChildExit::StoodDown => {
+            shared.hidden = true;
+            return ExitAction::StoodDown;
+        }
+        ChildExit::OnItsOwn => {}
     }
     match shared.policy.on_exit(uptime) {
         Some(delay) => ExitAction::RespawnAfter {
@@ -561,13 +618,19 @@ async fn monitor_loop(shared: Arc<Mutex<Shared>>, shutdown: Arc<AtomicBool>) {
         // below (TakenOver/GiveUp set hidden).
         let (action, uptime) = {
             let mut shared = shared.lock().unwrap();
-            let Some((sigterm, uptime)) = observe_exit(&mut shared) else { continue };
-            (exit_action(&mut shared, sigterm, uptime), uptime)
+            let Some((exit, uptime)) = observe_exit(&mut shared) else { continue };
+            (exit_action(&mut shared, exit, uptime), uptime)
         };
         let (delay, attempt) = match action {
             ExitAction::TakenOver => {
                 info!(
                     "Tray indicator was terminated (takeover or kill); staying down until 'monux gui tray show'"
+                );
+                continue;
+            }
+            ExitAction::StoodDown => {
+                info!(
+                    "Tray indicator stood down: another indicator already holds the tray, so the icon is up. Staying down until 'monux gui tray show'"
                 );
                 continue;
             }
@@ -757,13 +820,13 @@ mod tests {
     fn exit_action_marks_hidden_on_takeover_and_give_up() {
         let mut shared = shared_for_test();
         // SIGTERM death (takeover/manual kill): parked hidden, no respawn.
-        let action = exit_action(&mut shared, true, Duration::from_secs(5));
+        let action = exit_action(&mut shared, ChildExit::Terminated, Duration::from_secs(5));
         assert!(matches!(action, ExitAction::TakenOver));
         assert!(shared.hidden);
         // Ordinary crashes: bounded respawns, then GiveUp parks hidden.
         let mut shared = shared_for_test();
         for attempt in 1..=MAX_RESPAWNS {
-            match exit_action(&mut shared, false, Duration::from_secs(5)) {
+            match exit_action(&mut shared, ChildExit::OnItsOwn, Duration::from_secs(5)) {
                 ExitAction::RespawnAfter { delay, attempt: n } => {
                     assert_eq!(delay, RESPAWN_DELAY);
                     assert_eq!(n, attempt);
@@ -772,9 +835,57 @@ mod tests {
             }
             assert!(!shared.hidden);
         }
-        let action = exit_action(&mut shared, false, Duration::from_secs(5));
+        let action = exit_action(&mut shared, ChildExit::OnItsOwn, Duration::from_secs(5));
         assert!(matches!(action, ExitAction::GiveUp));
         assert!(shared.hidden);
+    }
+
+    #[test]
+    fn standing_down_parks_without_spending_the_respawn_budget() {
+        let mut shared = shared_for_test();
+        let action = exit_action(&mut shared, ChildExit::StoodDown, Duration::from_secs(0));
+        assert!(matches!(action, ExitAction::StoodDown));
+        // Parked, like a takeover: a live indicator already holds the tray.
+        assert!(shared.hidden);
+        // And nothing was charged — respawning would only stand down again,
+        // and three of those used to end in a "keeps exiting" warning about a
+        // tray that was working the whole time.
+        assert_eq!(shared.policy.respawns, 0);
+    }
+
+    #[test]
+    fn exits_are_classified_from_the_wait_status() {
+        // The only channel a child has for "I stood down" is its exit code.
+        let mut stood_down = spawn_sh(&format!("exit {}", crate::single_instance::EXIT_YIELDED));
+        assert_eq!(
+            classify_exit(&stood_down.wait().unwrap()),
+            ChildExit::StoodDown
+        );
+        // Any other nonzero code is an ordinary death, respawn-worthy.
+        let mut failed = spawn_sh("exit 1");
+        assert_eq!(classify_exit(&failed.wait().unwrap()), ChildExit::OnItsOwn);
+        let mut ok = spawn_sh("exit 0");
+        assert_eq!(classify_exit(&ok.wait().unwrap()), ChildExit::OnItsOwn);
+        // A signalled child has no exit code of its own, so the signal wins.
+        let mut termed = spawn_sh("kill -TERM $$; sleep 5");
+        assert_eq!(
+            classify_exit(&termed.wait().unwrap()),
+            ChildExit::Terminated
+        );
+    }
+
+    #[test]
+    fn the_indicator_child_does_not_inherit_the_post_update_restart_flag() {
+        // MONUX_RESTARTED makes a process yield the single-instance lock
+        // instead of taking it over. Inherited by the spawned indicator, that
+        // left the tray on the PRE-update binary forever (the new image's
+        // indicator kept yielding to the old image's orphan).
+        let cmd = indicator_command().expect("the command must build");
+        let cleared: Vec<_> = cmd
+            .get_envs()
+            .filter(|(k, v)| *k == std::ffi::OsStr::new("MONUX_RESTARTED") && v.is_none())
+            .collect();
+        assert_eq!(cleared.len(), 1, "MONUX_RESTARTED must be removed for the child");
     }
 
     #[test]
@@ -788,11 +899,11 @@ mod tests {
         shared.hidden = true;
         assert!(observe_exit(&mut shared).is_none());
         assert!(shared.child.is_some());
-        // Unhidden, the death is observed and classified (exit 0: not a
-        // SIGTERM death).
+        // Unhidden, the death is observed and classified (exit 0: it went on
+        // its own, neither signalled nor a stand-down).
         shared.hidden = false;
-        let (sigterm, uptime) = observe_exit(&mut shared).expect("death must be observed");
-        assert!(!sigterm);
+        let (exit, uptime) = observe_exit(&mut shared).expect("death must be observed");
+        assert_eq!(exit, ChildExit::OnItsOwn);
         assert!(uptime >= Duration::from_secs(1));
         assert!(shared.child.is_none());
     }
