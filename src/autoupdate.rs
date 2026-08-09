@@ -140,6 +140,46 @@ pub fn schedule_restart() {
     }
 }
 
+
+/// What the check loop should do about a remote sha it just learned about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    /// Build and restart into it.
+    Install,
+    /// Tell the user it exists and stop.
+    Notify,
+    /// Nothing to do this pass.
+    Nothing,
+}
+
+/// The install-or-notify decision, as a pure function over the four facts
+/// that drive it.
+///
+/// It exists because the version that lived inline got this wrong: the notify
+/// path shared `last_attempted` with the build path, so once the daemon had
+/// reported an update, the same flag suppressed installing it — and the
+/// explicit request had already been consumed by then. `mx daemon update` did
+/// nothing, silently, in exactly the situation it is for.
+///
+/// The rule: an explicit request always installs, because a person just asked
+/// and their intent outranks any bookkeeping. Unattended mode installs too,
+/// but honours `attempted` so a failing build isn't retried every interval —
+/// and then falls through to reporting it, because an auto-install machine
+/// that has quietly stopped updating is exactly the thing worth surfacing.
+/// Otherwise the update is reported once per sha.
+fn decide(newer: bool, requested: bool, mode: Mode, attempted: bool, notified: bool) -> Action {
+    if !newer {
+        return Action::Nothing;
+    }
+    if requested || (mode == Mode::AutoInstall && !attempted) {
+        return Action::Install;
+    }
+    if notified {
+        return Action::Nothing;
+    }
+    Action::Notify
+}
+
 /// Runs the auto-update loop; spawn it on the tokio runtime.
 /// `gate_config_dir`: for clients, the config dir holding the server's
 /// protocol version record — refreshed via mDNS on every check, so updates
@@ -168,6 +208,9 @@ pub async fn run(gate_config_dir: Option<std::path::PathBuf>, mode: Mode) {
     // build: the gate opens once the server is updated, which the next
     // check picks up.
     let mut last_attempted: Option<String> = None;
+    // The sha we last NOTIFIED about, kept apart from last_attempted so that
+    // telling the user about an update cannot also suppress installing it.
+    let mut last_notified: Option<String> = None;
     // The pin lives in the config dir; servers pass no gate dir, so fall
     // back to the default location for the pin check.
     let pin_dir = gate_config_dir.clone().or_else(update::default_config_dir);
@@ -197,20 +240,22 @@ pub async fn run(gate_config_dir: Option<std::path::PathBuf>, mode: Mode) {
                 // the update is "available" whether or not we build it.
                 set_update_available(newer.then(|| remote_sha.clone()));
                 let attempted = last_attempted.as_deref() == Some(remote_sha.as_str());
-                // Installing is either the configured mode or an explicit
-                // request; otherwise the update is only reported.
-                let install = mode == Mode::AutoInstall
-                    || INSTALL_REQUESTED.swap(false, Ordering::SeqCst);
-                if newer && !attempted && !install {
-                    // Notify once per newly-seen commit: last_attempted is
-                    // what keeps a standing update from re-notifying daily.
-                    last_attempted = Some(remote_sha.clone());
+                let notified = last_notified.as_deref() == Some(remote_sha.as_str());
+                let requested = INSTALL_REQUESTED.swap(false, Ordering::SeqCst);
+                let action = decide(newer, requested, mode, attempted, notified);
+                if action == Action::Nothing && requested && !newer {
+                    // The user asked and there was nothing to get: say so,
+                    // rather than leaving 'mx daemon update' looking ignored.
+                    info!("monux is already up to date ({})", short(&remote_sha));
+                }
+                if action == Action::Notify {
+                    last_notified = Some(remote_sha.clone());
                     info!(
                         "monux update available ({}); install it with 'mx daemon update', the tray, or 'monux update'",
                         short(&remote_sha)
                     );
                     notify_update_available(&remote_sha);
-                } else if newer && !attempted {
+                } else if action == Action::Install {
                     info!(
                         "monux update available ({}), rebuilding in the background...",
                         short(&remote_sha)
@@ -263,7 +308,7 @@ pub async fn run(gate_config_dir: Option<std::path::PathBuf>, mode: Mode) {
                             error!("Background monux update task failed: {:?}", e);
                         }
                     }
-                } else {
+                } else if !newer {
                     debug!("monux is up to date ({})", short(&remote_sha));
                 }
             }
@@ -332,4 +377,89 @@ fn notify_update(remote_sha: &str, delay: Duration) {
             delay.as_secs()
         ),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bug this function was extracted for, stated as a test.
+    ///
+    /// A notify-mode daemon reports an update, then the user runs
+    /// `mx daemon update`. The old inline version shared one flag between
+    /// "already reported" and "already tried to build", so the report
+    /// suppressed the install — and the request had been consumed reaching
+    /// that decision, so it was lost rather than deferred. Nothing happened,
+    /// nothing was logged, and the daemon stayed on the old build.
+    #[test]
+    fn an_explicit_request_installs_even_after_the_update_was_reported() {
+        // Reported already (notified), never built (not attempted).
+        assert_eq!(
+            decide(true, true, Mode::Notify, false, true),
+            Action::Install
+        );
+        // ...and even if a previous build attempt failed: the user asked
+        // again, which is a deliberate retry.
+        assert_eq!(
+            decide(true, true, Mode::Notify, true, true),
+            Action::Install
+        );
+    }
+
+    #[test]
+    fn notify_mode_reports_once_per_sha_and_then_stays_quiet() {
+        // First sighting: report it.
+        assert_eq!(
+            decide(true, false, Mode::Notify, false, false),
+            Action::Notify
+        );
+        // Same sha on the next daily tick: silence, not a second popup.
+        assert_eq!(
+            decide(true, false, Mode::Notify, false, true),
+            Action::Nothing
+        );
+    }
+
+    #[test]
+    fn auto_install_builds_once_and_does_not_retry_a_failed_sha() {
+        // Unattended: install without being asked.
+        assert_eq!(
+            decide(true, false, Mode::AutoInstall, false, false),
+            Action::Install
+        );
+        // A build already attempted for this sha (it failed, or its restart
+        // is pending): don't rebuild it every interval — but DO report it
+        // once. An auto-install machine exists so nobody thinks about it, so
+        // one that has quietly stopped updating is the failure worth
+        // surfacing; silence there is how a machine rots.
+        assert_eq!(
+            decide(true, false, Mode::AutoInstall, true, false),
+            Action::Notify
+        );
+        // ...and having reported it, it stays quiet.
+        assert_eq!(
+            decide(true, false, Mode::AutoInstall, true, true),
+            Action::Nothing
+        );
+        // ...unless the user asks explicitly, which is a deliberate retry.
+        assert_eq!(
+            decide(true, true, Mode::AutoInstall, true, false),
+            Action::Install
+        );
+    }
+
+    #[test]
+    fn nothing_newer_means_nothing_to_do_however_it_was_triggered() {
+        for requested in [true, false] {
+            for mode in [Mode::Notify, Mode::AutoInstall] {
+                assert_eq!(
+                    decide(false, requested, mode, false, false),
+                    Action::Nothing,
+                    "requested={} mode={:?}",
+                    requested,
+                    mode
+                );
+            }
+        }
+    }
 }
