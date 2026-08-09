@@ -225,6 +225,28 @@ impl_dispatch_device!(State, wl_seat::WlSeat, |state: &mut Self, event, seat: &w
     }
 });
 
+/// Records one advertised mime type for an offer, ignoring a repeat.
+///
+/// Sources really do advertise the same type more than once — a GTK app
+/// offering `text/plain` for both its UTF-8 and its locale encoding is the
+/// common case, and it showed up as `text/plain, text/plain, ...` in
+/// `monux status`. Nothing downstream is harmed by a duplicate (matching is
+/// by name), but it is carried everywhere the list goes: the space-separated
+/// wire advertisement to every client, the clipboard writer's offer on the
+/// far machine, and the status output. Dropping it here fixes all three at
+/// the one place duplicates enter.
+///
+/// Order is preserved rather than sorted: a source lists its types in
+/// preference order, and the far side's writer replays them in the order it
+/// receives them, so the FIRST occurrence is the one worth keeping. A linear
+/// scan is right for a list this size — a handful of entries, built once per
+/// clipboard change.
+fn record_mime_type(mime_types: &mut Vec<String>, mime_type: &str) {
+    if !mime_types.iter().any(|existing| existing == mime_type) {
+        mime_types.push(mime_type.to_string());
+    }
+}
+
 impl_dispatch_offer!(State, |state: &mut Self, offer: data_control::Offer, event| {
     trace!("got wayland offer event: {:?}", event);
     if let Event::Offer { mime_type } = &event {
@@ -242,9 +264,63 @@ impl_dispatch_offer!(State, |state: &mut Self, offer: data_control::Offer, event
             return;
         };
         if let Some(mime_types) = seat_data.pending_offer_types.get_mut(&offer) {
-            mime_types.push(mime_type.clone());
+            record_mime_type(mime_types, mime_type);
         } else {
             error!("No offer->types mapping found for offer/Offer event: {:?}", event);
         }
     }
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The real shape from a GTK source, which advertises text/plain twice —
+    /// this is what put "text/plain, text/plain, ..." in `monux status`, and
+    /// it rode the wire to every client from there.
+    #[test]
+    fn repeated_mime_types_are_recorded_once_in_offer_order() {
+        let mut types = Vec::new();
+        for advertised in [
+            "text/plain",
+            "text/plain",
+            "text/plain;charset=utf-8",
+            "TEXT",
+            "STRING",
+            "UTF8_STRING",
+        ] {
+            record_mime_type(&mut types, advertised);
+        }
+        assert_eq!(
+            types,
+            vec![
+                "text/plain",
+                "text/plain;charset=utf-8",
+                "TEXT",
+                "STRING",
+                "UTF8_STRING",
+            ]
+        );
+    }
+
+    /// Order is preference order, so a duplicate must not promote a type to
+    /// its LAST position — the first occurrence is the one that stays.
+    #[test]
+    fn a_repeat_does_not_reorder_the_list() {
+        let mut types = Vec::new();
+        for advertised in ["image/png", "text/plain", "image/png"] {
+            record_mime_type(&mut types, advertised);
+        }
+        assert_eq!(types, vec!["image/png", "text/plain"]);
+    }
+
+    /// Distinct types that merely share a prefix are not duplicates.
+    #[test]
+    fn similar_but_distinct_types_are_both_kept() {
+        let mut types = Vec::new();
+        for advertised in ["text/plain", "text/plain;charset=utf-8", "text/plain-ish"] {
+            record_mime_type(&mut types, advertised);
+        }
+        assert_eq!(types.len(), 3);
+    }
+}
