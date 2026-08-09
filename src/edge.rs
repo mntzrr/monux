@@ -1559,7 +1559,7 @@ fn log_edge_resolutions(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::ffi::OsStr;
 
@@ -1941,7 +1941,9 @@ mod tests {
             .collect()
     }
 
-    fn no_ips(_: &str) -> Vec<IpAddr> {
+    /// A resolver that resolves nothing, for edge-target tests that must not
+    /// depend on DNS. Shared with rotation's EdgeInfo tests.
+    pub(crate) fn no_ips(_: &str) -> Vec<IpAddr> {
         vec![]
     }
 
