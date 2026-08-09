@@ -426,6 +426,9 @@ fn main() -> Result<()> {
             let www = args.www.unwrap_or(false);
             let server_lock = single_instance::acquire("server")?;
             settle_after_takeover(&server_lock);
+            // Before the indicator supervisor spawns anything (see the note
+            // on the pid snapshot there).
+            reap_inherited_children();
             // A machine running only a server has no use for the client-side
             // update-gate file: its content can only be stale history (a
             // client machine's handshakes re-record it), and a stale entry
@@ -555,6 +558,7 @@ fn main() -> Result<()> {
                 .unwrap_or(monux::config::DEFAULT_INPUT_SCALE);
             let client_lock = single_instance::acquire("client")?;
             settle_after_takeover(&client_lock);
+            reap_inherited_children();
             if auto_update {
                 rt.spawn(monux::autoupdate::run(Some(config_dir.clone()), update_mode));
             }
@@ -697,6 +701,74 @@ fn reexec_after_update() -> Result<()> {
 /// drop or never register our brand-new virtual keyboard (seen in the wild as
 /// all keyboard input going dead after a few restarts; 'hyprctl reload' makes
 /// it reappear).
+/// Reaps processes inherited from the pre-exec image.
+///
+/// An auto-update restart re-execs: the pid survives, and so do its children.
+/// The tray indicator is deliberately ORPHANED rather than killed on shutdown
+/// (see indicator_spawn::Supervisor's Drop) so the icon stays up across the
+/// gap — but "orphaned" means "reparented to init once we exit", and a
+/// re-exec never exits. The old indicator therefore remains our child, stands
+/// down a moment later when the new image's indicator takes the
+/// single-instance lock, and becomes a zombie nobody waits on: one leaked
+/// process-table entry per restart, accumulating for as long as the daemon
+/// lives.
+///
+/// The new image holds no Child handle for a process it did not spawn, so it
+/// waits on the raw pids instead. MUST be called before the supervisor spawns
+/// anything: waitpid on a specific pid can never steal the status of a child
+/// we spawn later, but only if the pid list was taken before those exist.
+fn reap_inherited_children() {
+    let inherited = children_of(std::process::id());
+    if inherited.is_empty() {
+        return;
+    }
+    debug!(
+        "Reaping {} process(es) inherited across the restart: {:?}",
+        inherited.len(),
+        inherited
+    );
+    // On a thread: these exit on their own schedule (the old indicator only
+    // stands down once the new one has taken the lock), and startup must not
+    // wait for them.
+    std::thread::spawn(move || {
+        for pid in inherited {
+            let mut status = 0;
+            // SAFETY: waitpid on a specific pid; a non-child simply returns
+            // ECHILD, which is the "already gone" case and equally fine.
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+        }
+    });
+}
+
+/// The pids of our direct children, read from /proc.
+///
+/// /proc/<pid>/status rather than /stat: the latter's comm field can contain
+/// spaces and parentheses, which makes positional parsing of PPid a trap.
+fn children_of(parent: u32) -> Vec<libc::pid_t> {
+    let mut children = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return children;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|n| n.parse::<libc::pid_t>().ok()) else {
+            continue;
+        };
+        let Ok(status) = fs::read_to_string(format!("/proc/{}/status", pid)) else {
+            // Raced with the process exiting; nothing to reap.
+            continue;
+        };
+        let ppid = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:"))
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        if ppid == Some(parent) {
+            children.push(pid);
+        }
+    }
+    children
+}
+
 fn settle_after_takeover(lock: &single_instance::InstanceLock) {
     // A re-exec after an auto-update (MONUX_RESTARTED) releases the lock
     // atomically, so took_over is false — but the old image's virtual devices
@@ -1370,6 +1442,81 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
     use std::path::Path;
+
+
+    /// The reaper has to find our own children and nobody else's — it feeds
+    /// waitpid, so a wrong pid is at best a no-op and at worst a wait on
+    /// something we don't own.
+    #[test]
+    fn children_of_finds_our_own_and_only_our_own() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let ours = children_of(std::process::id());
+        assert!(ours.contains(&pid), "our child {} is missing from {:?}", pid, ours);
+        // pid 1 is nobody's child but init's, and certainly not ours.
+        assert!(!ours.contains(&1));
+        let _ = child.kill();
+        let _ = child.wait();
+        // Once reaped it is no longer a child.
+        assert!(!children_of(std::process::id()).contains(&pid));
+    }
+
+    /// The regression itself: a child that is SIGTERM'd but never waited on
+    /// becomes a zombie, and reap_inherited_children must clear it.
+    ///
+    /// This reproduces the shape of the restart bug rather than the mechanism
+    /// — re-exec'ing the test binary isn't practical — by leaking a child
+    /// handle, which is exactly what the pre-exec image leaves behind: a live
+    /// child with no Child struct anywhere to wait on it.
+    #[test]
+    fn an_unwaited_child_is_reaped_instead_of_left_a_zombie() {
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        // Leak the handle: nothing will ever wait on this process, which is
+        // the state a re-exec leaves the orphaned indicator in.
+        std::mem::forget(child);
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+
+        // It is now a zombie: still listed as ours, and in state Z.
+        let zombie_state = || {
+            std::fs::read_to_string(format!("/proc/{}/stat", pid))
+                .ok()
+                .and_then(|stat| {
+                    // State is the field after the parenthesised comm.
+                    stat.rsplit_once(") ")
+                        .and_then(|(_, rest)| rest.split(' ').next().map(|s| s.to_string()))
+                })
+        };
+        for _ in 0..100 {
+            if zombie_state().as_deref() == Some("Z") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(zombie_state().as_deref(), Some("Z"), "expected a zombie to clear");
+
+        reap_inherited_children();
+
+        // The reaper runs on its own thread; give it a moment to drain.
+        for _ in 0..100 {
+            if !children_of(std::process::id()).contains(&pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !children_of(std::process::id()).contains(&pid),
+            "the zombie survived the reaper"
+        );
+    }
 
     #[test]
     fn cli_definition_is_valid() {
