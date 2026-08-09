@@ -204,17 +204,28 @@ fn write_zstd(
     Ok(buf)
 }
 
-/// Sweeps stale clipboard-* unpack dirs under config_dir. Two concerns:
-/// 1. Keep enough generations (current + a few prior) so a paste still
-///    referencing files from 2-3 unpacks ago isn't deleted mid-paste.
-/// 2. Only ever delete dirs whose owning pid is DEAD (left behind by a
-///    crash/restart/update). A second monux process sharing this config dir
-///    has its own counter starting at 0, so an id far behind OUR counter can
-///    be that process's just-created unpack dir — deleting it mid-paste loses
-///    the files being pasted.
+/// Sweeps stale clipboard-* unpack dirs under config_dir. Which dirs may go
+/// depends entirely on WHOSE they are, because the id in the name is a
+/// per-process counter and only its own process can interpret it:
+///
+/// - Ours: the generation window applies (keep the current unpack plus a few
+///   prior ones, so a paste still referencing files from 2-3 unpacks ago isn't
+///   deleted mid-paste). Our counter is the one those ids came from.
+/// - Another LIVE monux sharing this config dir: never touched. Its counter
+///   starts at 0 independently, so an id far behind ours can be that process's
+///   just-created unpack dir — deleting it would lose the files being pasted.
+/// - A DEAD owner (crash, restart, update): removed regardless of id. Nothing
+///   can still reference those files — the wayland data source offering them
+///   died with the process — and a window comparison would strand them
+///   forever, since our counter restarts at 0 while theirs had run up.
+///
+/// The pid check must exempt our own pid: without that, `pid_is_running` is
+/// trivially true for every dir WE created and a long-lived daemon never
+/// reclaims a single one of them.
 fn sweep_stale_unpack_dirs(config_dir: &Path, dir_id: usize) {
     let dir_prefix = "clipboard-";
     let generations_to_keep = 5;
+    let our_pid = std::process::id();
     // The keep window as a checked subtraction: id < cutoff is swept. A
     // crafted clipboard-x-<usize::MAX> dir must not overflow the comparison
     // (id + generations_to_keep would panic in debug builds).
@@ -228,10 +239,13 @@ fn sweep_stale_unpack_dirs(config_dir: &Path, dir_id: usize) {
             let Some((pid_str, id_str)) = suffix.rsplit_once('-') else { continue };
             let Ok(pid) = pid_str.parse::<u32>() else { continue };
             let Ok(id) = id_str.parse::<usize>() else { continue };
-            if !matches!(cutoff, Some(cutoff) if id < cutoff) {
-                continue;
-            }
-            if pid_is_running(pid) {
+            if pid == our_pid {
+                // Ours: only past the keep window.
+                if !matches!(cutoff, Some(cutoff) if id < cutoff) {
+                    continue;
+                }
+            } else if pid_is_running(pid) {
+                // Another live monux's dir: its ids are not ours to judge.
                 continue;
             }
             debug!("Removing stale temp directory: {}", entry.path().display());
@@ -725,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn sweep_removes_only_dead_owners_dirs_past_the_window() {
+    fn sweep_reclaims_our_old_dirs_and_dead_owners_but_spares_live_peers() {
         let root = tempfile::tempdir().unwrap();
         let plant = |name: String| {
             let dir = root.path().join(name);
@@ -733,6 +747,7 @@ mod tests {
             dir
         };
         // A pid guaranteed dead: spawn and reap a child, then use its pid.
+        // (Reaping matters: /proc/<pid> still exists for an unreaped zombie.)
         let dead_pid = {
             let mut child = std::process::Command::new("sh")
                 .arg("-c")
@@ -743,27 +758,50 @@ mod tests {
             child.wait().unwrap();
             pid
         };
-        let live_pid = std::process::id();
-        let stale_dead = plant(format!("clipboard-{}-0", dead_pid));
-        let live_same_id = plant(format!("clipboard-{}-0", live_pid));
-        let recent_dead = plant(format!("clipboard-{}-9", dead_pid));
-        let crafted_max = plant(format!("clipboard-{}-{}", dead_pid, usize::MAX));
+        // A pid guaranteed alive and NOT ours, standing in for a second monux
+        // process sharing this config dir. Killed after the sweep.
+        let mut live_child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .unwrap();
+        let other_live_pid = live_child.id();
+        let our_pid = std::process::id();
+
+        let ours_old = plant(format!("clipboard-{}-0", our_pid));
+        let ours_recent = plant(format!("clipboard-{}-9", our_pid));
+        let ours_crafted_max = plant(format!("clipboard-{}-{}", our_pid, usize::MAX));
+        let other_live_old = plant(format!("clipboard-{}-0", other_live_pid));
+        let dead_old = plant(format!("clipboard-{}-0", dead_pid));
+        let dead_recent = plant(format!("clipboard-{}-9", dead_pid));
+        let dead_crafted_max = plant(format!("clipboard-{}-{}", dead_pid, usize::MAX));
         let malformed = plant("clipboard-x-y".to_string());
         let unrelated = plant("some-other-dir".to_string());
 
         sweep_stale_unpack_dirs(root.path(), 10);
 
-        // Past the keep window with a dead owner: swept (leftover from a
-        // crashed/restarted process).
-        assert!(!stale_dead.exists());
-        // Same id but a LIVE owner — a second monux process sharing the
-        // config dir, whose just-created unpack dir this may be: kept.
-        assert!(live_same_id.exists());
-        // Within the keep window: kept (a paste may still reference it).
-        assert!(recent_dead.exists());
+        let _ = live_child.kill();
+        let _ = live_child.wait();
+
+        // OURS, past the keep window: reclaimed. Exempting our own pid from
+        // the liveness check is the whole point — `pid_is_running` is
+        // trivially true for us, so without it a running daemon never deletes
+        // any dir it created, and every pasted file accumulates forever.
+        assert!(!ours_old.exists());
+        // Ours, inside the window: a paste may still reference it.
+        assert!(ours_recent.exists());
         // A crafted id must not overflow the window math (panic in debug):
         // usize::MAX is never < cutoff, so it is kept.
-        assert!(crafted_max.exists());
+        assert!(ours_crafted_max.exists());
+        // Another LIVE monux's dir: its counter is independent of ours, so its
+        // id says nothing about age here — never touched, at any id.
+        assert!(other_live_old.exists());
+        // A DEAD owner's dirs go regardless of id: nothing can reference them,
+        // and our counter restarts at 0, so a window comparison would strand
+        // everything a previous run left behind.
+        assert!(!dead_old.exists());
+        assert!(!dead_recent.exists());
+        assert!(!dead_crafted_max.exists());
         // Unparseable names and unrelated dirs are left alone.
         assert!(malformed.exists());
         assert!(unrelated.exists());

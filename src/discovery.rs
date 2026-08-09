@@ -545,7 +545,10 @@ fn local_ipv4_addrs() -> Result<Vec<IpAddr>> {
 
 /// Returns the machine hostname.
 pub fn get_hostname() -> Result<String> {
-    let mut buf = [0i8; 256];
+    // c_char, not i8: it is u8 on aarch64/arm, where a fixed [i8; N] doesn't
+    // even compile against gethostname's *mut c_char (an ARM client — an
+    // Asahi laptop, a Pi — is exactly the second machine this tool controls).
+    let mut buf = [0 as libc::c_char; 256];
     let ret = unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) };
     if ret != 0 {
         bail!("gethostname failed: {}", std::io::Error::last_os_error());
@@ -678,7 +681,14 @@ mod tests {
             assert!(!ip.is_loopback(), "loopback leaked into advertisement list");
             assert!(!ip.is_unspecified());
             if let IpAddr::V4(v4) = ip {
-                assert!(!v4.is_link_local(), "link-local leaked into advertisement list");
+                // No link-local assertion here: 169.254.0.0/16 is included on
+                // purpose (see local_ipv4_addrs) — a direct, routerless link
+                // between the two machines lives there, and both the mDNS
+                // advertisement and pick_addr's path preference need to see
+                // it. Asserting its absence made this test fail on exactly the
+                // cable-between-machines setup the preference exists for;
+                // link_local_pair_is_preferred_over_routed_path covers the
+                // behavior properly, against synthetic addresses.
                 // Byte-reversal guard: 1.0.0.127 is 127.0.0.1 with swapped octets
                 assert_ne!(v4.octets()[0], 1, "suspicious byte-swapped address: {}", v4);
                 // Docker's default bridges have the same address on every host;
