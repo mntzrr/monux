@@ -154,9 +154,66 @@ fn verify_against_key(src_dir: &Path, sha: &str, trusted_key: &str) -> Signature
     }
 }
 
-/// The commit currently published at the repo's HEAD (cheap update check; no
-/// clone needed).
+/// The commit of the newest release tag in a `git ls-remote --tags` or
+/// `git show-ref --tags -d` listing. Both are whitespace-separated
+/// `<sha> refs/tags/<name>` lines and peel annotated tags the same way, so one
+/// parser serves the remote check and the local checkout.
+///
+/// An annotated tag appears TWICE: `refs/tags/v1` is the tag object and
+/// `refs/tags/v1^{}` the commit it points at. The commit is what gets compared
+/// against this build's revision and checked out, so the peeled entry wins
+/// wherever it exists; a lightweight tag has only the plain entry.
+///
+/// Ordering is by parsed version rather than by git's --sort, so the choice is
+/// deterministic and testable without a repo. Tags that aren't versions
+/// (`nightly`, a personal marker) are ignored: monux releases are versions.
+fn newest_release_tag(listing: &str) -> Option<(String, String)> {
+    let mut best: Option<((u64, u64, u64), String, String)> = None;
+    let mut peeled: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut plain: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for line in listing.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(sha), Some(refname)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let Some(name) = refname.strip_prefix("refs/tags/") else {
+            continue;
+        };
+        match name.strip_suffix("^{}") {
+            Some(name) => peeled.insert(name.to_string(), sha.to_string()),
+            None => plain.insert(name.to_string(), sha.to_string()),
+        };
+    }
+    for (name, sha) in plain.iter().chain(peeled.iter()) {
+        let Some(version) =
+            crate::config::parse_version(name.strip_prefix('v').unwrap_or(name))
+        else {
+            continue;
+        };
+        // The peeled commit is authoritative when the tag has one.
+        let sha = peeled.get(name).unwrap_or(sha);
+        let candidate = (version, name.clone(), sha.clone());
+        if best.as_ref().is_none_or(|(best, _, _)| version > *best) {
+            best = Some(candidate);
+        }
+    }
+    best.map(|(_, name, sha)| (name, sha))
+}
+
+/// The commit this build should move to, as published by the repo.
+///
+/// With release signing configured this is the newest RELEASE TAG, not the
+/// branch head — because a signed tag is the only thing an install will
+/// accept (see verify_release_signature). Reporting HEAD here instead would
+/// announce "update available" for every push between releases and then
+/// refuse to install it, which is a notification that lies.
+///
+/// Without a signing key nothing gates on tags, so the branch head is still
+/// the right answer.
 pub fn latest_remote_sha(repo: &str) -> Result<String> {
+    if signing_configured() {
+        return latest_remote_release(repo).map(|(_, sha)| sha);
+    }
     let out = git_network_command()
         .args(["ls-remote", repo, "HEAD"])
         .output()
@@ -171,6 +228,33 @@ pub fn latest_remote_sha(repo: &str) -> Result<String> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .with_context(|| format!("git ls-remote {} returned no HEAD", repo))
+}
+
+/// The newest release tag published by the repo, as (tag, commit).
+fn latest_remote_release(repo: &str) -> Result<(String, String)> {
+    let out = git_network_command()
+        .args(["ls-remote", "--tags", repo])
+        .output()
+        .context("Failed to run git: is it installed?")?;
+    if !out.status.success() {
+        bail!("git ls-remote --tags {} failed", repo);
+    }
+    let listing = String::from_utf8(out.stdout)?;
+    newest_release_tag(&listing).with_context(|| {
+        format!(
+            "{} publishes no release tag yet — monux installs signed releases, so there is nothing to update to",
+            repo
+        )
+    })
+}
+
+/// The newest release tag in the local checkout, as (tag, commit).
+fn newest_local_release(src_dir: &Path) -> Result<(String, String)> {
+    // show-ref exits 1 with no output when there are no tags at all, which is
+    // "nothing to install", not a failure to report.
+    let listing = git_output(src_dir, &["show-ref", "--tags", "-d"]).unwrap_or_default();
+    newest_release_tag(&listing)
+        .context("the source checkout carries no release tag to install")
 }
 
 /// Whether the remote HEAD sha means there's an update for a build with the
@@ -297,10 +381,18 @@ pub fn run(
             // reattach to master before pulling. The pull then fast-forwards
             // across the pinned era like any other — no special casing.
             if head_is_detached(&src_dir) {
-                info!("Reattaching the source checkout to master (left detached by a downgrade)...");
+                // A '--to' downgrade, or the release-tag checkout below, both
+                // leave a detached HEAD; reattach so the pull fast-forwards.
+                info!("Reattaching the source checkout to master...");
                 git(&src_dir, &["checkout", "master"])?;
             }
             info!("Pulling latest source in {}...", src_dir.display());
+            // Tags reachable from the fetched history come along with a pull,
+            // but the target is now a TAG, so ask for them explicitly rather
+            // than relying on that.
+            if signing_configured() {
+                let _ = git(&src_dir, &["fetch", "--tags"]);
+            }
             if git(&src_dir, &["pull", "--ff-only"]).is_err() {
                 // The pull can only fail to fast-forward if the checkout and
                 // the remote have diverged — in practice because master was
@@ -388,7 +480,23 @@ pub fn run(
             short
         }
         None => {
-            let latest = git_output(&src_dir, &["rev-parse", "--short=12", "HEAD"])?;
+            // With signing configured the target is the newest RELEASE TAG,
+            // not the branch head: a signed tag is the only thing the gate
+            // below will accept, so aiming anywhere else guarantees a refusal
+            // after a full checkout. This is also what the daily check
+            // reported (latest_remote_sha), so the two agree on what "an
+            // update is available" means.
+            let latest = if signing_configured() {
+                let (tag, sha) = newest_local_release(&src_dir)?;
+                let short = git_output(&src_dir, &["rev-parse", "--short=12", &sha])?;
+                if short != CURRENT_REVISION.trim_end_matches("-dirty") {
+                    info!("Newest published release: {} ({})", tag, short);
+                    git(&src_dir, &["checkout", &sha])?;
+                }
+                short
+            } else {
+                git_output(&src_dir, &["rev-parse", "--short=12", "HEAD"])?
+            };
             let current_base = CURRENT_REVISION.trim_end_matches("-dirty");
             if !force && current_base != "unknown" && latest == current_base {
                 info!(
@@ -1370,6 +1478,107 @@ mod tests {
             Trust::Unattended,
         );
         assert!(refusal(gate).contains("carries no tag"));
+    }
+
+
+    /// The listing parser, against the exact shapes git produces. Annotated
+    /// tags appear twice and the PEELED entry is the commit — picking the tag
+    /// object instead would hand a sha that isn't a commit to checkout.
+    #[test]
+    fn newest_release_tag_picks_the_peeled_commit_of_the_highest_version() {
+        // Exactly what `git ls-remote --tags` printed for this repo.
+        let listing = "\
+c1818045d7dd57faf82009f43d41add05a9f42aa\trefs/tags/v13.0.0
+24cd1b5b87fe94aa3187d06b31b5ab02eaf2bcc2\trefs/tags/v13.0.0^{}
+b0f4d3fcb7fd0fef721612e385aab9119cdc1c9c\trefs/tags/v13.0.1
+a462dcb3d1d479d13dd27e78a16a7592e7b60b31\trefs/tags/v13.0.1^{}
+";
+        assert_eq!(
+            newest_release_tag(listing),
+            Some((
+                "v13.0.1".to_string(),
+                "a462dcb3d1d479d13dd27e78a16a7592e7b60b31".to_string()
+            ))
+        );
+        // `git show-ref --tags -d` says the same thing space-separated.
+        assert_eq!(
+            newest_release_tag(&listing.replace('\t', " ")),
+            newest_release_tag(listing)
+        );
+    }
+
+    #[test]
+    fn release_tags_order_by_version_not_by_string() {
+        // "v9.0.0" sorts after "v13.0.0" lexically; by version it does not.
+        let listing = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v9.0.0
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/v13.0.0
+cccccccccccccccccccccccccccccccccccccccc\trefs/tags/v13.2.0
+";
+        let (tag, _) = newest_release_tag(listing).unwrap();
+        assert_eq!(tag, "v13.2.0");
+    }
+
+    #[test]
+    fn non_version_tags_and_empty_listings_are_ignored() {
+        // A personal marker is not a release; monux releases are versions.
+        let listing = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/nightly
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/before-the-rewrite
+";
+        assert_eq!(newest_release_tag(listing), None);
+        assert_eq!(newest_release_tag(""), None);
+        // A lightweight tag has no peeled entry; its own sha is the commit.
+        let light = "dddddddddddddddddddddddddddddddddddddddd\trefs/tags/v1.2.3\n";
+        assert_eq!(
+            newest_release_tag(light),
+            Some(("v1.2.3".to_string(), "dddddddddddddddddddddddddddddddddddddddd".to_string()))
+        );
+    }
+
+    /// The regression this fixes: the daily check reported the branch HEAD
+    /// while the install demanded a signed tag, so every push between
+    /// releases announced an update that could never be installed.
+    ///
+    /// The two now answer the same question — asserted against a real repo
+    /// with a tagged commit and untagged commits on top of it.
+    #[test]
+    fn the_check_and_the_install_agree_on_the_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        test_repo(&repo);
+        let released = test_commit_version(&repo, "13.0.1");
+        test_git(&repo, &["tag", "v13.0.1"]);
+        // Work lands on master after the release — the situation that used to
+        // produce a phantom "update available".
+        let head = test_commit_version(&repo, "13.0.2");
+        assert_ne!(head, released);
+
+        // The local resolution (what run() checks out) picks the TAG, not HEAD.
+        let (tag, sha) = newest_local_release(&repo).unwrap();
+        assert_eq!(tag, "v13.0.1");
+        assert_eq!(sha, released, "the install must target the release, not master");
+
+        // ...and it tracks the next release once one is tagged.
+        test_git(&repo, &["tag", "v13.0.2"]);
+        let (tag, sha) = newest_local_release(&repo).unwrap();
+        assert_eq!(tag, "v13.0.2");
+        assert_eq!(sha, head);
+    }
+
+    #[test]
+    fn a_repo_with_no_release_tag_reports_nothing_to_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        test_repo(&repo);
+        test_commit_version(&repo, "13.0.0");
+        // Untagged: an install has no signed release to aim at, and says so
+        // rather than aiming at master and failing the signature check after
+        // a full checkout.
+        let err = newest_local_release(&repo).unwrap_err().to_string();
+        assert!(err.contains("no release tag"), "{}", err);
     }
 
     #[test]

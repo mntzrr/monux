@@ -1881,8 +1881,9 @@ pub fn keys_since(prev: &str) -> Vec<&'static KeySpec> {
 }
 
 /// Parses "7.4.0" (also "7.4", ignoring any -pre/+build suffix) into a
-/// comparable tuple; None when the major.minor don't parse.
-fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
+/// comparable tuple; None when the major.minor don't parse. Shared with the
+/// updater, which orders release tags by it.
+pub(crate) fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
     let v = v.split(['-', '+']).next()?.trim();
     let mut parts = v.split('.');
     let major = parts.next()?.parse().ok()?;
