@@ -841,8 +841,12 @@ impl Handler {
                     Handler::Client(h) => h.auto_update,
                 };
                 if auto_update {
-                    crate::autoupdate::hint_update_available();
-                    info!("Control socket: update check requested");
+                    // An explicit ask INSTALLS, where the daily check only
+                    // reports: this command is what the tray's update action
+                    // and `mx daemon update` are for, and a user who runs it
+                    // means "do it", not "look again".
+                    crate::autoupdate::request_install();
+                    info!("Control socket: update requested");
                     (Response::ok_empty(), None)
                 } else {
                     (

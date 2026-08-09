@@ -756,6 +756,16 @@ struct ServerArgs {
     #[arg(long, num_args = 0, default_missing_value = "true", help_heading = H_DAEMON)]
     no_auto_update: Option<bool>,
 
+    /// Install background updates automatically instead of only reporting them
+    ///
+    /// Off by default: the daily check reports an available update (tray,
+    /// 'monux status') and installs nothing, because installing compiles and
+    /// runs whatever the repo holds. With this flag the daemon installs and
+    /// restarts on its own — and then REQUIRES a verified release signature,
+    /// refusing anything it cannot attribute.
+    #[arg(long, num_args = 0, default_missing_value = "true", help_heading = H_DAEMON)]
+    auto_install: Option<bool>,
+
     /// Do not auto-spawn the tray indicator
     ///
     /// By default 'monux gui indicator' starts once the daemon is up whenever
@@ -818,6 +828,10 @@ impl ServerArgs {
             .no_indicator
             .take()
             .or_else(|| cfg.get_bool("server.no-indicator"));
+        self.auto_install = self
+            .auto_install
+            .take()
+            .or_else(|| cfg.get_bool("server.auto-install"));
     }
 }
 
@@ -908,6 +922,16 @@ struct ClientArgs {
     #[arg(long, num_args = 0, default_missing_value = "true", help_heading = H_DAEMON)]
     no_auto_update: Option<bool>,
 
+    /// Install background updates automatically instead of only reporting them
+    ///
+    /// Off by default: the daily check reports an available update (tray,
+    /// 'monux status') and installs nothing, because installing compiles and
+    /// runs whatever the repo holds. With this flag the daemon installs and
+    /// restarts on its own — and then REQUIRES a verified release signature,
+    /// refusing anything it cannot attribute.
+    #[arg(long, num_args = 0, default_missing_value = "true", help_heading = H_DAEMON)]
+    auto_install: Option<bool>,
+
     /// Do not auto-spawn the tray indicator
     ///
     /// By default 'monux gui indicator' starts once the daemon is up whenever
@@ -958,6 +982,10 @@ impl ClientArgs {
             .no_indicator
             .take()
             .or_else(|| cfg.get_bool("client.no-indicator"));
+        self.auto_install = self
+            .auto_install
+            .take()
+            .or_else(|| cfg.get_bool("client.auto-install"));
     }
 }
 
@@ -1189,7 +1217,14 @@ fn main() -> Result<()> {
             } else {
                 args.to.clone()
             };
-            let status = monux::update::run(args.force, false, constraint, to.as_deref())?;
+            let status = monux::update::run(
+                args.force,
+                false,
+                constraint,
+                to.as_deref(),
+                // Typed by a person at a terminal: they are the review gate.
+                monux::update::Trust::Interactive,
+            )?;
             // A plain update returns to the latest and lifts a downgrade pin
             // (auto-update skips while pinned and never unpins itself) — but
             // only once the install actually succeeded: clearing it before
@@ -1377,6 +1412,7 @@ fn main() -> Result<()> {
             }
             let auto_update = !args.no_auto_update.unwrap_or(false);
             let auto_indicator = !args.no_indicator.unwrap_or(false);
+            let update_mode = update_mode(args.auto_install.unwrap_or(false));
             let www = args.www.unwrap_or(false);
             let server_lock = single_instance::acquire("server")?;
             settle_after_takeover(&server_lock);
@@ -1391,7 +1427,7 @@ fn main() -> Result<()> {
             }
             if auto_update {
                 // The server leads protocol upgrades: no compatibility gate.
-                rt.spawn(monux::autoupdate::run(None));
+                rt.spawn(monux::autoupdate::run(None, update_mode));
             }
             let verifier = approval::MonuxCertVerification::new(
                 "server",
@@ -1501,6 +1537,7 @@ fn main() -> Result<()> {
             args.resolve(&monux::config::load_for_daemon(&config_dir));
             let auto_update = !args.no_auto_update.unwrap_or(false);
             let auto_indicator = !args.no_indicator.unwrap_or(false);
+            let update_mode = update_mode(args.auto_install.unwrap_or(false));
             let www = args.www.unwrap_or(false);
             let mouse_scale = args.mouse_scale.unwrap_or(monux::config::DEFAULT_INPUT_SCALE);
             let scroll_scale = args
@@ -1509,7 +1546,7 @@ fn main() -> Result<()> {
             let client_lock = single_instance::acquire("client")?;
             settle_after_takeover(&client_lock);
             if auto_update {
-                rt.spawn(monux::autoupdate::run(Some(config_dir.clone())));
+                rt.spawn(monux::autoupdate::run(Some(config_dir.clone()), update_mode));
             }
             // When no host is given, the client cycles its server candidates:
             // the remembered servers (most recent first — a one-time
@@ -1706,6 +1743,19 @@ fn maybe_elevate(reason: &str) -> Result<()> {
         .status()
         .context("Failed to re-exec with sudo")?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// The background check's mode, and the one line that tells the user which
+/// one they are running — the difference (does this machine install code on
+/// its own?) is worth stating at startup rather than leaving to the docs.
+fn update_mode(auto_install: bool) -> monux::autoupdate::Mode {
+    if auto_install {
+        info!("Background updates: checking daily AND installing automatically (--auto-install); only signed releases are accepted");
+        monux::autoupdate::Mode::AutoInstall
+    } else {
+        info!("Background updates: checking daily, reporting only — install with 'mx daemon update', the tray, or 'monux update'");
+        monux::autoupdate::Mode::Notify
+    }
 }
 
 fn init_config_dir() -> Result<PathBuf> {

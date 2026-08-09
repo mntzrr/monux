@@ -414,9 +414,11 @@ async fn handle_input_event(
             );
         }
         if any_consume {
+            // log_event, not {:?}: evdev's own Debug prints the real key code
+            // and these lines reach the log ring (see MASKED_KEY_CODE).
             debug!(
-                "Dropping key event consumed by one or more key combos: {:?}",
-                event
+                "Dropping key event consumed by one or more key combos: {}",
+                util::log_event(&event)
             );
         } else {
             input_events_batch.push(convert_device_event(event, stream.device(), device_info))
@@ -432,9 +434,11 @@ async fn handle_input_event(
                 .map(|d| d.is_zero())
                 .unwrap_or(false);
             if synthetic {
+                // No code: this fires for ordinary typing after a SYN_DROPPED
+                // and lands in the ring at INFO, where the default log level
+                // puts it straight into every bug report.
                 info!(
-                    "Synthetic (resync-injected) key event: code={} value={} device={:?}",
-                    event.code(),
+                    "Synthetic (resync-injected) key event: value={} device={:?}",
                     event.value(),
                     stream.device().name().unwrap_or("(Unnamed device)")
                 );
@@ -627,6 +631,57 @@ mod tests {
             .inputi32
             .expect("tracking-id event must be inputi32");
         assert_eq!(raw.value, -1);
+    }
+
+    /// The end-to-end guard for the masking rule: run a key event through the
+    /// real capture conversion with a subscriber capturing at TRACE (the most
+    /// verbose thing `monux diagnostics record --trace` produces), then assert
+    /// the code appears nowhere in what was captured.
+    ///
+    /// The unit tests in msgs::event pin each Display/Debug impl; this one
+    /// pins the property that actually matters — that nothing on the path a
+    /// keystroke takes writes its code into the ring that bug reports are
+    /// built from.
+    #[test]
+    fn a_captured_keystroke_never_reaches_the_log_ring() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        const SECRET: u16 = 30; // KEY_A
+        let info = device_info_with_dims(&[]);
+        let press = evdev::InputEvent::new(evdev::EventType::KEY.0, SECRET, 1);
+
+        let marker = format!("keymask-probe-{}", std::process::id());
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::TRACE)
+            .with(crate::logging::ring_layer_for_tests());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("{}", marker);
+            let converted = convert_axis_event(press, &info);
+            // The per-event trace line the capture path emits...
+            trace!(
+                "Input event @ {}: {} -> {:?}",
+                "probe-device",
+                util::log_event(&press),
+                converted
+            );
+            // ...and the batch rendering the forwarding path emits.
+            trace!("batch: {:?}", vec![converted]);
+        });
+
+        let captured = crate::logging::recent_logs(crate::logging::RECENT_LOGS_MAX);
+        let start = captured
+            .iter()
+            .position(|line| line.contains(&marker))
+            .expect("the probe marker must be captured");
+        let ours = captured[start..].join("\n");
+        assert!(
+            !ours.contains(&format!("code={}", SECRET)),
+            "a key code reached the log ring: {}",
+            ours
+        );
+        assert!(!ours.contains("KEY_A"), "a key name reached the log ring: {}", ours);
+        // The lines were genuinely captured (otherwise this proves nothing).
+        assert!(ours.contains("Input event @"), "{}", ours);
     }
 
     /// Continuous MT position axes keep the existing [0.0, 1.0] scaling.

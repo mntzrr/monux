@@ -272,7 +272,14 @@ pub async fn discover_server(
         })
     });
     let chosen_idx = remembered_hit.unwrap_or(0);
-    let chosen = &instances[chosen_idx];
+    // Indexing here would panic on an empty result. Today that can't happen —
+    // every break in discover_servers_blocking is reachable only after a
+    // resolve, and the no-resolve paths bail — but that is a four-branch
+    // invariant spread across a long loop, guarding a panic in the client's
+    // reconnect path. Ask for it instead, so a future edit turns into a retry.
+    let chosen = instances
+        .get(chosen_idx)
+        .context("mDNS discovery returned no servers")?;
     if instances.len() > 1 {
         let others: Vec<&str> = instances
             .iter()

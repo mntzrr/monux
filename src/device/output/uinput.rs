@@ -250,17 +250,41 @@ impl VirtualUInputDevices {
     }
 }
 
+/// The byte-cast in emit_events reinterprets `&[evdev::InputEvent]` as the
+/// kernel's `struct input_event` array. That holds because evdev's InputEvent
+/// is a repr(transparent) newtype over `libc::input_event` — but that is an
+/// implementation detail of a third-party crate, not part of its public
+/// contract. Without this assertion an evdev release that adds a field or
+/// changes the representation still COMPILES here, and starts writing garbage
+/// into /dev/uinput at 8 kHz. Fail the build instead.
+const _: () = {
+    assert!(
+        std::mem::size_of::<evdev::InputEvent>() == std::mem::size_of::<libc::input_event>(),
+        "evdev::InputEvent is no longer layout-compatible with struct input_event; emit_events must stop byte-casting"
+    );
+    assert!(
+        std::mem::align_of::<evdev::InputEvent>() == std::mem::align_of::<libc::input_event>(),
+        "evdev::InputEvent alignment diverged from struct input_event; emit_events must stop byte-casting"
+    );
+};
+
 /// Emits a batch of events plus the terminating SYN_REPORT with a single
 /// writev() syscall. evdev's VirtualDevice::emit issues two separate write()
 /// calls (events, then SYN_REPORT); at high event rates (e.g. an 8000 Hz
 /// gaming mouse) halving the syscall count keeps up more comfortably.
+///
+/// A short write is resumed rather than reported: uinput accepts whole events,
+/// but a frame that stops halfway leaves the kernel holding a partial report,
+/// which presents downstream as a stuck modifier or a touch that never lifts.
+/// Finishing the frame is strictly better than surfacing the error.
 fn emit_events(device: &mut uinput::VirtualDevice, events: &[evdev::InputEvent]) -> std::io::Result<()> {
     if events.is_empty() {
         return Ok(());
     }
     let syn = evdev::InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0);
-    // SAFETY: evdev::InputEvent is a newtype over the kernel's struct input_event
-    // and the evdev crate itself byte-casts event slices to write them
+    // SAFETY: evdev::InputEvent is a repr(transparent) newtype over the
+    // kernel's struct input_event (asserted layout-compatible above), and the
+    // evdev crate itself byte-casts event slices to write them
     // (evdev::write_events), so viewing the slices as byte iovecs is sound.
     let event_bytes = unsafe {
         std::slice::from_raw_parts(events.as_ptr() as *const u8, std::mem::size_of_val(events))
@@ -268,27 +292,52 @@ fn emit_events(device: &mut uinput::VirtualDevice, events: &[evdev::InputEvent])
     let syn_bytes = unsafe {
         std::slice::from_raw_parts(&syn as *const _ as *const u8, std::mem::size_of_val(&syn))
     };
-    let iov = [
-        libc::iovec {
-            iov_base: event_bytes.as_ptr() as *mut libc::c_void,
-            iov_len: event_bytes.len(),
-        },
-        libc::iovec {
-            iov_base: syn_bytes.as_ptr() as *mut libc::c_void,
-            iov_len: syn_bytes.len(),
-        },
-    ];
-    // SAFETY: the fd is valid (owned by device) and the iovecs point to live data.
-    let written = unsafe { libc::writev(device.as_raw_fd(), iov.as_ptr(), iov.len() as libc::c_int) };
-    if written < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let expected = (event_bytes.len() + syn_bytes.len()) as isize;
-    if written != expected {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::WriteZero,
-            "partial write to uinput device",
-        ));
+    write_all_vectored(device.as_raw_fd(), event_bytes, syn_bytes)
+}
+
+/// writev()s the two buffers, resuming from wherever a short write stopped
+/// until both are fully delivered (see emit_events). Split out so the resume
+/// arithmetic is unit-testable against a pipe.
+fn write_all_vectored(fd: libc::c_int, first: &[u8], second: &[u8]) -> std::io::Result<()> {
+    let total = first.len() + second.len();
+    let mut done = 0usize;
+    while done < total {
+        // Rebuild the iovecs from the resume offset: whichever buffer the
+        // previous write stopped inside is submitted from that byte on, and a
+        // buffer already fully written contributes nothing.
+        let (first_at, second_at) = if done < first.len() {
+            (&first[done..], second)
+        } else {
+            (&first[first.len()..], &second[done - first.len()..])
+        };
+        let mut iov: Vec<libc::iovec> = Vec::with_capacity(2);
+        for buf in [first_at, second_at] {
+            if !buf.is_empty() {
+                iov.push(libc::iovec {
+                    iov_base: buf.as_ptr() as *mut libc::c_void,
+                    iov_len: buf.len(),
+                });
+            }
+        }
+        // SAFETY: the fd is valid (owned by the caller) and every iovec points
+        // into a live buffer for its stated length.
+        let written =
+            unsafe { libc::writev(fd, iov.as_ptr(), iov.len() as libc::c_int) };
+        if written < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if written == 0 {
+            // No progress and no error: the fd will not take the rest.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "uinput device accepted no bytes",
+            ));
+        }
+        done += written as usize;
     }
     Ok(())
 }
@@ -429,9 +478,11 @@ impl VirtualUInputDevices {
                             removed_releases.push((e.code(), since));
                             let held = since.elapsed();
                             if held > Duration::from_millis(600) {
+                                // No code: these lines reach the log ring and
+                                // from there every bug report (MASKED_KEY_CODE).
+                                // The timing is the evidence; which key is not.
                                 debug!(
-                                    "Key {} was held {:.1}s before its release arrived (delivery delay?)",
-                                    e.code(),
+                                    "A key was held {:.1}s before its release arrived (delivery delay?)",
                                     held.as_secs_f32()
                                 );
                             }
@@ -440,8 +491,7 @@ impl VirtualUInputDevices {
                     1 => {
                         if self.pressed_keys.insert(e.code(), Instant::now()).is_some() {
                             warn!(
-                                "Duplicate press for key {} with no release in between (event duplicated?)",
-                                e.code()
+                                "Duplicate key press with no release in between (event duplicated?)"
                             );
                         }
                     }
@@ -457,10 +507,7 @@ impl VirtualUInputDevices {
                                     e.code()
                                 );
                             } else {
-                                trace!(
-                                    "Dropping auto-repeat for key {} with no matching press",
-                                    e.code()
-                                );
+                                trace!("Dropping an auto-repeat with no matching press");
                             }
                             continue;
                         }
@@ -470,7 +517,7 @@ impl VirtualUInputDevices {
                         // burst of repeated characters. Real-time repeats at
                         // the natural rate pass through untouched.
                         if !self.repeat_coalescer.should_deliver(e.code()) {
-                            trace!("Coalescing backlog auto-repeat for key {}", e.code());
+                            trace!("Coalescing a backlog auto-repeat");
                             continue;
                         }
                     }
@@ -1057,6 +1104,37 @@ mod tests {
             evdev::SynchronizationCode::SYN_DROPPED.0,
             0
         )));
+    }
+
+    /// A short write must be resumed, not reported: a frame that stops halfway
+    /// leaves the kernel with a partial report. A pipe with a small buffer
+    /// forces the short write that /dev/uinput only produces under load.
+    #[test]
+    fn a_short_write_is_resumed_until_the_frame_is_whole() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+
+        let (mut reader, writer) = os_pipe::pipe().unwrap();
+        // Comfortably more than a pipe's 64 KiB buffer, so writev cannot
+        // deliver it in one call and must be resumed.
+        let first = vec![b'a'; 96 * 1024];
+        let second = vec![b'b'; 32 * 1024];
+        let total = first.len() + second.len();
+
+        // Drain concurrently: a pipe blocks the writer once full.
+        let drain = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            reader.read_to_end(&mut got).unwrap();
+            got
+        });
+        write_all_vectored(writer.as_raw_fd(), &first, &second).unwrap();
+        drop(writer);
+
+        let got = drain.join().unwrap();
+        assert_eq!(got.len(), total, "every byte of the frame must land");
+        // ...and in order, with the boundary between the two buffers intact.
+        assert!(got[..first.len()].iter().all(|b| *b == b'a'));
+        assert!(got[first.len()..].iter().all(|b| *b == b'b'));
     }
 
     #[test]

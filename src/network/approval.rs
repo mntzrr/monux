@@ -11,6 +11,17 @@ use tracing::{info, warn};
 use crate::network::certs;
 
 const ALPN_QUIC_HTTP: &[&[u8]] = &[b"hq-29"];
+
+/// Marker prefixed to every rejection that is part of the NORMAL pairing flow
+/// rather than a fault: the cert is simply not approved yet, and the peer's
+/// automatic retry converges once the console prompt is answered.
+///
+/// rustls flattens our verifier error into `Error::General(String)`, so the
+/// connection layer can only recognize these by their text. It used to match
+/// three separate phrases, which meant rewording any message here silently
+/// turned the pairing flow back into an error storm. One sentinel, asserted by
+/// a test on every rejection path, is the honest version of that.
+pub const APPROVAL_PENDING_SENTINEL: &str = "monux-approval-pending";
 const PROMPT_TIMEOUT_SECS: u64 = 60;
 /// After a prompt is declined or times out, reject that fingerprint silently
 /// for this long instead of re-prompting on every automatic retry.
@@ -174,8 +185,15 @@ impl<'a> MonuxCertVerification<'a> {
         // Can get the openssl style from: openssl x509 -noout -sha256 -fingerprint -in /path/to/private.pem
         let approved_cert_fingerprints: Vec<String> = approved_cert_fingerprints
             .into_iter()
-            .map(|fingerprint| fingerprint.to_lowercase().replace(':', ""))
+            .map(|fingerprint| normalize_fingerprint(&fingerprint))
             .collect();
+        // Validate rather than silently carrying a value that can never
+        // match: a typo or a truncated paste otherwise presents to the user
+        // as "the peer keeps refusing me", with a startup line cheerfully
+        // reporting N configured fingerprints.
+        for fingerprint in &approved_cert_fingerprints {
+            validate_fingerprint(fingerprint)?;
+        }
         if !approved_cert_fingerprints.is_empty() {
             info!(
                 "Configured {} preapproved fingerprints: {:?}",
@@ -261,11 +279,13 @@ impl<'a> MonuxCertVerification<'a> {
             match prompt_decision(&approval_state, &their_cert_fingerprint, Instant::now()) {
                 // Only one prompt at a time, reject other prompts. They will retry connecting anyway.
                 PromptDecision::Pending => bail!(
-                    "{} cert rejected for now: an approval prompt is already pending",
+                    "{}: {} cert rejected for now, an approval prompt is already pending",
+                    APPROVAL_PENDING_SENTINEL,
                     their_name
                 ),
                 PromptDecision::Cooldown => bail!(
-                    "{} cert rejected for now: approval of {} was recently declined or timed out",
+                    "{}: {} cert rejected for now, approval of {} was recently declined or timed out",
+                    APPROVAL_PENDING_SENTINEL,
                     their_name,
                     their_cert_fingerprint
                 ),
@@ -296,7 +316,8 @@ impl<'a> MonuxCertVerification<'a> {
             their_name, their_cert_fingerprint
         );
         bail!(
-            "{} cert not approved yet: approval pending, the peer retries automatically",
+            "{}: {} cert not approved yet, the peer retries automatically",
+            APPROVAL_PENDING_SENTINEL,
             their_name
         )
     }
@@ -304,6 +325,33 @@ impl<'a> MonuxCertVerification<'a> {
 
 fn default_stdin_is_tty() -> bool {
     io::stdin().is_terminal()
+}
+
+/// Number of hex characters in a certificate fingerprint (a SHA-256 digest).
+const FINGERPRINT_HEX_LEN: usize = 64;
+
+/// Normalizes a user-supplied fingerprint to our storage form: lowercase hex
+/// with the openssl-style colons removed ("18:AE:75:F2..." => "18ae75f2...").
+pub fn normalize_fingerprint(fingerprint: &str) -> String {
+    fingerprint.trim().to_lowercase().replace(':', "")
+}
+
+/// Rejects a normalized fingerprint that could never match a real certificate.
+/// A SHA-256 digest is exactly 64 hex characters; anything else is a typo, a
+/// truncated paste, or a value copied from the wrong tool, and accepting it
+/// silently only surfaces later as an unexplained refusal.
+pub fn validate_fingerprint(normalized: &str) -> Result<()> {
+    if normalized.len() != FINGERPRINT_HEX_LEN
+        || !normalized.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        bail!(
+            "'{}' is not a certificate fingerprint: expected {} hex characters (a SHA-256 digest), got {}. Read the peer's off its startup banner, or from 'monux status'.",
+            normalized,
+            FINGERPRINT_HEX_LEN,
+            normalized.len()
+        );
+    }
+    Ok(())
 }
 
 /// What to do with an unknown certificate that could be prompted for.
@@ -717,7 +765,7 @@ mod tests {
             .verify_cert(&their_cert, "Server", false)
             .expect_err("unknown cert must be rejected while the prompt is pending");
         assert!(
-            err.to_string().contains("approval pending"),
+            err.to_string().contains(APPROVAL_PENDING_SENTINEL),
             "unexpected error: {}",
             err
         );
@@ -733,6 +781,7 @@ mod tests {
             "unexpected error: {}",
             err
         );
+        assert!(err.to_string().contains(APPROVAL_PENDING_SENTINEL));
         assert_eq!(PROMPT_SPAWNS.load(Ordering::SeqCst), 1);
         assert!(verifier.approval_state.read().unwrap().prompt_active);
     }
@@ -940,6 +989,84 @@ mod tests {
         let empty: Box<dyn std::any::Any> =
             Box::new(Vec::<rustls_pki_types::CertificateDer>::new());
         assert_eq!(peer_fingerprint_from_identity(empty), None);
+    }
+
+    /// Every rejection that is part of the normal pairing flow must carry the
+    /// sentinel the connection layer keys on (server.rs is_approval_pending);
+    /// every rejection that is NOT must not, or a genuine misconfiguration
+    /// would be logged as a routine retry.
+    #[test]
+    fn pairing_rejections_carry_the_sentinel_and_faults_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let their_cert = peer_cert(peer_dir.path());
+
+        // Prompt spawned, approval pending.
+        let mut verifier = test_verifier(dir.path(), true);
+        {
+            let v = Arc::get_mut(&mut verifier).expect("fresh verifier is uniquely owned");
+            v.stdin_is_tty = tty_yes;
+            v.prompt_spawner = noop_spawn;
+        }
+        let pending = verifier.verify_cert(&their_cert, "Server", false).unwrap_err();
+        assert!(pending.to_string().contains(APPROVAL_PENDING_SENTINEL), "{}", pending);
+
+        // A second attempt while that prompt is active.
+        let already = verifier.verify_cert(&their_cert, "Server", false).unwrap_err();
+        assert!(already.to_string().contains(APPROVAL_PENDING_SENTINEL), "{}", already);
+
+        // A fingerprint in its post-decline cooldown.
+        {
+            let mut state = verifier.approval_state.write().unwrap();
+            record_rejection(
+                &mut state,
+                certs::fingerprint(&their_cert),
+                Instant::now(),
+                Duration::from_secs(60),
+            );
+            state.prompt_active = false;
+        }
+        let cooldown = verifier.verify_cert(&their_cert, "Server", false).unwrap_err();
+        assert!(cooldown.to_string().contains(APPROVAL_PENDING_SENTINEL), "{}", cooldown);
+
+        // Not pairing flow: --www with an unknown peer, and a non-TTY stdin.
+        // These are setup faults and must keep erroring loudly.
+        let www = test_verifier(dir.path(), false);
+        let refused = www.verify_cert(&their_cert, "Client", true).unwrap_err();
+        assert!(!refused.to_string().contains(APPROVAL_PENDING_SENTINEL), "{}", refused);
+
+        let mut headless = test_verifier(dir.path(), true);
+        Arc::get_mut(&mut headless)
+            .expect("fresh verifier is uniquely owned")
+            .stdin_is_tty = tty_no;
+        let no_tty = headless.verify_cert(&their_cert, "Client", true).unwrap_err();
+        assert!(!no_tty.to_string().contains(APPROVAL_PENDING_SENTINEL), "{}", no_tty);
+    }
+
+    #[test]
+    fn fingerprint_validation_rejects_what_could_never_match() {
+        let good = "a".repeat(64);
+        assert!(validate_fingerprint(&good).is_ok());
+        // Colons and case are normalized away before validation.
+        let openssl = "18:AE:75:F2".to_string() + &"0".repeat(56);
+        let normalized = normalize_fingerprint(&openssl);
+        assert_eq!(normalized.len(), 64);
+        assert!(validate_fingerprint(&normalized).is_ok());
+        // Too short (a truncated paste), too long, and non-hex all refuse.
+        for bad in ["", "aabbccdd", &"a".repeat(63), &"a".repeat(65), &"z".repeat(64)] {
+            let err = validate_fingerprint(bad).unwrap_err().to_string();
+            assert!(err.contains("hex characters"), "{}: {}", bad, err);
+        }
+    }
+
+    /// A bad --fingerprints value must fail at construction, not silently
+    /// never match while the startup log reports it as configured.
+    #[test]
+    fn constructing_with_a_malformed_fingerprint_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = MonuxCertVerification::new("test", vec!["nope".to_string()], dir.path(), false)
+            .expect_err("a malformed fingerprint must be refused at startup");
+        assert!(err.to_string().contains("hex characters"), "{}", err);
     }
 
     #[test]

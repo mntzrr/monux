@@ -38,3 +38,20 @@ pub fn shutting_down() -> bool {
 pub fn mark_shutting_down() {
     SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
 }
+
+/// Locks a std Mutex, tolerating a poisoned one.
+///
+/// monux's mutexes guard plain bookkeeping — a supervisor's child handle, a
+/// clipboard payload cache, certificate approval state — never an invariant
+/// that a panic mid-update could leave half-applied. So poisoning carries no
+/// information here, while `.unwrap()` on it converts one panic in one thread
+/// into a permanently wedged subsystem for the lifetime of the process: a tray
+/// that never comes back, a clipboard that never serves again, on a daemon
+/// that is otherwise healthy.
+///
+/// The certificate verifier reasoned its way to this individually ("a
+/// panicking prompt thread must not wedge certificate verification for the
+/// lifetime of the process"); this is that decision, made once.
+pub fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}

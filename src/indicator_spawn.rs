@@ -444,7 +444,7 @@ fn exit_action(shared: &mut Shared, exit: ChildExit, uptime: Duration) -> ExitAc
 /// child). Takes the lock before spawning so concurrent callers can't
 /// displace each other's child (which would leak an unreaped zombie).
 fn spawn_and_store(shared: &Arc<Mutex<Shared>>) -> Result<u32> {
-    let mut shared = shared.lock().unwrap();
+    let mut shared = crate::lock(shared);
     let child = spawn_indicator()?;
     let pid = child.id();
     // A prior child that's somehow still here (concurrent spawn raced in):
@@ -473,7 +473,7 @@ impl SupervisorHandle {
     /// touches a manually-started indicator.
     pub fn hide(&self) {
         let child = {
-            let mut shared = self.shared.lock().unwrap();
+            let mut shared = crate::lock(&self.shared);
             shared.hidden = true;
             shared.child.take()
         };
@@ -490,7 +490,7 @@ impl SupervisorHandle {
         if self.shutdown.load(Ordering::Relaxed) {
             bail!("the daemon is shutting down");
         }
-        let child_running = self.shared.lock().unwrap().child_running();
+        let child_running = crate::lock(&self.shared).child_running();
         match show_decision(self.veto, has_desktop_session(), child_running) {
             ShowDecision::OptedOut => bail!(
                 "the daemon was started with --no-indicator (or MONUX_NO_INDICATOR), an explicit opt-out — restart the daemon without it to enable the tray icon"
@@ -502,7 +502,7 @@ impl SupervisorHandle {
             ShowDecision::Spawn => {
                 let pid = spawn_and_store(&self.shared)?;
                 // A fresh start after give-up/takeover gets a fresh budget.
-                let mut shared = self.shared.lock().unwrap();
+                let mut shared = crate::lock(&self.shared);
                 shared.policy = RespawnPolicy::new();
                 shared.hidden = false;
                 info!("Showed the tray indicator on request (pid {})", pid);
@@ -589,7 +589,7 @@ impl Drop for Supervisor {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         let child = {
-            let mut shared = self.shared.lock().unwrap();
+            let mut shared = crate::lock(&self.shared);
             // Hidden too: a monitor preempted mid-respawn must not park a
             // fresh child in the slot after this Drop — nobody would ever
             // reap that one (see monitor_loop's final re-check).
@@ -623,7 +623,7 @@ async fn monitor_loop(shared: Arc<Mutex<Shared>>, shutdown: Arc<AtomicBool>) {
         // two would spawn a fresh child and then be re-hidden by the action
         // below (TakenOver/GiveUp set hidden).
         let (action, uptime) = {
-            let mut shared = shared.lock().unwrap();
+            let mut shared = crate::lock(&shared);
             let Some((exit, uptime)) = observe_exit(&mut shared) else { continue };
             (exit_action(&mut shared, exit, uptime), uptime)
         };
@@ -664,12 +664,12 @@ async fn monitor_loop(shared: Arc<Mutex<Shared>>, shutdown: Arc<AtomicBool>) {
             if shutdown.load(Ordering::Relaxed) {
                 return;
             }
-            if shared.lock().unwrap().hidden {
+            if crate::lock(&shared).hidden {
                 break;
             }
         }
         {
-            let mut shared = shared.lock().unwrap();
+            let mut shared = crate::lock(&shared);
             // Shutdown (or hidden/shown, which spawns directly) during the
             // delay or before this final lock? A spawn after the Drop's reap
             // would be orphaned — no supervisor is left to ever reap it.
@@ -946,13 +946,13 @@ mod tests {
         // hide: marks hidden and reaps the spawned child promptly.
         handle.hide();
         {
-            let mut shared = shared.lock().unwrap();
+            let mut shared = crate::lock(&shared);
             assert!(shared.hidden);
             assert!(!shared.child_running());
         }
         // hide is idempotent with no child.
         handle.hide();
-        assert!(shared.lock().unwrap().hidden);
+        assert!(crate::lock(&shared).hidden);
         // An opted-out handle refuses show (before any probe/spawn)...
         let opted_out = SupervisorHandle {
             shared: shared.clone(),

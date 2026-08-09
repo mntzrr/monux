@@ -421,18 +421,6 @@ pub async fn recv_hostname(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<S
     }
 }
 
-/// Errors when the peer's protocol version doesn't match ours.
-pub fn ensure_compatible_version(their_version: u64) -> Result<()> {
-    if their_version != shared::PROTOCOL_VERSION {
-        bail!(
-            "Their protocol version {} doesn't match our expected version {}. You need to update monux across your server and client(s) so that the protocol versions line up. Use 'monux -V' to check the version.",
-            their_version,
-            shared::PROTOCOL_VERSION
-        );
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,12 +439,11 @@ mod tests {
         );
     }
 
-    /// The clamp retry sends the clamped version, not ours: the bootstrap
-    /// construction must carry the version it is given (send_version just
+    /// The bootstrap must carry the version it is given (send_version just
     /// writes these bytes).
     #[test]
     fn version_bootstrap_carries_the_given_version() {
-        for version in [shared::MIN_SPEAKABLE_VERSION, shared::PROTOCOL_VERSION, 0, u64::MAX] {
+        for version in [shared::PROTOCOL_VERSION_NEGOTIATION, shared::PROTOCOL_VERSION, 0, u64::MAX] {
             let mut bytes = version_bootstrap_bytes(version).unwrap();
             let (decoded, _) =
                 postcard::take_from_bytes_cobs::<shared::VersionBootstrapMessage>(&mut bytes)

@@ -34,6 +34,13 @@ const TAKEOVER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Environment variable overriding the lock directory; used by tests to
 /// avoid colliding with real instances on the same machine.
+///
+/// Honored in debug builds only. It is a test hook, and in a release build it
+/// is also a redirect: anything that can set the daemon's environment could
+/// point the lock somewhere harmless and start a second instance alongside the
+/// first, which is exactly the state the lock exists to prevent (two monuxes
+/// fighting over keyboard grabs and virtual devices).
+#[cfg(debug_assertions)]
 const LOCK_DIR_ENV: &str = "MONUX_LOCK_DIR";
 
 /// Holds the single-instance flock for the lifetime of the process.
@@ -49,10 +56,53 @@ pub struct InstanceLock {
 /// Filesystem path of the lock file for `kind` ("server", "client" or
 /// "indicator").
 fn lock_path(kind: &str) -> PathBuf {
-    let dir = std::env::var_os(LOCK_DIR_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let dir = lock_dir();
     dir.join(format!("monux-{}.lock", kind))
+}
+
+/// The directory holding the lock files. The override is debug-only (see
+/// LOCK_DIR_ENV); release builds always use /tmp.
+fn lock_dir() -> PathBuf {
+    #[cfg(debug_assertions)]
+    if let Some(dir) = std::env::var_os(LOCK_DIR_ENV) {
+        return PathBuf::from(dir);
+    }
+    PathBuf::from("/tmp")
+}
+
+/// Rejects a lock file we must not trust. The lock lives in world-writable
+/// /tmp, so any local user can create the path first and then hold the flock
+/// forever — monux would never start again, on a machine where nothing looks
+/// wrong. A file we can neither have created nor been handed by root is not
+/// our lock; refusing it with the path named is far better than the silent
+/// "another instance is running" it produced before.
+///
+/// Ownership is the check that matters: the flock is authoritative for
+/// exclusion, but only among processes that agree on which file to take.
+/// `euid` is a parameter so the mismatch branch is testable without root.
+fn ensure_lock_file_owner(path: &std::path::Path, euid: libc::uid_t) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        // Not there yet: we are about to create it, so it will be ours.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(e).with_context(|| format!("Failed to stat lock file {}", path.display()))
+        }
+    };
+    let owner = meta.uid();
+    // root's is legitimate: a root-run daemon (the documented sudo fallback)
+    // creates the file, and an unprivileged instance must still contend for
+    // the same lock rather than starting alongside it.
+    if owner != euid && owner != 0 {
+        bail!(
+            "Refusing to use lock file {}: it is owned by uid {}, not by us (uid {}) or root. Another user created it, so it cannot be trusted to exclude anything — remove it and retry.",
+            path.display(),
+            owner,
+            euid
+        );
+    }
+    Ok(())
 }
 
 /// A deliberate stand-down: a post-update re-exec found a live instance
@@ -102,6 +152,10 @@ pub fn acquire(kind: &str) -> Result<InstanceLock> {
             path.display()
         );
     }
+    // ...and a regular file planted by another user is no better: they could
+    // hold its flock forever and keep monux from ever starting (see
+    // ensure_lock_file_owner).
+    ensure_lock_file_owner(&path, unsafe { libc::geteuid() })?;
     // 0666 so that instances running as other users (e.g. root via sudo)
     // share the same lock; chmod too since umask may restrict the create mode.
     let file = match fs::OpenOptions::new()
@@ -260,6 +314,12 @@ fn read_pid(path: &PathBuf) -> Option<i32> {
 /// stale. We immediately release — this is a read-only check.
 pub fn live_holder(kind: &str) -> Option<i32> {
     let path = lock_path(kind);
+    // A foreign-owned lock file says nothing about this machine's roles (see
+    // ensure_lock_file_owner); reading it would let another user decide
+    // whether the update gate applies here.
+    if ensure_lock_file_owner(&path, unsafe { libc::geteuid() }).is_err() {
+        return None;
+    }
     // Probe the flock: if it's free, the pid file is stale (the old holder
     // crashed without flock-release being an issue — flock auto-releases on
     // process death — but the pid file survived). flock works on a read-only
@@ -349,6 +409,32 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
         assert_eq!(fs::metadata(&victim).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    /// A lock file owned by another user must be refused by name rather than
+    /// contended for: any local user can create the path first in
+    /// world-writable /tmp and hold its flock forever, which used to present
+    /// as a permanent, unexplained "another monux is already running".
+    #[test]
+    fn a_foreign_owned_lock_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("monux-ownertest.lock");
+        fs::write(&path, "pid 1\n").unwrap();
+
+        // We own it: accepted. So is root's (the sudo-fallback daemon's).
+        let us = unsafe { libc::geteuid() };
+        assert!(ensure_lock_file_owner(&path, us).is_ok());
+        if us != 0 {
+            // Pretending WE are someone else is the same test as the file
+            // belonging to someone else, without needing a second uid.
+            let err = ensure_lock_file_owner(&path, us + 1)
+                .expect_err("a file owned by another user must be refused")
+                .to_string();
+            assert!(err.contains("owned by uid"), "{}", err);
+            assert!(err.contains("monux-ownertest.lock"), "{}", err);
+        }
+        // A file that doesn't exist yet is fine: we are about to create it.
+        assert!(ensure_lock_file_owner(&dir.path().join("absent.lock"), us).is_ok());
     }
 
     /// The normal path still works with O_NOFOLLOW: a plain lock file (or no

@@ -165,31 +165,7 @@ pub async fn run<O: output::OutputHandler>(
     output_handler: &mut O,
 ) -> Result<()> {
     let server_addr = &cfg.server_addr;
-    // speak_as is None normally (our bootstrap claims our own
-    // PROTOCOL_VERSION); the clamp retry below claims an older server's
-    // version instead.
-    let connect = |speak_as: Option<u64>| Connection::new(cfg, speak_as);
-    let (mut client, connect_time) = match connect(None).await {
-        Ok(ok) => ok,
-        Err(e) => match e.downcast_ref::<ConnectionError>() {
-            // The server is older than the negotiation era but still
-            // speakable (it refused our bootstrap before we could
-            // negotiate): retry the whole connection ONCE, clamped to its
-            // version. All feature gates key off the negotiated version,
-            // so clamping needs no other code.
-            Some(ConnectionError::ServerOlder { server_version }) => {
-                let server_version = *server_version;
-                info!(
-                    "The server speaks protocol v{}, we speak v{}: clamping to v{} — update the server for the full feature set",
-                    server_version,
-                    shared::PROTOCOL_VERSION,
-                    server_version
-                );
-                connect(Some(server_version)).await?
-            }
-            None => return Err(e),
-        },
-    };
+    let (mut client, connect_time) = Connection::new(cfg).await?;
     client.control_state.set_connected(client.conn().clone());
     // Remember this server for next time: mDNS (link-local multicast) can't
     // cross routers, so a working address is worth trying before discovery
@@ -263,30 +239,6 @@ pub async fn run<O: output::OutputHandler>(
         }
     }
 }
-
-/// A connection failure the caller can act on (as opposed to a plain error).
-#[derive(Debug)]
-enum ConnectionError {
-    /// The server speaks an older, pre-negotiation protocol that we can
-    /// still fully speak (>= MIN_SPEAKABLE_VERSION): it refuses our
-    /// bootstrap on sight, so the caller retries the whole connection
-    /// clamped to its version.
-    ServerOlder { server_version: u64 },
-}
-
-impl std::fmt::Display for ConnectionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            ConnectionError::ServerOlder { server_version } => write!(
-                f,
-                "the server speaks an older protocol (v{}) that we can clamp to",
-                server_version
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ConnectionError {}
 
 struct Connection {
     events_send: SendStream,
@@ -418,10 +370,7 @@ impl EdgeInference {
 
 impl Connection {
     /// Connects to the specified server, or returns an error if the connection fails.
-    /// `speak_as` is what our version bootstrap claims: None for our own
-    /// PROTOCOL_VERSION, Some(v) on the clamp retry against an older server
-    /// (which refuses our real version on sight; see run).
-    async fn new(cfg: &ClientConfig, speak_as: Option<u64>) -> Result<(Self, Instant)> {
+    async fn new(cfg: &ClientConfig) -> Result<(Self, Instant)> {
         let ClientConfig {
             server_addr,
             cert_verifier,
@@ -483,13 +432,10 @@ impl Connection {
             .await
             .context("Failed to initialize events stream")?;
 
-        // Exchange versions with the server; either side closes the connection
-        // if it can't support the other's version. Our bootstrap claims
-        // speak_as: our own version, or the clamped one on the retry against
-        // an older server.
+        // Exchange versions with the server; either side closes the
+        // connection if it can't support the other's version.
         let mut event_bytes = Vec::with_capacity(1024);
-        let speak_as = speak_as.unwrap_or(shared::PROTOCOL_VERSION);
-        transport::send_version(&mut events_send, speak_as).await?;
+        transport::send_version(&mut events_send, shared::PROTOCOL_VERSION).await?;
         let server_version = transport::recv_version(&mut events_recv, &mut event_bytes).await?;
         // Record the server's version (even on mismatch) for the update gate:
         // 'monux update' refuses builds our server couldn't talk to. Recording
@@ -513,49 +459,33 @@ impl Connection {
                 crate::autoupdate::hint_update_available();
             }
         }
-        // Judge the pair against what we actually SPEAK: on the clamp retry
-        // that's the server's older version, so the exact-match old server
-        // pairs at it.
-        let negotiated = match shared::negotiate(server_version, speak_as) {
-            Some(negotiated) => negotiated,
-            None => {
-                if speak_as == shared::PROTOCOL_VERSION
-                    && (shared::MIN_SPEAKABLE_VERSION..shared::PROTOCOL_VERSION).contains(&server_version)
-                {
-                    // Older but speakable: the caller retries clamped to it.
-                    return Err(ConnectionError::ServerOlder { server_version }.into());
-                }
-                if server_version == shared::PROTOCOL_VERSION {
-                    // We clamped to a server that upgraded between the two
-                    // attempts and refused our old bootstrap: fail this
-                    // attempt; the reconnect loop retries unclamped.
-                    bail!(
-                        "The server upgraded to protocol v{} during the clamped retry; reconnecting negotiates normally",
-                        server_version
-                    );
-                }
-                // Pre-negotiation mismatch: refused exactly as before.
-                transport::ensure_compatible_version(server_version)?;
-                unreachable!("negotiate() only refuses mismatches; equality handled above");
-            }
-        };
-        if negotiated < speak_as {
+        // One way to pair: both sides at v16+, running at the lower version.
+        // A server below that is refused outright — it predates negotiation
+        // and would refuse us anyway; it auto-updates and comes back.
+        let negotiated = shared::negotiate(server_version, shared::PROTOCOL_VERSION)
+            .with_context(|| {
+                format!(
+                    "The server speaks protocol v{}, which is too old for this client (v{} or newer is required). Update monux on the server; it will reconnect automatically.",
+                    server_version,
+                    shared::PROTOCOL_VERSION_NEGOTIATION
+                )
+            })?;
+        if negotiated < shared::PROTOCOL_VERSION {
             info!(
                 "The server speaks protocol v{}, we speak v{}: running at v{} (disabled: {})",
                 server_version,
-                speak_as,
+                shared::PROTOCOL_VERSION,
                 negotiated,
                 shared::disabled_features(negotiated)
             );
         }
 
-        // Protocol v15: the server follows the events-stream version with
-        // its hostname (length-prefixed) when the negotiated version has the
-        // feature. Learned for the approval prompt (a direct-IP connect has
-        // no mDNS name) and for the remembered-servers store
-        // (known_servers.rs). An older server sends nothing, so there is
-        // nothing to wait for then.
-        let server_hostname = if shared::expects_hostname(negotiated) {
+        // The server follows the events-stream version with its hostname
+        // (length-prefixed). Learned for the approval prompt (a direct-IP
+        // connect has no mDNS name) and for the remembered-servers store
+        // (known_servers.rs). Unconditional since 13.0.0 — the frame used to
+        // ride a v15 gate, and v16 is the floor now.
+        let server_hostname = {
             let hostname = transport::recv_hostname(&mut events_recv, &mut event_bytes).await?;
             if hostname.is_empty() {
                 None
@@ -563,8 +493,6 @@ impl Connection {
                 cert_verifier.set_handshake_server_name(hostname.clone());
                 Some(hostname)
             }
-        } else {
-            None
         };
 
         let (mut bulk_send, mut bulk_recv) = conn
@@ -582,7 +510,7 @@ impl Connection {
         // would parse any leftover events-stream bytes as the bulk version
         // if either side ever pipelines data behind the version frame.
         let mut bulk_handshake_bytes = Vec::with_capacity(1024);
-        transport::send_version(&mut bulk_send, speak_as).await?;
+        transport::send_version(&mut bulk_send, shared::PROTOCOL_VERSION).await?;
         let bulk_server_version = transport::recv_version(&mut bulk_recv, &mut bulk_handshake_bytes).await?;
         // Same server as the events stream, whose version was already
         // negotiated there: it must speak the same version here.
@@ -1475,7 +1403,15 @@ impl Connection {
                     } else {
                         // Need to collect more data.
                         // Save what we've got so far, and assign remaining_bytes to what's left.
-                        let mut payload = Vec::with_capacity(c.content_len_bytes as usize);
+                        // Capped capacity hint, for the same reason as the
+                        // server's mirror of this branch: content_len_bytes is
+                        // declared by the peer, so a tiny header must not be
+                        // able to commit the whole max clipboard size before
+                        // any payload arrives (see payload_capacity_hint).
+                        let mut payload =
+                            Vec::with_capacity(crate::server::payload_capacity_hint(
+                                c.content_len_bytes,
+                            ));
                         payload.extend_from_slice(resp_remainder);
                         let d = data::ClipboardData {
                             requested_type: c.requested_type.to_string(),

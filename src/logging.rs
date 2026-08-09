@@ -90,7 +90,15 @@ fn timestamp() -> String {
 /// before they reach this layer, so the hot path (QUIC/input debugging
 /// volume) never pays for it; per kept event it's one string format and one
 /// short-held mutex push.
-struct RingBufferLayer;
+pub(crate) struct RingBufferLayer;
+
+/// The ring layer, for tests that need to assert on what a bug report would
+/// carry (see device::input's keystroke-masking guard). Test-only: the daemon
+/// installs the layer through init_logging.
+#[cfg(test)]
+pub(crate) fn ring_layer_for_tests() -> RingBufferLayer {
+    RingBufferLayer
+}
 
 impl<S: tracing::Subscriber> Layer<S> for RingBufferLayer {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {

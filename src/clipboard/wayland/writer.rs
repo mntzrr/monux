@@ -137,7 +137,7 @@ fn spawn_fetch(
     std::thread::spawn(move || {
         if let Some(d) = fetch_sync(&mime_type, &fetch_data_tx, max_uncompressed_size_bytes, &config_dir, &serve_runtime) {
             debug!("Background-fetched clipboard type {}: {} bytes", d.requested_type, d.bytes.len());
-            clipboard_data.lock().unwrap().insert(d.requested_type, std::sync::Arc::<[u8]>::from(d.bytes));
+            crate::lock(&clipboard_data).insert(d.requested_type, std::sync::Arc::<[u8]>::from(d.bytes));
         }
     });
 }
@@ -211,7 +211,7 @@ impl_dispatch_source!(State, |state: &mut Self, source: data_control::Source, ev
             // --watch) can fire dozens of paste requests per second. Warn once
             // per window so freeze reports can be correlated with storms.
             {
-                let mut stats = prepared_state.send_stats.lock().unwrap();
+                let mut stats = crate::lock(&prepared_state.send_stats);
                 if stats.0.elapsed() >= std::time::Duration::from_secs(1) {
                     *stats = (std::time::Instant::now(), 0);
                 }
@@ -277,7 +277,7 @@ fn serve_send(
 ) {
     let started = std::time::Instant::now();
     let bytes: std::sync::Arc<[u8]> = {
-        let cached = clipboard_data.lock().unwrap().get(&mime_type).cloned();
+        let cached = crate::lock(&clipboard_data).get(&mime_type).cloned();
         match cached {
             Some(cached_bytes) => {
                 debug!("Reusing cached clipboard with type {}: {} bytes", mime_type, cached_bytes.len());
@@ -288,7 +288,7 @@ fn serve_send(
                     Some(d) => {
                         debug!("Background-fetched clipboard type {}: {} bytes", d.requested_type, d.bytes.len());
                         let bytes = std::sync::Arc::<[u8]>::from(d.bytes);
-                        clipboard_data.lock().unwrap().insert(d.requested_type, std::sync::Arc::clone(&bytes));
+                        crate::lock(&clipboard_data).insert(d.requested_type, std::sync::Arc::clone(&bytes));
                         bytes
                     }
                     // Retryable fetch failure: serve empty, the next request retries.

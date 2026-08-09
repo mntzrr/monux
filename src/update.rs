@@ -16,9 +16,138 @@ const DEFAULT_REPO: &str = "https://github.com/mntzrr/monux.git";
 /// Commit this binary was built from, set by build.rs ("<sha>" or "<sha>-dirty").
 pub const CURRENT_REVISION: &str = env!("MONUX_GIT_SHA");
 
-/// The repo updates are pulled from (MONUX_UPDATE_REPO overrides for testing).
+/// The repo updates are pulled from.
+///
+/// MONUX_UPDATE_REPO overrides it in DEBUG BUILDS ONLY. In a release build it
+/// would be a remote-code-execution channel for anything that can set the
+/// daemon's environment: this path compiles and runs whatever it fetches, and
+/// `monux setup` re-execs under `sudo -E`, which forwards the environment into
+/// a root process.
 pub fn repo_url() -> String {
-    std::env::var("MONUX_UPDATE_REPO").unwrap_or_else(|_| DEFAULT_REPO.to_string())
+    #[cfg(debug_assertions)]
+    if let Ok(repo) = std::env::var("MONUX_UPDATE_REPO") {
+        return repo;
+    }
+    DEFAULT_REPO.to_string()
+}
+
+/// The public half of the key that signs monux releases, in OpenSSH format
+/// (`ssh-ed25519 AAAA...`). Empty here means release signing is NOT configured
+/// for this build — see `verify_release_signature`.
+///
+/// SSH rather than GPG because the verification is self-contained: git checks
+/// it against an allowed-signers file we write ourselves, with no keyring to
+/// import into and no gnupg home to depend on.
+///
+/// To enable, generate a key kept OFF the build machines that run updates:
+///     ssh-keygen -t ed25519 -C 'monux release signing' -f monux-release
+/// paste the contents of `monux-release.pub` here, and sign every release tag:
+///     git config gpg.format ssh
+///     git config user.signingkey /path/to/monux-release
+///     git tag -s v13.0.0 -m 'monux v13.0.0' && git push --tags
+const RELEASE_SIGNING_KEY: &str = "";
+
+/// The identity the allowed-signers file binds the key to. Arbitrary, but it
+/// must match the `-n` namespace-independent principal git records; git only
+/// checks that SOME allowed principal signed, so any stable string works.
+const RELEASE_SIGNING_PRINCIPAL: &str = "releases@monux";
+
+/// What signature verification could conclude about a release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Signature {
+    /// A tag whose signature verifies against RELEASE_SIGNING_KEY, and whose
+    /// commit is the one we are about to build.
+    Verified { tag: String },
+    /// No signing key is compiled into this build, so nothing CAN be
+    /// verified. Unattended installs refuse; an explicit `monux update` warns
+    /// and proceeds, because the person who typed it is the review gate.
+    Unconfigured,
+    /// A key is configured and the check failed: no signed tag at this
+    /// commit, a bad signature, or a signer we don't trust.
+    Rejected { reason: String },
+}
+
+/// Whether release signing is compiled into this build at all.
+pub fn signing_configured() -> bool {
+    !RELEASE_SIGNING_KEY.trim().is_empty()
+}
+
+/// Verifies that `sha` is the commit of a tag signed by the release key.
+///
+/// Checking the TAG rather than the commit is deliberate: a tag is the
+/// explicit "this is a release" act, so an attacker who lands a commit on
+/// master — the exact scenario this exists for — still cannot produce
+/// something this accepts.
+fn verify_release_signature(src_dir: &Path, sha: &str) -> Signature {
+    if !signing_configured() {
+        return Signature::Unconfigured;
+    }
+    // git needs the trusted key on disk; a temp file next to the checkout is
+    // enough, and it is rewritten every run so it can't go stale.
+    let allowed = src_dir
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("monux-allowed-signers");
+    let entry = format!(
+        "{} {}\n",
+        RELEASE_SIGNING_PRINCIPAL,
+        RELEASE_SIGNING_KEY.trim()
+    );
+    if let Err(e) = std::fs::write(&allowed, entry) {
+        return Signature::Rejected {
+            reason: format!("could not stage the release signing key at {}: {}", allowed.display(), e),
+        };
+    }
+    let tags = match git_output(src_dir, &["tag", "--points-at", sha]) {
+        Ok(tags) => tags,
+        Err(e) => {
+            return Signature::Rejected {
+                reason: format!("could not list tags at {}: {:#}", sha, e),
+            }
+        }
+    };
+    let tags: Vec<&str> = tags.lines().map(str::trim).filter(|t| !t.is_empty()).collect();
+    if tags.is_empty() {
+        return Signature::Rejected {
+            reason: format!(
+                "{} carries no tag — monux installs signed RELEASES, not whatever is on master",
+                &sha[..12.min(sha.len())]
+            ),
+        };
+    }
+    for tag in &tags {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(src_dir)
+            .arg("-c")
+            .arg("gpg.format=ssh")
+            .arg("-c")
+            .arg(format!(
+                "gpg.ssh.allowedSignersFile={}",
+                allowed.display()
+            ))
+            .args(["verify-tag", tag])
+            .output();
+        match out {
+            Ok(out) if out.status.success() => {
+                return Signature::Verified {
+                    tag: (*tag).to_string(),
+                }
+            }
+            Ok(_) => continue,
+            Err(e) => {
+                return Signature::Rejected {
+                    reason: format!("could not run git verify-tag: {}", e),
+                }
+            }
+        }
+    }
+    Signature::Rejected {
+        reason: format!(
+            "no tag at this commit ({}) carries a valid monux release signature",
+            tags.join(", ")
+        ),
+    }
 }
 
 /// The commit currently published at the repo's HEAD (cheap update check; no
@@ -95,17 +224,36 @@ pub enum UpdateStatus {
     /// with (see pair_works); nothing was built (see the
     /// protocol_constraint parameter of run).
     SkippedIncompatible,
+    /// The target commit is not a signed release, so nothing was built (see
+    /// verify_release_signature). Unlike SkippedIncompatible this will not
+    /// resolve on its own — the signature of a given commit does not change —
+    /// so the caller records the attempt and stops retrying it.
+    SkippedUnverified,
+}
+
+/// Who asked for an install, which decides how strict signature checking is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trust {
+    /// A person typed `monux update`. They are the review gate, so a build
+    /// with no signing key compiled in warns loudly and proceeds; a build
+    /// that HAS a key still demands a valid signature.
+    Interactive,
+    /// The background updater, with nobody watching. Fail closed: refuse
+    /// anything not signed, including the unconfigured case, because
+    /// "unverifiable" and "unattended" together is the situation this whole
+    /// mechanism exists to prevent.
+    Unattended,
 }
 
 /// Whether a build speaking `target` protocol can pair with a server
-/// speaking `server`: exact matches always pair (the pre-negotiation rule),
-/// and from the negotiation era (v16) on, any pair connects at the lower
-/// version (shared::negotiate). Everything else is refused — e.g. a v16
-/// build against a v15 server: a v16 client CAN clamp to it, but the gate
-/// keeps the server-first update order regardless (the clamp covers version
-/// splits in the field, not updates).
+/// speaking `server`: both must be in the negotiation era (v16+), and the
+/// pair then connects at the lower version (shared::negotiate).
+///
+/// The old exact-match escape hatch is gone with pre-v16 support (13.0.0):
+/// there is no longer any build we could install that pairs with a v15
+/// server, so a matching-but-ancient pair is not an outcome to preserve.
 pub fn pair_works(target: u64, server: u64) -> bool {
-    target.min(server) >= crate::msgs::shared::PROTOCOL_VERSION_NEGOTIATION || target == server
+    target.min(server) >= crate::msgs::shared::PROTOCOL_VERSION_NEGOTIATION
 }
 
 pub fn run(
@@ -113,6 +261,7 @@ pub fn run(
     low_priority: bool,
     protocol_constraint: Option<u64>,
     to: Option<&str>,
+    trust: Trust,
 ) -> Result<UpdateStatus> {
     let repo = repo_url();
     let src_dir = match std::env::var_os("MONUX_UPDATE_CACHE") {
@@ -288,6 +437,18 @@ pub fn run(
         }
     };
 
+    // Signature gate, immediately before the expensive build and after the
+    // checkout is on the target commit. `--force` does NOT bypass it: force
+    // is about rebuilding and about the protocol gate, never about running
+    // code we can't attribute.
+    match check_release_signature(&src_dir, &latest, trust) {
+        SignatureGate::Proceed => {}
+        SignatureGate::Refuse(reason) => {
+            info!("{}", reason);
+            return Ok(UpdateStatus::SkippedUnverified);
+        }
+    }
+
     let root = install_root();
     let cargo = find_cargo()?;
     // Clean staging leftovers from previously killed installs. Skip dirs whose
@@ -408,6 +569,47 @@ pub fn run(
         }
     }
     Ok(UpdateStatus::Installed)
+}
+
+/// Whether an install may proceed past the signature check.
+enum SignatureGate {
+    Proceed,
+    Refuse(String),
+}
+
+/// Applies the release-signature policy for a given trust level (see Trust).
+/// Split from verify_release_signature so the policy — as opposed to the git
+/// plumbing — is unit-testable.
+fn signature_gate(signature: Signature, trust: Trust) -> SignatureGate {
+    match (signature, trust) {
+        (Signature::Verified { tag }, _) => {
+            info!("Release signature verified: {}", tag);
+            SignatureGate::Proceed
+        }
+        (Signature::Unconfigured, Trust::Interactive) => {
+            warn!(
+                "This build has no release signing key compiled in, so the source being installed cannot be attributed to anyone. Proceeding because you asked for this update explicitly."
+            );
+            SignatureGate::Proceed
+        }
+        (Signature::Unconfigured, Trust::Unattended) => SignatureGate::Refuse(
+            "Not installing in the background: this build has no release signing key compiled in, so nothing can be verified. Run 'monux update' yourself to install anyway."
+                .to_string(),
+        ),
+        (Signature::Rejected { reason }, Trust::Unattended) => SignatureGate::Refuse(format!(
+            "Not installing in the background: {}. Run 'monux update' if you mean to install it anyway.",
+            reason
+        )),
+        (Signature::Rejected { reason }, Trust::Interactive) => SignatureGate::Refuse(format!(
+            "Refusing to install: {}.",
+            reason
+        )),
+    }
+}
+
+/// verify_release_signature plus the trust policy (see signature_gate).
+fn check_release_signature(src_dir: &Path, sha: &str, trust: Trust) -> SignatureGate {
+    signature_gate(verify_release_signature(src_dir, sha), trust)
 }
 
 /// Holds the cross-process update flock for the duration of an update run
@@ -923,24 +1125,97 @@ mod tests {
 
     #[test]
     fn pair_works_matrix() {
-        // Exact matches always pair (the pre-negotiation rule).
-        assert!(pair_works(15, 15));
-        assert!(pair_works(16, 16));
-        assert!(pair_works(14, 14));
         // Negotiation era: any v16+ pair connects at the lower version,
         // whichever side is newer.
+        assert!(pair_works(16, 16));
         assert!(pair_works(16, 17));
         assert!(pair_works(17, 16));
         assert!(pair_works(17, 18));
-        // A pre-negotiation server still demands an exact match — even
-        // though a v16 client could clamp to it, the gate keeps the
-        // server-first update order.
+        // A pre-v16 peer on either side can no longer be paired with at all,
+        // matching versions included: 13.0.0 dropped the exact-match escape
+        // hatch along with the client's clamp retry, so there is no build we
+        // could install that would talk to one.
+        assert!(!pair_works(15, 15));
+        assert!(!pair_works(14, 14));
         assert!(!pair_works(16, 15));
         assert!(!pair_works(15, 16));
         assert!(!pair_works(17, 15));
         assert!(!pair_works(15, 17));
         assert!(!pair_works(16, 14));
         assert!(!pair_works(14, 15));
+    }
+
+    fn proceeds(gate: SignatureGate) -> bool {
+        matches!(gate, SignatureGate::Proceed)
+    }
+
+    fn refusal(gate: SignatureGate) -> String {
+        match gate {
+            SignatureGate::Refuse(reason) => reason,
+            SignatureGate::Proceed => panic!("expected a refusal"),
+        }
+    }
+
+    /// The whole point of the trust split: nothing installs unattended that
+    /// cannot be attributed, while a person at a terminal is allowed to be
+    /// their own review gate.
+    #[test]
+    fn unattended_installs_fail_closed_and_interactive_ones_do_not() {
+        let verified = || Signature::Verified {
+            tag: "v13.0.0".to_string(),
+        };
+        let rejected = || Signature::Rejected {
+            reason: "no tag at this commit".to_string(),
+        };
+
+        // A verified release installs either way.
+        assert!(proceeds(signature_gate(verified(), Trust::Unattended)));
+        assert!(proceeds(signature_gate(verified(), Trust::Interactive)));
+
+        // No signing key compiled in: the background updater refuses, a
+        // person gets a warning and their update.
+        let err = refusal(signature_gate(Signature::Unconfigured, Trust::Unattended));
+        assert!(err.contains("no release signing key"), "{}", err);
+        assert!(err.contains("monux update"), "{}", err);
+        assert!(proceeds(signature_gate(
+            Signature::Unconfigured,
+            Trust::Interactive
+        )));
+
+        // A configured key with a failing check refuses BOTH ways: an
+        // explicit ask is consent to install an unsigned build, never
+        // consent to install one whose signature is wrong.
+        let err = refusal(signature_gate(rejected(), Trust::Unattended));
+        assert!(err.contains("no tag at this commit"), "{}", err);
+        let err = refusal(signature_gate(rejected(), Trust::Interactive));
+        assert!(err.contains("Refusing to install"), "{}", err);
+    }
+
+    /// With no key compiled in, verification cannot conclude anything — and
+    /// must say so rather than reporting a pass.
+    #[test]
+    fn verification_reports_unconfigured_without_a_key() {
+        assert!(!signing_configured(), "no release key is compiled in yet");
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            verify_release_signature(tmp.path(), "deadbeefdeadbeef"),
+            Signature::Unconfigured
+        );
+    }
+
+    /// An untagged commit is refused by name: monux installs releases, not
+    /// whatever happens to be on master.
+    #[test]
+    fn an_untagged_commit_is_not_a_release() {
+        // Exercised through the policy layer, since the git-facing half is
+        // inert until a key is compiled in.
+        let gate = signature_gate(
+            Signature::Rejected {
+                reason: "5b4c00e carries no tag — monux installs signed RELEASES, not whatever is on master".to_string(),
+            },
+            Trust::Unattended,
+        );
+        assert!(refusal(gate).contains("carries no tag"));
     }
 
     #[test]

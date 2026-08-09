@@ -279,8 +279,28 @@ pub fn motion_event(code: u16, value: i32) -> InputEvent {
     }
 }
 
+/// Placeholder printed instead of a key event's real code (see the Debug and
+/// Display impls on InputI32/InputF64). Everything a user types crosses these
+/// structs, and the log lines they land in are collected verbatim into bug
+/// reports (`monux diagnostics`, which the tray offers to copy and which
+/// `--peer` pulls from the other machine too). A code here is a keystroke, so
+/// the redaction lives in the types rather than at each of the dozen call
+/// sites that format them — a masking rule you have to remember is a masking
+/// rule that leaks.
+///
+/// The real code is still reachable when explicitly asked for: KEYTRACE lines
+/// print it, gated on MONUX_TRACE_KEYS naming that exact code (see
+/// device::key_traced).
+const MASKED_KEY_CODE: &str = "<key>";
+
+/// Whether an event type carries a keystroke, and so must have its code
+/// masked in any human-readable rendering.
+fn is_key_type(type_: u16) -> bool {
+    type_ == evdev::EventType::KEY.0
+}
+
 /// An input event to be written to a virtual device indicated by the target.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 pub struct InputEvent {
     /// For discrete unscaled values: keys, relative axes, and discrete
     /// absolute axes (ABS_MT_SLOT, ABS_MT_TRACKING_ID, ... — the axes
@@ -304,11 +324,21 @@ impl std::fmt::Display for InputEvent {
     }
 }
 
+/// Debug defers to Display, which masks key codes (see MASKED_KEY_CODE). A
+/// derived Debug would print the code, and this type is formatted with `{:?}`
+/// on paths that reach the log ring — batch dumps in the input pipeline, the
+/// ServerEvent renderings below.
+impl std::fmt::Debug for InputEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 // InputI32
 
 /// Equivalent to a uinput event for the client to emit locally.
 /// Omits the timestamp since it isn't required.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 pub struct InputI32 {
     pub type_: u16,
     pub code: u16,
@@ -317,11 +347,29 @@ pub struct InputI32 {
 
 impl std::fmt::Display for InputI32 {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "InputI32(type={}, code={}, value={})",
-            self.type_, self.code, self.value
-        )
+        if is_key_type(self.type_) {
+            // The code IS the keystroke (see MASKED_KEY_CODE). The value
+            // stays: press/release/repeat is what these lines are read for,
+            // and it reveals nothing about which key.
+            write!(
+                f,
+                "InputI32(type={}, code={}, value={})",
+                self.type_, MASKED_KEY_CODE, self.value
+            )
+        } else {
+            write!(
+                f,
+                "InputI32(type={}, code={}, value={})",
+                self.type_, self.code, self.value
+            )
+        }
+    }
+}
+
+/// See the Debug impl on InputEvent: masked, not derived.
+impl std::fmt::Debug for InputI32 {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
     }
 }
 
@@ -346,7 +394,7 @@ impl InputI32 {
 /// Used for continuous absolute coordinates, with a scale of [0.0, 1.0] to
 /// be resized by the client. Discrete absolute axes travel raw via InputI32
 /// instead.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 pub struct InputF64 {
     pub type_: u16,
     pub code: u16,
@@ -355,11 +403,28 @@ pub struct InputF64 {
 
 impl std::fmt::Display for InputF64 {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "InputF64(type={}, code={}, value={})",
-            self.type_, self.code, self.value
-        )
+        // Scaled axes are never key events, but mask on the same rule rather
+        // than on the assumption — the rule is what survives a refactor.
+        if is_key_type(self.type_) {
+            write!(
+                f,
+                "InputF64(type={}, code={}, value={})",
+                self.type_, MASKED_KEY_CODE, self.value
+            )
+        } else {
+            write!(
+                f,
+                "InputF64(type={}, code={}, value={})",
+                self.type_, self.code, self.value
+            )
+        }
+    }
+}
+
+/// See the Debug impl on InputEvent: masked, not derived.
+impl std::fmt::Debug for InputF64 {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
     }
 }
 
@@ -521,9 +586,16 @@ mod tests {
             "SwitchRequest(y_fraction=0.5)"
         );
         assert_eq!(format!("{}", ClientEvent::Pong), "Pong");
+        // EV_KEY (type 1): the code is a keystroke and is masked; the value
+        // (press/release/repeat) is what the line is read for and stays.
         assert_eq!(
             format!("{}", InputI32 { type_: 1, code: 30, value: -1 }),
-            "InputI32(type=1, code=30, value=-1)"
+            "InputI32(type=1, code=<key>, value=-1)"
+        );
+        // EV_REL (type 2): an axis, not a keystroke — printed in full.
+        assert_eq!(
+            format!("{}", InputI32 { type_: 2, code: 0, value: 8 }),
+            "InputI32(type=2, code=0, value=8)"
         );
         assert_eq!(
             format!("{}", InputF64 { type_: 2, code: 0, value: 0.5 }),
@@ -533,13 +605,65 @@ mod tests {
             inputi32: Some(InputI32 { type_: 1, code: 30, value: 1 }),
             inputf64: None,
         };
-        assert_eq!(format!("{}", keyed), "InputEvent(inputi32=InputI32(type=1, code=30, value=1))");
+        assert_eq!(
+            format!("{}", keyed),
+            "InputEvent(inputi32=InputI32(type=1, code=<key>, value=1))"
+        );
         let empty = InputEvent { inputi32: None, inputf64: None };
         assert_eq!(format!("{}", empty), "InputEvent(?)");
         assert_eq!(
             format!("{}", ClipboardTypes { types: "text/plain image/png", max_size_bytes: 7 }),
             "ClipboardTypes(types=[text/plain image/png], max_size_bytes=7)"
         );
+    }
+
+    /// The masking has to hold for `{:?}` as well as `{}`: most of the log
+    /// sites that carry these types format a whole batch with Debug, and a
+    /// derived Debug prints the code. Covers the wrappers too — a masked
+    /// InputI32 inside a Debug-formatted Vec<InputEvent> inside a ServerEvent
+    /// is the exact shape the input pipeline logs.
+    #[test]
+    fn debug_masks_key_codes_through_every_wrapper() {
+        const SECRET: u16 = 30; // KEY_A
+        let key = InputEvent {
+            inputi32: Some(InputI32 {
+                type_: evdev::EventType::KEY.0,
+                code: SECRET,
+                value: 1,
+            }),
+            inputf64: None,
+        };
+        let renderings = [
+            format!("{:?}", key.inputi32.as_ref().unwrap()),
+            format!("{:?}", key),
+            format!("{:?}", vec![key.clone()]),
+            format!("{}", ServerEvent::Input(vec![key.clone()])),
+            format!(
+                "{}",
+                ServerEvent::ClassedInput {
+                    class: DeviceClass::Keyboard,
+                    events: vec![key.clone()],
+                }
+            ),
+        ];
+        for rendering in &renderings {
+            assert!(
+                rendering.contains(MASKED_KEY_CODE),
+                "expected a masked code in: {}",
+                rendering
+            );
+            assert!(
+                !rendering.contains(&format!("code={}", SECRET)),
+                "the real key code leaked: {}",
+                rendering
+            );
+        }
+        // A non-key event keeps its code: masking everything would blind the
+        // pointer/axis debugging these lines also exist for.
+        let motion = motion_event(evdev::RelativeAxisCode::REL_X.0, 5);
+        let rendering = format!("{:?}", motion);
+        assert!(rendering.contains("code=0"), "{}", rendering);
+        assert!(!rendering.contains(MASKED_KEY_CODE), "{}", rendering);
     }
 
     #[test]

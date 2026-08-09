@@ -1,11 +1,23 @@
-//! Background auto-update (on by default; `--no-auto-update` opts out):
-//! periodically checks the update repo for a newer commit and, when one
-//! appears, rebuilds and installs it at low CPU priority, then restarts the
-//! process to apply it. The restart is the ordinary graceful shutdown
-//! (SIGTERM to ourselves) followed by main re-exec'ing the new binary, so the
-//! session drops for a few seconds and then heals itself: clients reconnect
-//! automatically and the server re-activates whichever machine was active
-//! (session resumption in rotation.rs).
+//! Background update checking (on by default; `--no-auto-update` opts out).
+//!
+//! The daily check NOTIFIES by default and installs nothing. Installing means
+//! compiling and running whatever the repo currently holds — including every
+//! build script and proc macro in the dependency tree — so it is not something
+//! that should happen on a timer, unattended, on a machine where monux may be
+//! running as root for uinput access. The user pulls the trigger, via the tray
+//! action, `mx daemon update`, or `monux update`.
+//!
+//! `--auto-install` restores unattended installing for people who want it.
+//! Even then the target must carry a verified release signature (see
+//! update::Trust): unattended and unverifiable together is precisely the
+//! combination this exists to prevent.
+//!
+//! An install — however triggered — rebuilds at low CPU priority and then
+//! restarts the process to apply it. The restart is the ordinary graceful
+//! shutdown (SIGTERM to ourselves) followed by main re-exec'ing the new
+//! binary, so the session drops for a few seconds and then heals itself:
+//! clients reconnect automatically and the server re-activates whichever
+//! machine was active (session resumption in rotation.rs).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,11 +63,33 @@ fn set_update_available(sha: Option<String>) {
 /// instead of waiting for the daily tick.
 static UPDATE_HINT: Notify = Notify::const_new();
 
-/// Hints that an update is probably available; the auto-update loop (when
-/// running) checks immediately rather than at the next interval. Cheap and
-/// coalescing: repeated hints collapse into at most one extra check.
+/// Set when someone explicitly asked to INSTALL, rather than just to check
+/// (the control socket's update_now, which backs `mx daemon update` and the
+/// tray's update action). The loop consumes it on its next pass, so a notify-
+/// mode daemon installs exactly the updates a person asked for.
+static INSTALL_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Hints that an update is probably available; the check loop (when running)
+/// checks immediately rather than at the next interval. Cheap and coalescing:
+/// repeated hints collapse into at most one extra check. Does NOT install.
 pub fn hint_update_available() {
     UPDATE_HINT.notify_one();
+}
+
+/// Asks the check loop to install the update it finds, not merely report it.
+/// Used by the control socket's update_now.
+pub fn request_install() {
+    INSTALL_REQUESTED.store(true, Ordering::SeqCst);
+    UPDATE_HINT.notify_one();
+}
+
+/// How the loop treats an update it finds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Report it and stop (the default).
+    Notify,
+    /// Build and restart into it, subject to signature verification.
+    AutoInstall,
 }
 
 /// Test hook: override the startup delay (seconds).
@@ -111,7 +145,7 @@ pub fn schedule_restart() {
 /// protocol version record — refreshed via mDNS on every check, so updates
 /// that would break compatibility with the server are skipped. Servers pass
 /// None: they lead protocol upgrades.
-pub async fn run(gate_config_dir: Option<std::path::PathBuf>) {
+pub async fn run(gate_config_dir: Option<std::path::PathBuf>, mode: Mode) {
     tokio::select! {
         _ = tokio::time::sleep(initial_delay()) => {}
         _ = UPDATE_HINT.notified() => {
@@ -121,7 +155,7 @@ pub async fn run(gate_config_dir: Option<std::path::PathBuf>) {
     // Test hook: pretend an update was installed, exercising the automatic
     // restart without a rebuild. Fires once per boot lineage (the re-exec'd
     // image has MONUX_RESTARTED set) and skips the real update loop entirely.
-    if std::env::var_os("MONUX_AUTO_UPDATE_FAKE").is_some() {
+    if std::env::var_os("MONUX_AUTO_UPDATE_FAKE").is_some() && mode == Mode::AutoInstall {
         if std::env::var_os("MONUX_RESTARTED").is_none() {
             info!("Pretending a background update succeeded (MONUX_AUTO_UPDATE_FAKE)");
             restart_after_grace("fake-update", false).await;
@@ -163,7 +197,20 @@ pub async fn run(gate_config_dir: Option<std::path::PathBuf>) {
                 // the update is "available" whether or not we build it.
                 set_update_available(newer.then(|| remote_sha.clone()));
                 let attempted = last_attempted.as_deref() == Some(remote_sha.as_str());
-                if newer && !attempted {
+                // Installing is either the configured mode or an explicit
+                // request; otherwise the update is only reported.
+                let install = mode == Mode::AutoInstall
+                    || INSTALL_REQUESTED.swap(false, Ordering::SeqCst);
+                if newer && !attempted && !install {
+                    // Notify once per newly-seen commit: last_attempted is
+                    // what keeps a standing update from re-notifying daily.
+                    last_attempted = Some(remote_sha.clone());
+                    info!(
+                        "monux update available ({}); install it with 'mx daemon update', the tray, or 'monux update'",
+                        short(&remote_sha)
+                    );
+                    notify_update_available(&remote_sha);
+                } else if newer && !attempted {
                     info!(
                         "monux update available ({}), rebuilding in the background...",
                         short(&remote_sha)
@@ -172,11 +219,19 @@ pub async fn run(gate_config_dir: Option<std::path::PathBuf>) {
                     // stale record) inside the blocking task: discovery is
                     // synchronous IO with a timeout.
                     let gate_dir = gate_config_dir.clone();
+                    // An explicit request is Interactive: a person asked for
+                    // it just now, so an unsigned build warns instead of
+                    // refusing. The timer's own installs stay Unattended.
+                    let trust = if mode == Mode::AutoInstall {
+                        update::Trust::Unattended
+                    } else {
+                        update::Trust::Interactive
+                    };
                     let result = tokio::task::spawn_blocking(move || {
                         let constraint = gate_dir
                             .as_deref()
                             .and_then(|dir| update::refresh_protocol_constraint(Some(dir)));
-                        update::run(false, true, constraint, None)
+                        update::run(false, true, constraint, None, trust)
                     })
                     .await;
                     match result {
@@ -191,6 +246,13 @@ pub async fn run(gate_config_dir: Option<std::path::PathBuf>) {
                         Ok(Ok(update::UpdateStatus::SkippedIncompatible)) => {
                             // Logged by update::run; last_attempted stays unset
                             // so the next check retries (the gate may have opened).
+                        }
+                        Ok(Ok(update::UpdateStatus::SkippedUnverified)) => {
+                            // Logged by update::run. Recorded, unlike the
+                            // protocol gate: a commit's signature will not
+                            // become valid later, so retrying it daily would
+                            // only repeat the same refusal forever.
+                            last_attempted = Some(remote_sha.clone());
                         }
                         Ok(Err(e)) => {
                             last_attempted = Some(remote_sha.clone());
@@ -238,6 +300,22 @@ async fn restart_after_grace(remote_sha: &str, notify: bool) {
     tokio::time::sleep(delay).await;
     info!("Restarting to apply monux {}...", short(remote_sha));
     schedule_restart();
+}
+
+/// Tells the user an update exists and that installing it is their call.
+/// The tray shows the same fact continuously (update_available); this is the
+/// one-shot nudge when it first appears.
+fn notify_update_available(remote_sha: &str) {
+    crate::notify::notify(
+        "monux-update",
+        crate::notify::Urgency::Low,
+        10000,
+        "monux update available",
+        &format!(
+            "monux {} is available. Install it from the tray, or run 'mx daemon update'.",
+            short(remote_sha)
+        ),
+    );
 }
 
 /// Shows a best-effort desktop notification that an update was installed and

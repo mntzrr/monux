@@ -315,6 +315,17 @@ pub static REGISTRY: &[KeySpec] = &[
         since: BASELINE_SINCE,
     },
     KeySpec {
+        key: "server.auto-install",
+        section: Section::Server,
+        flag: "auto-install",
+        expects: "true|false",
+        default_display: "false (report updates, install on request)",
+        help: "install background updates automatically instead of only reporting them",
+        kind: Kind::Bool,
+        validate: v_bool,
+        since: "13.0.0",
+    },
+    KeySpec {
         key: "server.no-indicator",
         section: Section::Server,
         flag: "no-indicator",
@@ -435,6 +446,17 @@ pub static REGISTRY: &[KeySpec] = &[
         kind: Kind::Bool,
         validate: v_bool,
         since: BASELINE_SINCE,
+    },
+    KeySpec {
+        key: "client.auto-install",
+        section: Section::Client,
+        flag: "auto-install",
+        expects: "true|false",
+        default_display: "false (report updates, install on request)",
+        help: "install background updates automatically instead of only reporting them",
+        kind: Kind::Bool,
+        validate: v_bool,
+        since: "13.0.0",
     },
     KeySpec {
         key: "client.no-indicator",
@@ -2608,10 +2630,29 @@ mod tests {
 
     #[test]
     fn keys_since_reports_only_newer_entries() {
-        assert_eq!(keys_since(BASELINE_SINCE).len(), 0);
+        // Everything predating the baseline, and everything at it, is old
+        // news; keys added later are what the daemon announces.
         assert_eq!(keys_since("7.3.0").len(), REGISTRY.len());
         assert_eq!(keys_since("7.3").len(), REGISTRY.len());
         assert_eq!(keys_since("99.0.0").len(), 0);
+
+        // The post-baseline keys are exactly the ones whose `since` says so —
+        // asserted against the registry rather than a hard-coded count, so
+        // adding a key doesn't mean editing this test.
+        let announced = keys_since(BASELINE_SINCE);
+        let expected: Vec<&str> = REGISTRY
+            .iter()
+            .filter(|s| s.since != BASELINE_SINCE)
+            .map(|s| s.key)
+            .collect();
+        assert_eq!(
+            announced.iter().map(|s| s.key).collect::<Vec<_>>(),
+            expected
+        );
+        // A user upgrading FROM a version that already had them hears nothing.
+        for spec in &announced {
+            assert!(keys_since(spec.since).iter().all(|s| s.key != spec.key));
+        }
     }
 
     #[test]

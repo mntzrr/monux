@@ -467,14 +467,15 @@ pub async fn run_server_connections_loop(
 
 /// Whether a connection failure is just an unapproved certificate: the
 /// verifier rejects instantly and the peer retries automatically until the
-/// console prompt is answered (see approval.rs), so these are expected
-/// during pairing and log at info level. Needles match the rejection
-/// messages in approval.rs.
+/// console prompt is answered (see approval.rs), so these are expected during
+/// pairing and log at info level.
+///
+/// Matched on a stable sentinel rather than on the prose of the messages —
+/// rustls flattens the verifier error to a string, so text is the only
+/// channel, but the text that carries meaning should be the part nobody
+/// rewords casually (see APPROVAL_PENDING_SENTINEL).
 fn is_approval_pending(e: impl std::fmt::Display) -> bool {
-    let text = e.to_string();
-    text.contains("approval pending")
-        || text.contains("approval prompt is already pending")
-        || text.contains("recently declined or timed out")
+    e.to_string().contains(approval::APPROVAL_PENDING_SENTINEL)
 }
 
 async fn handle_connection(
@@ -526,19 +527,16 @@ async fn handle_connection(
         );
     }
 
-    // Protocol v15: tell the client our hostname right after the version
-    // exchange (length-prefixed; the client reads it only when the negotiated
-    // version has the feature, so mixed pairs behave exactly as before).
-    // Direct-IP connects get the same display name as mDNS-discovered ones
-    // (approval prompt), and the client can remember us by name
-    // (known_servers.rs).
-    if shared::sends_hostname(negotiated) {
-        let hostname = crate::discovery::get_hostname().unwrap_or_default();
-        events_send
-            .write_all(&shared::encode_hostname(&hostname))
-            .await
-            .context("Failed to send our hostname")?;
-    }
+    // Tell the client our hostname right after the version exchange
+    // (length-prefixed). Direct-IP connects get the same display name as
+    // mDNS-discovered ones (approval prompt), and the client can remember us
+    // by name (known_servers.rs). Unconditional since 13.0.0: the frame rode
+    // a v15 gate, and v16 is the floor now.
+    let hostname = crate::discovery::get_hostname().unwrap_or_default();
+    events_send
+        .write_all(&shared::encode_hostname(&hostname))
+        .await
+        .context("Failed to send our hostname")?;
 
     // Start second stream for bulk messages
     let (mut bulk_send, mut bulk_recv) = conn
@@ -756,6 +754,21 @@ async fn handle_event_messages(
     Ok(())
 }
 
+/// Largest capacity a peer-declared content length may reserve up front. The
+/// length is already bounded by max_clipboard_size_bytes, but that bound is
+/// what an honest peer needs, not what a header alone should be able to
+/// commit: allocating it before any payload arrives turns a tiny frame into
+/// megabytes of resident memory per connection. Past this, the buffer just
+/// grows as chunks land.
+pub(crate) const MAX_PAYLOAD_CAPACITY_HINT: usize = 256 * 1024;
+
+/// The capacity to pre-reserve for an announced clipboard payload (see
+/// MAX_PAYLOAD_CAPACITY_HINT). Shared with the client's bulk reader, which
+/// makes the identical reservation from a server-declared length.
+pub(crate) fn payload_capacity_hint(content_len_bytes: u64) -> usize {
+    content_len_bytes.min(MAX_PAYLOAD_CAPACITY_HINT as u64) as usize
+}
+
 async fn handle_bulk_messages(
     source: SocketAddr,
     rotation_tx: &mpsc::Sender<rotation::RotationEvent>,
@@ -846,7 +859,15 @@ async fn handle_bulk_messages(
                 } else {
                     // Need to collect more data.
                     // Save what we've got so far, and assign remaining_bytes to what's left.
-                    let mut payload = Vec::with_capacity(c.content_len_bytes as usize);
+                    // The capacity hint is CAPPED rather than taken from the
+                    // header: content_len_bytes is a peer-declared number, so
+                    // reserving it up front lets a ~40-byte header commit the
+                    // whole max clipboard size per connection before a single
+                    // payload byte arrives. Growth from here follows bytes
+                    // actually received, which costs nothing next to the
+                    // network time.
+                    let mut payload =
+                        Vec::with_capacity(payload_capacity_hint(c.content_len_bytes));
                     payload.extend_from_slice(resp_remainder);
                     let d = (
                         ClipboardData {
