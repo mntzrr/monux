@@ -45,7 +45,7 @@ pub fn repo_url() -> String {
 ///     git config gpg.format ssh
 ///     git config user.signingkey /path/to/monux-release
 ///     git tag -s v13.0.0 -m 'monux v13.0.0' && git push --tags
-const RELEASE_SIGNING_KEY: &str = "";
+const RELEASE_SIGNING_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINRgzzs8DrRL2XxJwYVuFXfZV2gVMA53v3ix7QdZlMtd monux release signing";
 
 /// The identity the allowed-signers file binds the key to. Arbitrary, but it
 /// must match the `-n` namespace-independent principal git records; git only
@@ -79,7 +79,15 @@ pub fn signing_configured() -> bool {
 /// master — the exact scenario this exists for — still cannot produce
 /// something this accepts.
 fn verify_release_signature(src_dir: &Path, sha: &str) -> Signature {
-    if !signing_configured() {
+    verify_against_key(src_dir, sha, RELEASE_SIGNING_KEY)
+}
+
+/// verify_release_signature against an explicit trusted key, so the whole
+/// path — including the part that must REJECT a signature from the wrong
+/// signer — can be exercised with a throwaway key in a test. The shipped key
+/// is a const; the mechanism is not.
+fn verify_against_key(src_dir: &Path, sha: &str, trusted_key: &str) -> Signature {
+    if trusted_key.trim().is_empty() {
         return Signature::Unconfigured;
     }
     // git needs the trusted key on disk; a temp file next to the checkout is
@@ -88,11 +96,7 @@ fn verify_release_signature(src_dir: &Path, sha: &str) -> Signature {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("monux-allowed-signers");
-    let entry = format!(
-        "{} {}\n",
-        RELEASE_SIGNING_PRINCIPAL,
-        RELEASE_SIGNING_KEY.trim()
-    );
+    let entry = format!("{} {}\n", RELEASE_SIGNING_PRINCIPAL, trusted_key.trim());
     if let Err(e) = std::fs::write(&allowed, entry) {
         return Signature::Rejected {
             reason: format!("could not stage the release signing key at {}: {}", allowed.display(), e),
@@ -1195,12 +1199,162 @@ mod tests {
     /// must say so rather than reporting a pass.
     #[test]
     fn verification_reports_unconfigured_without_a_key() {
-        assert!(!signing_configured(), "no release key is compiled in yet");
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(
-            verify_release_signature(tmp.path(), "deadbeefdeadbeef"),
+            verify_against_key(tmp.path(), "deadbeefdeadbeef", ""),
             Signature::Unconfigured
         );
+        assert_eq!(
+            verify_against_key(tmp.path(), "deadbeefdeadbeef", "   \n"),
+            Signature::Unconfigured
+        );
+    }
+
+    /// The shipped key must be a well-formed OpenSSH public key. A truncated
+    /// or mangled paste would compile fine, make signing_configured() report
+    /// true, and then reject every real release — discovered at the worst
+    /// possible moment.
+    #[test]
+    fn the_shipped_release_key_is_well_formed() {
+        if !signing_configured() {
+            // No key yet: nothing to check, and the unattended path fails
+            // closed anyway (see unattended_installs_fail_closed).
+            return;
+        }
+        let key = RELEASE_SIGNING_KEY.trim();
+        let mut fields = key.split_whitespace();
+        let algo = fields.next().expect("a key type");
+        let blob = fields.next().expect("a key body");
+        assert!(
+            algo.starts_with("ssh-") || algo.starts_with("ecdsa-") || algo.starts_with("sk-"),
+            "unexpected key type {:?}: git's ssh signing wants an OpenSSH public key",
+            algo
+        );
+        // The base64 body of an ed25519 public key is 68 chars; anything much
+        // shorter is a truncated paste.
+        assert!(
+            blob.len() >= 40 && blob.chars().all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c)),
+            "the key body doesn't look like base64: {:?}",
+            blob
+        );
+        assert!(
+            !key.contains("PRIVATE"),
+            "that is a PRIVATE key — only the .pub half belongs in the binary"
+        );
+    }
+
+    /// Runs git in a test repo with ssh signing configured.
+    fn sign_git(dir: &Path, key: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "gpg.format=ssh"])
+            .arg("-c")
+            .arg(format!("user.signingkey={}", key.display()))
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "monux-test")
+            .env("GIT_AUTHOR_EMAIL", "monux-test@example.com")
+            .env("GIT_COMMITTER_NAME", "monux-test")
+            .env("GIT_COMMITTER_EMAIL", "monux-test@example.com")
+            .output()
+            .unwrap()
+    }
+
+    /// Generates a throwaway ssh signing key, returning (private path, public key).
+    fn throwaway_key(dir: &Path, name: &str) -> (PathBuf, String) {
+        let path = dir.join(name);
+        let out = Command::new("ssh-keygen")
+            .args(["-t", "ed25519", "-N", "", "-C", "monux-test", "-f"])
+            .arg(&path)
+            .output()
+            .expect("ssh-keygen must be available");
+        assert!(out.status.success(), "ssh-keygen failed: {:?}", out);
+        let public = std::fs::read_to_string(path.with_extension("pub")).unwrap();
+        (path, public.trim().to_string())
+    }
+
+    /// The property the whole mechanism exists for: a release signed by the
+    /// trusted key verifies, and one signed by ANY other key does not.
+    ///
+    /// Exercises the real git plumbing — a real repo, a real `git tag -s`, a
+    /// real `git verify-tag` against a real allowed-signers file — because
+    /// the interesting failure modes live there, not in our branching.
+    #[test]
+    fn only_a_tag_signed_by_the_trusted_key_verifies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keys = tmp.path().join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        let (ours, our_public) = throwaway_key(&keys, "release");
+        let (theirs, _their_public) = throwaway_key(&keys, "impostor");
+
+        // A checkout with one commit, tagged and signed by OUR key.
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        test_repo(&repo);
+        let sha = test_commit_version(&repo, "13.0.0");
+        let out = sign_git(&repo, &ours, &["tag", "-s", "v13.0.0", "-m", "monux v13.0.0"]);
+        assert!(out.status.success(), "signed tag failed: {:?}", out);
+
+        match verify_against_key(&repo, &sha, &our_public) {
+            Signature::Verified { tag } => assert_eq!(tag, "v13.0.0"),
+            other => panic!("a tag signed by the trusted key must verify: {:?}", other),
+        }
+
+        // The same tag is worthless against a different trusted key — this is
+        // the assertion that makes the whole feature mean anything.
+        let (_, stranger) = throwaway_key(&keys, "stranger");
+        match verify_against_key(&repo, &sha, &stranger) {
+            Signature::Rejected { reason } => {
+                assert!(reason.contains("valid monux release signature"), "{}", reason)
+            }
+            other => panic!("a foreign signature must be rejected: {:?}", other),
+        }
+
+        // A tag signed by an impostor at the same commit is rejected too: it
+        // is the SIGNER that is checked, not the presence of a signature.
+        let out = sign_git(&repo, &theirs, &["tag", "-s", "v13.0.1", "-m", "impostor"]);
+        assert!(out.status.success(), "impostor tag failed: {:?}", out);
+        match verify_against_key(&repo, &sha, &our_public) {
+            // Our own valid tag is still there, so this commit still verifies —
+            // the impostor tag simply doesn't help it.
+            Signature::Verified { tag } => assert_eq!(tag, "v13.0.0"),
+            other => panic!("the genuine tag should still carry it: {:?}", other),
+        }
+    }
+
+    /// monux installs signed RELEASES, not whatever happens to be on master:
+    /// an untagged commit is refused however healthy the repo is.
+    #[test]
+    fn an_untagged_commit_is_refused_even_with_a_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_ours, our_public) = throwaway_key(tmp.path(), "release");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        test_repo(&repo);
+        let sha = test_commit_version(&repo, "13.0.0");
+
+        match verify_against_key(&repo, &sha, &our_public) {
+            Signature::Rejected { reason } => {
+                assert!(reason.contains("carries no tag"), "{}", reason)
+            }
+            other => panic!("an untagged commit must be refused: {:?}", other),
+        }
+
+        // An UNSIGNED tag is no better: the tag is the release marker, the
+        // signature is the authority.
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["tag", "v13.0.0"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        match verify_against_key(&repo, &sha, &our_public) {
+            Signature::Rejected { reason } => {
+                assert!(reason.contains("valid monux release signature"), "{}", reason)
+            }
+            other => panic!("an unsigned tag must be refused: {:?}", other),
+        }
     }
 
     /// An untagged commit is refused by name: monux installs releases, not
