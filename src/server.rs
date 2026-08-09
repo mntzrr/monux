@@ -35,6 +35,9 @@ impl std::error::Error for VersionMismatch {}
 /// How often to repeat the friendly refusal log for the same client.
 const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How many client handshakes may be in flight at once (see the accept loop).
+const MAX_CONCURRENT_HANDSHAKES: usize = 32;
+
 /// Tracks per-client protocol versions so a version-mismatched client reads
 /// like the self-healing flow it is (it will auto-update and return), not
 /// like a broken connection erroring every few seconds — and so the moment
@@ -357,12 +360,33 @@ pub async fn run_server_connections_loop(
         transport::NetworkMode::Local => Duration::from_secs(75),
         transport::NetworkMode::Www => Duration::from_secs(15),
     };
+    // Bound on handshakes running at once. Each accepted attempt spawns a task
+    // that holds a Connecting for up to handshake_timeout (75s in Local mode),
+    // all of it before the peer has authenticated — so without this, anyone who
+    // can reach the port can make the server accumulate tasks and per-connection
+    // state at will. quinn's max_incoming (transport.rs) bounds only what it
+    // holds BEFORE we accept, and we accept immediately, so this side is the one
+    // that actually bounds handshakes.
+    //
+    // A permit is taken before accepting, so backpressure reaches quinn's own
+    // queue instead of the accept loop spinning; it is released when the
+    // handshake resolves, times out, or fails. The ceiling is far above any
+    // real rotation, so a legitimate client is never made to wait.
+    let handshake_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
     // Task launcher for new client connections
     // Monotonic token tagging each accepted connection: a reconnect can reuse
     // the same addr:port, and the token lets the rotation tell a late removal
     // from the old (dead) connection apart from the healthy new entry.
     let mut next_conn_token: u64 = 1;
     loop {
+        // Claim a handshake slot BEFORE accepting: while every slot is busy,
+        // attempts queue in quinn (bounded by max_incoming) rather than piling
+        // up as tasks here. The semaphore is never closed, so acquire only
+        // fails if it were, which cannot happen.
+        let handshake_permit = match Arc::clone(&handshake_slots).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => bail!("Handshake semaphore closed, exiting server"),
+        };
         let conn = server_endpoint.accept().await;
         let conn = match conn {
             Some(c) => c,
@@ -395,6 +419,12 @@ pub async fn run_server_connections_loop(
         // is only spawned once the client's fingerprint is known: AddClient
         // carries it (rotation.rs).
         task::spawn(async move {
+            // handshake_permit is moved into this task by the drop() below and
+            // held for the handshake only: the slot bounds connections being
+            // ESTABLISHED, not established ones, so a full rotation of
+            // long-lived clients never starves pairing. Every early return
+            // here (handshake error, timeout, missing certificate) releases it
+            // at scope exit.
             let conn = match tokio::time::timeout(handshake_timeout, connecting).await {
                 Ok(Ok(conn)) => conn,
                 Ok(Err(e)) => {
@@ -434,6 +464,9 @@ pub async fn run_server_connections_loop(
                 }
             };
             debug!("Got fingerprint: {}", fingerprint);
+            // The handshake is done; free the slot before the connection task,
+            // which lives as long as the client stays connected.
+            drop(handshake_permit);
             task::spawn(async move {
                 let result = handle_connection(conn, fingerprint, rotation_tx_cpy.clone(), max_clipboard_size_bytes, conn_token, peer_versions_cpy).await;
                 // Remove the client from the rotation on EVERY exit path,

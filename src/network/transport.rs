@@ -43,6 +43,10 @@ const SOCKET_BUF_SIZE: libc::c_int = 2 * 1024 * 1024;
 /// Linux socket priority for interactive/low-latency traffic.
 const SOCKET_PRIORITY: libc::c_int = 6;
 
+/// Ceiling on connection attempts quinn buffers before the accept loop takes
+/// them (see build_server).
+const MAX_INCOMING: usize = 64;
+
 /// Network profile for the QUIC transport.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum NetworkMode {
@@ -86,6 +90,19 @@ pub fn build_server(
     let mut server_config =
         ServerConfig::with_crypto(approval::rustls_server_config(cert_verifier)?);
     server_config.transport_config(transport_config(mode));
+    // Bound the connection attempts quinn holds before the accept loop takes
+    // them. quinn's default is 65536 (~100 MiB worst case) — sized for a
+    // public server, not for a KVM whose rotation is a handful of machines.
+    // Connection setup is entirely pre-authentication, so this memory is
+    // reachable by anyone who can reach the port; Www mode forces address
+    // validation via retry() first, but Local deliberately skips that for
+    // latency, which is exactly where the cap earns its keep.
+    //
+    // This bounds only PRE-accept state: an Incoming stops existing the moment
+    // the application accepts it, which server.rs does immediately. The
+    // handshakes it then spawns are bounded on monux's own side (see
+    // MAX_CONCURRENT_HANDSHAKES there).
+    server_config.max_incoming(MAX_INCOMING);
 
     Endpoint::new(
         EndpointConfig::default(),

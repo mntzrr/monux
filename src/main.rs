@@ -1013,7 +1013,14 @@ async fn server(args: ServerDaemonArgs<'_>) -> Result<()> {
             // Max compressed clipboard size over the wire
             max_clipboard_size_bytes,
             // Max uncompressed clipboard size, just in case
-            max_uncompressed_size_bytes: 10 * max_clipboard_size_bytes,
+            // Saturating, not plain: max_clipboard_size_bytes is already a
+            // checked KB*1024 whose validator caps KB at u64::MAX/1024, so it
+            // can reach values where *10 overflows — a debug build panicked
+            // the whole daemon on a value the validator accepts, and a release
+            // build wrapped to an arbitrary ceiling. Saturating is also the
+            // honest meaning here: this bounds decompression, and u64::MAX is
+            // "no practical limit".
+            max_uncompressed_size_bytes: max_clipboard_size_bytes.saturating_mul(10),
             rotation_tx,
             rotation_rx,
             motion_mode,
@@ -1274,7 +1281,8 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
 - Add your user to the 'input' group and log back in: 'sudo usermod -aG input $USER'
 - Enable uinput and/or evdev in the kernel, check for /dev/uinput and /dev/input/
 - As a fallback, run as root with 'sudo -E monux client ...' (-E keeps clipboard support)")?;
-    let max_uncompressed_size_bytes = 10 * max_clipboard_size_bytes;
+    // Saturating for the same reason as the server's ceiling above.
+    let max_uncompressed_size_bytes = max_clipboard_size_bytes.saturating_mul(10);
     let mut local_clipboard = clipboard::client::LocalClipboard::new(
         config_dir.clone(),
         max_uncompressed_size_bytes,

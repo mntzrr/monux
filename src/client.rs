@@ -854,7 +854,13 @@ impl Connection {
         // can route them as precisely as the frames arrived. Frames of
         // different classes never share a queue (see queue_input).
         let mut pending_class: Option<event::DeviceClass> = None;
-        while offset < self.event_bytes.len() {
+        // bytes_len, not a live self.event_bytes.len(): `consumed` below is
+        // computed against this same snapshot, and the loop body awaits (stream
+        // writes, output handler, clipboard). Should any of those ever append to
+        // the buffer, a live bound with a snapshot arithmetic would desynchronize
+        // the COBS parser silently rather than fail. The server's two twins
+        // (server.rs) already bound on the snapshot.
+        while offset < bytes_len {
             // A partial frame (no COBS terminator yet) is kept for the next chunk.
             if !shared::has_complete_cobs_frame(&self.event_bytes[offset..]) {
                 break;

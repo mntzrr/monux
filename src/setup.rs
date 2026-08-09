@@ -210,23 +210,59 @@ struct AutostartTarget {
     owner: Option<(u32, u32)>,
 }
 
-/// Looks up a user's home directory and uid/gid (getpwnam(3)).
+/// Looks up a user's home directory and uid/gid (getpwnam_r(3)).
+///
+/// The _r form, not plain getpwnam: the latter returns a pointer into a
+/// static buffer that any concurrent lookup in the process may overwrite, so
+/// its soundness would rest on a global "nothing else calls this right now"
+/// property rather than on anything checkable here. With a caller-owned
+/// buffer the result is ours alone.
 pub(crate) fn passwd_entry(name: &str) -> Result<(PathBuf, u32, u32)> {
     use std::os::unix::ffi::OsStrExt;
     let cname = std::ffi::CString::new(name).context("Invalid user name")?;
-    let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
-    if pw.is_null() {
-        bail!("User '{}' not found", name);
+    // sysconf's suggested size, with a floor for systems that don't answer
+    // and a ceiling so a hostile value can't ask for an unbounded allocation.
+    let suggested = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let mut cap = if suggested > 0 { suggested as usize } else { 1024 };
+    loop {
+        // libc::c_char, not i8: it is u8 on aarch64, where a hardcoded i8
+        // wouldn't compile.
+        let mut buf = vec![0 as libc::c_char; cap];
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: pwd and buf outlive the call and are exclusively ours;
+        // getpwnam_r writes the entry into pwd, its strings into buf, and
+        // sets result to &pwd on success or NULL when there is no such user.
+        let rc = unsafe {
+            libc::getpwnam_r(
+                cname.as_ptr(),
+                &mut pwd,
+                buf.as_mut_ptr(),
+                cap,
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE && cap < 1024 * 1024 {
+            // The entry didn't fit; retry with a bigger buffer.
+            cap *= 2;
+            continue;
+        }
+        if rc != 0 {
+            return Err(std::io::Error::from_raw_os_error(rc))
+                .with_context(|| format!("Failed to look up user '{}'", name));
+        }
+        if result.is_null() {
+            bail!("User '{}' not found", name);
+        }
+        // SAFETY: rc == 0 and result is non-null, so pwd is fully populated
+        // and its string pointers point into buf, which is still alive.
+        let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+        return Ok((
+            PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())),
+            pwd.pw_uid,
+            pwd.pw_gid,
+        ));
     }
-    let (dir, uid, gid) = unsafe {
-        let pw = &*pw;
-        (std::ffi::CStr::from_ptr(pw.pw_dir), pw.pw_uid, pw.pw_gid)
-    };
-    Ok((
-        PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())),
-        uid,
-        gid,
-    ))
 }
 
 /// Where a per-user install goes: the invoking user's home dir, plus the

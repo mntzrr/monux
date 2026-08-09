@@ -547,6 +547,61 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// When the diagnostics mirror was last refreshed (see
     /// DIAGNOSTICS_REFRESH_INTERVAL); None until the first refresh.
     last_diagnostics_refresh: Option<Instant>,
+    /// Per-client clipboard fetch budget (see CLIPBOARD_FETCH_BURST), keyed by
+    /// endpoint in lockstep with the roster.
+    clipboard_fetch_budget: HashMap<SocketAddr, FetchBudget>,
+}
+
+/// How many clipboard fetches one client may make per
+/// CLIPBOARD_FETCH_WINDOW before being throttled.
+///
+/// Approval is permanent and unscoped: a client approved once may fetch the
+/// clipboard whenever it likes, including while it is NOT the switched-active
+/// machine. That is deliberate and load-bearing — the client advertises the
+/// server's clipboard to its own local apps (set_remote_clipboard) regardless
+/// of who holds input, so "copy on the server, walk over, paste on the
+/// laptop" works, and refusing inactive clients would break it.
+///
+/// What the openness costs is a bound: nothing stopped an approved-and-
+/// forgotten machine from polling continuously and receiving every clipboard
+/// the server ever owns, silently. A budget keeps every legitimate paste
+/// (which costs one fetch per mime type, a handful at most) while turning
+/// continuous exfiltration into something that is both slow and loud.
+const CLIPBOARD_FETCH_BURST: u32 = 30;
+const CLIPBOARD_FETCH_WINDOW: Duration = Duration::from_secs(60);
+
+/// One client's clipboard fetch budget over a sliding window.
+struct FetchBudget {
+    window_start: Instant,
+    fetches: u32,
+    /// Whether the throttle has already been reported for this window, so a
+    /// client that keeps hammering costs one log line, not thousands.
+    reported: bool,
+}
+
+impl FetchBudget {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_start: now,
+            fetches: 0,
+            reported: false,
+        }
+    }
+
+    /// Charges one fetch. Returns whether it is allowed, and whether this is
+    /// the first refusal of the current window (i.e. worth logging).
+    fn charge(&mut self, now: Instant) -> (bool, bool) {
+        if now.duration_since(self.window_start) >= CLIPBOARD_FETCH_WINDOW {
+            *self = Self::new(now);
+        }
+        if self.fetches < CLIPBOARD_FETCH_BURST {
+            self.fetches += 1;
+            return (true, false);
+        }
+        let first_refusal = !self.reported;
+        self.reported = true;
+        (false, first_refusal)
+    }
 }
 
 /// What a Rotation is built from: the handles it owns and the tuning modes
@@ -618,6 +673,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             resolve_cache: Arc::new(edge::ResolveCache::default()),
             edge_info_sent: HashMap::new(),
             last_diagnostics_refresh: None,
+            clipboard_fetch_budget: HashMap::new(),
         })
     }
 
@@ -1445,6 +1501,34 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         request_id: Option<u64>,
     ) -> Result<()> {
         debug!("Handling clipboard content request from source={} with max_size_bytes={} for requested type {}: have {:?}", request_source, max_size_bytes, requested_type, self.clipboard.target());
+
+        // Budget remote fetches (see CLIPBOARD_FETCH_BURST). Only remote ones:
+        // a local fetch is this machine's own user pasting, and rationing that
+        // would be rationing the server against itself.
+        if let ClipboardRequestSource::Remote(client) = &request_source {
+            let client = *client;
+            let (allowed, first_refusal) = self
+                .clipboard_fetch_budget
+                .entry(client)
+                .or_insert_with(|| FetchBudget::new(Instant::now()))
+                .charge(Instant::now());
+            if !allowed {
+                if first_refusal {
+                    warn!(
+                        "Client {} asked for more than {} clipboard fetches in {}s; throttling it. A paste costs a handful of fetches, so this is either a misbehaving clipboard manager or a machine reading this server's clipboard on a loop — if you don't recognize it, remove its certificate from known_certs/.",
+                        client,
+                        CLIPBOARD_FETCH_BURST,
+                        CLIPBOARD_FETCH_WINDOW.as_secs()
+                    );
+                }
+                // Empty reply, not a dropped request: the requester's paste
+                // then completes with nothing instead of waiting out its
+                // timeout, exactly as for any other unservable fetch.
+                self.fail_clipboard_fetch(request_source, requested_type, request_id)
+                    .await;
+                return Ok(());
+            }
+        }
 
         let target = match self.clipboard.target() {
             Some(c) => c,
@@ -2896,6 +2980,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         self.liveness.forget(endpoint);
         self.link_quality.remove(endpoint);
         self.edge_info_sent.remove(endpoint);
+        self.clipboard_fetch_budget.remove(endpoint);
         // Always refetch the idx to avoid issues if there was an await in which the client was
         // removed behind our back.
         if self.roster.remove(endpoint) {
@@ -3810,6 +3895,35 @@ mod tests {
         let clients = edge_client_entries(&[("10.0.0.1:9000", "aaaa1111")]);
         cache.refresh(Some(&map), &clients, &no_ips);
         assert_eq!(cache.edge_string(&clients[0].0), Some("right".to_string()));
+    }
+
+    /// The budget must be invisible to normal use — a paste costs one fetch
+    /// per mime type — while bounding a client that reads the clipboard on a
+    /// loop. See CLIPBOARD_FETCH_BURST for why refusing inactive clients
+    /// outright is not the answer.
+    #[test]
+    fn clipboard_fetch_budget_allows_pastes_and_bounds_polling() {
+        let now = Instant::now();
+        let mut budget = FetchBudget::new(now);
+        // A realistic paste: a handful of types, all served.
+        for i in 0..CLIPBOARD_FETCH_BURST {
+            let (allowed, reported) = budget.charge(now);
+            assert!(allowed, "fetch {} of the burst must be served", i);
+            assert!(!reported);
+        }
+        // Past the burst, refused — and reported exactly once, so a client
+        // hammering the socket costs one log line rather than thousands.
+        let (allowed, first_refusal) = budget.charge(now);
+        assert!(!allowed);
+        assert!(first_refusal);
+        let (allowed, first_refusal) = budget.charge(now);
+        assert!(!allowed);
+        assert!(!first_refusal, "the refusal must only be reported once");
+
+        // The window rolls over and the client is served again: this throttles
+        // exfiltration, it does not permanently cut a machine off.
+        let (allowed, _) = budget.charge(now + CLIPBOARD_FETCH_WINDOW);
+        assert!(allowed);
     }
 
     #[tokio::test]

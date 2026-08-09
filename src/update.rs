@@ -437,128 +437,163 @@ pub fn run(
         }
     }
 
-    // For a '--to' install: the target's version and the protocol it speaks,
-    // kept for the pin and the install summary.
-    let mut pinned: Option<(String, u64)> = None;
-    let latest = match to {
+    // Resolve what we would install and read everything the gates need
+    // STRAIGHT FROM GIT OBJECTS. No checkout happens until every gate has
+    // passed, so a refusal — for any reason — leaves the source checkout
+    // exactly as it was, rather than parked on a commit we just declined.
+    let current_base = CURRENT_REVISION.trim_end_matches("-dirty");
+    // (sha, short sha, human label for logs, whether it needs a checkout)
+    let (target_sha, latest, target_label, needs_checkout) = match to {
         Some(target) => {
             let sha = resolve_target(&src_dir, target)?;
             let short = git_output(&src_dir, &["rev-parse", "--short=12", &sha])?;
-            let manifest = git_output(&src_dir, &["show", &format!("{}:Cargo.toml", sha)])?;
-            let version = cargo_toml_version(&manifest)
-                .with_context(|| format!("No package version in Cargo.toml at {}", target))?;
-            let shared = git_output(&src_dir, &["show", &format!("{}:src/msgs/shared.rs", sha)])?;
-            let target_version = protocol_version_in(&shared)
-                .with_context(|| format!("Failed to read the protocol version of {}", target))?;
-            let current_base = CURRENT_REVISION.trim_end_matches("-dirty");
-            if !force && current_base != "unknown" && short == current_base {
-                info!(
-                    "monux is already at v{} ({}). Use --force to rebuild anyway.",
-                    version, CURRENT_REVISION
-                );
-                return Ok(UpdateStatus::AlreadyCurrent);
-            }
-            // The update gate, on the resolved target: a client never
-            // installs a build its server couldn't pair with (see
-            // pair_works). Read from git objects above, before touching the
-            // checkout — a refusal leaves it exactly as it was.
-            if !force {
-                if let Some(server_version) = protocol_constraint {
-                    if let Err(e) = check_to_gate(&version, &short, target_version, server_version) {
-                        info!("{:#}", e);
-                        return Ok(UpdateStatus::SkippedIncompatible);
-                    }
-                }
-            }
-            info!("Checking out v{} ({})...", version, short);
-            git(&src_dir, &["checkout", &sha])?;
-            info!(
-                "Installing monux v{} ({}): the current build is {}",
-                version, short, CURRENT_REVISION
-            );
-            pinned = Some((version, target_version));
-            short
+            (sha, short, target.to_string(), true)
         }
-        None => {
+        None if signing_configured() => {
             // With signing configured the target is the newest RELEASE TAG,
             // not the branch head: a signed tag is the only thing the gate
             // below will accept, so aiming anywhere else guarantees a refusal
             // after a full checkout. This is also what the daily check
             // reported (latest_remote_sha), so the two agree on what "an
             // update is available" means.
-            let latest = if signing_configured() {
-                let (tag, sha) = newest_local_release(&src_dir)?;
-                let short = git_output(&src_dir, &["rev-parse", "--short=12", &sha])?;
-                if short != CURRENT_REVISION.trim_end_matches("-dirty") {
-                    info!("Newest published release: {} ({})", tag, short);
-                    git(&src_dir, &["checkout", &sha])?;
-                }
-                short
-            } else {
-                git_output(&src_dir, &["rev-parse", "--short=12", "HEAD"])?
-            };
-            let current_base = CURRENT_REVISION.trim_end_matches("-dirty");
-            if !force && current_base != "unknown" && latest == current_base {
-                info!(
-                    "monux is already up to date ({}). Use --force to rebuild anyway.",
-                    CURRENT_REVISION
-                );
-                return Ok(UpdateStatus::AlreadyCurrent);
-            }
-            // A rewound/force-pushed master: HEAD differs from our build's
-            // commit but doesn't descend from it, so installing it would be
-            // a downgrade (is_newer_remote's inequality alone can't tell).
-            // Refuse as not-newer; --force overrides.
-            if !force
-                && current_base != "unknown"
-                && !current_base.is_empty()
-                && is_rewound_remote(&src_dir, current_base)
-            {
-                info!(
-                    "Not updating to {}: the remote HEAD is not a descendant of this build's commit ({}) — master was likely rewound or force-pushed, so the update would be a downgrade. Use --force to override.",
-                    latest, CURRENT_REVISION
-                );
-                return Ok(UpdateStatus::AlreadyCurrent);
-            }
-
-            // The update gate: a client never installs a build its server
-            // couldn't pair with. Since protocol v16 pairs negotiate
-            // (connecting at the lower version), the gate accepts any
-            // negotiation-era pair; a pre-negotiation server still demands
-            // an exact match (see pair_works). Checked from the pulled
-            // source, before the expensive build.
-            if !force {
-                if let Some(server_version) = protocol_constraint {
-                    let source_version = source_protocol_version(&src_dir)?;
-                    if !pair_works(source_version, server_version) {
-                        let remedy = if source_version > server_version {
-                            "Update the server first"
-                        } else {
-                            "Downgrade the server first"
-                        };
-                        info!(
-                            "Not updating to {}: it speaks protocol v{}, but the server speaks v{} — the pair couldn't negotiate a common protocol. {}; this gate opens automatically once this client reconnects to it (or use --force to override).",
-                            latest, source_version, server_version, remedy
-                        );
-                        return Ok(UpdateStatus::SkippedIncompatible);
-                    }
-                }
-            }
-            info!("Updating monux: {} -> {}", CURRENT_REVISION, latest);
-            latest
+            let (tag, sha) = newest_local_release(&src_dir)?;
+            let short = git_output(&src_dir, &["rev-parse", "--short=12", &sha])?;
+            (sha, short, tag, true)
+        }
+        None => {
+            let sha = git_output(&src_dir, &["rev-parse", "HEAD"])?;
+            let short = git_output(&src_dir, &["rev-parse", "--short=12", "HEAD"])?;
+            (sha, short, "HEAD".to_string(), false)
         }
     };
 
-    // Signature gate, immediately before the expensive build and after the
-    // checkout is on the target commit. `--force` does NOT bypass it: force
-    // is about rebuilding and about the protocol gate, never about running
-    // code we can't attribute.
-    match check_release_signature(&src_dir, &latest, trust) {
+    // The target's declared version and protocol, both read from git objects.
+    let manifest = git_output(&src_dir, &["show", &format!("{}:Cargo.toml", target_sha)])?;
+    let target_crate_version = cargo_toml_version(&manifest)
+        .with_context(|| format!("No package version in Cargo.toml at {}", target_label))?;
+    let shared = git_output(
+        &src_dir,
+        &["show", &format!("{}:src/msgs/shared.rs", target_sha)],
+    )?;
+    let target_protocol = protocol_version_in(&shared)
+        .with_context(|| format!("Failed to read the protocol version of {}", target_label))?;
+
+    if !force && current_base != "unknown" && latest == current_base {
+        // Named for a '--to', which asked for a specific version and deserves
+        // to be told it already has it; generic otherwise.
+        match to {
+            Some(_) => info!(
+                "monux is already at v{} ({}). Use --force to rebuild anyway.",
+                target_crate_version, CURRENT_REVISION
+            ),
+            None => info!(
+                "monux is already up to date ({}). Use --force to rebuild anyway.",
+                CURRENT_REVISION
+            ),
+        }
+        return Ok(UpdateStatus::AlreadyCurrent);
+    }
+
+    // Downgrade guard. '--to' is exempt: naming a version IS the request to
+    // install that version, downgrades included (that's --rollback).
+    if !force && to.is_none() {
+        if signing_configured() {
+            // Compare VERSIONS, not git ancestry. Ancestry can't answer here:
+            // is_ancestor_of_head returns None whenever the running build's
+            // commit isn't in the checkout, which is the normal case for the
+            // --depth 1 clone this path uses, and None was treated as "assume
+            // a normal update". That left a fresh clone willing to install any
+            // older signed release someone served as "newest" — the signature
+            // still holds, but a known-vulnerable past release satisfies it.
+            // A version comparison is a total order and needs no history.
+            match (
+                crate::config::parse_version(&target_crate_version),
+                crate::config::parse_version(env!("CARGO_PKG_VERSION")),
+            ) {
+                (Some(target), Some(running)) if target < running => {
+                    info!(
+                        "Not updating to {} (v{}): this build is v{}, so that would be a downgrade. Use --force to override, or 'monux update --to {}' to install it deliberately.",
+                        latest, target_crate_version, env!("CARGO_PKG_VERSION"), target_crate_version
+                    );
+                    return Ok(UpdateStatus::AlreadyCurrent);
+                }
+                (None, _) | (_, None) => {
+                    // An unparseable version on either side: fall through
+                    // rather than refuse, so a malformed manifest can't wedge
+                    // updates entirely. The signature gate still applies.
+                    debug!(
+                        "Could not compare versions ({} vs {}); skipping the downgrade check",
+                        target_crate_version,
+                        env!("CARGO_PKG_VERSION")
+                    );
+                }
+                _ => {}
+            }
+        } else if current_base != "unknown"
+            && !current_base.is_empty()
+            && is_rewound_remote(&src_dir, current_base)
+        {
+            // No signing key, so the target is the branch head and there are
+            // no version tags to compare: fall back to ancestry, which does
+            // answer the question this path actually faces (master rewound or
+            // force-pushed under us).
+            info!(
+                "Not updating to {}: the remote HEAD is not a descendant of this build's commit ({}) — master was likely rewound or force-pushed, so the update would be a downgrade. Use --force to override.",
+                latest, CURRENT_REVISION
+            );
+            return Ok(UpdateStatus::AlreadyCurrent);
+        }
+    }
+
+    // The update gate: a client never installs a build its server couldn't
+    // pair with. Since protocol v16 pairs negotiate (connecting at the lower
+    // version), the gate accepts any negotiation-era pair; a pre-negotiation
+    // server still demands an exact match (see pair_works).
+    if !force {
+        if let Some(server_version) = protocol_constraint {
+            if let Err(e) = check_to_gate(
+                &target_crate_version,
+                &latest,
+                target_protocol,
+                server_version,
+            ) {
+                info!("{:#}", e);
+                return Ok(UpdateStatus::SkippedIncompatible);
+            }
+        }
+    }
+
+    // Signature gate, before the checkout and the expensive build. `--force`
+    // does NOT bypass it: force is about rebuilding and about the protocol
+    // gate, never about running code we can't attribute. It reads tag objects
+    // (git tag --points-at / verify-tag), so it needs no working tree — which
+    // is what lets it run before the checkout rather than after it.
+    match check_release_signature(&src_dir, &target_sha, trust) {
         SignatureGate::Proceed => {}
         SignatureGate::Refuse(reason) => {
             info!("{}", reason);
             return Ok(UpdateStatus::SkippedUnverified);
         }
+    }
+
+    // Every gate passed: now move the checkout onto the target.
+    if needs_checkout {
+        info!("Checking out v{} ({})...", target_crate_version, latest);
+        git(&src_dir, &["checkout", &target_sha])?;
+    }
+    // A '--to' install pins auto-update at the version it just placed.
+    let pinned: Option<(String, u64)> = to.map(|_| (target_crate_version.clone(), target_protocol));
+    match &pinned {
+        Some(_) => info!(
+            "Installing monux v{} ({}): the current build is {}",
+            target_crate_version, latest, CURRENT_REVISION
+        ),
+        // Names the target too: with signing configured that is the release
+        // tag being installed, which the old flow logged separately.
+        None => info!(
+            "Updating monux: {} -> {} ({})",
+            CURRENT_REVISION, latest, target_label
+        ),
     }
 
     let root = install_root();
@@ -776,15 +811,6 @@ fn acquire_update_lock(src_dir: &Path) -> Result<UpdateLock> {
         }
     }
     Ok(UpdateLock { _file: file })
-}
-
-/// Reads the protocol version a source checkout speaks, straight from its
-/// shared.rs — no build needed.
-fn source_protocol_version(src_dir: &Path) -> Result<u64> {
-    let shared_rs = src_dir.join("src").join("msgs").join("shared.rs");
-    let text = std::fs::read_to_string(&shared_rs)
-        .with_context(|| format!("Failed to read {}", shared_rs.display()))?;
-    protocol_version_in(&text).with_context(|| format!("in {}", shared_rs.display()))
 }
 
 /// Parses PROTOCOL_VERSION out of shared.rs content.
@@ -1584,10 +1610,17 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/before-the-rewrite
     #[test]
     fn parses_own_source_protocol_version() {
         // Guards the gate against repo layout drift: the parser must find the
-        // constant this very binary was built with.
-        let own = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // constant this very binary was built with. The gate now reads
+        // shared.rs out of a git object rather than the working tree (so it
+        // can run before the checkout), but it is the same parser, and this
+        // file is the one whose format it has to keep matching.
+        let shared_rs = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("msgs")
+            .join("shared.rs");
+        let text = std::fs::read_to_string(&shared_rs).unwrap();
         assert_eq!(
-            source_protocol_version(own).unwrap(),
+            protocol_version_in(&text).unwrap(),
             crate::msgs::shared::PROTOCOL_VERSION
         );
     }

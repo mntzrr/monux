@@ -27,6 +27,14 @@ const PROMPT_TIMEOUT_SECS: u64 = 60;
 /// for this long instead of re-prompting on every automatic retry.
 const REJECTION_COOLDOWN_SECS: u64 = 60;
 
+/// First global pause after an unanswered prompt, doubling per consecutive
+/// unanswered prompt up to GLOBAL_PROMPT_BACKOFF_MAX (see
+/// ApprovalState::prompt_backoff_until). Short enough that a user who walked
+/// away mid-pairing just retries; steep enough that a peer minting fresh
+/// certs stops being able to occupy the console.
+const GLOBAL_PROMPT_BACKOFF_BASE: Duration = Duration::from_secs(15);
+const GLOBAL_PROMPT_BACKOFF_MAX: Duration = Duration::from_secs(15 * 60);
+
 pub fn rustls_client_config(
     verifier: Arc<MonuxCertVerification<'static>>,
 ) -> Result<Arc<dyn quinn::crypto::ClientConfig>> {
@@ -97,6 +105,19 @@ struct ApprovalState {
     /// every few seconds, and without this every attempt would retrigger the
     /// prompt.
     rejection_cooldowns: HashMap<String, Instant>,
+    /// Earliest time ANY new fingerprint may raise a prompt (see
+    /// GLOBAL_PROMPT_BACKOFF_BASE). The per-fingerprint cooldown above is the
+    /// wrong granularity to stop repetition, because minting a fresh
+    /// self-signed cert is free: an unauthenticated peer could raise a new
+    /// prompt every PROMPT_TIMEOUT_SECS forever, holding the single prompt
+    /// slot and burying the console — pre-authentication, from anyone who can
+    /// reach the port.
+    prompt_backoff_until: Option<Instant>,
+    /// Consecutive prompts that went unanswered (declined or timed out),
+    /// driving the backoff above. Reset the moment a prompt IS answered with
+    /// an approval: a user who is actually pairing must not be made to wait
+    /// out an attacker's accumulated penalty.
+    unanswered_prompts: u32,
 }
 
 #[derive(Debug)]
@@ -131,6 +152,9 @@ pub struct MonuxCertVerification<'a> {
     /// How long a declined/timed-out fingerprint is rejected silently before
     /// we may prompt for it again. Injectable for tests.
     rejection_cooldown: Duration,
+    /// Base of the global prompt backoff (see GLOBAL_PROMPT_BACKOFF_BASE).
+    /// Injectable for the same reason as rejection_cooldown.
+    global_backoff_base: Duration,
     /// Stdin-TTY check, injectable so tests can exercise the prompt path.
     stdin_is_tty: fn() -> bool,
     /// Prompt-thread spawner, injectable so tests can observe spawns without
@@ -210,12 +234,15 @@ impl<'a> MonuxCertVerification<'a> {
                 known_certs: certs::load_known_certs(config_dir)?,
                 prompt_active: false,
                 rejection_cooldowns: HashMap::new(),
+                prompt_backoff_until: None,
+                unanswered_prompts: 0,
             })),
             allow_interactive_prompts,
             discovered_server_name: Mutex::new(None),
             peer_fingerprint: Mutex::new(None),
             crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
             rejection_cooldown: Duration::from_secs(REJECTION_COOLDOWN_SECS),
+            global_backoff_base: GLOBAL_PROMPT_BACKOFF_BASE,
             stdin_is_tty: default_stdin_is_tty,
             prompt_spawner: spawn_prompt_thread,
         }))
@@ -289,6 +316,11 @@ impl<'a> MonuxCertVerification<'a> {
                     their_name,
                     their_cert_fingerprint
                 ),
+                PromptDecision::Backoff => bail!(
+                    "{}: {} cert rejected for now, approval prompts are paused after recent unanswered ones",
+                    APPROVAL_PENDING_SENTINEL,
+                    their_name
+                ),
                 PromptDecision::Prompt => {
                     // Claim the prompt slot under the lock, so a concurrent
                     // verification sees Pending instead of double-spawning.
@@ -309,6 +341,7 @@ impl<'a> MonuxCertVerification<'a> {
                 .and_then(|slot| slot.clone()),
             config_dir: self.config_dir.clone(),
             rejection_cooldown: self.rejection_cooldown,
+            global_backoff_base: self.global_backoff_base,
             approval_state: Arc::clone(&self.approval_state),
         });
         info!(
@@ -368,11 +401,20 @@ enum PromptDecision {
     /// re-prompting until the cooldown lapses, so rapid automatic retries
     /// don't spam the console.
     Cooldown,
+    /// Recent prompts went unanswered, so prompting is globally paused for a
+    /// growing interval — including for fingerprints never seen before, which
+    /// is the whole point (see ApprovalState::prompt_backoff_until).
+    Backoff,
 }
 
 fn prompt_decision(state: &ApprovalState, fingerprint: &str, now: Instant) -> PromptDecision {
     if state.prompt_active {
         return PromptDecision::Pending;
+    }
+    // The global backoff is checked before the per-fingerprint cooldown: it
+    // exists precisely for fingerprints that have never been seen before.
+    if matches!(state.prompt_backoff_until, Some(until) if now < until) {
+        return PromptDecision::Backoff;
     }
     match state.rejection_cooldowns.get(fingerprint) {
         Some(until) if now < *until => PromptDecision::Cooldown,
@@ -380,17 +422,54 @@ fn prompt_decision(state: &ApprovalState, fingerprint: &str, now: Instant) -> Pr
     }
 }
 
+/// The global pause owed after `unanswered` consecutive unanswered prompts:
+/// `base` doubling per repeat, capped (see GLOBAL_PROMPT_BACKOFF_BASE).
+/// `base` is a parameter for the same reason rejection_cooldown is — so tests
+/// can exercise the real path without waiting out a production interval.
+fn global_backoff(unanswered: u32, base: Duration) -> Duration {
+    if unanswered == 0 {
+        return Duration::ZERO;
+    }
+    // Shift on u32 and saturate: an attacker can keep this counter climbing
+    // indefinitely, and 1u32 << 32 is undefined-ish (a debug panic).
+    let doublings = (unanswered - 1).min(20);
+    base.saturating_mul(1u32 << doublings)
+        .min(GLOBAL_PROMPT_BACKOFF_MAX)
+}
+
 /// Records a prompt approval: the cert becomes known immediately, so the
-/// peer's automatic retry passes the known-certs check.
+/// peer's automatic retry passes the known-certs check. A real answer also
+/// clears the global backoff — the user is at the console pairing, which is
+/// the situation the backoff must never obstruct.
 fn record_approval(state: &mut ApprovalState, cert: rustls_pki_types::CertificateDer<'static>) {
     state.known_certs.push(cert);
+    state.unanswered_prompts = 0;
+    state.prompt_backoff_until = None;
 }
 
 /// Records a prompt rejection/timeout: reject this fingerprint without
-/// re-prompting until the cooldown lapses. Also prunes lapsed entries.
-fn record_rejection(state: &mut ApprovalState, fingerprint: String, now: Instant, cooldown: Duration) {
+/// re-prompting until the cooldown lapses, and pause prompting GLOBALLY for a
+/// growing interval so a peer minting fresh certificates cannot re-raise the
+/// prompt indefinitely. Also prunes lapsed entries.
+fn record_rejection(
+    state: &mut ApprovalState,
+    fingerprint: String,
+    now: Instant,
+    cooldown: Duration,
+    backoff_base: Duration,
+) {
     state.rejection_cooldowns.retain(|_, until| *until > now);
     state.rejection_cooldowns.insert(fingerprint, now + cooldown);
+    state.unanswered_prompts = state.unanswered_prompts.saturating_add(1);
+    let backoff = global_backoff(state.unanswered_prompts, backoff_base);
+    state.prompt_backoff_until = Some(now + backoff);
+    if state.unanswered_prompts > 1 {
+        warn!(
+            "{} approval prompts in a row went unanswered; pausing new approval prompts for {}s. If you are not expecting to pair a machine, something on this network is repeatedly asking to.",
+            state.unanswered_prompts,
+            backoff.as_secs()
+        );
+    }
 }
 
 /// Everything the approval prompt thread needs, bundled so the spawn step is
@@ -401,6 +480,7 @@ struct PromptJob {
     discovered_server_name: Option<String>,
     config_dir: PathBuf,
     rejection_cooldown: Duration,
+    global_backoff_base: Duration,
     approval_state: Arc<RwLock<ApprovalState>>,
 }
 
@@ -460,6 +540,7 @@ fn prompt_thread_main(job: PromptJob) {
             their_cert_fingerprint,
             Instant::now(),
             job.rejection_cooldown,
+            job.global_backoff_base,
         );
     }
 }
@@ -648,26 +729,47 @@ fn prompt_yn(msg: &str, default: bool) -> bool {
 }
 
 fn prompt_internal(msg: &str) -> Result<u8> {
-    // Use nonblock to allow timeout on stdin.
-    // Could try to use async, but Tokio docs don't recommend it in this context.
-    let mut stdin = nonblock::NonBlockingReader::from_fd(io::stdin())
-        .context("Failed to set up nonblocking reader for stdin")?;
+    // Read the answer from our OWN open file description on the controlling
+    // terminal, never from fd 0.
+    //
+    // nonblock sets O_NONBLOCK on the descriptor it is handed and never
+    // restores it (it has no Drop, and into_blocking is not on this path).
+    // O_NONBLOCK lives on the open file DESCRIPTION, not the descriptor — and
+    // when monux runs in a foreground terminal, fd 0 is the very same
+    // description the invoking shell holds. Setting the flag there mutated the
+    // user's shell, outlived the daemon, and left it failing reads with EAGAIN
+    // ("bash: read error: 0: Resource temporarily unavailable"). The is_terminal
+    // guard on this path made that certain rather than unlikely: it fires only
+    // when the description IS a live shared terminal.
+    //
+    // Opening /dev/tty gives us a fresh description, so the flag is ours alone
+    // and dies with the File at the end of this function. It also means the
+    // prompt still works when stdin is redirected but a terminal is attached.
+    let tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .context("Failed to open /dev/tty for the approval prompt")?;
+    let mut prompt_out = tty
+        .try_clone()
+        .context("Failed to duplicate /dev/tty for prompt output")?;
+    let mut tty_in = nonblock::NonBlockingReader::from_fd(tty)
+        .context("Failed to set up nonblocking reader for /dev/tty")?;
 
     // Flush any preceding input before prompt
     {
         let mut discard = vec![];
-        stdin
+        tty_in
             .read_available(&mut discard)
             .context("Failed to flush initial input")?;
     }
 
-    // Send the prompt
-    let msg_formatted = msg.to_string();
-    let mut stdout = io::stdout();
-    stdout
-        .write_all(msg_formatted.as_bytes())
-        .context("Failed to write prompt to stdout")?;
-    stdout.flush().context("Failed to flush stdout")?;
+    // Send the prompt to the terminal itself, so it is visible even when the
+    // daemon's stdout is redirected to a log file.
+    prompt_out
+        .write_all(msg.as_bytes())
+        .context("Failed to write prompt to the terminal")?;
+    prompt_out.flush().context("Failed to flush the prompt")?;
 
     // Wait for first char, or time out. Use blocking APIs.
     let end_at = Instant::now()
@@ -676,7 +778,7 @@ fn prompt_internal(msg: &str) -> Result<u8> {
     let mut content = vec![];
     loop {
         thread::sleep(Duration::from_millis(50));
-        stdin
+        tty_in
             .read_available(&mut content)
             .context("Failed to check for user input")?;
 
@@ -687,7 +789,7 @@ fn prompt_internal(msg: &str) -> Result<u8> {
 
         // Still nothing, check for timeout
         if Instant::now() >= end_at {
-            println!();
+            let _ = prompt_out.write_all(b"\n");
             bail!("Prompt timed out after {}s", PROMPT_TIMEOUT_SECS)
         }
     }
@@ -725,6 +827,8 @@ mod tests {
             known_certs: vec![],
             prompt_active: false,
             rejection_cooldowns: HashMap::new(),
+            prompt_backoff_until: None,
+            unanswered_prompts: 0,
         }
     }
 
@@ -830,6 +934,10 @@ mod tests {
             v.stdin_is_tty = tty_yes;
             v.prompt_spawner = count_cooldown_spawn;
             v.rejection_cooldown = Duration::from_millis(50);
+            // No global backoff: it has its own tests, and leaving any here
+            // would short-circuit the per-fingerprint cooldown under test
+            // (the retry below is immediate).
+            v.global_backoff_base = Duration::ZERO;
         }
         let their_cert = peer_cert(peer_dir.path());
         let their_fingerprint = certs::fingerprint(&their_cert);
@@ -848,6 +956,7 @@ mod tests {
                 their_fingerprint,
                 Instant::now(),
                 verifier.rejection_cooldown,
+                verifier.global_backoff_base,
             );
             state.prompt_active = false;
         }
@@ -905,6 +1014,66 @@ mod tests {
         assert!(handle.join().is_err());
         // The guard ran during unwinding and tolerated the poisoned lock.
         assert!(!state.read().unwrap_or_else(|e| e.into_inner()).prompt_active);
+    }
+
+    /// The attack the global backoff exists for: minting a fresh self-signed
+    /// certificate is free, so a per-FINGERPRINT cooldown alone let an
+    /// unauthenticated peer raise a brand-new prompt every time one lapsed,
+    /// holding the single prompt slot and burying the console indefinitely.
+    /// A never-before-seen fingerprint must be refused while the backoff runs.
+    #[test]
+    fn a_fresh_fingerprint_cannot_reprompt_during_the_global_backoff() {
+        let mut state = empty_state();
+        let now = Instant::now();
+        let cooldown = Duration::from_secs(60);
+        let base = Duration::from_secs(15);
+
+        // One prompt goes unanswered.
+        record_rejection(&mut state, "fp-1".to_string(), now, cooldown, base);
+        // The attacker's NEXT certificate is a fingerprint we have never seen,
+        // so no per-fingerprint cooldown applies to it — only the global one.
+        assert_eq!(
+            prompt_decision(&state, "fp-2-brand-new", now + Duration::from_secs(1)),
+            PromptDecision::Backoff
+        );
+        // Once it lapses, prompting resumes.
+        assert_eq!(
+            prompt_decision(&state, "fp-2-brand-new", now + base + Duration::from_secs(1)),
+            PromptDecision::Prompt
+        );
+    }
+
+    #[test]
+    fn the_global_backoff_doubles_and_caps() {
+        let base = Duration::from_secs(15);
+        assert_eq!(global_backoff(0, base), Duration::ZERO);
+        assert_eq!(global_backoff(1, base), base);
+        assert_eq!(global_backoff(2, base), base * 2);
+        assert_eq!(global_backoff(3, base), base * 4);
+        // Capped, and a persistent attacker can't shift-overflow it.
+        assert_eq!(global_backoff(50, base), GLOBAL_PROMPT_BACKOFF_MAX);
+        assert_eq!(global_backoff(u32::MAX, base), GLOBAL_PROMPT_BACKOFF_MAX);
+    }
+
+    /// A user who is genuinely pairing must never be made to sit out a
+    /// penalty someone else's traffic accumulated: an approval resets it.
+    #[test]
+    fn approving_clears_the_global_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = empty_state();
+        let now = Instant::now();
+        record_rejection(&mut state, "fp-1".to_string(), now, Duration::from_secs(60), Duration::from_secs(15));
+        record_rejection(&mut state, "fp-2".to_string(), now, Duration::from_secs(60), Duration::from_secs(15));
+        assert_eq!(state.unanswered_prompts, 2);
+        assert!(state.prompt_backoff_until.is_some());
+
+        record_approval(&mut state, peer_cert(dir.path()));
+        assert_eq!(state.unanswered_prompts, 0);
+        assert!(state.prompt_backoff_until.is_none());
+        assert_eq!(
+            prompt_decision(&state, "fp-3", now + Duration::from_secs(1)),
+            PromptDecision::Prompt
+        );
     }
 
     #[test]
@@ -1023,6 +1192,9 @@ mod tests {
                 certs::fingerprint(&their_cert),
                 Instant::now(),
                 Duration::from_secs(60),
+                // No global backoff, so this exercises the per-fingerprint
+                // cooldown branch rather than being short-circuited by it.
+                Duration::ZERO,
             );
             state.prompt_active = false;
         }
