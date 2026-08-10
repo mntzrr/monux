@@ -322,6 +322,22 @@ fn protocol_version_of(properties: &TxtProperties) -> Option<u64> {
 /// Extracts a server's advertised certificate fingerprint from its mDNS TXT
 /// properties: `None` when the property is absent (servers predate the
 /// advertisement) — "no information", never an error.
+/// Whether an advertisement carries the certificate fingerprint of a server
+/// this client already trusts. An absent `fp` property is not trusted: the
+/// point is attribution, and an advertisement that declines to identify itself
+/// has none.
+fn is_remembered(
+    properties: &TxtProperties,
+    remembered: &[crate::known_servers::RememberedServer],
+) -> bool {
+    match fingerprint_of(properties) {
+        Some(fp) => remembered
+            .iter()
+            .any(|server| server.fingerprint.eq_ignore_ascii_case(&fp)),
+        None => false,
+    }
+}
+
 fn fingerprint_of(properties: &TxtProperties) -> Option<String> {
     properties
         .get_property_val_str(FINGERPRINT_PROPERTY)
@@ -339,16 +355,32 @@ pub fn protocol_version_constraint(discovered: &[u64]) -> Option<u64> {
 /// by Monux servers on the LAN, for the update gate in `monux update` — which
 /// runs before the tokio runtime exists, hence the blocking API. Best-effort
 /// within a short timeout; servers without the property are skipped.
-pub fn discover_server_protocol_versions() -> Result<Vec<u64>> {
+///
+/// Only advertisements attributable to an already-trusted server count (see
+/// collect_server_protocol_versions): the gate decides whether this machine
+/// may install a security fix, and advertising on the LAN takes no
+/// credentials at all.
+pub fn discover_server_protocol_versions(
+    remembered: &[crate::known_servers::RememberedServer],
+) -> Result<Vec<u64>> {
     let daemon = ServiceDaemon::new().context("Failed to create mDNS daemon")?;
-    let versions = collect_server_protocol_versions(&daemon);
+    let versions = collect_server_protocol_versions(&daemon, remembered);
     if let Err(e) = daemon.shutdown() {
         debug!("Failed to shutdown mDNS daemon: {}", e);
     }
     versions
 }
 
-fn collect_server_protocol_versions(daemon: &ServiceDaemon) -> Result<Vec<u64>> {
+/// Advertisements are only counted when their `fp` property matches a server
+/// this client has already paired with. Without that check any host on the
+/// LAN can publish `pv=15`, and because the gate takes the MINIMUM across
+/// everything discovered — and persists it — a single unauthenticated record
+/// pins the machine below the negotiation floor and silently skips every
+/// update, including the one that would fix it.
+fn collect_server_protocol_versions(
+    daemon: &ServiceDaemon,
+    remembered: &[crate::known_servers::RememberedServer],
+) -> Result<Vec<u64>> {
     let receiver = daemon
         .browse(SERVICE_TYPE)
         .context("Failed to browse for Monux servers")?;
@@ -380,6 +412,12 @@ fn collect_server_protocol_versions(daemon: &ServiceDaemon) -> Result<Vec<u64>> 
                             debug!(
                                 "Ignoring our own mDNS advertisement of protocol v{} for the update gate",
                                 version
+                            );
+                        } else if !is_remembered(resolved.get_properties(), remembered) {
+                            debug!(
+                                "Ignoring protocol v{} from {}: it is not a server this machine has paired with",
+                                version,
+                                resolved.get_fullname()
                             );
                         } else {
                             debug!(
@@ -598,6 +636,38 @@ mod tests {
         // No property (a pre-advertisement server): no information.
         let empty = HashMap::<String, String>::new().into_txt_properties();
         assert_eq!(fingerprint_of(&empty), None);
+    }
+
+    /// The update gate may only be moved by servers this machine has actually
+    /// paired with: advertising on the LAN takes no credentials, and the gate
+    /// decides whether a security fix gets installed.
+    #[test]
+    fn only_a_remembered_server_can_move_the_update_gate() {
+        use mdns_sd::IntoTxtProperties;
+        let remembered = vec![crate::known_servers::RememberedServer {
+            addr: "10.0.0.5:1213".parse().unwrap(),
+            fingerprint: "aabbccdd".to_string(),
+            hostname: Some("desk".to_string()),
+            last_connected: 0,
+        }];
+
+        let ours =
+            HashMap::from([("fp".to_string(), "aabbccdd".to_string())]).into_txt_properties();
+        assert!(is_remembered(&ours, &remembered));
+        // Fingerprints are stored lowercase but the wire form is a hint only.
+        let shouty =
+            HashMap::from([("fp".to_string(), "AABBCCDD".to_string())]).into_txt_properties();
+        assert!(is_remembered(&shouty, &remembered));
+
+        // A stranger on the LAN — the whole attack.
+        let stranger =
+            HashMap::from([("fp".to_string(), "deadbeef".to_string())]).into_txt_properties();
+        assert!(!is_remembered(&stranger, &remembered));
+        // An advertisement that declines to identify itself has no standing.
+        let anonymous = HashMap::<String, String>::new().into_txt_properties();
+        assert!(!is_remembered(&anonymous, &remembered));
+        // Nothing paired yet: nothing can gate.
+        assert!(!is_remembered(&ours, &[]));
     }
 
     #[test]

@@ -294,6 +294,15 @@ pub(crate) fn run_cursor_poller(socket: Arc<Mutex<PathBuf>>, pos_tx: mpsc::Unbou
                     "Screen-edge cursor poll failed ({:#}), retrying in {:?}",
                     e, POLL_FAILURE_BACKOFF
                 );
+                // A failed send is the usual way out, but a poller whose
+                // queries never succeed again never gets to send: with the
+                // compositor gone for good (the session ended under a
+                // still-running daemon) this thread used to retry every
+                // POLL_FAILURE_BACKOFF for the rest of the process's life,
+                // long after the manager that reads it had returned.
+                if pos_tx.is_closed() {
+                    return;
+                }
                 if let Some(rebound) = rebound_hyprland_socket(&path) {
                     info!(
                         "Screen-edge switching following the new Hyprland instance at {}",
@@ -447,6 +456,32 @@ mod tests {
         // Outputs left of/above the layout origin report negatives.
         assert_eq!(parse_cursorpos("-100, -200").unwrap(), (-100, -200));
         assert_eq!(parse_cursorpos("3440,160\n").unwrap(), (3440, 160));
+    }
+
+    #[test]
+    fn the_cursor_poller_gives_up_when_the_manager_is_gone() {
+        // The manager has returned (its receiver is dropped) while every
+        // query fails — the state a daemon outliving its graphical session
+        // sits in. The Ok arm's failed send is unreachable there, so only
+        // the failure path's own check ends the thread.
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = Arc::new(Mutex::new(tmp.path().join("nothing-listens-here.sock")));
+        let (pos_tx, pos_rx) = mpsc::unbounded_channel();
+        drop(pos_rx);
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            run_cursor_poller(socket, pos_tx);
+            let _ = done_tx.send(());
+        });
+        // The deadline is under one backoff on purpose: the poller must be
+        // out before its first retry sleep. A generous one would pass on a
+        // machine that does have Hyprland, where the rebound finds the live
+        // instance and the second iteration's failed send ends the thread
+        // anyway — the very escape a Hyprland-less machine never gets.
+        done_rx
+            .recv_timeout(POLL_FAILURE_BACKOFF / 2)
+            .expect("the poller returns instead of retrying a dead socket forever");
     }
 
     #[test]

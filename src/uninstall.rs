@@ -24,6 +24,7 @@
 //! The `input` group membership is deliberately left alone (it may predate
 //! monux or be used by other software); a hint with the undo command is printed.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -77,6 +78,43 @@ fn monux_rule_handles(nft_list_output: &str) -> Vec<u64> {
                 .and_then(|(_, handle)| handle.trim().parse().ok())
         })
         .collect()
+}
+
+/// The source prefix of our policy routing rule in `ip rule show` output, when
+/// the rule sitting at our priority really is the one setup added
+/// (`ip rule add from <hotspot subnet> lookup main priority 32763`).
+///
+/// INVARIANT: teardown never deletes a rule it cannot identify as ours.
+/// `ip rule del priority N` carries no other selector, so the kernel deletes
+/// whichever rule happens to sit at that pref — and this priority was picked
+/// to slot in next to Mullvad's own rules, i.e. precisely where other VPN and
+/// split-tunnel software puts theirs. The hotspot's AP interface is long gone
+/// by uninstall time, so the 10.42/16 source and the main-table lookup are the
+/// only evidence left that the rule was ours; matching them lets teardown
+/// delete by the full selector, which a foreign rule cannot match.
+fn hotspot_policy_rule_source(ip_rule_show_output: &str) -> Option<String> {
+    let prefix = format!("{}:", VPN_WORKAROUND_RULE_PRIORITY);
+    ip_rule_show_output.lines().find_map(|line| {
+        // "32763:\tfrom 10.42.0.0/24 lookup main", plus a trailing "proto ..."
+        // on the iproute2 versions that print one.
+        let tokens: Vec<&str> = line
+            .trim()
+            .strip_prefix(&prefix)?
+            .split_whitespace()
+            .collect();
+        if tokens.first() != Some(&"from") {
+            return None;
+        }
+        let routed_to_main = tokens
+            .windows(2)
+            .any(|pair| pair[0] == "lookup" && pair[1] == "main");
+        // The AP always carried a static 10.42.x.1/24 address, so the rule
+        // setup derived from it always sourced from 10.42/16.
+        tokens
+            .get(1)
+            .filter(|source| routed_to_main && source.starts_with("10.42."))
+            .map(|source| source.to_string())
+    })
 }
 
 /// Runs the uninstall. Best-effort throughout: individual failures downgrade
@@ -273,7 +311,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 fn execute(plan: &Plan) {
-    remove_root_owned(&plan.root_owned);
+    remove_root_owned(&plan.root_owned, &mut sudo_status);
     remove_qos_marking();
     remove_hotspot_profile();
     remove_autostart_units(&plan.autostart_unit_dir, &mut systemctl_user);
@@ -321,40 +359,47 @@ fn execute(plan: &Plan) {
 
 /// Removes root-owned paths via sudo subprocesses (sudo prompts inline).
 /// A failure downgrades to a manual-removal hint; the rest of the uninstall
-/// continues regardless.
-fn remove_root_owned(paths: &[PathBuf]) {
+/// continues regardless. The sudo runner is a seam so tests stay off the real
+/// sudo.
+fn remove_root_owned(paths: &[PathBuf], sudo: &mut dyn FnMut(&[&OsStr]) -> bool) {
     if paths.is_empty() {
         return;
     }
     println!("Removing system settings persisted by 'monux setup'...");
-    let removed = Command::new("sudo")
-        .arg("rm")
-        .arg("-f")
-        .args(paths)
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
-    if !removed {
+    let mut rm: Vec<&OsStr> = vec![OsStr::new("rm"), OsStr::new("-f")];
+    rm.extend(paths.iter().map(|p| p.as_os_str()));
+    if !sudo(&rm) {
         println!("note: couldn't remove root-owned files (sudo failed); remove them manually:");
         for path in paths {
             println!("  sudo rm -f {}", path.display());
         }
         return;
     }
-    // Reload udev so the removed rule stops applying, and restore the
-    // kernel-default UDP buffer limits live: the persisted sysctl config is
-    // gone, this also reverts the running values without waiting for reboot.
-    let _ = Command::new("sudo")
-        .args(["udevadm", "control", "--reload"])
-        .status();
-    let _ = Command::new("sudo")
-        .args([
-            "sysctl",
-            "-w",
-            "net.core.rmem_max=212992",
-            "net.core.wmem_max=212992",
-        ])
-        .status();
+    // Reload udev so the removed rule stops applying.
+    let _ = sudo(&[
+        OsStr::new("udevadm"),
+        OsStr::new("control"),
+        OsStr::new("--reload"),
+    ]);
+    // Re-apply the sysctl.d files that remain, so the live UDP buffer limits
+    // stop reflecting the config just removed — but only when that config was
+    // ours to begin with. setup writes SYSCTL_BUF_CONF_PATH only on a machine
+    // whose buffers are too small (setup::setup_socket_buffers returns early
+    // when they are already large enough), so on every other machine the large
+    // values came from someone else's /etc/sysctl.d file and are none of our
+    // business. '--system' rather than '-w <assumed kernel default>' for the
+    // same reason: whatever config files are left must keep winning, and a
+    // hardcoded default can sit below what one of them asks for.
+    if paths
+        .iter()
+        .any(|p| p == Path::new(setup::SYSCTL_BUF_CONF_PATH))
+    {
+        let _ = sudo(&[
+            OsStr::new("sysctl"),
+            OsStr::new("--system"),
+            OsStr::new("--quiet"),
+        ]);
+    }
     println!("Removed udev rules, uinput module load, WiFi powersave and UDP buffer configs.");
     if paths
         .iter()
@@ -456,13 +501,21 @@ fn remove_hotspot_profile() {
         .args(["nmcli", "connection", "delete", HOTSPOT_CON_NAME])
         .status();
     println!("Removed the monux hotspot (unit, configs, NAT, AP interface) and the '{}' profile (if installed).", HOTSPOT_CON_NAME);
-    // The VPN workaround rules setup may have installed: the tagged rule in
-    // Mullvad's table, and the policy rule by its priority. Best-effort —
-    // anything already gone is skipped silently.
-    let priority = VPN_WORKAROUND_RULE_PRIORITY.to_string();
-    let _ = Command::new("sudo")
-        .args(["ip", "rule", "del", "priority", &priority])
-        .status();
+    // The VPN workaround rules setup may have installed: the policy rule that
+    // steered the hotspot subnet around the tunnel, and the tagged rule in
+    // Mullvad's table. Best-effort — anything already gone is skipped
+    // silently.
+    if let Some(source) = sudo_output(&["ip", "rule", "show"])
+        .as_deref()
+        .and_then(hotspot_policy_rule_source)
+    {
+        let priority = VPN_WORKAROUND_RULE_PRIORITY.to_string();
+        let _ = Command::new("sudo")
+            .args([
+                "ip", "rule", "del", "from", &source, "lookup", "main", "priority", &priority,
+            ])
+            .status();
+    }
     if let Some(list) = sudo_output(&["nft", "-a", "list", "table", "inet", "mullvad"]) {
         for handle in monux_rule_handles(&list) {
             let rule = format!("delete rule inet mullvad forward handle {}", handle);
@@ -508,6 +561,16 @@ fn remove_autostart_units(unit_dir: &Path, systemctl: &mut dyn FnMut(&[&str]) ->
 fn systemctl_user(args: &[&str]) -> bool {
     Command::new("systemctl")
         .arg("--user")
+        .args(args)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// `sudo <args>` for the root-owned removal, inheriting stdio so sudo can
+/// prompt for the password inline; false when the command can't run or fails.
+fn sudo_status(args: &[&OsStr]) -> bool {
+    Command::new("sudo")
         .args(args)
         .status()
         .map(|status| status.success())
@@ -635,6 +698,91 @@ mod tests {
         let untagged = "table inet mullvad {\n\tchain forward {\n\t\tct state established,related accept # handle 2\n\t}\n}\n";
         assert!(monux_rule_handles(untagged).is_empty());
         assert!(monux_rule_handles("").is_empty());
+    }
+
+    #[test]
+    fn only_our_own_policy_rule_is_recognized() {
+        // What setup installed: from the hotspot subnet, into the main table.
+        let ours = "0:\tfrom all lookup local\n32763:\tfrom 10.42.0.0/24 lookup main\n32766:\tfrom all lookup main\n";
+        assert_eq!(
+            hotspot_policy_rule_source(ours).as_deref(),
+            Some("10.42.0.0/24")
+        );
+        // iproute2 prints a proto for rules that carry one; still ours.
+        assert_eq!(
+            hotspot_policy_rule_source("32763:\tfrom 10.42.3.0/24 lookup main proto static\n")
+                .as_deref(),
+            Some("10.42.3.0/24")
+        );
+        // A VPN/split-tunnel rule at the same priority — the band was picked
+        // right next to Mullvad's own rules — is not ours and must survive.
+        let foreign = "32763:\tfrom 192.168.8.0/24 lookup 200\n32764:\tnot from all lookup main suppress_prefixlength 0\n";
+        assert!(hotspot_policy_rule_source(foreign).is_none());
+        // Our subnet but a foreign table, and our rule shape at a foreign
+        // priority: neither is the rule setup added.
+        assert!(hotspot_policy_rule_source("32763:\tfrom 10.42.0.0/24 lookup 200\n").is_none());
+        assert!(hotspot_policy_rule_source("32760:\tfrom 10.42.0.0/24 lookup main\n").is_none());
+        assert!(hotspot_policy_rule_source("").is_none());
+    }
+
+    /// Records what `remove_root_owned` hands to sudo, as one Vec of argument
+    /// strings per invocation.
+    fn recording_sudo(
+        log: &std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>>,
+        succeeds: bool,
+    ) -> impl FnMut(&[&OsStr]) -> bool + '_ {
+        let log = log.clone();
+        move |args: &[&OsStr]| {
+            log.borrow_mut()
+                .push(args.iter().map(|a| a.to_string_lossy().into()).collect());
+            succeeds
+        }
+    }
+
+    #[test]
+    fn socket_buffers_are_reapplied_only_when_our_sysctl_conf_was_removed() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        // A machine whose big buffers came from someone else's sysctl.d file:
+        // setup wrote no conf of ours, so the live values must be left alone.
+        remove_root_owned(
+            &[PathBuf::from(setup::UDEV_RULE_PATH)],
+            &mut recording_sudo(&log, true),
+        );
+        assert_eq!(
+            log.borrow().as_slice(),
+            vec![
+                vec!["rm", "-f", setup::UDEV_RULE_PATH],
+                vec!["udevadm", "control", "--reload"],
+            ]
+        );
+
+        // Our own conf among the removed paths: re-derive the live values from
+        // the sysctl.d files that remain — never from an assumed default.
+        log.borrow_mut().clear();
+        remove_root_owned(
+            &[
+                PathBuf::from(setup::UDEV_RULE_PATH),
+                PathBuf::from(setup::SYSCTL_BUF_CONF_PATH),
+            ],
+            &mut recording_sudo(&log, true),
+        );
+        assert_eq!(
+            log.borrow().last().unwrap().as_slice(),
+            ["sysctl", "--system", "--quiet"]
+        );
+
+        // A failed sudo rm removed nothing, so nothing is reloaded either.
+        log.borrow_mut().clear();
+        remove_root_owned(
+            &[PathBuf::from(setup::SYSCTL_BUF_CONF_PATH)],
+            &mut recording_sudo(&log, false),
+        );
+        assert_eq!(log.borrow().len(), 1);
+
+        // Nothing to remove: sudo is never invoked at all.
+        log.borrow_mut().clear();
+        remove_root_owned(&[], &mut recording_sudo(&log, true));
+        assert!(log.borrow().is_empty());
     }
 
     #[test]

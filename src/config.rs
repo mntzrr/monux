@@ -813,16 +813,20 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 /// The contiguous run of strict was-lines directly at the bottom of `prefix`
 /// — i.e. directly above the key the prefix belongs to — is that key's
-/// was-stack, newest first. Returns (head, stack); the head is user content
-/// that is never touched.
-fn split_bottom_stack(prefix: &str) -> (&str, Vec<WasEntry>) {
+/// was-stack, newest first. Returns (head, stack, indent): the head is user
+/// content above the stack and is never touched, and the indent is the key's
+/// own leading whitespace. The indent sits *below* the stack in the prefix,
+/// so it is neither head nor stack: it is held out here and re-appended by
+/// `render_stack_block`, which is what keeps an indented key indented.
+fn split_bottom_stack(prefix: &str) -> (&str, Vec<WasEntry>, &str) {
     let mut segs: Vec<&str> = prefix.split_inclusive('\n').collect();
-    // A trailing whitespace-only segment without a newline is the key's own
-    // indent, not a comment line — it stays part of the head.
-    while matches!(segs.last(), Some(s) if !s.contains('\n') && s.trim().is_empty()) {
-        segs.pop();
-    }
-    let mut head_end = prefix.len();
+    // split_inclusive only ever leaves the last segment without a newline, so
+    // there is at most one such segment to take.
+    let indent = match segs.last() {
+        Some(s) if !s.contains('\n') && s.trim().is_empty() => segs.pop().expect("just matched"),
+        _ => "",
+    };
+    let mut head_end = prefix.len() - indent.len();
     let mut stack = vec![];
     while let Some(seg) = segs.last() {
         let line = seg.strip_suffix('\n').unwrap_or(seg);
@@ -836,7 +840,7 @@ fn split_bottom_stack(prefix: &str) -> (&str, Vec<WasEntry>) {
         }
     }
     stack.reverse(); // file order is newest first
-    (&prefix[..head_end], stack)
+    (&prefix[..head_end], stack, indent)
 }
 
 /// Every maximal run of strict was-lines in `text`, as (start, end, entries)
@@ -893,14 +897,17 @@ fn orphan_runs_in(prefix: &str, managed: bool) -> Vec<(usize, usize, Vec<WasEntr
 /// first, capped at HISTORY_CAP — the oldest falls off) and returns the new
 /// prefix. The user content above the stack is preserved verbatim.
 fn push_stack(prefix: &str, entry: WasEntry) -> String {
-    let (head, mut stack) = split_bottom_stack(prefix);
+    let (head, mut stack, indent) = split_bottom_stack(prefix);
     stack.insert(0, entry);
     stack.truncate(HISTORY_CAP);
-    render_stack_block(head, &stack)
+    render_stack_block(head, &stack, indent)
 }
 
-/// Rebuilds a prefix from user content + a was-stack.
-fn render_stack_block(head: &str, stack: &[WasEntry]) -> String {
+/// Rebuilds a prefix from user content + a was-stack + the key's own indent.
+/// A was-line is history only at column 0 (see `parse_was_line`), so the
+/// stack is never indented; the indent goes back on the last line, where the
+/// key follows it.
+fn render_stack_block(head: &str, stack: &[WasEntry], indent: &str) -> String {
     let mut out = String::from(head);
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
@@ -908,6 +915,7 @@ fn render_stack_block(head: &str, stack: &[WasEntry]) -> String {
     for entry in stack {
         out.push_str(&entry.render());
     }
+    out.push_str(indent);
     out
 }
 
@@ -1424,18 +1432,41 @@ pub fn unset_value(path: &Path, key: &str) -> Result<UnsetOutcome> {
     // Capture the key's prefix (comments + was-stack) and the following
     // key before removing it.
     let removed = match key.split_once('.') {
-        Some((section, flag)) => doc
-            .get_mut(section)
-            .and_then(|i| i.as_table_mut())
-            .map(|table| {
-                let prefix = key_prefix(table, flag).to_string();
-                let next_flag = table
-                    .iter()
-                    .skip_while(|(name, _)| *name != flag)
-                    .nth(1)
-                    .map(|(name, _)| name.to_string());
-                (section.to_string(), table.remove(flag), prefix, next_flag)
-            }),
+        Some((section, flag)) => {
+            // An inline-table section (`server = { port = 4321 }`) is a real
+            // override: the load path takes it and the daemon runs on it. It
+            // is not editable here though — an inline table has nowhere to put
+            // the `# was:` line, so this bails exactly like `set` does rather
+            // than reporting "already at default", which would contradict both
+            // `mx config show` and the running daemon.
+            if doc
+                .get(section)
+                .and_then(|i| i.as_inline_table())
+                .is_some_and(|t| t.contains_key(flag))
+            {
+                bail!(
+                    "'{}' in {} is a value, not a [section] table",
+                    section,
+                    path.display()
+                );
+            }
+            doc.get_mut(section)
+                .and_then(|i| i.as_table_mut())
+                .map(|table| {
+                    // The key line is about to go, and its own indent goes
+                    // with it: what stays behind is the comment block that
+                    // sat above it, which starts at column 0.
+                    let prefix = key_prefix(table, flag)
+                        .trim_end_matches(|c: char| c != '\n' && c.is_whitespace())
+                        .to_string();
+                    let next_flag = table
+                        .iter()
+                        .skip_while(|(name, _)| *name != flag)
+                        .nth(1)
+                        .map(|(name, _)| name.to_string());
+                    (section.to_string(), table.remove(flag), prefix, next_flag)
+                })
+        }
         None => None,
     };
     let Some((section, removed, prefix, next_flag)) = removed else {
@@ -1570,10 +1601,10 @@ pub fn revert_value(path: &Path, key: &str, to: Option<&str>) -> Result<RevertOu
             .and_then(|p| p.as_str())
             .unwrap_or("")
             .to_string();
-        let (head, _) = split_bottom_stack(&prefix);
+        let (head, _, indent) = split_bottom_stack(&prefix);
         key_mut
             .leaf_decor_mut()
-            .set_prefix(render_stack_block(head, &remaining));
+            .set_prefix(render_stack_block(head, &remaining, indent));
         let decor = table
             .get(spec.flag)
             .and_then(|i| i.as_value())
@@ -1586,14 +1617,14 @@ pub fn revert_value(path: &Path, key: &str, to: Option<&str>) -> Result<RevertOu
     } else {
         // Recreate the key line below its (remaining) was-block.
         let adopted = adopt_orphan(&mut doc, spec).unwrap_or_default();
-        let (head, _) = split_bottom_stack(&adopted);
-        let head = head.to_string();
+        let (head, _, indent) = split_bottom_stack(&adopted);
+        let (head, indent) = (head.to_string(), indent.to_string());
         let table = section_table(&mut doc, section, path)?;
         table.insert(spec.flag, toml_edit::Item::Value(parsed));
         let (mut key_mut, _) = table.get_key_value_mut(spec.flag).expect("just inserted");
         key_mut
             .leaf_decor_mut()
-            .set_prefix(render_stack_block(&head, &remaining));
+            .set_prefix(render_stack_block(&head, &remaining, &indent));
     }
     atomic_write(path, &doc.to_string())?;
     Ok(RevertOutcome {
@@ -1604,18 +1635,34 @@ pub fn revert_value(path: &Path, key: &str, to: Option<&str>) -> Result<RevertOu
 }
 
 /// The was-stack of a managed key: the run directly above its line, or the
-/// orphan block it left behind when unset.
+/// orphan block it left behind when unset. A key set in an inline-table
+/// section has neither — the section has no comment lines to hold a stack,
+/// and an orphan block belongs to a key that is *absent* from the file, which
+/// this one is not.
 fn key_stack(doc: &toml_edit::DocumentMut, spec: &KeySpec) -> Vec<WasEntry> {
     let section = spec.section.as_str();
     if let Some(table) = doc.get(section).and_then(|i| i.as_table()) {
         if table.contains_value(spec.flag) {
             return split_bottom_stack(key_prefix(table, spec.flag)).1;
         }
+    } else if key_is_set(doc, spec) {
+        return vec![];
     }
     match find_orphan(doc, spec) {
         Some(orphan) => orphan.entries,
         None => vec![],
     }
+}
+
+/// Whether the file carries a value for the key, in a `[section]` table or an
+/// inline-table section — the same reach the load path (`File::parse`, which
+/// takes any table) has, so `history` and `show` cannot disagree about
+/// whether a key is set.
+fn key_is_set(doc: &toml_edit::DocumentMut, spec: &KeySpec) -> bool {
+    doc.get(spec.section.as_str())
+        .and_then(|i| i.as_table_like())
+        .and_then(|t| t.get(spec.flag))
+        .is_some_and(|i| i.is_value())
 }
 
 /// One key's history, for `config history`.
@@ -1669,7 +1716,7 @@ fn read_history(path: &Path) -> Result<Vec<KeyHistory>> {
         .map(|spec| {
             let current = doc
                 .get(spec.section.as_str())
-                .and_then(|i| i.as_table())
+                .and_then(|i| i.as_table_like())
                 .and_then(|t| t.get(spec.flag))
                 .filter(|i| i.is_value())
                 .map(render_item);
@@ -1789,6 +1836,23 @@ pub fn validate_file(path: &Path) -> Result<Vec<Issue>> {
     let file = File::parse(&text).expect("the TOML parsed successfully above");
     let mut issues = vec![];
     for key in &file.unknown {
+        // A dotless entry is a top-level item outside every section (the
+        // "not a table" branch of File::parse). `mx config unset` addresses
+        // keys as <section>.<flag> only, so there is no cleanup line to print
+        // for one — offering it would just hand the user a command that exits
+        // with "unknown config key".
+        if !key.contains('.') {
+            issues.push(Issue {
+                line: key_line(&text, key),
+                severity: Severity::Warning,
+                message: format!(
+                    "'{}' sits outside any section — every key lives under [server] or [client]; move or delete it by hand",
+                    key
+                ),
+                cleanup: None,
+            });
+            continue;
+        }
         issues.push(Issue {
             line: key_line(&text, key),
             severity: Severity::Warning,
@@ -2338,14 +2402,29 @@ const EDIT_HEADER: &str = "\
 fn cli_edit(path: &Path) -> Result<bool> {
     let scratch = PathBuf::from(format!("{}.edit-{}", path.display(), std::process::id()));
     if path.exists() {
-        fs::copy(path, &scratch)
-            .with_context(|| format!("Failed to copy {} for editing", path.display()))?;
+        if let Err(e) = fs::copy(path, &scratch) {
+            // A half-written copy is worthless — nobody has edited it yet —
+            // and would otherwise sit in the config dir forever.
+            let _ = fs::remove_file(&scratch);
+            return Err(e)
+                .with_context(|| format!("Failed to copy {} for editing", path.display()));
+        }
     } else {
         atomic_write(&scratch, EDIT_HEADER)?;
     }
-    let result = edit_loop(path, &scratch);
-    let _ = fs::remove_file(&scratch);
-    result
+    match edit_loop(path, &scratch) {
+        Ok(installed) => {
+            let _ = fs::remove_file(&scratch);
+            Ok(installed)
+        }
+        // Everything after the editor exits — reading the scratch back, the
+        // history diff, the atomic install — can still fail, and by then the
+        // scratch holds the only copy of what the user typed. Keep it and name
+        // it, the way crontab does. The name carries the pid, so the next
+        // `mx config edit` starts from a scratch of its own and cannot clobber
+        // it.
+        Err(e) => Err(e.context(format!("your edits are kept in {}", scratch.display()))),
+    }
 }
 
 fn edit_loop(path: &Path, scratch: &Path) -> Result<bool> {
@@ -2683,6 +2762,55 @@ mod tests {
             .unwrap();
         assert_eq!(invalid.line, Some(6));
         assert!(matches!(invalid.severity, Severity::Error));
+        // A key above the first section header has no <section>.<flag> name,
+        // so no cleanup command is printed for it — the one we used to print
+        // could never have worked.
+        fs::write(&path, "port = 1213\n[server]\nwww = true\n").unwrap();
+        let issues = validate_file(&path).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert!(matches!(issues[0].severity, Severity::Warning));
+        assert!(
+            issues[0].message.contains("'port' sits outside any section"),
+            "{}",
+            issues[0].message
+        );
+        assert_eq!(issues[0].cleanup, None);
+        let err = unset_value(&path, "port").unwrap_err();
+        assert!(err.to_string().contains("unknown config key"), "{}", err);
+    }
+
+    #[test]
+    fn inline_table_section_is_refused_instead_of_reported_as_default() {
+        let (_dir, path) = tmp_config();
+        // A hand-written inline-table section is a real override: the load
+        // path takes it and the daemon runs on it.
+        fs::write(&path, "server = { port = 4321 }\n").unwrap();
+        assert_eq!(load(&path).unwrap().get_int::<u16>("server.port"), Some(4321));
+        assert!(validate_file(&path).unwrap().is_empty());
+        // So `unset` must refuse it out loud, the way `set` already does,
+        // rather than claim the key is at its default and change nothing.
+        for err in [
+            unset_value(&path, "server.port").unwrap_err(),
+            set_value(&path, "server.port", &["5555".to_string()]).unwrap_err(),
+        ] {
+            assert!(
+                err.to_string().contains("is a value, not a [section] table"),
+                "{}",
+                err
+            );
+        }
+        assert_eq!(read_text(&path), "server = { port = 4321 }\n");
+        // `history` agrees with `show`: the key is set, it just has no stack
+        // (an inline table has nowhere to keep one).
+        let all = read_history(&path).unwrap();
+        let port = all.iter().find(|h| h.spec.key == "server.port").unwrap();
+        assert_eq!(port.current.as_deref(), Some("4321"));
+        assert!(port.entries.is_empty());
+        // A key the inline section does not carry is genuinely at its default.
+        assert!(matches!(
+            unset_value(&path, "server.www").unwrap(),
+            UnsetOutcome::AlreadyDefault(_)
+        ));
     }
 
     #[test]
@@ -2822,6 +2950,70 @@ mod tests {
         assert!(!text.contains("port = "));
         // The daemon load path is unaffected by any of this.
         assert_eq!(load(&path).unwrap().get_bool("client.www"), Some(true));
+    }
+
+    #[test]
+    fn indented_keys_keep_their_indent_across_mutations() {
+        let (_dir, path) = tmp_config();
+        // The key's own indent sits BELOW the was-stack in the key's prefix.
+        // It is neither head nor stack: counting it into the head sliced the
+        // head out of the middle of the newest was-line.
+        fs::write(
+            &path,
+            "[server]\n# was: 1000 @ 2026-07-25T01:12:03Z\n  port = 4321\n",
+        )
+        .unwrap();
+        set_value(&path, "server.port", &["5555".to_string()]).unwrap();
+        let text = read_text(&path);
+        assert!(text.contains("\n  port = 5555\n"), "indent kept:\n{}", text);
+        assert!(!text.contains("\n# \n"), "no sliced was-line:\n{}", text);
+        let values: Vec<String> = stack_of(&path, "server.port")
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect();
+        assert_eq!(values, vec!["4321", "1000"]);
+        // Revert rebuilds the same block, indent included.
+        revert_value(&path, "server.port", None).unwrap();
+        let text = read_text(&path);
+        assert!(text.contains("\n  port = 4321\n"), "indent kept:\n{}", text);
+
+        // An indented key with no history yet keeps its indent too.
+        fs::write(&path, "[server]\n  www = true\n").unwrap();
+        set_value(&path, "server.www", &["false".to_string()]).unwrap();
+        let text = read_text(&path);
+        assert!(text.contains("\n  www = false\n"), "indent kept:\n{}", text);
+        assert_eq!(stack_of(&path, "server.www").len(), 1);
+        // Unsetting takes the indent with the key line: the was-block that
+        // stays behind is left at column 0, with no blank-but-spaced line.
+        unset_value(&path, "server.www").unwrap();
+        let text = read_text(&path);
+        assert!(
+            text.lines().all(|l| l.trim().is_empty() == l.is_empty()),
+            "no whitespace-only line:\n{:?}",
+            text
+        );
+        assert_eq!(stack_of(&path, "server.www").len(), 2);
+
+        // An indent longer than "# was: " used to cut the banked value at a
+        // byte that is not a char boundary — a panic mid-command, reachable
+        // from `mx config set server.device` with a non-ASCII device name.
+        fs::write(
+            &path,
+            "[server]\n# was: [\"Clavier Français\"] @ 2026-07-25T01:12:03Z\n          device = [\"kbd\"]\n",
+        )
+        .unwrap();
+        set_value(&path, "server.device", &["mouse".to_string()]).unwrap();
+        let text = read_text(&path);
+        assert!(
+            text.contains("\n          device = [\"mouse\"]\n"),
+            "indent kept:\n{}",
+            text
+        );
+        let values: Vec<String> = stack_of(&path, "server.device")
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect();
+        assert_eq!(values, vec!["[\"kbd\"]", "[\"Clavier Français\"]"]);
     }
 
     #[test]
@@ -3072,6 +3264,52 @@ mod tests {
         let outcome = revert_value(&path, "server.www", None).unwrap();
         assert_eq!(outcome.restored, "true");
         assert_eq!(load(&path).unwrap().get_bool("server.www"), Some(true));
+    }
+
+    /// An executable stub $EDITOR that overwrites the file it is handed with
+    /// `content`, standing in for the user's editing session.
+    fn stub_editor(dir: &Path, name: &str, content: &str) -> PathBuf {
+        let script = dir.join(name);
+        fs::write(
+            &script,
+            format!("#!/bin/sh\ncat > \"$1\" <<'MONUX_EOF'\n{}MONUX_EOF\n", content),
+        )
+        .unwrap();
+        fs::set_permissions(&script, PermissionsExt::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[test]
+    fn edit_keeps_the_scratch_when_the_install_fails() {
+        let (dir, path) = tmp_config();
+        fs::write(&path, "[server]\nport = 4321\n").unwrap();
+        let scratch = PathBuf::from(format!("{}.edit-{}", path.display(), std::process::id()));
+        // $EDITOR is process-global; no other test reads it.
+        let editor = stub_editor(dir.path(), "rewrite.sh", "server = { www = true }\n");
+        std::env::set_var("EDITOR", &editor);
+        // This edit is valid TOML with valid values, so it clears the editor
+        // loop's checks and only the history injection fails — i.e. a failure
+        // strictly after the user has done the work, when the scratch holds
+        // the only copy of it.
+        let err = cli_edit(&path).unwrap_err();
+        assert!(
+            format!("{:#}", err).contains("your edits are kept in"),
+            "{:#}",
+            err
+        );
+        assert_eq!(read_text(&scratch), "server = { www = true }\n");
+        assert_eq!(
+            read_text(&path),
+            "[server]\nport = 4321\n",
+            "a failed install leaves the config alone"
+        );
+        // A clean run installs and takes the scratch with it.
+        let editor = stub_editor(dir.path(), "ok.sh", "[server]\nport = 5555\n");
+        std::env::set_var("EDITOR", &editor);
+        assert!(cli_edit(&path).unwrap());
+        assert_eq!(load(&path).unwrap().get_int::<u16>("server.port"), Some(5555));
+        assert!(!scratch.exists(), "no scratch left behind on success");
+        std::env::remove_var("EDITOR");
     }
 
     #[test]

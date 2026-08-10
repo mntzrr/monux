@@ -104,7 +104,19 @@ impl SharedClipboardReader {
         let mut inner = self.inner.lock().await;
         let epoch = self.cache_epoch.load(Ordering::SeqCst);
         if let Some((cached_epoch, cached_type, content, data_type)) = &inner.last_served {
-            if *cached_epoch == epoch && cached_type == requested_type {
+            // The size cap is part of the hit condition even though it isn't
+            // part of the cache key: it is per REQUESTER (every machine has
+            // its own --max-clipboard-size), while the payload was read under
+            // whichever cap happened to come first. Handing a payload read
+            // under a larger cap to a smaller requester frames a header the
+            // receive side treats as fatal — it resets the connection and
+            // retries, and the retry hits the same cache while the epoch is
+            // unchanged. Falling through instead re-reads under this
+            // requester's cap, which at worst fails into an empty answer.
+            if *cached_epoch == epoch
+                && cached_type == requested_type
+                && content.len() as u64 <= max_size_bytes
+            {
                 debug!(
                     "Serving clipboard type {} from cache for {}: {} bytes",
                     requested_type,
@@ -224,6 +236,56 @@ mod tests {
         let _ = reader.read("text/plain", u64::MAX, "test").await.unwrap();
         reader.invalidate();
         let _ = reader.read("text/plain", u64::MAX, "test").await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A reader that answers with a fixed-size payload, erroring when it
+    /// doesn't fit the caller's cap — as the real readers do, since
+    /// max_size_bytes becomes their LimitedCursor limit.
+    struct SizedReader {
+        calls: Arc<AtomicUsize>,
+        len: usize,
+    }
+
+    #[async_trait]
+    impl ClipboardReader for SizedReader {
+        async fn read(
+            &mut self,
+            _requested_type: &str,
+            max_size_bytes: u64,
+            _request_source: &str,
+        ) -> Result<Vec<u8>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.len as u64 > max_size_bytes {
+                return Err(anyhow::anyhow!("payload exceeds max size"));
+            }
+            Ok(vec![b'x'; self.len])
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_payload_is_not_served_past_a_smaller_requesters_cap() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        // Under the 100-byte compression floor, so the cached payload is the
+        // 50 bytes the reader produced rather than a zstd frame.
+        let reader = SharedClipboardReader::new(Box::new(SizedReader {
+            calls: calls.clone(),
+            len: 50,
+        }));
+        let (content, _) = reader.read("text/plain", u64::MAX, "test").await.unwrap();
+        assert_eq!(content.len(), 50);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A requester whose cap the cached payload exactly fits still hits.
+        let (content, _) = reader.read("text/plain", 50, "test").await.unwrap();
+        assert_eq!(content.len(), 50);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A requester with a smaller cap must not be handed the oversized
+        // payload: its receive side treats an over-cap header as fatal and
+        // resets the connection, then retries into the same cache. Falling
+        // through re-reads under this cap, which fails cleanly instead.
+        assert!(reader.read("text/plain", 49, "test").await.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 

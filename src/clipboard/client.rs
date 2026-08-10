@@ -21,6 +21,14 @@ pub struct LocalClipboard {
     // TODO can we nest a tokio select here instead of exposing these upstream?:
     pub clipboard_fetch_rx: mpsc::Receiver<data::ClipboardFetch>,
     pub local_types_rx: watch::Receiver<Vec<String>>,
+    /// A second receiver on the same watch, read only by
+    /// clear_remote_clipboard to tell whether a local app has taken the
+    /// selection since we advertised the server's clipboard. It cannot share
+    /// local_types_rx: the client event loop awaits changed() on that one and
+    /// thereby marks every change seen, and it only acts on those changes
+    /// while this client is active — so an inactive client would otherwise
+    /// have no record at all that a local owner appeared.
+    local_takeover_rx: watch::Receiver<Vec<String>>,
     local_types: Option<Vec<String>>,
     serving_remote_clipboard: bool,
 }
@@ -61,6 +69,7 @@ impl LocalClipboard {
             reader: serve::SharedClipboardReader::new(Box::new(reader)),
             types_tx: crate::clipboard::spawn_writer_dispatcher(Box::new(writer)),
             clipboard_fetch_rx,
+            local_takeover_rx: local_regular_types_rx.clone(),
             local_types_rx: local_regular_types_rx,
             local_types: None,
             serving_remote_clipboard: false,
@@ -119,6 +128,19 @@ impl LocalClipboard {
         if self.serving_remote_clipboard {
             self.local_types = None;
             self.serving_remote_clipboard = false;
+            // Clearing is a global set_selection(NULL) on every seat — it
+            // unsets whatever the compositor currently holds, not only our own
+            // offer (this is how `wl-copy --clear` works). So it is only safe
+            // while the selection is still ours: if a local app took it since
+            // we advertised — a clipboard manager re-owning it, a wl-copy
+            // script — clearing would destroy content monux never put there.
+            // A watch error means the type watcher is gone, which is no
+            // evidence of a local owner, so clear as usual rather than leave a
+            // stale advertisement no fetch can ever answer.
+            if self.local_takeover_rx.has_changed().unwrap_or(false) {
+                debug!("Leaving the local clipboard alone: an app took the selection while the server's clipboard was advertised");
+                return Ok(());
+            }
             // Non-blocking: the actual advertisement happens on the writer
             // dispatcher thread; a failed send only means we're shutting down.
             let _ = self.types_tx.send(vec![]);
@@ -130,11 +152,111 @@ impl LocalClipboard {
     pub fn set_remote_clipboard(&mut self, types: Vec<String>) -> Result<()> {
         self.local_types = None;
         self.serving_remote_clipboard = true;
+        // The selection is ours again as of this advertisement: any watch
+        // change from here on is a local app taking it back (our own offers
+        // never reach the watcher — they carry IGNORED_MIME_TYPE), which is
+        // exactly what clear_remote_clipboard must not stomp on.
+        self.local_takeover_rx.mark_unchanged();
         // Defense in depth: a peer on an older build may still advertise
         // machine-internal types; never offer those to local apps.
         // Non-blocking: the actual advertisement happens on the writer
         // dispatcher thread; a failed send only means we're shutting down.
         let _ = self.types_tx.send(filter_shareable_mime_types(types));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    /// Stands in for the wayland reader: nothing in these tests serves a
+    /// fetch, only the advertisement side is exercised.
+    struct NullReader;
+
+    #[async_trait]
+    impl crate::clipboard::ClipboardReader for NullReader {
+        async fn read(
+            &mut self,
+            _requested_type: &str,
+            _max_size_bytes: u64,
+            _request_source: &str,
+        ) -> Result<Vec<u8>> {
+            Ok(vec![])
+        }
+    }
+
+    /// A LocalClipboard with the wayland pieces replaced, plus the ends the
+    /// test drives: the watch sender the type watcher would own, and the
+    /// receiver the writer dispatcher would own (so advertisements — the empty
+    /// list among them — can be observed).
+    fn test_clipboard() -> (
+        LocalClipboard,
+        watch::Sender<Vec<String>>,
+        std::sync::mpsc::Receiver<Vec<String>>,
+    ) {
+        let (local_types_tx, local_types_rx) = watch::channel(vec![]);
+        let (types_tx, advertised_rx) = std::sync::mpsc::channel();
+        // Nothing serves a fetch here, so the sending half can go.
+        let (_, clipboard_fetch_rx) = mpsc::channel(1);
+        let clipboard = LocalClipboard {
+            reader: serve::SharedClipboardReader::new(Box::new(NullReader)),
+            types_tx,
+            clipboard_fetch_rx,
+            local_takeover_rx: local_types_rx.clone(),
+            local_types_rx,
+            local_types: None,
+            serving_remote_clipboard: false,
+        };
+        (clipboard, local_types_tx, advertised_rx)
+    }
+
+    #[test]
+    fn clearing_releases_the_selection_while_it_is_still_ours() {
+        let (mut clipboard, _local_types_tx, advertised) = test_clipboard();
+        clipboard
+            .set_remote_clipboard(vec!["text/plain".to_string()])
+            .unwrap();
+        assert_eq!(advertised.try_recv().unwrap(), vec!["text/plain"]);
+        // Nothing else took the selection, so the connection loss must take
+        // our own advertisement back down.
+        clipboard.clear_remote_clipboard().unwrap();
+        assert_eq!(advertised.try_recv().unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn clearing_leaves_a_local_owner_alone() {
+        let (mut clipboard, local_types_tx, advertised) = test_clipboard();
+        clipboard
+            .set_remote_clipboard(vec!["text/plain".to_string()])
+            .unwrap();
+        assert_eq!(advertised.try_recv().unwrap(), vec!["text/plain"]);
+        // A local app takes the selection while this client is INACTIVE: the
+        // client event loop only calls set_local_clipboard while active, so
+        // this change is the sole record that the clipboard is no longer ours.
+        local_types_tx.send(vec!["text/html".to_string()]).unwrap();
+        // set_selection(None) is global, so clearing here would destroy that
+        // app's clipboard — nothing may be advertised.
+        clipboard.clear_remote_clipboard().unwrap();
+        assert!(advertised.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_fresh_server_clipboard_makes_the_selection_ours_again() {
+        let (mut clipboard, local_types_tx, advertised) = test_clipboard();
+        clipboard
+            .set_remote_clipboard(vec!["text/plain".to_string()])
+            .unwrap();
+        local_types_tx.send(vec!["text/html".to_string()]).unwrap();
+        // The server pushes a new clipboard: we take the selection back, so
+        // the earlier local owner no longer protects it from a later clear.
+        clipboard
+            .set_remote_clipboard(vec!["image/png".to_string()])
+            .unwrap();
+        assert_eq!(advertised.try_recv().unwrap(), vec!["text/plain"]);
+        assert_eq!(advertised.try_recv().unwrap(), vec!["image/png"]);
+        clipboard.clear_remote_clipboard().unwrap();
+        assert_eq!(advertised.try_recv().unwrap(), Vec::<String>::new());
     }
 }

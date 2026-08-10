@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{self, prelude::*, IsTerminal};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -136,11 +137,17 @@ pub struct MonuxCertVerification<'a> {
     /// Disabled for the server in --www mode, where internet-facing peers must
     /// be pre-approved instead of prompting on the console.
     allow_interactive_prompts: bool,
-    /// Server name (client side only), shown in the approval prompt so the
-    /// user can sanity-check which machine they are connecting to. Learned
-    /// via mDNS discovery or the v15+ handshake; both are unauthenticated,
-    /// so this is a hint, not proof.
-    discovered_server_name: Mutex<Option<String>>,
+    /// The connection attempt currently in flight (client side only), shown in
+    /// the approval prompt so the user can sanity-check which machine they are
+    /// being asked to trust. The name is learned via mDNS discovery or the
+    /// handshake; both are unauthenticated, so it is a hint, not proof — the
+    /// address beside it is the one fact the client knows for certain.
+    ///
+    /// Keyed to the attempt rather than kept for the process: one verifier
+    /// serves every reconnect, and the loop cycles remembered servers and mDNS
+    /// candidates, so a name learned for the machine reached last time must
+    /// never caption the prompt for the machine being approved now.
+    server_attempt: Mutex<Option<ServerAttempt>>,
     /// The server certificate's fingerprint as learned during the client-side
     /// handshake, read after a successful connect for the remembered-servers
     /// store (known_servers.rs). Server side, the client's fingerprint is
@@ -169,21 +176,26 @@ impl<'a> MonuxCertVerification<'a> {
         certs::fingerprint(&self.our_cert)
     }
 
-    /// Records the mDNS-discovered server instance name, for display in the
-    /// client-side approval prompt.
-    pub fn set_discovered_server_name(&self, name: String) {
-        if let Ok(mut slot) = self.discovered_server_name.lock() {
-            *slot = Some(name);
+    /// Opens a connection attempt against `addr`, optionally captioned with the
+    /// name mDNS gave for it. Called once per attempt, before connecting, so
+    /// the prompt can only ever describe the machine currently being verified.
+    pub fn begin_attempt(&self, addr: SocketAddr, discovered_name: Option<String>) {
+        if let Ok(mut slot) = self.server_attempt.lock() {
+            *slot = Some(ServerAttempt {
+                addr,
+                name: discovered_name.as_deref().and_then(sanitized_prompt_name),
+            });
         }
     }
 
-    /// Records the server's hostname learned from the v15+ handshake, for the
-    /// approval prompt — but only when no mDNS-discovered name exists (mDNS
-    /// was there first and says the same thing).
+    /// Records the server's hostname learned from the handshake. Overwrites
+    /// whatever mDNS supplied: both describe THIS attempt (begin_attempt reset
+    /// the slot before the connect), and the handshake came from the machine
+    /// actually answering rather than from whoever won the mDNS race.
     pub fn set_handshake_server_name(&self, name: String) {
-        if let Ok(mut slot) = self.discovered_server_name.lock() {
-            if slot.is_none() {
-                *slot = Some(name);
+        if let Ok(mut slot) = self.server_attempt.lock() {
+            if let Some(attempt) = slot.as_mut() {
+                attempt.name = sanitized_prompt_name(&name);
             }
         }
     }
@@ -238,7 +250,7 @@ impl<'a> MonuxCertVerification<'a> {
                 unanswered_prompts: 0,
             })),
             allow_interactive_prompts,
-            discovered_server_name: Mutex::new(None),
+            server_attempt: Mutex::new(None),
             peer_fingerprint: Mutex::new(None),
             crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
             rejection_cooldown: Duration::from_secs(REJECTION_COOLDOWN_SECS),
@@ -334,11 +346,7 @@ impl<'a> MonuxCertVerification<'a> {
         (self.prompt_spawner)(PromptJob {
             cert: their_cert.clone().into_owned(),
             we_are_server,
-            discovered_server_name: self
-                .discovered_server_name
-                .lock()
-                .ok()
-                .and_then(|slot| slot.clone()),
+            server_attempt: self.server_attempt.lock().ok().and_then(|slot| slot.clone()),
             config_dir: self.config_dir.clone(),
             rejection_cooldown: self.rejection_cooldown,
             global_backoff_base: self.global_backoff_base,
@@ -477,7 +485,7 @@ fn record_rejection(
 struct PromptJob {
     cert: rustls_pki_types::CertificateDer<'static>,
     we_are_server: bool,
-    discovered_server_name: Option<String>,
+    server_attempt: Option<ServerAttempt>,
     config_dir: PathBuf,
     rejection_cooldown: Duration,
     global_backoff_base: Duration,
@@ -513,7 +521,7 @@ fn prompt_thread_main(job: PromptJob) {
     };
     let their_name = if job.we_are_server { "Client" } else { "Server" };
     let their_cert_fingerprint = certs::fingerprint(&job.cert);
-    if prompt_unknown_cert(&job.cert, job.we_are_server, job.discovered_server_name.as_deref()) {
+    if prompt_unknown_cert(&job.cert, job.we_are_server, job.server_attempt.as_ref()) {
         info!("{} cert approved: {}", their_name, their_cert_fingerprint);
         if let Err(e) =
             certs::write_approved_cert(&job.cert, &their_cert_fingerprint, &job.config_dir)
@@ -660,10 +668,41 @@ impl<'a> rustls::server::danger::ClientCertVerifier for MonuxCertVerification<'a
     }
 }
 
+/// The connection attempt an approval prompt is about: the address dialled,
+/// and the server's self-declared name for it if one was learned.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ServerAttempt {
+    addr: SocketAddr,
+    name: Option<String>,
+}
+
+/// The longest server name the prompt will print.
+const MAX_PROMPT_NAME_CHARS: usize = 64;
+
+/// Reduces a server-supplied name to something safe to write to a terminal.
+///
+/// The name is an mDNS instance label or a handshake field: unauthenticated,
+/// attacker-chosen, and arbitrary UTF-8 — advertising `_monux._udp.local.`
+/// takes no credentials at all. It is printed inside the one security decision
+/// the user ever makes, so a label carrying ESC could clear the screen and
+/// redraw a forged "fingerprint verified" line over the real warning, and a
+/// newline could fake whole lines of prompt. Control characters are dropped
+/// rather than escaped (nothing legitimate has them) and the result is bounded
+/// so a long name cannot scroll the fingerprint out of view.
+fn sanitized_prompt_name(name: &str) -> Option<String> {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_PROMPT_NAME_CHARS)
+        .collect();
+    let trimmed = cleaned.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 fn prompt_unknown_cert(
     their_cert: &rustls_pki_types::CertificateDer,
     we_are_server: bool,
-    discovered_server_name: Option<&str>,
+    server_attempt: Option<&ServerAttempt>,
 ) -> bool {
     let their_cert_fingerprint = certs::fingerprint(their_cert);
     if !io::stdin().is_terminal() {
@@ -687,9 +726,24 @@ Allow this new client and save its certificate for future connections? ({}s time
             their_cert_fingerprint, PROMPT_TIMEOUT_SECS
         )
     } else {
-        let discovered_line = discovered_server_name
-            .map(|name| format!("The server calls itself: {} (learned via mDNS or the handshake — unauthenticated)\n", name))
-            .unwrap_or_default();
+        // The address is the one fact the client knows for certain, so it
+        // leads; the name is a hint from the far end and is labelled as one.
+        let discovered_line = match server_attempt {
+            Some(attempt) => {
+                let named = attempt
+                    .name
+                    .as_deref()
+                    .map(|name| {
+                        format!(
+                            ", which calls itself: {} (learned via mDNS or the handshake — unauthenticated)",
+                            name
+                        )
+                    })
+                    .unwrap_or_default();
+                format!("You are connecting to: {}{}\n", attempt.addr, named)
+            }
+            None => String::new(),
+        };
         format!(
             "APPROVAL NEEDED: New unknown server connection
 

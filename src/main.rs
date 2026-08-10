@@ -32,13 +32,19 @@ fn handle_signals(mut signals: Signals, out: mpsc::Sender<Event>, diagnostics: A
     let mut iter = signals.into_iter();
     loop {
         match iter.next() {
+            // try_send, not blocking_send: `out` is the same bounded channel
+            // every input batch travels on, so a stalled events loop would
+            // park this thread inside the switch arm and the SIGHUP below —
+            // whose whole purpose is to report on a stalled loop — would never
+            // be dequeued. A switch that cannot be queued is better dropped
+            // loudly than paid for with the dump.
             Some(signal::SIGUSR1) => {
-                if let Err(e) = out.blocking_send(Event::SwitchNext) {
+                if let Err(e) = out.try_send(Event::SwitchNext) {
                     error!("Failed to submit SwitchNext event for SIGUSR1: {:?}", e);
                 }
             }
             Some(signal::SIGUSR2) => {
-                if let Err(e) = out.blocking_send(Event::SwitchPrev) {
+                if let Err(e) = out.try_send(Event::SwitchPrev) {
                     error!("Failed to submit SwitchPrev event for SIGUSR2: {:?}", e);
                 }
             }
@@ -424,6 +430,22 @@ fn main() -> Result<()> {
             let auto_indicator = !args.no_indicator.unwrap_or(false);
             let update_mode = update_mode(args.auto_install.unwrap_or(false));
             let www = args.www.unwrap_or(false);
+            // Validation before the takeover below: single_instance::acquire
+            // SIGTERMs the running daemon, so anything that can reject the
+            // command line has to have rejected it by then. A typo would
+            // otherwise leave the machine with no daemon at all — and the
+            // installed unit's Restart=on-failure will not bring it back,
+            // because the old one exited cleanly on the signal.
+            let max_clipboard_size_bytes = args
+                .max_clipboard_size_kb
+                .unwrap_or(monux::config::DEFAULT_MAX_CLIPBOARD_SIZE_KB)
+                .checked_mul(1024)
+                .context("--max-clipboard-size-kb is too large")?;
+            // Screen-edge switching is opt-in: no --edge-map, no edge manager.
+            let edge_map = match &args.edge_map {
+                Some(specs) => Some(monux::edge::parse_edge_map(specs)?),
+                None => None,
+            };
             let server_lock = single_instance::acquire("server")?;
             settle_after_takeover(&server_lock);
             // Before the indicator supervisor spawns anything (see the note
@@ -460,11 +482,6 @@ fn main() -> Result<()> {
             } else {
                 NetworkMode::Local
             };
-            let max_clipboard_size_bytes = args
-                .max_clipboard_size_kb
-                .unwrap_or(monux::config::DEFAULT_MAX_CLIPBOARD_SIZE_KB)
-                .checked_mul(1024)
-                .context("--max-clipboard-size-kb is too large")?;
             let motion_mode = match args.motion_hz {
                 None => {
                     info!(
@@ -496,11 +513,6 @@ fn main() -> Result<()> {
                     info!("Pacing bulk transfers to {} Mbps (pinned)", mbps);
                     monux::rotation::ThrottleMode::Pinned(Some(mbps))
                 }
-            };
-            // Screen-edge switching is opt-in: no --edge-map, no edge manager.
-            let edge_map = match &args.edge_map {
-                Some(specs) => Some(monux::edge::parse_edge_map(specs)?),
-                None => None,
             };
             // An empty --pause-shortcut disables pause/resume.
             let pause_shortcut = args
@@ -556,12 +568,24 @@ fn main() -> Result<()> {
             let scroll_scale = args
                 .scroll_scale
                 .unwrap_or(monux::config::DEFAULT_INPUT_SCALE);
-            let client_lock = single_instance::acquire("client")?;
-            settle_after_takeover(&client_lock);
-            reap_inherited_children();
-            if auto_update {
-                rt.spawn(monux::autoupdate::run(Some(config_dir.clone()), update_mode));
-            }
+            // Validation before the takeover below: single_instance::acquire
+            // SIGTERMs the running daemon, so anything that can reject the
+            // command line has to have rejected it by then. A typo would
+            // otherwise leave the machine with no daemon at all — and the
+            // installed unit's Restart=on-failure will not bring it back,
+            // because the old one exited cleanly on the signal.
+            let max_clipboard_size_bytes = args
+                .max_clipboard_size_kb
+                .unwrap_or(monux::config::DEFAULT_MAX_CLIPBOARD_SIZE_KB)
+                .checked_mul(1024)
+                .context("--max-clipboard-size-kb is too large")?;
+            // Screen-edge switching back to the server is opt-in: no
+            // --edge-map, no edge detection. Client targets are validated at
+            // startup ('auto' only), not at fire time.
+            let edge_map = match &args.edge_map {
+                Some(specs) => Some(monux::edge::parse_client_edge_map(specs)?),
+                None => None,
+            };
             // When no host is given, the client cycles its server candidates:
             // the remembered servers (most recent first — a one-time
             // 'monux client <ip>' is remembered, see known_servers.rs) and
@@ -586,6 +610,12 @@ fn main() -> Result<()> {
                     None
                 }
             };
+            let client_lock = single_instance::acquire("client")?;
+            settle_after_takeover(&client_lock);
+            reap_inherited_children();
+            if auto_update {
+                rt.spawn(monux::autoupdate::run(Some(config_dir.clone()), update_mode));
+            }
             let verifier = approval::MonuxCertVerification::new(
                 "client",
                 args.fingerprint.take().unwrap_or(vec![]),
@@ -604,11 +634,6 @@ fn main() -> Result<()> {
             } else {
                 NetworkMode::Local
             };
-            let max_clipboard_size_bytes = args
-                .max_clipboard_size_kb
-                .unwrap_or(monux::config::DEFAULT_MAX_CLIPBOARD_SIZE_KB)
-                .checked_mul(1024)
-                .context("--max-clipboard-size-kb is too large")?;
             if mouse_scale != 1.0 || scroll_scale != 1.0 {
                 info!(
                     "Scaling injected input: pointer motion x{}, scroll x{}",
@@ -629,13 +654,6 @@ fn main() -> Result<()> {
                     info!("Pacing bulk transfers to {} Mbps (pinned)", mbps);
                     monux::rotation::ThrottleMode::Pinned(Some(mbps))
                 }
-            };
-            // Screen-edge switching back to the server is opt-in: no
-            // --edge-map, no edge detection. Client targets are validated at
-            // startup ('auto' only), not at fire time.
-            let edge_map = match &args.edge_map {
-                Some(specs) => Some(monux::edge::parse_client_edge_map(specs)?),
-                None => None,
             };
             rt.block_on(async {
                 client(ClientDaemonArgs {
@@ -1212,11 +1230,13 @@ fn candidate_cycle(
 /// the cycle from a fresh read of the remembered store when the current pass
 /// is exhausted. Returns None when the pass's mDNS attempt found no server;
 /// the caller then retries the current address.
+/// The mDNS name, when there is one, is returned alongside the address rather
+/// than written to the shared verifier: it describes THIS candidate, and the
+/// verifier outlives every attempt (see MonuxCertVerification::begin_attempt).
 async fn draw_candidate(
     cycle: &mut std::collections::VecDeque<Candidate>,
     config_dir: &std::path::Path,
-    verifier: &approval::MonuxCertVerification<'static>,
-) -> Option<SocketAddr> {
+) -> Option<(SocketAddr, Option<String>)> {
     if cycle.is_empty() {
         *cycle = candidate_cycle(&monux::known_servers::load(config_dir));
     }
@@ -1224,14 +1244,13 @@ async fn draw_candidate(
         .pop_front()
         .expect("a candidate pass always holds at least the mDNS attempt")
     {
-        Candidate::Remembered(addr) => Some(addr),
+        // A remembered address carries no name of its own; the handshake
+        // supplies one once the far end answers.
+        Candidate::Remembered(addr) => Some((addr, None)),
         Candidate::Discover => {
             info!("Discovering the server via mDNS...");
             match discovery::discover_server(None, &monux::known_servers::load(config_dir)).await {
-                Ok((addr, name)) => {
-                    verifier.set_discovered_server_name(name);
-                    Some(addr)
-                }
+                Ok((addr, name)) => Some((addr, Some(name))),
                 Err(e) => {
                     warn!("mDNS discovery found no server: {:?}", e);
                     None
@@ -1295,10 +1314,16 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
     // IS the mDNS discovery — fatal when it finds nothing, as before.
     let discovery_mode = initial_addr.is_none();
     let mut cycle: std::collections::VecDeque<Candidate> = std::collections::VecDeque::new();
+    // The name mDNS gave for the current candidate, if any: it captions the
+    // approval prompt for THIS attempt only (see begin_attempt below).
+    let mut discovered_name: Option<String> = None;
     let mut connect_addr = match initial_addr {
         Some(addr) => addr,
-        None => match draw_candidate(&mut cycle, &config_dir, &verifier).await {
-            Some(addr) => addr,
+        None => match draw_candidate(&mut cycle, &config_dir).await {
+            Some((addr, name)) => {
+                discovered_name = name;
+                addr
+            }
             None => bail!(
                 "No server found: nothing is remembered yet and mDNS discovery found no server on this network. Connect once with 'monux client <ip>' (remembered thereafter)"
             ),
@@ -1356,6 +1381,10 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
         info!("Connecting to server: {}", connect_addr);
         control_state.set_server(connect_addr);
         connection_config.server_addr = connect_addr;
+        // Scope the prompt's identity hint to the machine about to be dialled,
+        // so a name learned on an earlier pass can never caption the approval
+        // of a different server.
+        verifier.begin_attempt(connect_addr, discovered_name.take());
         let connected_at = Instant::now();
         tokio::select! {
             run_result = client::run(
@@ -1393,7 +1422,7 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
                         // servers, most recent first, then one mDNS attempt,
                         // then a fresh pass — see draw_candidate). A failed
                         // mDNS attempt keeps the current address.
-                        if let Some(next) = draw_candidate(&mut cycle, &config_dir, &verifier).await
+                        if let Some((next, name)) = draw_candidate(&mut cycle, &config_dir).await
                         {
                             if next != connect_addr {
                                 info!(
@@ -1402,6 +1431,7 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
                                 );
                             }
                             connect_addr = next;
+                            discovered_name = name;
                         }
                     }
                 }

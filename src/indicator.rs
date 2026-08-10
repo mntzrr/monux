@@ -39,7 +39,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use ksni::blocking::TrayMethods;
 
@@ -258,9 +258,11 @@ enum MenuAction {
     /// control socket exists to ask (see start_daemon).
     StartServer,
     StartClient,
-    /// With a daemon: hides the tray icon (the daemon SIGTERMs this very
-    /// process, after acking) until 'monux gui tray show' or a daemon
-    /// restart. Without one (the standalone tray): exits the indicator.
+    /// Hides the tray icon until 'monux gui tray show' or a daemon restart:
+    /// with a daemon, the hide is asked for over the socket (so no respawn
+    /// follows) and this process then leaves on its own; without one (the
+    /// standalone tray), leaving is the whole of it. See exits_after_ack for
+    /// why the ack alone is not enough.
     HideTray,
     Restart,
     Exit,
@@ -691,6 +693,22 @@ fn action_request(action: &MenuAction) -> String {
     }
 }
 
+/// Whether an acked action ends this process.
+///
+/// INVARIANT: "Hide tray icon" hides the icon the user clicked on. The
+/// daemon's ack does not carry that: `PostAction::IndicatorHide` only parks
+/// the supervisor in the hidden state and SIGTERMs the indicator it spawned
+/// ITSELF (indicator_spawn.rs: "The supervisor only ever manages ITS spawned
+/// child"), which is nobody at all under --no-indicator, after a manually
+/// started `monux gui indicator` took the single-instance lock, or once the
+/// respawn budget is spent. Waiting to be killed in those cases leaves the
+/// icon on screen with the row having reported success, so the indicator
+/// takes itself off the tray instead. The daemon's deferred hide() still
+/// flips `hidden`, so the exit is not mistaken for a crash and respawned.
+fn exits_after_ack(action: &MenuAction) -> bool {
+    matches!(action, MenuAction::HideTray)
+}
+
 /// Runs one menu action against the bound socket, then re-polls immediately
 /// so the icon and menu reflect the effect — including the daemon vanishing
 /// after restart/exit, which simply lands on the not-running view until the
@@ -701,12 +719,10 @@ fn run_action(tray: &mut MonuxTray, action: &MenuAction) {
     let outcome = match (action, tray.socket.clone()) {
         (MenuAction::StartServer, _) => start_daemon(Role::Server).map(|_| String::new()),
         (MenuAction::StartClient, _) => start_daemon(Role::Client).map(|_| String::new()),
-        // Standalone indicator (no daemon to hide us): exiting is the hide;
-        // 'monux gui tray show' / 'monux gui indicator' brings a tray back.
-        (MenuAction::HideTray, None) => {
-            info!("Hiding the standalone tray indicator on request");
-            std::process::exit(0);
-        }
+        // Standalone indicator: there is no daemon to ask, so the hide is
+        // nothing but this process leaving (below); 'monux gui tray show' /
+        // 'monux gui indicator' brings a tray back.
+        (MenuAction::HideTray, None) => Ok(String::new()),
         (MenuAction::CopyDiagnostics, Some(socket)) => copy_diagnostics(&socket)
             .map(|tool| format!("Diagnostics copied to the clipboard ({})", tool)),
         (other, Some(socket)) => send_command(&socket, &action_request(other)).map(|_| String::new()),
@@ -714,6 +730,10 @@ fn run_action(tray: &mut MonuxTray, action: &MenuAction) {
     };
     match outcome {
         Ok(note) => {
+            if exits_after_ack(action) {
+                info!("Hiding the tray indicator on request");
+                std::process::exit(0);
+            }
             if let MenuAction::CopyDiagnostics = action {
                 tray.note = Some(note.clone());
                 notify::notify(NOTIFY_ID, Urgency::Low, 3000, "monux", &note);
@@ -804,18 +824,60 @@ fn start_via_systemctl(unit_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// A daemon that dies within this long of being spawned never got past
+/// startup — no uinput/evdev permissions, the port already bound, a config
+/// it refused. Anything later is the daemon's own lifecycle and none of the
+/// launcher's business to report.
+const DAEMON_STARTUP_GRACE: Duration = Duration::from_secs(3);
+
+/// What to tell the user about a spawned daemon that exited, or None when
+/// the exit is not a failed start. A clean exit never is: the started daemon
+/// spawns its own indicator, which takes the single-instance lock and
+/// SIGTERMs this standalone one, so this thread usually dies with us long
+/// before the daemon does.
+fn startup_failure_note(
+    role: Role,
+    status: &std::process::ExitStatus,
+    uptime: Duration,
+) -> Option<String> {
+    if status.success() || uptime >= DAEMON_STARTUP_GRACE {
+        return None;
+    }
+    Some(format!(
+        "monux {} exited immediately ({}) — run 'monux {}' in a terminal to see why",
+        role.as_str(),
+        status,
+        role.as_str()
+    ))
+}
+
 /// Spawns `monux <role>` detached: our own binary re-run as the daemon,
 /// stdin null and output dropped (the daemon outlives this indicator, so it
 /// must not hold our stdio handles open). Unsupervised: the indicator is not
 /// a service manager, the daemon keeps running after we exit.
 fn spawn_daemon(role: Role) -> Result<()> {
-    Command::new(crate::indicator_spawn::own_exe()?)
+    let mut child = Command::new(crate::indicator_spawn::own_exe()?)
         .arg(role.as_str())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("failed to spawn monux {}", role.as_str()))?;
+    // Wait off-thread: the menu callback has to return at once, but a child
+    // nobody waits on stays a zombie for the lifetime of this indicator, and
+    // the indicator polls forever (notify.rs reaps notify-send for the same
+    // reason). The wait is also the only account we can give of a start that
+    // failed — spawn() succeeding says nothing about the daemon coming up,
+    // and by the time the truth is known run_action has long since cleared
+    // its note, so an immediate death is reported as a notification.
+    let started = std::time::Instant::now();
+    std::thread::spawn(move || {
+        let Ok(status) = child.wait() else { return };
+        if let Some(note) = startup_failure_note(role, &status, started.elapsed()) {
+            warn!("{}", note);
+            notify::notify(NOTIFY_ID, Urgency::Normal, 5000, "monux", &note);
+        }
+    });
     Ok(())
 }
 
@@ -1146,6 +1208,51 @@ mod tests {
             StartHow::Spawn(Role::Client)
         );
         assert_eq!(start_decision(None, Role::Server), StartHow::Spawn(Role::Server));
+    }
+
+    #[test]
+    fn hiding_the_tray_ends_this_process_daemon_or_not() {
+        // The daemon acks a hide it may have nothing to enforce with: it only
+        // SIGTERMs the indicator it spawned itself, which is nobody under
+        // --no-indicator or after a manual 'monux gui indicator' took over.
+        // The row is only honest if this process leaves either way.
+        assert!(exits_after_ack(&MenuAction::HideTray));
+        // Every other action leaves the indicator on the tray to show the
+        // effect it just had.
+        for action in [
+            MenuAction::SwitchLocal,
+            MenuAction::SwitchTo("fp".to_string()),
+            MenuAction::Pause,
+            MenuAction::Resume,
+            MenuAction::UpdateNow,
+            MenuAction::CopyDiagnostics,
+            MenuAction::StartServer,
+            MenuAction::StartClient,
+            MenuAction::Restart,
+            MenuAction::Exit,
+        ] {
+            assert!(!exits_after_ack(&action), "{:?} must not exit", action);
+        }
+    }
+
+    #[test]
+    fn a_daemon_that_dies_at_once_is_reported_a_later_exit_is_not() {
+        use std::os::unix::process::ExitStatusExt;
+        let failed = std::process::ExitStatus::from_raw(1 << 8);
+        let note = startup_failure_note(Role::Server, &failed, Duration::from_millis(50)).unwrap();
+        assert!(note.contains("monux server exited immediately"), "{}", note);
+        // Past the grace the daemon had started; its exit is its own story.
+        assert_eq!(
+            startup_failure_note(Role::Server, &failed, DAEMON_STARTUP_GRACE),
+            None
+        );
+        // A clean exit is never a failed start — it is what the takeover by
+        // the daemon's own indicator looks like.
+        let clean = std::process::ExitStatus::from_raw(0);
+        assert_eq!(
+            startup_failure_note(Role::Client, &clean, Duration::from_millis(50)),
+            None
+        );
     }
 
     #[test]

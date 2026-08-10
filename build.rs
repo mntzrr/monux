@@ -5,6 +5,14 @@
 use std::process::Command;
 
 fn main() {
+    // `monux update` builds from `git archive` output, which carries no .git
+    // for the commands below to read, so it passes the verified commit in
+    // explicitly. An exported tree cannot be dirty, so the suffix is skipped.
+    println!("cargo:rerun-if-env-changed=MONUX_BUILD_SHA");
+    if let Ok(sha) = std::env::var("MONUX_BUILD_SHA") {
+        println!("cargo:rustc-env=MONUX_GIT_SHA={sha}");
+        return;
+    }
     let mut revision =
         git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     if revision != "unknown" && !git(&["status", "--porcelain"]).unwrap_or_default().is_empty() {

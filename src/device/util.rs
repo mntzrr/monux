@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use evdev::{AbsoluteAxisCode, Device, EvdevEnum, InputEvent, EventSummary, KeyCode, KeyEvent};
+use evdev::{
+    AbsoluteAxisCode, Device, EvdevEnum, EventSummary, InputEvent, KeyCode, KeyEvent, MiscCode,
+    MiscEvent,
+};
 use tracing::{debug, info, trace};
 
 #[derive(Debug, PartialEq)]
@@ -154,19 +157,30 @@ pub fn log_device_info(
     trace!("Evdev device details:\n{}", device);
 }
 
-/// Summarizes an evdev InputEvent, hiding the key being pressed in the case of a key event.
+/// Summarizes an evdev InputEvent, hiding the key being pressed in the case of
+/// a key event — and the scancode in the MSC_SCAN event that accompanies it.
 pub fn log_event(event: &InputEvent) -> String {
-    let kind = match event.destructure() {
+    match event.destructure() {
         EventSummary::Key(_evt, _code, value) => {
             // Replace the key with an X to avoid logging passwords etc. BOTH
             // fields must be rebuilt: KeyEvent's own Debug prints its code,
             // so keeping the original event as the first field would still
             // leak the real key.
-            EventSummary::Key(KeyEvent::new(KeyCode::KEY_X, value), KeyCode::KEY_X, value)
+            let kind = EventSummary::Key(KeyEvent::new(KeyCode::KEY_X, value), KeyCode::KEY_X, value);
+            format!("{:?}={}", kind, value)
         }
-        k => k,
-    };
-    format!("{:?}={}", kind, event.value())
+        // Every keyboard emits MSC_SCAN with the raw scancode immediately
+        // before the EV_KEY it describes, so masking only the key above would
+        // leave the same keystroke readable one line up. Here it is the VALUE
+        // that identifies the key, and it appears twice — MiscEvent's derived
+        // Debug prints it, and the trailing event.value() prints it again — so
+        // both are replaced.
+        EventSummary::Misc(_evt, code, _value) if code == MiscCode::MSC_SCAN => {
+            let kind = EventSummary::Misc(MiscEvent::new(MiscCode::MSC_SCAN, 0), MiscCode::MSC_SCAN, 0);
+            format!("{:?}=<scancode>", kind)
+        }
+        k => format!("{:?}={}", k, event.value()),
+    }
 }
 
 fn device_info_string(device: &Device, dims: &BTreeMap<u16, (i32, i32)>) -> String {

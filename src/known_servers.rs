@@ -200,11 +200,35 @@ fn find_by_fingerprint_prefix<'a>(
         .find(|s| s.fingerprint.starts_with(&prefix))
 }
 
+/// Applies an explicitly requested port to a remembered server's address.
+///
+/// A remembered record stores the endpoint that worked last time, so its
+/// port is the right answer for a name only the store knows: a server on a
+/// non-standard port keeps answering to a plain `monux client <name>`. It
+/// stops being the right answer the moment the user names a port — after the
+/// server moves, `monux client desk --port 2000` has to dial 2000 instead of
+/// redialing the dead port the store still holds.
+///
+/// INVARIANT: the port argument arrives pre-defaulted (main.rs collapses a
+/// missing `--port` and a missing config entry into
+/// [`crate::config::DEFAULT_PORT`]), so "no port given" and "port 1213
+/// given" are indistinguishable here and only a non-default port counts as
+/// deliberate. That asymmetry is the safe way round: moving a remembered
+/// non-standard endpoint onto 1213 would break the very connect the store
+/// exists to keep working.
+fn with_requested_port(addr: SocketAddr, port: u16) -> SocketAddr {
+    if port == crate::config::DEFAULT_PORT {
+        return addr;
+    }
+    SocketAddr::new(addr.ip(), port)
+}
+
 /// Resolves a `--host` argument, in order: IP literal → remembered-store
 /// hostname (case-insensitive) → system name resolution (`resolve`, today's
 /// to_socket_addrs path) → remembered-store fingerprint prefix. Every field
 /// printed by `monux servers` is then a valid connect target. The resolver
-/// is injected so the order is testable without DNS.
+/// is injected so the order is testable without DNS. An explicitly requested
+/// port wins over a remembered one on every path (see with_requested_port).
 pub fn resolve_host(
     host: &str,
     port: u16,
@@ -217,11 +241,12 @@ pub fn resolve_host(
     }
     // 2) A remembered server's hostname (case-insensitive).
     if let Some(server) = find_by_hostname(remembered, host) {
+        let addr = with_requested_port(server.addr, port);
         info!(
             "Resolved '{}' to {} via the remembered servers (hostname match)",
-            host, server.addr
+            host, addr
         );
-        return Ok(server.addr);
+        return Ok(addr);
     }
     // 3) System name resolution (DNS, /etc/hosts, <name>.local, ...).
     let resolved = resolve(host);
@@ -230,11 +255,12 @@ pub fn resolve_host(
     }
     // 4) A remembered server's fingerprint prefix.
     if let Some(server) = find_by_fingerprint_prefix(remembered, host) {
+        let addr = with_requested_port(server.addr, port);
         info!(
             "Resolved '{}' to {} via the remembered servers (fingerprint-prefix match)",
-            host, server.addr
+            host, addr
         );
-        return Ok(server.addr);
+        return Ok(addr);
     }
     match resolved {
         Ok(_) => bail!(
@@ -416,6 +442,7 @@ not-an-addr  aabbccdd  myhost  1000
         let remembered = vec![
             server("10.1.1.1:1213", "aabbccdd1122", Some("myhost"), 100),
             server("10.2.2.2:1213", "ffeeddcc", Some("other"), 90),
+            server("10.3.3.3:2000", "cc11", Some("moved"), 80),
         ];
         // 1) An IP literal wins over everything (the resolver must not run).
         assert_eq!(
@@ -448,6 +475,30 @@ not-an-addr  aabbccdd  myhost  1000
         assert_eq!(
             resolve_host("FFEEDD", 1213, &remembered, |_| Ok(None)).unwrap(),
             "10.2.2.2:1213".parse().unwrap()
+        );
+        // A remembered entry keeps its own port for a plain connect: that is
+        // the endpoint that worked, and the caller's 1213 is indistinguishable
+        // from no port at all.
+        assert_eq!(
+            resolve_host("moved", crate::config::DEFAULT_PORT, &remembered, |_| {
+                panic!("resolver must not run for a remembered hostname")
+            })
+            .unwrap(),
+            "10.3.3.3:2000".parse().unwrap()
+        );
+        // But a port the user asked for wins over the remembered one — the
+        // server moved and the store still points at the dead port.
+        assert_eq!(
+            resolve_host("moved", 3000, &remembered, |_| {
+                panic!("resolver must not run for a remembered hostname")
+            })
+            .unwrap(),
+            "10.3.3.3:3000".parse().unwrap()
+        );
+        // Including on the fingerprint-prefix path.
+        assert_eq!(
+            resolve_host("cc11", 3000, &remembered, |_| Ok(None)).unwrap(),
+            "10.3.3.3:3000".parse().unwrap()
         );
         // Nothing matches: an error, and the resolver's error propagates.
         assert!(resolve_host("nope", 1213, &remembered, |_| Ok(None)).is_err());

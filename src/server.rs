@@ -616,8 +616,10 @@ async fn handle_connection(
         .await?;
 
     let mut bulk_bytes = Vec::with_capacity(65536);
-    let mut incoming_clipboard_data: Option<(ClipboardData, Option<SocketAddr>, u64)> =
-        None;
+    // The partially-received clipboard payload and the request id it answers.
+    // The requester is NOT carried here: it is looked up from what the rotation
+    // recorded when it sent the fetch, never from what the peer claims.
+    let mut incoming_clipboard_data: Option<(ClipboardData, u64)> = None;
     loop {
         tokio::select! {
             event_result = events_recv.read_chunk(16384, true) => {
@@ -670,7 +672,7 @@ async fn handle_connection(
                         endpoint: conn.remote_address(),
                     })
                     .await?;
-                if let Some((c, request_client, request_id)) = &mut incoming_clipboard_data {
+                if let Some((c, request_id)) = &mut incoming_clipboard_data {
                     if c.remaining_bytes >= resp.bytes.len() {
                         // Chunk is all clipboard data.
                         c.bytes.extend_from_slice(&resp.bytes);
@@ -686,7 +688,6 @@ async fn handle_connection(
                         // Streamed clipboard data is all accumulated, flush and clear
                         rotation_tx.send(rotation::RotationEvent::ClipboardSendContent(rotation::ClipboardSendContentArgs{
                             data_source: conn.remote_address(),
-                            request_client: *request_client,
                             request_id: *request_id,
                             data: incoming_clipboard_data.take().unwrap().0
                         })).await?;
@@ -807,7 +808,7 @@ async fn handle_bulk_messages(
     rotation_tx: &mpsc::Sender<rotation::RotationEvent>,
     bytes: &mut Vec<u8>,
     max_clipboard_size_bytes: u64,
-) -> Result<Option<(ClipboardData, Option<SocketAddr>, u64)>> {
+) -> Result<Option<(ClipboardData, u64)>> {
     let mut offset = 0;
     let bytes_len = bytes.len();
     while offset < bytes_len {
@@ -857,7 +858,7 @@ async fn handle_bulk_messages(
                     (None, Some(error)) => Err(error.to_string()),
                     (None, None) => Err("sent an empty response".to_string()),
                 };
-                control::peer_diagnostics_hub().complete(d.request_id, reply);
+                control::peer_diagnostics_hub().complete(source, d.request_id, reply);
             }
             bulk::ClientBulk::ClipboardHeader(c) => {
                 if c.content_len_bytes > max_clipboard_size_bytes {
@@ -877,7 +878,6 @@ async fn handle_bulk_messages(
                         .send(rotation::RotationEvent::ClipboardSendContent(
                             rotation::ClipboardSendContentArgs {
                                 data_source: source,
-                                request_client: c.request_client,
                                 request_id: c.request_id,
                                 data: ClipboardData {
                                     requested_type: c.requested_type.to_string(),
@@ -909,7 +909,6 @@ async fn handle_bulk_messages(
                             bytes: payload,
                             remaining_bytes: c.content_len_bytes as usize - resp_remainder.len(),
                         },
-                        c.request_client,
                         c.request_id,
                     );
                     // All bytes were consumed (into the pending clipboard data).

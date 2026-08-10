@@ -299,6 +299,23 @@ fn is_key_type(type_: u16) -> bool {
     type_ == evdev::EventType::KEY.0
 }
 
+/// The scancode in an `EV_MSC` / `MSC_SCAN` event, masked for exactly the
+/// reason MASKED_KEY_CODE is: a raw scancode names the physical key just as
+/// precisely as a key code does (0x70004 is 'a'), and every keyboard emits one
+/// in the same frame as the EV_KEY it describes. Masking only EV_KEY would
+/// leave the same keystroke readable one line above.
+///
+/// This is the mirror image of MASKED_KEY_CODE: there the code is the secret
+/// and the value is safe, here the code (MSC_SCAN) is safe and the VALUE is
+/// the secret.
+const MASKED_SCANCODE: &str = "<scancode>";
+
+/// Whether an event carries a keystroke in its value rather than its code.
+/// See MASKED_SCANCODE.
+fn is_scancode(type_: u16, code: u16) -> bool {
+    type_ == evdev::EventType::MISC.0 && code == evdev::MiscCode::MSC_SCAN.0
+}
+
 /// An input event to be written to a virtual device indicated by the target.
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
 pub struct InputEvent {
@@ -356,6 +373,14 @@ impl std::fmt::Display for InputI32 {
                 "InputI32(type={}, code={}, value={})",
                 self.type_, MASKED_KEY_CODE, self.value
             )
+        } else if is_scancode(self.type_, self.code) {
+            // The VALUE is the keystroke here (see MASKED_SCANCODE). The code
+            // stays: MSC_SCAN is the same constant on every keyboard.
+            write!(
+                f,
+                "InputI32(type={}, code={}, value={})",
+                self.type_, self.code, MASKED_SCANCODE
+            )
         } else {
             write!(
                 f,
@@ -410,6 +435,12 @@ impl std::fmt::Display for InputF64 {
                 f,
                 "InputF64(type={}, code={}, value={})",
                 self.type_, MASKED_KEY_CODE, self.value
+            )
+        } else if is_scancode(self.type_, self.code) {
+            write!(
+                f,
+                "InputF64(type={}, code={}, value={})",
+                self.type_, self.code, MASKED_SCANCODE
             )
         } else {
             write!(

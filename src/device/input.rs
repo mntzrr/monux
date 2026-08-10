@@ -204,6 +204,24 @@ async fn apply_grab_transition(
     }
 }
 
+/// The backoff timer for a failed (un)grab. MissedTickBehavior::Delay is an
+/// invariant here, not a preference: the retry select branch is disabled
+/// while the device sits in its desired grab state — normally the whole
+/// session — and select! never polls a disabled branch's future, so the
+/// interval's deadline is hours stale by the time a grab first fails. Under
+/// tokio's default (Burst) the timer would then be "caught up" one period per
+/// poll, firing elapsed/GRAB_RETRY_INTERVAL times back to back: an EVIOCGRAB
+/// ioctl and a warning line each, thousands of them in milliseconds, evicting
+/// the whole diagnostic ring exactly when the grab failure it is meant to
+/// explain happened. Delay measures the next period from the tick actually
+/// taken. The period is a parameter so the behavior can be tested without
+/// waiting out the real backoff.
+fn grab_retry_interval(period: Duration) -> time::Interval {
+    let mut interval = time::interval(period);
+    interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    interval
+}
+
 async fn read_device_or_grab_events(
     stream: &mut EventStream,
     mut handler_config: HandlerConfig,
@@ -218,7 +236,7 @@ async fn read_device_or_grab_events(
     // for the next state change. If the (un)grab fails, keep retrying in the
     // background instead of giving up on the device: without the grab, input
     // leaks to the local system while also being routed onwards by monux.
-    let mut retry_interval = time::interval(GRAB_RETRY_INTERVAL);
+    let mut retry_interval = grab_retry_interval(GRAB_RETRY_INTERVAL);
     let mut pending_grab = {
         let target = class_grabbed(class, &state_rx.borrow_and_update());
         if target == device_info.is_grabbed {
@@ -585,6 +603,42 @@ mod tests {
         );
     }
 
+    /// A retry timer that went unpolled for many periods — the normal case,
+    /// since the branch driving it is disabled for as long as the device sits
+    /// in its desired grab state — owes exactly one tick, not one per period
+    /// of the gap. The period here stands in for GRAB_RETRY_INTERVAL: what is
+    /// under test is the missed-tick behavior, not the length of the backoff.
+    #[tokio::test]
+    async fn a_stale_grab_retry_timer_owes_one_tick_not_a_burst() {
+        const PERIOD: Duration = Duration::from_millis(50);
+        let mut retry = grab_retry_interval(PERIOD);
+        // The construction tick, consumed as the device task's loop would.
+        retry.tick().await;
+        // The device stays in its desired state: nothing polls the timer for
+        // several periods (for hours, in the field).
+        time::sleep(PERIOD * 6).await;
+        // A grab now starts failing, so the first retry is due immediately.
+        let start = time::Instant::now();
+        retry.tick().await;
+        let first = start.elapsed();
+        assert!(
+            first < PERIOD,
+            "the owed tick should be due at once, waited {:?}",
+            first
+        );
+        // The next one waits out the backoff. With Burst it would fire at
+        // once as well, once for every period the device sat idle.
+        let start = time::Instant::now();
+        retry.tick().await;
+        let second = start.elapsed();
+        assert!(
+            second >= PERIOD,
+            "retry fired {:?} after the last one, short of the {:?} backoff",
+            second,
+            PERIOD
+        );
+    }
+
     /// The cap must clear a real multitouch frame: measured touchpad frames
     /// run to 8 events with one finger down, so a five-finger frame plus
     /// button and timestamp events stays well inside it.
@@ -647,8 +701,17 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt;
 
         const SECRET: u16 = 30; // KEY_A
+        // The scancode the keyboard emits in the same frame as that key. It
+        // names the physical key just as precisely, so it has to be masked
+        // too — and it travels as the event's VALUE, not its code.
+        const SECRET_SCANCODE: i32 = 458756; // HID usage 0x70004 = 'a'
         let info = device_info_with_dims(&[]);
         let press = evdev::InputEvent::new(evdev::EventType::KEY.0, SECRET, 1);
+        let scan = evdev::InputEvent::new(
+            evdev::EventType::MISC.0,
+            evdev::MiscCode::MSC_SCAN.0,
+            SECRET_SCANCODE,
+        );
 
         let marker = format!("keymask-probe-{}", std::process::id());
         let subscriber = tracing_subscriber::registry()
@@ -656,16 +719,18 @@ mod tests {
             .with(crate::logging::ring_layer_for_tests());
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!("{}", marker);
-            let converted = convert_axis_event(press, &info);
-            // The per-event trace line the capture path emits...
-            trace!(
-                "Input event @ {}: {} -> {:?}",
-                "probe-device",
-                util::log_event(&press),
-                converted
-            );
-            // ...and the batch rendering the forwarding path emits.
-            trace!("batch: {:?}", vec![converted]);
+            for event in [press, scan] {
+                let converted = convert_axis_event(event, &info);
+                // The per-event trace line the capture path emits...
+                trace!(
+                    "Input event @ {}: {} -> {:?}",
+                    "probe-device",
+                    util::log_event(&event),
+                    converted
+                );
+                // ...and the batch rendering the forwarding path emits.
+                trace!("batch: {:?}", vec![converted]);
+            }
         });
 
         let captured = crate::logging::recent_logs(crate::logging::RECENT_LOGS_MAX);
@@ -680,8 +745,16 @@ mod tests {
             ours
         );
         assert!(!ours.contains("KEY_A"), "a key name reached the log ring: {}", ours);
-        // The lines were genuinely captured (otherwise this proves nothing).
+        assert!(
+            !ours.contains(&SECRET_SCANCODE.to_string()),
+            "a scancode reached the log ring: {}",
+            ours
+        );
+        // The lines were genuinely captured (otherwise this proves nothing),
+        // and the MSC_SCAN one among them — the masking has to be what keeps
+        // the scancode out, not the event being dropped before it is logged.
         assert!(ours.contains("Input event @"), "{}", ours);
+        assert!(ours.contains("MSC_SCAN"), "the scancode event was never logged: {}", ours);
     }
 
     /// Continuous MT position axes keep the existing [0.0, 1.0] scaling.

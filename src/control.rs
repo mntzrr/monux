@@ -15,13 +15,22 @@
 //!
 //! # Security
 //!
-//! Same-user only: XDG_RUNTIME_DIR is 0700 per the XDG spec and the /tmp
-//! fallback dir is created 0700 as well, so no other user can reach the
-//! socket. bind() also refuses a socket dir owned by another user (a
-//! pre-existing /tmp/monux-<uid> must never be trusted) and treats a failed
-//! 0700 chmod as fatal. There is no authentication beyond that — any process
-//! running as the same user can drive switches, pause, updates and shutdown,
-//! exactly as it already could via signals (SIGUSR1/SIGUSR2/SIGTERM).
+//! Same-user only, established by the KERNEL rather than by the filesystem:
+//! both halves check SO_PEERCRED and refuse a peer that is neither this euid
+//! nor root — the daemon so no other user can drive it, the CLI so a squatted
+//! socket cannot answer for a daemon it is not (a fake `monux status`, a fake
+//! ack for `monux daemon exit`, an attacker-authored bundle pasted into a bug
+//! report). Neither end therefore depends on the socket's directory being
+//! trustworthy, which matters because the /tmp fallback lives in a
+//! world-writable directory.
+//!
+//! The directory is hardened regardless: XDG_RUNTIME_DIR is 0700 per the XDG
+//! spec, the /tmp fallback is created 0700, and bind() refuses a socket dir
+//! owned by another user (a pre-existing /tmp/monux-<uid> must never be
+//! trusted) or reached through a symlink, treating a failed 0700 chmod as
+//! fatal. There is no authentication beyond identity — any process running as
+//! the same user can drive switches, pause, updates and shutdown, exactly as
+//! it already could via signals (SIGUSR1/SIGUSR2/SIGTERM).
 //!
 //! # Wire protocol (newline-delimited JSON)
 //!
@@ -106,7 +115,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::device::Event;
 use crate::msgs::shared::PROTOCOL_VERSION;
@@ -176,25 +185,57 @@ pub fn socket_path(role: Role) -> PathBuf {
 /// pre-existing dir owned by another user could have its socket replaced,
 /// feeding fake acks/state to `monux status` — and locked down to 0700. A
 /// failed chmod is a hard error for the same reason.
+///
+/// The ownership check and the chmod run against a DESCRIPTOR opened
+/// O_NOFOLLOW, never against the path. The /tmp fallback dir sits in a
+/// world-writable directory, so a path-based check can be aimed elsewhere by
+/// planting a symlink at that name: the owner check would then be satisfied
+/// by the link's target and the 0700 chmod would land on a directory we never
+/// meant to touch. single_instance.rs hardens its own /tmp lock file the same
+/// way, for the same reason.
 fn prepare_socket_dir(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir)
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    // Refuse a planted link by name first, so the error says what is actually
+    // wrong; the O_NOFOLLOW open below closes the swap-after-check race.
+    if std::fs::symlink_metadata(dir)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        bail!(
+            "Refusing to use control socket dir {}: it is a symlink",
+            dir.display()
+        );
+    }
+    // 0700 from birth rather than a create-then-chmod: no window in which a
+    // freshly created dir is reachable by anyone else.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
         .with_context(|| format!("Failed to create control socket dir {}", dir.display()))?;
-    ensure_dir_owner(dir, unsafe { libc::geteuid() })?;
+    let handle = std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(dir)
+        .with_context(|| format!("Failed to open control socket dir {}", dir.display()))?;
+    let owner = handle
+        .metadata()
+        .with_context(|| format!("Failed to stat control socket dir {}", dir.display()))?
+        .uid();
+    ensure_dir_owner(dir, owner, unsafe { libc::geteuid() })?;
     // 0700 even if the dir pre-existed with looser perms: the socket is
     // same-user only (see module docs).
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    handle
+        .set_permissions(std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("Failed to lock down control socket dir {}", dir.display()))?;
     Ok(())
 }
 
-/// Bails unless `dir` is owned by `expected_uid` (the euid at the call site;
-/// a parameter so the mismatch branch is testable without root).
-fn ensure_dir_owner(dir: &Path, expected_uid: libc::uid_t) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let owner = std::fs::metadata(dir)
-        .with_context(|| format!("Failed to stat control socket dir {}", dir.display()))?
-        .uid();
+/// Bails unless `owner` is `expected_uid` (the dir's uid from an fstat of the
+/// opened dir, and the euid at the call site; both are parameters so the
+/// mismatch branch is testable without root). `dir` is only used in the
+/// message.
+fn ensure_dir_owner(dir: &Path, owner: libc::uid_t, expected_uid: libc::uid_t) -> Result<()> {
     if owner != expected_uid {
         bail!(
             "Control socket dir {} is owned by uid {}, not by us (uid {}): refusing to trust it — remove it or fix its ownership",
@@ -204,6 +245,64 @@ fn ensure_dir_owner(dir: &Path, expected_uid: libc::uid_t) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The uid of the process on the other end of a connected unix socket, as the
+/// KERNEL reports it (SO_PEERCRED, recorded at connect time). Unlike the
+/// socket path's permissions this says nothing about who created the path, so
+/// it holds even when the directory itself cannot be trusted — which is what
+/// makes it the right check for both halves of this protocol.
+fn peer_uid(fd: std::os::unix::io::RawFd) -> Result<libc::uid_t> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `fd` is a live connected socket borrowed from its owner for the
+    // duration of the call, and cred/len describe exactly the buffer
+    // SO_PEERCRED writes.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("Failed to read the control socket peer's credentials");
+    }
+    Ok(cred.uid)
+}
+
+/// Whether a control-socket peer running as `peer` may be trusted by a
+/// process running as `euid`, given the uid that invoked us (`SUDO_UID`, when
+/// this process was elevated).
+///
+/// Same user, or root — and root is a statement of fact rather than a
+/// concession: it can already ptrace the daemon and replace its binary.
+///
+/// The invoking user is the third case, and it is what keeps the documented
+/// `sudo -E monux server` fallback working: that puts a ROOT daemon on one end
+/// of this socket and the user's own unprivileged `mx status` / tray on the
+/// other. Refusing them would be a stricter rule than the socket ever had —
+/// it lives in that user's runtime dir, 0700 — while buying nothing: they
+/// started this daemon with sudo, so they can restart it saying anything.
+/// Every OTHER local user is still refused, which is the actual threat.
+fn peer_uid_trusted(peer: libc::uid_t, euid: libc::uid_t, invoker: Option<libc::uid_t>) -> bool {
+    peer == euid || peer == 0 || (euid == 0 && invoker == Some(peer))
+}
+
+/// The uid that invoked this process through sudo, if any. Only consulted when
+/// running as root (see peer_uid_trusted); sudo sets it, so an unelevated
+/// process inheriting a stale value gains nothing from it.
+fn invoking_uid() -> Option<libc::uid_t> {
+    std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|uid| uid.parse::<libc::uid_t>().ok())
 }
 
 /// Live server state, published in status responses (see module docs).
@@ -529,11 +628,13 @@ impl Diagnostics {
     }
 }
 
-/// Longest the server waits for one client to answer a diagnostics request.
-/// A client builds its bundle from in-memory mirrors, so this only trips
-/// when the peer is wedged or the link is dead — which is very often exactly
-/// what the report is about. The wait is therefore bounded and its expiry
-/// recorded, never allowed to hold the report open.
+/// Longest the server waits for the clients to answer a diagnostics request —
+/// for the whole roster together, not per client (collect_peer_diagnostics
+/// shares one deadline across it). A client builds its bundle from in-memory
+/// mirrors, so this only trips when the peer is wedged or the link is dead —
+/// which is very often exactly what the report is about. The wait is
+/// therefore bounded and its expiry recorded, never allowed to hold the
+/// report open.
 pub const PEER_DIAGNOSTICS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Correlates outgoing peer-diagnostics requests with the responses that
@@ -560,8 +661,11 @@ pub fn peer_diagnostics_hub() -> &'static PeerDiagnosticsHub {
 #[derive(Default)]
 struct PeerDiagnosticsInner {
     next_id: u64,
-    /// Requests still awaiting an answer, by request id.
-    pending: std::collections::HashMap<u64, tokio::sync::oneshot::Sender<PeerReply>>,
+    /// Requests still awaiting an answer, keyed by request id, each holding
+    /// the peer that was asked. The responder is checked against it: the id
+    /// travels in a frame the peer writes, so on its own it lets any connected
+    /// client answer any other client's request (see complete).
+    pending: std::collections::HashMap<u64, (SocketAddr, tokio::sync::oneshot::Sender<PeerReply>)>,
 }
 
 /// What a client's bulk reader hands back for one request.
@@ -572,23 +676,39 @@ impl PeerDiagnosticsHub {
         Self::default()
     }
 
-    /// Registers a new request, returning its id and the receiver to await.
-    pub fn open(&self) -> (u64, tokio::sync::oneshot::Receiver<PeerReply>) {
+    /// Registers a new request against the peer being asked, returning its id
+    /// and the receiver to await.
+    pub fn open(&self, peer: SocketAddr) -> (u64, tokio::sync::oneshot::Receiver<PeerReply>) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut inner = self.inner.lock().expect("peer diagnostics hub poisoned");
         inner.next_id += 1;
         let id = inner.next_id;
-        inner.pending.insert(id, tx);
+        inner.pending.insert(id, (peer, tx));
         (id, rx)
     }
 
-    /// Delivers a response. Unknown ids are dropped with a debug line rather
-    /// than an error: a request that already timed out is exactly the case,
-    /// and a late answer to it is not a fault.
-    pub fn complete(&self, id: u64, reply: PeerReply) {
+    /// Delivers a response from `peer`. Unknown ids are dropped with a debug
+    /// line rather than an error: a request that already timed out is exactly
+    /// the case, and a late answer to it is not a fault.
+    ///
+    /// An id answered by a peer it was not addressed to is dropped the same
+    /// way. Ids are a sequential counter handed out one per connected client
+    /// in a tight loop, so a client can trivially guess its neighbour's and
+    /// answer first — putting a bundle of its choosing under the other
+    /// machine's label in the operator's bug report.
+    pub fn complete(&self, peer: SocketAddr, id: u64, reply: PeerReply) {
         let sender = {
             let mut inner = self.inner.lock().expect("peer diagnostics hub poisoned");
-            inner.pending.remove(&id)
+            match inner.pending.get(&id) {
+                Some((asked, _)) if *asked != peer => {
+                    debug!(
+                        "Ignoring peer diagnostics response for request {} from {}: it was addressed to {}",
+                        id, peer, asked
+                    );
+                    None
+                }
+                _ => inner.pending.remove(&id).map(|(_, tx)| tx),
+            }
         };
         match sender {
             Some(tx) => {
@@ -654,11 +774,19 @@ async fn collect_peer_diagnostics(
     };
 
     let hub = peer_diagnostics_hub();
+    // ONE deadline for the whole roster rather than one per peer. Every
+    // request is already in flight by the time we get here, so the peers are
+    // answering in parallel whatever we do; billing each silent one its own
+    // full timeout would only make the report take N times as long and push
+    // it past the caller's budget (see PEER_SOCKET_TIMEOUT). A oneshot holds
+    // its value, so a peer that answered while we were waiting on an earlier
+    // one is still read here, without a wait of its own.
+    let deadline = tokio::time::Instant::now() + PEER_DIAGNOSTICS_TIMEOUT;
     let mut out = Vec::with_capacity(pending.len());
     for peer in pending {
         let diagnostics = match peer.waiting {
             Err(reason) => Err(reason),
-            Ok(rx) => match tokio::time::timeout(PEER_DIAGNOSTICS_TIMEOUT, rx).await {
+            Ok(rx) => match tokio::time::timeout_at(deadline, rx).await {
                 Ok(Ok(reply)) => reply,
                 Ok(Err(_)) => Err("the connection dropped before it answered".to_string()),
                 Err(_) => {
@@ -992,9 +1120,34 @@ impl Listener {
     /// Accepts connections forever; each is served by its own task so a slow
     /// or stuck peer never blocks the daemon's event loops (or other peers).
     pub async fn run(self, handler: Handler) -> Result<()> {
+        use std::os::unix::io::AsRawFd;
         let handler = Arc::new(handler);
+        let euid = unsafe { libc::geteuid() };
         loop {
             let (stream, _) = self.listener.accept().await?;
+            // Identity comes from the kernel, not from the directory the
+            // socket sits in (see the module docs' Security section). A
+            // stranger reaching us at all is worth a WARN: on a correctly
+            // set-up machine the socket dir already excludes them, so this
+            // means the dir's protection is not doing its job.
+            match peer_uid(stream.as_raw_fd()) {
+                Ok(peer) if peer_uid_trusted(peer, euid, invoking_uid()) => {}
+                Ok(peer) => {
+                    warn!(
+                        "Refused a control socket connection from uid {}: this daemon (uid {}) serves its own user only",
+                        peer,
+                        euid
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        "Refused a control socket connection with unreadable credentials: {:#}",
+                        e
+                    );
+                    continue;
+                }
+            }
             let handler = handler.clone();
             tokio::task::spawn(async move {
                 if let Err(e) = serve_connection(stream, handler).await {
@@ -1070,18 +1223,56 @@ async fn serve_connection(stream: tokio::net::UnixStream, handler: Arc<Handler>)
 /// must not hang on that.
 const SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Budget for the one request the daemon does NOT answer from memory: a
+/// `diagnostics` that asks for the connected peers' bundles. Before it writes
+/// a single byte the daemon may spend PEER_DIAGNOSTICS_TIMEOUT waiting for
+/// the rotation loop to hand back the roster and another one waiting for the
+/// clients themselves — and a silent client is precisely what the report is
+/// usually about. A caller on SOCKET_TIMEOUT would walk away from a bundle
+/// the daemon is about to produce and report the healthy daemon as "is monux
+/// running?", so the budget is derived from PEER_DIAGNOSTICS_TIMEOUT (plus
+/// slack for building and writing the bundle) instead of being an independent
+/// constant the two sides can drift apart on.
+const PEER_SOCKET_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2 * PEER_DIAGNOSTICS_TIMEOUT.as_secs() + 2);
+
 /// Sends one request to a control socket and returns the raw response line.
 /// Synchronous with a short timeout: used by the short-lived
 /// `monux status` CLI and the tray indicator's poll loop.
 pub fn request_line(socket: &Path, request: &str) -> Result<String> {
+    request_line_with_timeout(socket, request, SOCKET_TIMEOUT)
+}
+
+/// [`request_line`] with a caller-chosen budget, for the requests the daemon
+/// cannot answer out of its mirrors (see PEER_SOCKET_TIMEOUT).
+pub fn request_line_with_timeout(
+    socket: &Path,
+    request: &str,
+    timeout: std::time::Duration,
+) -> Result<String> {
     use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::io::AsRawFd;
     let stream = std::os::unix::net::UnixStream::connect(socket)
         .with_context(|| format!("Failed to connect to {}", socket.display()))?;
+    // Who answers matters as much as what they answer: everything downstream
+    // (status output, the tray, `daemon exit`'s ack, a diagnostics bundle
+    // pasted into a bug report) is taken at face value, and the path alone
+    // does not establish that a monux daemon of ours is on the other end.
+    let peer = peer_uid(stream.as_raw_fd())?;
+    let euid = unsafe { libc::geteuid() };
+    if !peer_uid_trusted(peer, euid, invoking_uid()) {
+        bail!(
+            "Refusing to trust {}: it is served by uid {}, not by us (uid {}) — another user created it first, so its answers are not the daemon's; remove the directory or fix its ownership",
+            socket.display(),
+            peer,
+            euid
+        );
+    }
     stream
-        .set_read_timeout(Some(SOCKET_TIMEOUT))
+        .set_read_timeout(Some(timeout))
         .context("Failed to set control socket read timeout")?;
     stream
-        .set_write_timeout(Some(SOCKET_TIMEOUT))
+        .set_write_timeout(Some(timeout))
         .context("Failed to set control socket write timeout")?;
     let mut writer = stream
         .try_clone()
@@ -1126,7 +1317,7 @@ pub fn status_cli(
         }
         (None, true, true) => bail!("--server and --client are mutually exclusive"),
     };
-    let (path, raw) = query_first(&candidates, r#"{"cmd":"status"}"#)?;
+    let (path, raw) = query_first(&candidates, r#"{"cmd":"status"}"#, SOCKET_TIMEOUT)?;
     format_status(&path, &raw, json)
 }
 
@@ -1158,7 +1349,15 @@ pub fn fetch_diagnostics(
         "peer": peer,
     })
     .to_string();
-    let (path, raw) = query_first(&candidates, &request)?;
+    // Asking for the peers turns this into the one request that waits on the
+    // network before answering; the budget has to cover that (see
+    // PEER_SOCKET_TIMEOUT) or the CLI abandons a bundle it is about to get.
+    let timeout = if peer {
+        PEER_SOCKET_TIMEOUT
+    } else {
+        SOCKET_TIMEOUT
+    };
+    let (path, raw) = query_first(&candidates, &request, timeout)?;
     let parsed: serde_json::Value = serde_json::from_str(&raw)
         .with_context(|| format!("Malformed response from {}: {}", path.display(), raw))?;
     if parsed["ok"] != serde_json::Value::Bool(true) {
@@ -1190,7 +1389,7 @@ pub fn daemon_cli(request: &str, ok_message: &str, socket: Option<&Path>) -> Res
         Some(path) => vec![path.to_path_buf()],
         None => vec![socket_path(Role::Server), socket_path(Role::Client)],
     };
-    let (path, raw) = query_first(&candidates, request)?;
+    let (path, raw) = query_first(&candidates, request, SOCKET_TIMEOUT)?;
     let response: RawResponse = serde_json::from_str(&raw)
         .with_context(|| format!("Malformed response from {}: {}", path.display(), raw))?;
     if !response.ok {
@@ -1219,7 +1418,7 @@ pub fn tray_cli(hide: bool, socket: Option<&Path>) -> Result<String> {
     };
     let action = if hide { "hide" } else { "show" };
     let request = format!(r#"{{"cmd":"indicator","action":"{}"}}"#, action);
-    let result = query_first(&candidates, &request);
+    let result = query_first(&candidates, &request, SOCKET_TIMEOUT);
     match (tray_decision(hide, socket.is_some(), result.is_ok()), result) {
         (TrayDecision::Unhide, Ok((path, raw))) => {
             let response: RawResponse = serde_json::from_str(&raw)
@@ -1276,14 +1475,20 @@ fn tray_decision(hide: bool, explicit_socket: bool, daemon_answered: bool) -> Tr
 /// Sends `request` to the first candidate socket that answers, returning the
 /// answering path and the raw response line. The first socket that answers
 /// wins; missing files and stale sockets (crash remnants) fall through to
-/// the next candidate. Shared by status_cli, daemon_cli and tray_cli.
-fn query_first(candidates: &[PathBuf], request: &str) -> Result<(PathBuf, String)> {
+/// the next candidate. `timeout` is per candidate — it bounds how long the
+/// daemon has to answer, so it belongs to the REQUEST rather than to this
+/// helper. Shared by status_cli, daemon_cli, tray_cli and fetch_diagnostics.
+fn query_first(
+    candidates: &[PathBuf],
+    request: &str,
+    timeout: std::time::Duration,
+) -> Result<(PathBuf, String)> {
     let mut last_err = None;
     for path in candidates {
         if !path.exists() {
             continue;
         }
-        match request_line(path, request) {
+        match request_line_with_timeout(path, request, timeout) {
             Ok(raw) => return Ok((path.clone(), raw)),
             Err(e) => {
                 debug!("Control socket {} unusable: {:?}", path.display(), e);
@@ -1433,18 +1638,74 @@ mod tests {
             std::fs::metadata(&socket_dir).unwrap().permissions().mode() & 0o777,
             0o700
         );
-        ensure_dir_owner(&socket_dir, unsafe { libc::geteuid() }).unwrap();
+        let owner = std::fs::metadata(&socket_dir).unwrap().uid();
+        ensure_dir_owner(&socket_dir, owner, unsafe { libc::geteuid() }).unwrap();
 
         // A dir owned by another user must be refused. (A foreign-owned dir
         // can't be chowned into existence without root, so the mismatch
         // branch is exercised with a uid that isn't the dir's owner.)
-        let foreign_uid = std::fs::metadata(&socket_dir).unwrap().uid().wrapping_add(1);
-        let err = ensure_dir_owner(&socket_dir, foreign_uid).unwrap_err();
+        let err = ensure_dir_owner(&socket_dir, owner, owner.wrapping_add(1)).unwrap_err();
         assert!(
             format!("{:#}", err).contains("refusing to trust"),
             "unexpected error: {:#}",
             err
         );
+
+        // A dir that does not exist yet is created 0700 outright, never
+        // created loose and tightened afterwards.
+        let fresh = dir.path().join("fresh");
+        prepare_socket_dir(&fresh).unwrap();
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    /// A symlink planted at the socket dir's name — anyone can do that in the
+    /// world-writable /tmp the fallback path lives in — must be refused, and
+    /// its target left completely alone: the ownership check must not be
+    /// satisfiable by the TARGET's uid, and the 0700 lockdown must not land
+    /// on a directory we never meant to touch.
+    #[test]
+    fn a_symlinked_socket_dir_is_refused_and_its_target_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let planted = dir.path().join("monux");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        let err = prepare_socket_dir(&planted).unwrap_err();
+        assert!(
+            format!("{:#}", err).contains("symlink"),
+            "unexpected error: {:#}",
+            err
+        );
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn only_our_own_user_and_root_may_use_a_control_socket() {
+        // Same user: the ordinary case, both directions.
+        assert!(peer_uid_trusted(1000, 1000, None));
+        // Root: it can ptrace the daemon and replace its binary anyway.
+        assert!(peer_uid_trusted(0, 1000, None));
+        assert!(peer_uid_trusted(0, 0, None));
+        // The documented `sudo -E monux server` fallback: a root daemon must
+        // still answer the user who started it, or `mx status` and the tray
+        // stop working against it.
+        assert!(peer_uid_trusted(1000, 0, Some(1000)));
+        // ...but only that user, and only while actually elevated.
+        assert!(!peer_uid_trusted(1001, 0, Some(1000)));
+        assert!(!peer_uid_trusted(1000, 0, None));
+        // Any other local user is refused — the whole protocol assumes the
+        // peer is us.
+        assert!(!peer_uid_trusted(1001, 1000, None));
+        assert!(!peer_uid_trusted(1000, 1001, Some(1000)));
     }
 
     #[test]
@@ -1944,13 +2205,14 @@ mod tests {
         // Stand in for the rotation loop: answer with one reachable client
         // and one that is too old to ask.
         let hub = peer_diagnostics_hub();
+        let peer_a: SocketAddr = "10.0.0.5:1213".parse().unwrap();
         let fake_rotation = tokio::spawn(async move {
             let event = rotation_rx.recv().await.expect("a request must arrive");
             let crate::rotation::RotationEvent::RequestPeerDiagnostics(args) = event else {
                 panic!("expected a peer diagnostics request");
             };
             assert_eq!(args.lines, crate::logging::RECENT_LOGS_DEFAULT as u32);
-            let (id, rx) = hub.open();
+            let (id, rx) = hub.open(peer_a);
             args.reply
                 .send(vec![
                     crate::rotation::PendingPeer {
@@ -1975,7 +2237,7 @@ mod tests {
                 environment: Default::default(),
             };
             answer.state_dump = "connected=true".to_string();
-            hub.complete(id, Ok(answer));
+            hub.complete(peer_a, id, Ok(answer));
         });
 
         let mut req = req("diagnostics", None);
@@ -2009,8 +2271,12 @@ mod tests {
         assert!(rotation_rx.try_recv().is_err());
     }
 
+    /// Three silent peers must cost the SAME wait as one: the deadline is
+    /// shared across the roster. Waiting on them one after another used to
+    /// bill each its own timeout, which took the response past the CLI's
+    /// budget and turned a healthy daemon into "is monux running?".
     #[tokio::test]
-    async fn a_silent_peer_is_recorded_rather_than_hanging_the_report() {
+    async fn silent_peers_are_recorded_and_share_one_deadline() {
         let (event_tx, _event_rx) = mpsc::channel(8);
         let (handler, mut rotation_rx) = server_handler_with_rotation(event_tx, false);
         let hub = peer_diagnostics_hub();
@@ -2019,51 +2285,138 @@ mod tests {
             let crate::rotation::RotationEvent::RequestPeerDiagnostics(args) = event else {
                 panic!("expected a peer diagnostics request");
             };
-            let (id, rx) = hub.open();
-            // Never completed: the client is wedged or the link is black-holed.
-            args.reply
-                .send(vec![crate::rotation::PendingPeer {
-                    label: "aabbccdd @ 10.0.0.5:1213".to_string(),
-                    waiting: Ok(rx),
-                    request_id: Some(id),
-                }])
-                .expect("the requester is still waiting");
-            id
+            // None of them is ever completed: wedged clients, or links that
+            // black-hole.
+            let pending: Vec<_> = (0..3)
+                .map(|i| {
+                    let (id, rx) = hub.open(format!("10.0.0.{}:1213", 5 + i).parse().unwrap());
+                    (
+                        id,
+                        crate::rotation::PendingPeer {
+                            label: format!("aabbccd{} @ 10.0.0.{}:1213", i, 5 + i),
+                            waiting: Ok(rx),
+                            request_id: Some(id),
+                        },
+                    )
+                })
+                .collect();
+            let (ids, peers): (Vec<u64>, Vec<_>) = pending.into_iter().unzip();
+            args.reply.send(peers).expect("the requester is still waiting");
+            ids
         });
 
         let mut req = req("diagnostics", None);
         req.peer = Some(true);
         let started = std::time::Instant::now();
         let (resp, _) = handler.dispatch(&req).await;
-        let id = fake_rotation.await.unwrap();
+        let ids = fake_rotation.await.unwrap();
 
         assert!(resp.ok);
-        assert_eq!(resp.peers.len(), 1);
-        let err = resp.peers[0].diagnostics.as_ref().unwrap_err();
-        assert!(err.contains("did not answer"), "{}", err);
-        // Bounded by the timeout, not by the peer's willingness to answer.
-        assert!(started.elapsed() < PEER_DIAGNOSTICS_TIMEOUT * 2);
-        // And the hub kept no entry for the answer nobody awaits any more.
-        hub.complete(id, Err("late".to_string()));
+        assert_eq!(resp.peers.len(), 3);
+        for peer in &resp.peers {
+            let err = peer.diagnostics.as_ref().unwrap_err();
+            assert!(err.contains("did not answer"), "{}", err);
+        }
+        // One timeout for the roster, not one per peer.
+        assert!(
+            started.elapsed() < PEER_DIAGNOSTICS_TIMEOUT * 2,
+            "three silent peers took {:?}",
+            started.elapsed()
+        );
+        // And the hub kept no entry for answers nobody awaits any more.
+        for id in ids {
+            hub.complete("10.0.0.5:1213".parse().unwrap(), id, Err("late".to_string()));
+        }
+    }
+
+    /// The CLI half must outwait the daemon half on a peer request. The
+    /// daemon writes nothing until it has polled its clients, which takes
+    /// longer than the budget every other command gets — a plain
+    /// SOCKET_TIMEOUT here made `monux diagnostics --peer` report a healthy
+    /// daemon as absent and fall back to an offline bundle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_diagnostics_fetch_outwaits_the_daemon_side_collection() {
+        // The budget has to cover both of the daemon's waits (the rotation
+        // loop's, then the roster's) before a byte is written.
+        assert!(PEER_SOCKET_TIMEOUT > PEER_DIAGNOSTICS_TIMEOUT * 2);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.sock");
+        let listener = Listener::bind_at(&path, "server").unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (handler, mut rotation_rx) = server_handler_with_rotation(event_tx, false);
+        let task = tokio::spawn(listener.run(handler));
+        // Stand in for a rotation loop that takes its time — longer than the
+        // ordinary SOCKET_TIMEOUT, well inside the peer budget.
+        let fake_rotation = tokio::spawn(async move {
+            let event = rotation_rx.recv().await.expect("a request must arrive");
+            let crate::rotation::RotationEvent::RequestPeerDiagnostics(args) = event else {
+                panic!("expected a peer diagnostics request");
+            };
+            tokio::time::sleep(SOCKET_TIMEOUT + std::time::Duration::from_millis(500)).await;
+            args.reply.send(Vec::new()).expect("the requester is still waiting");
+        });
+        // Let the listener come up before querying (connect would EAGAIN).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let queried = path.clone();
+        let fetched = tokio::task::spawn_blocking(move || {
+            fetch_diagnostics(true, false, Some(&queried), 10, true)
+        })
+        .await
+        .unwrap();
+        fake_rotation.await.unwrap();
+        let (role, diagnostics, peers) = fetched.expect("the daemon answered, just not quickly");
+        assert_eq!(role, Role::Server);
+        assert_eq!(diagnostics.role, "server");
+        assert!(peers.is_empty());
+
+        task.abort();
+        let _ = task.await;
     }
 
     #[test]
     fn the_hub_correlates_answers_and_forgets_cancelled_requests() {
         let hub = PeerDiagnosticsHub::new();
-        let (id_a, mut rx_a) = hub.open();
-        let (id_b, mut rx_b) = hub.open();
+        let a: SocketAddr = "10.0.0.5:1213".parse().unwrap();
+        let b: SocketAddr = "10.0.0.6:1213".parse().unwrap();
+        let (id_a, mut rx_a) = hub.open(a);
+        let (id_b, mut rx_b) = hub.open(b);
         assert_ne!(id_a, id_b, "ids must not collide");
 
-        hub.complete(id_a, Err("nope".to_string()));
+        hub.complete(a, id_a, Err("nope".to_string()));
         assert_eq!(rx_a.try_recv().unwrap().unwrap_err(), "nope");
 
         // A cancelled request's answer is dropped, not misdelivered.
         hub.cancel(id_b);
-        hub.complete(id_b, Err("late".to_string()));
+        hub.complete(b, id_b, Err("late".to_string()));
         assert!(rx_b.try_recv().is_err());
 
         // An id that was never opened is ignored rather than panicking.
-        hub.complete(9999, Err("unknown".to_string()));
+        hub.complete(a, 9999, Err("unknown".to_string()));
+    }
+
+    /// Ids are a sequential counter handed out one per connected client in a
+    /// tight loop, so a client can guess its neighbour's and answer first —
+    /// putting a bundle of its choosing under the other machine's label in the
+    /// operator's bug report. Only the peer that was asked may answer.
+    #[test]
+    fn a_peer_cannot_answer_a_request_addressed_to_another_peer() {
+        let hub = PeerDiagnosticsHub::new();
+        let asked: SocketAddr = "10.0.0.5:1213".parse().unwrap();
+        let impostor: SocketAddr = "10.0.0.6:1213".parse().unwrap();
+        let (id, mut rx) = hub.open(asked);
+
+        hub.complete(impostor, id, Err("forged".to_string()));
+        assert!(
+            rx.try_recv().is_err(),
+            "a peer that was not asked must not be able to answer"
+        );
+
+        // The real answer still lands afterwards: the forgery must not have
+        // consumed the entry either.
+        hub.complete(asked, id, Err("genuine".to_string()));
+        assert_eq!(rx.try_recv().unwrap().unwrap_err(), "genuine");
     }
 
     #[test]

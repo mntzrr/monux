@@ -72,7 +72,8 @@ included alongside this one's.
 
 Pass --redact to replace IP addresses, hostnames, usernames and home paths
 with placeholders before the bundle leaves this machine — in the peer
-sections too, using the names each peer reports about itself. Loopback
+sections too, using the names each peer reports about itself, and in the log
+lines naming a server this machine discovered or connected to. Loopback
 addresses and certificate fingerprints are kept: they identify nobody, and
 the report is much harder to read without them. A hostname or username too
 generic to substitute safely (three characters or fewer, or a word the report
@@ -528,6 +529,9 @@ fn bundle_names(bundle: &Bundle) -> Names {
             names.add(&d.environment);
         }
     }
+    if let Some(config_dir) = crate::update::default_config_dir() {
+        names.add_remembered_servers(&config_dir);
+    }
     names
 }
 
@@ -724,6 +728,26 @@ impl Names {
         }
     }
 
+    /// The hostnames of the servers this machine has connected to, read from
+    /// the remembered store.
+    ///
+    /// The wire carries a machine's names only in the other direction: an
+    /// `Environment` describes the machine it came from, and a CLIENT bundle
+    /// has no peer sections at all (`--peer` is server-only), so the one
+    /// machine a client talks about most is the one machine whose name never
+    /// reaches this set. Its logs still print that name — mDNS discovery and
+    /// every reconnect — while the client itself learned it from the v15+
+    /// handshake and wrote it to known_servers on the way past (client.rs).
+    /// Reading it back here is the only channel that exists without changing
+    /// what a daemon reports about itself.
+    fn add_remembered_servers(&mut self, config_dir: &Path) {
+        for server in crate::known_servers::load(config_dir) {
+            if let Some(hostname) = server.hostname {
+                self.hostnames.push(hostname);
+            }
+        }
+    }
+
     /// (name, placeholder) pairs to substitute, dropping the names that would
     /// damage the report more than they protect (see is_unsubstitutable) and
     /// de-duplicating. A name that is both a hostname and a username on some
@@ -810,13 +834,15 @@ fn redact_names(text: &str, names: &Names) -> String {
     let ipv4 = IPV4.get_or_init(|| {
         Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").expect("valid ipv4 pattern")
     });
-    // At least three colon-separated hex groups: enough structure that log
-    // text and timestamps (two colons, non-hex neighbours) don't match.
-    let ipv6 = IPV6.get_or_init(|| {
-        Regex::new(r"\b(?:[0-9a-fA-F]{1,4}:){3,7}[0-9a-fA-F]{1,4}\b").expect("valid ipv6 pattern")
-    });
+    // A loose CANDIDATE — hex digits and colons — left for [`scrubbable_ipv6`]
+    // to accept or reject. Counting colon-separated groups instead cannot see
+    // the shapes monux actually emits: every address Rust prints goes through
+    // Ipv6Addr's RFC 5952 Display, which compresses the longest zero run, so
+    // `[fd00::5]:1213` has no unbroken run of groups to count and used to
+    // survive --redact untouched.
+    let ipv6 = IPV6.get_or_init(|| Regex::new(r"[0-9a-fA-F:]{2,}").expect("valid ipv6 pattern"));
 
-    let mut out = ipv4
+    let scanned = ipv4
         .replace_all(text, |caps: &regex::Captures| {
             let found = &caps[0];
             if KEPT_ADDRS.contains(&found) {
@@ -826,13 +852,13 @@ fn redact_names(text: &str, names: &Names) -> String {
             }
         })
         .into_owned();
-    out = ipv6
-        .replace_all(&out, |caps: &regex::Captures| {
-            let found = &caps[0];
-            if KEPT_ADDRS.contains(&found) {
-                found.to_string()
-            } else {
+    let mut out = ipv6
+        .replace_all(&scanned, |caps: &regex::Captures| {
+            let found = caps.get(0).expect("the whole match always exists");
+            if scrubbable_ipv6(&scanned, found.start(), found.end()) {
                 "<ipv6>".to_string()
+            } else {
+                found.as_str().to_string()
             }
         })
         .into_owned();
@@ -847,6 +873,77 @@ fn redact_names(text: &str, names: &Names) -> String {
         // mDNS presents the same name with a .local suffix.
         out = out.replace(&format!("{}.local", name), "<hostname>.local");
     }
+    redact_mdns_instances(&out)
+}
+
+/// Whether an IPv6-shaped candidate at `text[start..end]` is really an address
+/// to replace.
+///
+/// The pattern that finds candidates is deliberately loose, so the decision
+/// lives here — and the harder half of it is not "does this parse" but "is
+/// this a token at all". `monux::device::input` contains `ce::`, which parses
+/// perfectly well as the address `ce::`; substituting it would rewrite every
+/// log target in the bundle to `monux::devi<ipv6>nput`. So a candidate whose
+/// neighbour is a word character is part of a longer word, not an address.
+///
+/// The unspecified and loopback addresses are kept for the same reason their
+/// IPv4 counterparts are (see [`KEPT_ADDRS`]): they identify nobody. That also
+/// happens to be what spares a bare `::`, which parses as the unspecified
+/// address and is the separator in every Rust path the bundle mentions.
+fn scrubbable_ipv6(text: &str, start: usize, end: usize) -> bool {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    if text[..start].chars().next_back().is_some_and(is_word) {
+        return false;
+    }
+    let after = &text[end..];
+    if after.chars().next().is_some_and(is_word) {
+        return false;
+    }
+    // A dotted-quad tail means this is only the leading half of an
+    // IPv4-mapped address (`::ffff:127.0.0.1`, what a v6 socket reports for a
+    // v4 peer). The IPv4 pass ran first and already decided what happens to
+    // the quad; replacing the half in front of it would leave a mangled
+    // address behind rather than a placeholder.
+    if after.starts_with('.') && after[1..].starts_with(|c: char| c.is_ascii_digit()) {
+        return false;
+    }
+    match text[start..end].parse::<std::net::Ipv6Addr>() {
+        Ok(addr) => !addr.is_unspecified() && !addr.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+/// The mDNS service suffix, mirroring discovery.rs's `SERVICE_TYPE`. Used to
+/// recognise a service name in log text; a drift here costs a missed scrub,
+/// not a broken lookup.
+const MDNS_SERVICE_SUFFIX: &str = "._monux._udp.local.";
+
+/// Replaces the instance label of every mDNS service name with the hostname
+/// placeholder.
+///
+/// A client logs `Discovered Monux server: <name>._monux._udp.local.` for
+/// EVERY server it resolves, and the instance name is that machine's hostname
+/// (discovery.rs registers it as one). Those names reach no `Environment` and
+/// no remembered-server record — a server the client looked at and did not
+/// connect to is known only by this log line — so the shape is what identifies
+/// them. The label is bounded by the whitespace the log line itself put there:
+/// RFC 6763 lets an instance name contain almost anything, so nothing narrower
+/// can be assumed about it.
+fn redact_mdns_instances(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find(MDNS_SERVICE_SUFFIX) {
+        let label_start = rest[..pos]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        out.push_str(&rest[..label_start]);
+        out.push_str("<hostname>");
+        out.push_str(MDNS_SERVICE_SUFFIX);
+        rest = &rest[pos + MDNS_SERVICE_SUFFIX.len()..];
+    }
+    out.push_str(rest);
     out
 }
 
@@ -903,6 +1000,10 @@ pub fn peers_missing_redaction_names(bundle: &Bundle) -> Vec<String> {
 
 /// Addresses kept verbatim through redaction: they identify nobody, and a
 /// state dump reads much better with them intact.
+///
+/// The IPv4 pass matches this list by spelling; the IPv6 pass decides on the
+/// parsed address instead (see [`scrubbable_ipv6`]), so it keeps `::1` however
+/// it was written — and `::` with it.
 const KEPT_ADDRS: [&str; 4] = ["127.0.0.1", "0.0.0.0", "255.255.255.255", "::1"];
 
 /// Replaces `needle` only where it stands as a whole word, so a username that
@@ -1200,6 +1301,40 @@ fn default_report_path() -> PathBuf {
     std::env::temp_dir().join(format!("monux-report-{}.md", std::process::id()))
 }
 
+/// Creates a file for one of this module's artifacts, readable only by its
+/// owner.
+///
+/// Both artifacts land on a predictable name in a directory every account on
+/// the machine can write to (`/tmp/monux-report-<pid>.md`,
+/// `/tmp/monux-<role>-capture-<pid>.log`), and both hold exactly what
+/// [`PRIVACY_NOTE`] calls out as identifying: hostname, LAN addresses,
+/// certificate fingerprints, log lines — and, for a `--trace` capture, the
+/// traced key CODES. At the default 0644 those are readable by everyone on
+/// the machine, for a report whose author has not decided yet whether to
+/// publish it. 0600 is what the rest of monux's on-disk state uses (config.rs,
+/// known_servers.rs, certs.rs).
+///
+/// Exclusive creation first, so a name somebody else got to is not written
+/// through. A file that is already there is still truncated — a recycled pid,
+/// or a second `record --out <path>` over the same file, must keep working —
+/// but only after the chmod succeeds, which is what stops the bundle from
+/// being written into a file this user does not own.
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).mode(0o600);
+    let file = match options.create_new(true).open(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            options.create_new(false).create(true).truncate(true).open(path)?
+        }
+        other => other?,
+    };
+    // .mode() only governs a file this call created; one that was already
+    // there keeps whatever permissions it was given.
+    file.set_permissions(PermissionsExt::from_mode(0o600))?;
+    Ok(file)
+}
+
 /// Gets a report to the point of filing — and stops there.
 ///
 /// Deliberately does NOT create the issue, or open a browser. Filing is
@@ -1216,7 +1351,10 @@ fn prepare_issue(text: &str, title: Option<&str>, d: &Diagnostics, path: &Path) 
     let title = title.unwrap_or(TITLE_PLACEHOLDER);
     let mut out = String::new();
 
-    let wrote = std::fs::write(path, text);
+    let wrote = create_private_file(path).and_then(|mut file| {
+        use std::io::Write;
+        file.write_all(text.as_bytes())
+    });
     match &wrote {
         Ok(()) => out.push_str(&format!(
             "Report written to {} ({} bytes).\n",
@@ -1325,7 +1463,7 @@ pub fn record(opts: &RecordOptions) -> Result<String> {
     let exe = std::env::current_exe().context("Could not find the running monux binary")?;
     let level = if opts.trace { "trace" } else { "debug" };
 
-    let mut file = std::fs::File::create(&path)
+    let mut file = create_private_file(&path)
         .with_context(|| format!("Could not create the capture file {}", path.display()))?;
     write_capture_header(&mut file, role, level, opts)?;
 
@@ -1586,6 +1724,12 @@ mod tests {
         assert!(out.contains("fp d1d8"));
     }
 
+    /// Redaction with no machine's names in it, so an assertion about the
+    /// address passes wherever the test runs.
+    fn scrub(text: &str) -> String {
+        redact_names(text, &Names::default())
+    }
+
     #[test]
     fn redaction_replaces_ipv6_but_spares_timestamps() {
         let text = "peer fe80::1c2d:3e4f:5a6b:7c8d at 2026-08-07T10:11:12Z";
@@ -1594,6 +1738,72 @@ mod tests {
         assert!(out.contains("<ipv6>"), "{}", out);
         // A clock time is not an address.
         assert!(out.contains("2026-08-07T10:11:12Z"), "{}", out);
+
+        // The shapes monux actually prints are COMPRESSED — Ipv6Addr's
+        // Display folds the longest zero run — and a pattern counting
+        // colon-separated hex groups matched none of them.
+        for (addr, expected) in [
+            ("[fd00::5]:1213", "client [<ipv6>]:1213 fp d1d8"),
+            ("[fd12:3456:789a::2]:1213", "client [<ipv6>]:1213 fp d1d8"),
+            (
+                "[2001:db8:85a3::8a2e:370:7334]:1213",
+                "client [<ipv6>]:1213 fp d1d8",
+            ),
+            ("2001:db8:1:2:a1b2:c3d4:e5f6:7890", "client <ipv6> fp d1d8"),
+        ] {
+            assert_eq!(scrub(&format!("client {} fp d1d8", addr)), expected, "{}", addr);
+        }
+
+        // Loopback and the unspecified address identify nobody and stay, as
+        // their IPv4 counterparts do — which is also what spares the `::` in
+        // every log target the bundle is full of.
+        let readable = "listen [::]:1213 local [::1]:1213 from monux::device::input";
+        assert_eq!(scrub(readable), readable);
+        // An IPv4-mapped peer keeps its kept quad rather than half a
+        // placeholder; a routable one is scrubbed by the IPv4 pass.
+        assert_eq!(scrub("[::ffff:127.0.0.1]:1213"), "[::ffff:127.0.0.1]:1213");
+        assert_eq!(scrub("[::ffff:10.0.0.5]:1213"), "[::ffff:<ip>]:1213");
+    }
+
+    /// A client bundle has no peer sections (`--peer` is server-only), so the
+    /// server — the machine a client's logs name most — used to be the one
+    /// machine `--redact` left in place. Its name is on disk in the
+    /// remembered store, and travels from there into the substitution set.
+    #[test]
+    fn redaction_scrubs_the_server_a_client_remembers() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::known_servers::record(
+            dir.path(),
+            "10.0.0.5:1213".parse().unwrap(),
+            "d1d88653",
+            Some("alices-workstation"),
+            1_700_000_000,
+        )
+        .unwrap();
+        let mut names = Names::default();
+        names.add_remembered_servers(dir.path());
+
+        let out = redact_names(
+            "INFO monux::client: connected to alices-workstation (10.0.0.5:1213)",
+            &names,
+        );
+        assert_eq!(
+            out,
+            "INFO monux::client: connected to <hostname> (<ip>:1213)"
+        );
+    }
+
+    /// A server this client only LOOKED at is named in the discovery log and
+    /// reaches neither an Environment nor the remembered store, so the mDNS
+    /// shape is the only thing that identifies it as a hostname.
+    #[test]
+    fn redaction_scrubs_an_mdns_instance_name_it_was_never_told() {
+        assert_eq!(
+            scrub("INFO monux::discovery: Discovered Monux server: bobs-desktop._monux._udp.local."),
+            "INFO monux::discovery: Discovered Monux server: <hostname>._monux._udp.local."
+        );
+        // Text with no service name in it is returned as it stands.
+        assert_eq!(scrub("no service names here"), "no service names here");
     }
 
     #[test]
@@ -1881,6 +2091,41 @@ mod tests {
         );
         assert!(out.contains(TITLE_PLACEHOLDER), "{}", out);
         assert!(out.contains("Replace the title placeholder"), "{}", out);
+    }
+
+    /// The report goes to a predictable name in a directory every account on
+    /// the machine can write to, and it carries this machine's hostname, LAN
+    /// addresses and log lines. Nobody else gets to read it.
+    #[test]
+    fn the_report_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        prepare_issue("# report body", None, &diagnostics_fixture(), &path);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{:o}", mode);
+    }
+
+    /// A file already sitting on the path — a leftover from a recycled pid, or
+    /// a second `record --out <path>` over the same file — is still replaced:
+    /// refusing would cost the user the capture they just made. It does not
+    /// keep the wider permissions it came with.
+    #[test]
+    fn an_existing_artifact_file_is_replaced_and_tightened() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture.log");
+        std::fs::write(&path, "a stale capture from an earlier run").unwrap();
+        std::fs::set_permissions(&path, PermissionsExt::from_mode(0o644)).unwrap();
+
+        create_private_file(&path)
+            .unwrap()
+            .write_all(b"fresh")
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{:o}", mode);
     }
 
     #[test]

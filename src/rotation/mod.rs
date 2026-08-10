@@ -339,11 +339,12 @@ impl std::fmt::Display for ClipboardRequestSource {
 }
 
 pub struct ClipboardSendContentArgs {
-    /// The client sending the clipboard data
+    /// The client sending the clipboard data. This is the connection the frame
+    /// arrived on, not anything the frame claims, which is what makes it safe
+    /// to route on (see Rotation::clipboard_send_content_from_client).
     pub data_source: SocketAddr,
-    /// Copied from the ServerClipboardRequest, indicates where the clipboard data should be sent
-    pub request_client: Option<SocketAddr>,
-    /// Copied from the ClientClipboardHeader, correlates the content with its request
+    /// Copied from the ClientClipboardHeader, correlates the content with its
+    /// request. Only meaningful paired with data_source.
     pub request_id: u64,
     pub data: data::ClipboardData,
 }
@@ -827,7 +828,6 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 if let Err(e) = self
                     .clipboard_send_content_from_client(
                         args.data_source,
-                        args.request_client,
                         args.request_id,
                         args.data,
                     )
@@ -1050,7 +1050,14 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             if removed_current_client.recoverable(endpoint, &now) {
                 // Enable this client automatically since it was recently disconnected
                 // This automatically unsets self.removed_current_client
-                self.update_current_client(Some(endpoint)).await;
+                // ...but never while paused: the user parked input on this
+                // machine, and a peer reconnecting is not consent to move it.
+                // Notifications are suppressed while paused, so the switch
+                // would be silent, and input would land on the client the
+                // moment the pause is lifted.
+                if !self.paused {
+                    self.update_current_client(Some(endpoint)).await;
+                }
             } else if removed_current_client.expired(&now) {
                 // Clean up expired client info
                 self.removed_current_client = None;
@@ -1063,11 +1070,20 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         if let Some(pending) = &self.pending_resume_fingerprint {
             if *pending == fingerprint {
                 self.pending_resume_fingerprint = None;
-                info!(
-                    "Resuming session: re-activating client {} that was active when the previous server stopped",
-                    endpoint
-                );
-                self.update_current_client(Some(endpoint)).await;
+                // Same rule as the reconnect path above: a resume is not a
+                // reason to override a pause the user asked for.
+                if self.paused {
+                    info!(
+                        "Not resuming the session for {} while input is paused; it stays on this machine",
+                        endpoint
+                    );
+                } else {
+                    info!(
+                        "Resuming session: re-activating client {} that was active when the previous server stopped",
+                        endpoint
+                    );
+                    self.update_current_client(Some(endpoint)).await;
+                }
             }
         }
     }
@@ -1371,14 +1387,22 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         let types = crate::clipboard::filter_shareable_mime_types(types);
         debug!("Announcing new clipboard source: source={:?} current={:?} with max_size_bytes={} has types={:?}", source, self.current_client, max_size_bytes, types);
         // An update with no types means the selection is gone — locally (the
-        // compositor revoked it) or on a client. Either way the tracked
-        // target is stale and must stop being announced, or every fetch
-        // against it fails. Clear right away, bypassing the debounce, and
-        // reset the source's debounce state so a re-own right after (e.g. a
-        // clipboard manager persisting the content) is processed.
+        // compositor revoked it) or on a client. Clear right away, bypassing
+        // the debounce, and reset the source's debounce state so a re-own
+        // right after (e.g. a clipboard manager persisting the content) is
+        // processed.
+        //
+        // Only the OWNER's revocation clears, though. Everyone announces their
+        // selection going away, including machines that never held the shared
+        // clipboard: an ordinary app quitting on this machine while a client
+        // owns the clipboard, or a client deactivating with nothing shareable
+        // to offer. Treating those as a clear would drop the real owner's
+        // content on every machine until someone copies again.
         if types.is_empty() {
             self.clipboard.reset_debounce(source);
-            self.clipboard_clear().await;
+            if self.clipboard.target().map(|target| target.source) == Some(source) {
+                self.clipboard_clear().await;
+            }
             return Ok(());
         }
         // The clipboard changed hands: drop any cached served payload so
@@ -1561,14 +1585,18 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         // Figure out where the requested clipboard can be found
         if let Some(clipboard_source) = target.source {
             // A client has the clipboard: route request to them.
-            // Request ids correlate a response with its request. A plain
-            // per-originator counter is enough: the goal is
-            // accidental-misdelivery protection, not adversarial resistance.
+            // Every fetch is tracked against the peer it is sent to, under an
+            // id THIS machine allocates. The owner's reply is then matched on
+            // (peer, id), so the routing never depends on a field the
+            // answering peer chose — see ClipboardRouter::pending_requests.
             let (msg, local_request_id, on_behalf_of) = match request_source {
                 ClipboardRequestSource::Local(waiting_clipboard_tx) => {
-                    // Clipboard request is from the server itself.
-                    // Keep the oneshot for replying later, keyed by a fresh request id.
-                    let request_id = self.clipboard.track_request(waiting_clipboard_tx);
+                    // Clipboard request is from the server itself: keep the
+                    // oneshot for replying later.
+                    let request_id = self.clipboard.track_request(
+                        clipboard_source,
+                        clipboard::PendingFetch::Local(waiting_clipboard_tx),
+                    );
                     let msg = bulk::ServerBulk::ClipboardRequest(bulk::ServerClipboardRequest {
                         requested_type,
                         max_size_bytes,
@@ -1578,21 +1606,31 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                     (msg, Some(request_id), None)
                 }
                 ClipboardRequestSource::Remote(client) => {
-                    // Clipboard request is from a client: forward its request id.
-                    let request_id = match request_id {
+                    // Clipboard request is from a client. Its own id is
+                    // remembered rather than forwarded: two clients can pick
+                    // the same one, and it is restored when the reply is
+                    // relayed back.
+                    let client_request_id = match request_id {
                         Some(id) => id,
                         None => {
                             warn!("Clipboard request from {} is missing a request_id, using 0", client);
                             0
                         }
                     };
+                    let request_id = self.clipboard.track_request(
+                        clipboard_source,
+                        clipboard::PendingFetch::Relay {
+                            client,
+                            client_request_id,
+                        },
+                    );
                     let msg = bulk::ServerBulk::ClipboardRequest(bulk::ServerClipboardRequest {
                         requested_type,
                         max_size_bytes,
                         request_client: Some(client),
                         request_id,
                     });
-                    (msg, None, Some(client))
+                    (msg, Some(request_id), Some(client))
                 }
             };
             debug!(
@@ -1609,7 +1647,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 if !matches!(sent, Ok(true)) {
                     // The request couldn't be sent: drop the pending fetch so that
                     // it fails fast instead of waiting out the 5s timeout.
-                    self.clipboard.untrack_request(request_id);
+                    self.clipboard
+                        .untrack_request(clipboard_source, request_id);
                 }
             }
             match sent {
@@ -1815,55 +1854,63 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     }
 
     /// Sends clipboard content in response to a prior request via clipboard_request_content.
+    /// Routes a clipboard payload a peer sent back, to whoever asked for it.
+    ///
+    /// The destination comes from what we recorded when the fetch went out —
+    /// never from the frame. The frame's own `request_client` field is written
+    /// by the answering peer, so honoring it would let any approved client
+    /// address bytes at any other machine (or at a local paste) simply by
+    /// naming it, with no fetch outstanding at all.
     async fn clipboard_send_content_from_client(
         &mut self,
         // The client sending the clipboard data
         data_source: SocketAddr,
-        // Copied from the ServerClipboardRequest, indicates where the clipboard data should be sent
-        request_client: Option<SocketAddr>,
-        // Copied from the ClientClipboardHeader, correlates the content with its request
+        // Correlates the content with its request. Only meaningful paired with
+        // data_source: the two together are the key we tracked the fetch under.
         request_id: u64,
         data: data::ClipboardData,
     ) -> Result<()> {
+        let Some(pending) = self.clipboard.take_request(data_source, request_id) else {
+            // No such fetch is outstanding against this peer: a duplicate, a
+            // reply that lost the race with the timeout, or a peer answering
+            // something it was never asked.
+            warn!(
+                "Discarding clipboard data from {} for unknown/timed-out request_id={}",
+                data_source, request_id
+            );
+            return Ok(());
+        };
         debug!(
-            "Sending clipboard content of requested_type={} data_type={:?} with len={} from source={} to dest={:?}",
+            "Sending clipboard content of requested_type={} data_type={:?} with len={} from source={}",
             data.requested_type,
             data.data_type,
             data.bytes.len(),
-            data_source,
-            request_client
+            data_source
         );
-        if let Some(request_client) = request_client {
-            // Send to specified remote client (assuming it's still available etc...)
-            let msg = bulk::ServerBulk::ClipboardHeader(bulk::ServerClipboardHeader {
-                requested_type: &data.requested_type,
-                data_type: data.data_type.as_deref(),
-                content_len_bytes: data.bytes.len() as u64,
-                request_id,
-            });
-            // If send_bulk returns Ok(false), the client wasn't found. In that case just ignore the request,
-            // don't try to reset state since the client should already be removed.
-            if !(self
-                .send_bulk(&request_client, msg, Some(data.bytes))
-                .await?)
-            {
-                warn!("Unable to send clipboard data received from {} to {}: not connected (clients: {:?})",
-                      data_source, request_client, self.roster);
-            }
-        } else {
-            // Send to the local clipboard, completing the pending fetch that made the request.
-            match self.clipboard.take_request(request_id) {
-                Some(waiting_clipboard_tx) => {
-                    if let Err(_d_again) = waiting_clipboard_tx.send(data) {
-                        warn!(
-                            "Discarding clipboard data for request_id={}: the requester already gave up (timed out?)",
-                            request_id
-                        );
-                    }
+        match pending {
+            clipboard::PendingFetch::Relay {
+                client,
+                client_request_id,
+            } => {
+                // Relay to the client that asked, under the id IT used.
+                let msg = bulk::ServerBulk::ClipboardHeader(bulk::ServerClipboardHeader {
+                    requested_type: &data.requested_type,
+                    data_type: data.data_type.as_deref(),
+                    content_len_bytes: data.bytes.len() as u64,
+                    request_id: client_request_id,
+                });
+                // If send_bulk returns Ok(false), the client wasn't found. In that case just ignore the request,
+                // don't try to reset state since the client should already be removed.
+                if !(self.send_bulk(&client, msg, Some(data.bytes)).await?) {
+                    warn!("Unable to send clipboard data received from {} to {}: not connected (clients: {:?})",
+                          data_source, client, self.roster);
                 }
-                None => {
+            }
+            clipboard::PendingFetch::Local(waiting_clipboard_tx) => {
+                // Complete this machine's own pending paste.
+                if let Err(_d_again) = waiting_clipboard_tx.send(data) {
                     warn!(
-                        "Discarding clipboard data for unknown/timed-out request_id={}",
+                        "Discarding clipboard data for request_id={}: the requester already gave up (timed out?)",
                         request_id
                     );
                 }
@@ -1927,12 +1974,28 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         if let Some(new_client) = new_client {
             // Try to send switch{true} to the newly assigned current_client.
             // If it fails then current_client is cleaned up.
+            //
+            // Ok(()) alone does not mean the switch happened: it is also
+            // returned when there is no current client to send to, and by the
+            // unknown-endpoint recovery — both of which leave input on this
+            // machine. The clipboard push just above can trigger exactly that
+            // by removing the client on a failed write. Confirming the roster
+            // agrees keeps the log line and the notification, which exist so a
+            // surprising switch is identifiable afterwards, from reporting the
+            // opposite of what happened.
             if let Ok(()) = self
                 .send_event_to_remote_client(event::ServerEvent::Switch(event::SwitchEvent {
                     enabled: true,
                 }))
                 .await
             {
+                if self.current_client != Some(new_client) {
+                    warn!(
+                        "Switch to {} did not take effect; input stays on this machine",
+                        new_client
+                    );
+                    return;
+                }
                 info!(
                     "Switched to client: {} (clients: {})",
                     new_client,
@@ -2874,7 +2937,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 });
                 continue;
             }
-            let (request_id, rx) = hub.open();
+            let (request_id, rx) = hub.open(client.endpoint);
             let msg = bulk::ServerBulk::DiagnosticsRequest(bulk::DiagnosticsRequest {
                 request_id,
                 lines,
@@ -2988,6 +3051,11 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             // fresh ephemeral port, so keeping it would leak one map key per
             // reconnect.
             self.clipboard.forget_source(endpoint);
+            // Fetches this client owed a reply to will never be answered, and
+            // fetches made on its behalf have nowhere to go. Dropping both now
+            // keeps the pending map from growing across reconnects; a Relay
+            // entry has no closed-channel signal to prune it later.
+            self.clipboard.drop_requests_for(*endpoint);
             notify_client_dropped(endpoint);
         } else {
             // Can happen when cleaning up a client that was never added.
@@ -4332,6 +4400,51 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Everyone announces their own selection going away, owner or not. Only
+    /// the owner's revocation may clear the shared clipboard — otherwise an
+    /// unrelated app quitting on one machine destroys the content every other
+    /// machine is still pasting from.
+    #[tokio::test]
+    async fn an_empty_update_from_a_non_owner_leaves_the_clipboard_alone() {
+        let (dir, mut rotation) = clipboard_rotation("clip-nonowner-clear").await;
+        let owner: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        rotation
+            .clipboard_update_source(Some(owner), vec!["text/plain".to_string()], 1024)
+            .await
+            .unwrap();
+        assert!(rotation.clipboard.target().is_some());
+
+        // The server's own watcher revoking a third-party app's offer, while
+        // the client still owns the shared clipboard.
+        rotation
+            .clipboard_update_source(None, vec![], 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            rotation.clipboard.target().map(|t| t.source),
+            Some(Some(owner)),
+            "a non-owner's revocation must not clear the owner's clipboard"
+        );
+
+        // A different client deactivating with nothing shareable: also not the
+        // owner, also not a clear.
+        let bystander: SocketAddr = "127.0.0.1:5678".parse().unwrap();
+        rotation
+            .clipboard_update_source(Some(bystander), vec![], 1024)
+            .await
+            .unwrap();
+        assert!(rotation.clipboard.target().is_some());
+
+        // The owner's own revocation still clears, as before.
+        rotation
+            .clipboard_update_source(Some(owner), vec![], 1024)
+            .await
+            .unwrap();
+        assert!(rotation.clipboard.target().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn clipboard_clear_drops_pending_fetches() {
         let (dir, mut rotation) = clipboard_rotation("clip-clear-pending").await;
@@ -4340,7 +4453,10 @@ mod tests {
         // owner disconnected mid-fetch) must error immediately on clear, not
         // wait out the 5s fetch timeout.
         let (tx, rx) = oneshot::channel::<data::ClipboardData>();
-        rotation.clipboard.track_request(tx);
+        rotation.clipboard.track_request(
+            "10.0.0.1:1".parse().unwrap(),
+            clipboard::PendingFetch::Local(tx),
+        );
         rotation.clipboard_clear().await;
         assert!(rx.await.is_err());
         assert_eq!(rotation.clipboard.pending_request_count(), 0);

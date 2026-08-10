@@ -311,6 +311,13 @@ fn resolve_autostart_target() -> Result<Option<AutostartTarget>> {
 }
 
 /// Best-effort chown (used so root-written files stay user-manageable).
+///
+/// `lchown`, never `chown`: this runs as root against paths inside the
+/// invoking user's home, so any component may be — or may have just become — a
+/// symlink that user planted. `chown` follows it and hands the TARGET away, so
+/// `~/.config/systemd/user -> /etc` would chown /etc to an unprivileged uid.
+/// `lchown` changes the link itself, which is harmless. Same threat the
+/// O_NOFOLLOW in atomic_write_no_follow defends against, on the ownership side.
 fn chown_best_effort(path: &Path, uid: u32, gid: u32) {
     use std::os::unix::ffi::OsStrExt;
     let cpath = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
@@ -318,29 +325,76 @@ fn chown_best_effort(path: &Path, uid: u32, gid: u32) {
         Err(_) => return,
     };
     unsafe {
-        libc::chown(cpath.as_ptr(), uid, gid);
+        libc::lchown(cpath.as_ptr(), uid, gid);
     }
+}
+
+/// Refuses a path any of whose existing components is a symlink.
+///
+/// `lchown` protects the final component, but `create_dir`/`create_dir_all`
+/// still RESOLVE symlinked components, so `~/.config/systemd -> /etc` turns
+/// "create the unit directory" into "create /etc/user and chown it away".
+/// Bailing is the right answer rather than an openat(O_NOFOLLOW) walk: nothing
+/// legitimately puts a symlink on this path, and setup runs as root into a
+/// tree the unprivileged user controls.
+fn ensure_no_symlink_components(path: &Path) -> Result<()> {
+    let mut walked = PathBuf::new();
+    for component in path.components() {
+        walked.push(component);
+        if let Ok(metadata) = std::fs::symlink_metadata(&walked) {
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "{} is a symlink; refusing to create or chown through it as root",
+                    walked.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `create_dir_all` that reports which directories it actually created.
+///
+/// Root-run setup must chown only its own work: a directory that was already
+/// there is not ours to hand to anyone, which is the rule the `config_dir`
+/// guard in write_unit_file applied to one level and this applies to all of
+/// them. Creating a level at a time also means `create_dir` — which fails with
+/// EEXIST on a symlink rather than following it — sees each component.
+fn create_dir_all_tracked(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut missing = Vec::new();
+    let mut cursor = Some(path);
+    while let Some(dir) = cursor {
+        if std::fs::symlink_metadata(dir).is_ok() {
+            break;
+        }
+        missing.push(dir.to_path_buf());
+        cursor = dir.parent();
+    }
+    let mut created = Vec::with_capacity(missing.len());
+    for dir in missing.into_iter().rev() {
+        match std::fs::create_dir(&dir) {
+            Ok(()) => created.push(dir),
+            // Raced by someone else: it exists now, but we did not create it,
+            // so it is not ours to chown.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(created)
 }
 
 fn write_unit_file(path: &Path, role: Role, owner: Option<(u32, u32)>) -> Result<()> {
     if let Some(parent) = path.parent() {
-        // ~/.config may not exist yet; note it BEFORE create_dir_all creates
-        // it, so we chown only a ~/.config we created ourselves — never a
-        // pre-existing one (that directory isn't ours to touch).
-        let config_dir = parent.parent().and_then(|p| p.parent());
-        let config_dir_existed = config_dir.map(|dir| dir.exists());
-        std::fs::create_dir_all(parent)
+        ensure_no_symlink_components(parent)?;
+        // Directories we just created must stay user-manageable when running
+        // as root — but only those. The rule the ~/.config level already
+        // followed ("never a pre-existing one, that directory isn't ours to
+        // touch") holds for every level, and create_dir_all_tracked is what
+        // reports which ones those were.
+        let created = create_dir_all_tracked(parent)
             .with_context(|| format!("could not create {}", parent.display()))?;
-        // Directories we may have just created must stay user-manageable when
-        // running as root: chown the levels this feature owns
-        // (.config/systemd and .config/systemd/user, plus ~/.config itself
-        // when we just created it).
         if let Some((uid, gid)) = owner {
-            chown_best_effort(parent, uid, gid);
-            if let Some(grandparent) = parent.parent() {
-                chown_best_effort(grandparent, uid, gid);
-            }
-            if let (Some(dir), Some(false)) = (config_dir, config_dir_existed) {
+            for dir in &created {
                 chown_best_effort(dir, uid, gid);
             }
         }
@@ -778,10 +832,13 @@ fn desktop_shortcut_content() -> &'static str {
 /// user-manageable.
 fn write_desktop_shortcut(path: &Path, owner: Option<(u32, u32)>) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        ensure_no_symlink_components(parent)?;
+        let created = create_dir_all_tracked(parent)
             .with_context(|| format!("could not create {}", parent.display()))?;
         if let Some((uid, gid)) = owner {
-            chown_best_effort(parent, uid, gid);
+            for dir in &created {
+                chown_best_effort(dir, uid, gid);
+            }
         }
     }
     atomic_write_no_follow(path, desktop_shortcut_content())
@@ -1571,6 +1628,49 @@ mod tests {
         // The symlink's old target is untouched, and no temp file lingers.
         assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "precious");
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 2);
+    }
+
+    /// The ownership half of the same threat: setup runs as root into a tree
+    /// the unprivileged user controls, so a symlink standing in for one of the
+    /// unit directory's components must never be created or chowned through.
+    /// Without the guard, create_dir_all resolves the link and the chown that
+    /// follows hands its target — /etc, in the real attack — to that user.
+    #[test]
+    fn unit_dir_refuses_to_be_created_through_a_symlinked_component() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let home = tmp.path().join("home/.config");
+        std::fs::create_dir_all(&home).unwrap();
+        // ~/.config/systemd -> the directory the attacker actually wants.
+        std::os::unix::fs::symlink(&outside, home.join("systemd")).unwrap();
+
+        let unit_path = home.join("systemd/user/monux-server.service");
+        let err = write_unit_file(&unit_path, Role::Server, None)
+            .expect_err("a symlinked component must be refused, not followed");
+        assert!(
+            err.to_string().contains("is a symlink"),
+            "unexpected error: {}",
+            err
+        );
+        // Nothing was created on the far side of the link.
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    /// Only directories setup actually created are chowned; a pre-existing one
+    /// is not ours to hand to anyone.
+    #[test]
+    fn create_dir_all_tracked_reports_only_what_it_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let existing = tmp.path().join("a");
+        std::fs::create_dir(&existing).unwrap();
+
+        let created = create_dir_all_tracked(&existing.join("b/c")).unwrap();
+        assert_eq!(created, vec![existing.join("b"), existing.join("b/c")]);
+        // A second run creates nothing, so it chowns nothing.
+        assert!(create_dir_all_tracked(&existing.join("b/c"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

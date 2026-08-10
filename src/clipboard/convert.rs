@@ -67,6 +67,20 @@ pub async fn read(
     }
 }
 
+/// Whether a requested mime type is a file list, i.e. one whose payload names
+/// local paths that a file manager will act on (copy, or MOVE for a "cut").
+///
+/// INVARIANT: a payload for one of these types must only ever reach a local
+/// app after unpack_zip_payload has written the files under config_dir and the
+/// paths have been rewritten to point there. read() always stamps
+/// MONUX_COPIED_FILES_DATATYPE on them, so any other datatype — including a
+/// missing one — is a peer contradicting its own protocol, and its raw bytes
+/// would be a list of paths on OUR disk that we hand to the file manager. The
+/// callers use this to refuse those payloads before they can be served.
+pub fn is_file_list_type(requested_type: &str) -> bool {
+    requested_type == PATHS_TARGET_GNOME || requested_type == PATHS_TARGET_URIS
+}
+
 /// Converts clipboard data received from another Monux peer over the network
 /// to a payload suitable for sending to a host application.
 pub async fn write(
@@ -77,14 +91,13 @@ pub async fn write(
     config_dir: &Path,
 ) -> Result<Vec<u8>> {
     debug!("Converting clipboard data from data_type={} to requested_type={}", data_type, requested_type);
+    // The file-list arms come first, and are followed by a bail for those
+    // types under any other datatype: the zstd arm below binds requested_type
+    // irrefutably, so ordering it first would let a peer satisfy a file-list
+    // request with a zstd payload and have its decompressed bytes — a list of
+    // paths on this machine — handed to the file manager unchanged (see
+    // is_file_list_type).
     match (requested_type, data_type) {
-        (requested_type, MONUX_ZSTD_TARGET_DATATYPE) => {
-            let requested_type = requested_type.to_string();
-            task::spawn_blocking(move || {
-                write_zstd(buf, max_uncompressed_size_bytes, &requested_type)
-            })
-            .await?
-        }
         (PATHS_TARGET_GNOME, MONUX_COPIED_FILES_DATATYPE) => {
             let config_dir = config_dir.to_path_buf();
             let paths = task::spawn_blocking(move || {
@@ -100,6 +113,21 @@ pub async fn write(
             })
             .await??;
             write_uri_file_paths(paths)
+        }
+        (PATHS_TARGET_GNOME | PATHS_TARGET_URIS, data_type) => {
+            bail!(
+                "Refusing clipboard file list for requested_type={} sent as data_type={}: only {} carries file lists",
+                requested_type,
+                data_type,
+                MONUX_COPIED_FILES_DATATYPE
+            )
+        }
+        (requested_type, MONUX_ZSTD_TARGET_DATATYPE) => {
+            let requested_type = requested_type.to_string();
+            task::spawn_blocking(move || {
+                write_zstd(buf, max_uncompressed_size_bytes, &requested_type)
+            })
+            .await?
         }
         (requested_type, data_type) => {
             warn!("Clipboard data conversion from data_type={} to requested_type={} isn't supported, writing empty clipboard", data_type, requested_type);
@@ -866,6 +894,64 @@ mod tests {
         let unpack_root = tempfile::tempdir().unwrap();
         let zip = build_test_zip(&[("a.txt", &big[..100]), ("b.txt", &big[..100])]);
         assert!(unpack_zip_payload(zip, 150, unpack_root.path()).is_err());
+    }
+
+    #[tokio::test]
+    async fn file_list_types_accept_only_the_zip_datatype() {
+        // The payload a hostile peer would send: paths on the RECEIVING
+        // machine, with a "cut" operation, so a file manager acting on it
+        // moves the user's own files. Long enough to clear read()'s 100-byte
+        // compression floor, so it can also be offered as a zstd payload.
+        let hostile = format!(
+            "cut\n{}",
+            "file:///home/victim/Documents\n".repeat(5)
+        )
+        .into_bytes();
+        for requested_type in [PATHS_TARGET_GNOME, PATHS_TARGET_URIS] {
+            // zstd used to satisfy these types because the zstd arm bound
+            // requested_type irrefutably and came first: the decompressed
+            // bytes went to the file manager verbatim.
+            let (compressed, data_type) =
+                read(hostile.clone(), GENEROUS_CAP, "text/plain").await.unwrap();
+            assert_eq!(data_type.as_deref(), Some(MONUX_ZSTD_TARGET_DATATYPE));
+            let unpack_root = tempfile::tempdir().unwrap();
+            for (payload, data_type) in [
+                (compressed, MONUX_ZSTD_TARGET_DATATYPE),
+                (hostile.clone(), "text/plain"),
+                (hostile.clone(), ""),
+            ] {
+                assert!(
+                    write(
+                        payload,
+                        GENEROUS_CAP,
+                        requested_type,
+                        data_type,
+                        unpack_root.path(),
+                    )
+                    .await
+                    .is_err(),
+                    "{} was accepted as data_type={}",
+                    requested_type,
+                    data_type
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_datatype_for_an_ordinary_type_writes_empty() {
+        // Only the file-list types are fatal: everything else keeps answering
+        // with an empty clipboard rather than failing the serve.
+        let out = write(
+            b"whatever".to_vec(),
+            GENEROUS_CAP,
+            "text/plain",
+            "application/x-unknown",
+            &PathBuf::from("/nonexistent"),
+        )
+        .await
+        .unwrap();
+        assert!(out.is_empty());
     }
 
     #[tokio::test]

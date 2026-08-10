@@ -59,16 +59,36 @@ pub enum Update {
     Duplicate,
 }
 
+/// Where the reply to an outstanding clipboard fetch has to go.
+pub enum PendingFetch {
+    /// This machine's own paste, waiting on the oneshot.
+    Local(oneshot::Sender<data::ClipboardData>),
+    /// A client asked on its own behalf; the reply is relayed back to it under
+    /// the id IT used, which is not the id we asked the owner with (see
+    /// ClipboardRouter::pending_requests).
+    Relay {
+        client: SocketAddr,
+        client_request_id: u64,
+    },
+}
+
 /// The clipboard's location, the debounce state, and the fetches in flight.
 pub struct ClipboardRouter {
     /// Who owns the clipboard right now, and what it offers.
     target: Option<ClipboardTarget>,
     /// Access to the local system clipboard; None when disabled.
     pub local: Option<server::LocalClipboard>,
-    /// Pending fetches originated by this machine, keyed by request id.
-    pending_requests: HashMap<u64, oneshot::Sender<data::ClipboardData>>,
-    /// Next locally-originated request id. Wrapping is fine: ids only need to
-    /// correlate a reply with its request, not resist adversaries.
+    /// Fetches in flight, keyed by the peer the request was sent to AND the id
+    /// it was sent with.
+    ///
+    /// Keyed on the peer, not on the id alone, because the id arrives in a
+    /// frame an approved-but-hostile peer writes: keying on it alone lets any
+    /// connected client claim any outstanding fetch — answering another
+    /// machine's paste, or a local one, with bytes of its choosing. The peer is
+    /// the connection the frame actually came in on, which no peer can forge.
+    pending_requests: HashMap<(SocketAddr, u64), PendingFetch>,
+    /// Next request id this machine allocates. Wrapping is fine: an id only
+    /// has to be unique among the fetches outstanding against one peer.
     next_request_id: u64,
     /// When each source's last update was processed (the per-source
     /// debounce). None = the local machine, Some(endpoint) = a client.
@@ -182,30 +202,51 @@ impl ClipboardRouter {
     }
 
     /// Allocates a request id and remembers who is waiting on it.
-    pub fn track_request(&mut self, tx: oneshot::Sender<data::ClipboardData>) -> u64 {
+    /// Records a fetch sent to `owner`, returning the id to ask under. The id
+    /// is always allocated here rather than reusing a requesting client's own:
+    /// two clients can pick the same id, and the key must stay unique per
+    /// owner. Relay entries carry the client's id so the reply can be
+    /// translated back on the way out.
+    pub fn track_request(&mut self, owner: SocketAddr, fetch: PendingFetch) -> u64 {
         let id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
-        // Drop entries whose requester already gave up (timed out).
-        self.pending_requests.retain(|_, tx| !tx.is_closed());
-        self.pending_requests.insert(id, tx);
+        self.prune_requests();
+        self.pending_requests.insert((owner, id), fetch);
         id
     }
 
-    pub fn take_request(&mut self, id: u64) -> Option<oneshot::Sender<data::ClipboardData>> {
-        self.pending_requests.remove(&id)
+    /// Claims the fetch `owner` is answering. Returns None when that peer has
+    /// no such fetch outstanding — which is what a forged or stale reply looks
+    /// like, and is why the peer is half of the key.
+    pub fn take_request(&mut self, owner: SocketAddr, id: u64) -> Option<PendingFetch> {
+        self.pending_requests.remove(&(owner, id))
     }
 
-    pub fn untrack_request(&mut self, id: u64) {
-        self.pending_requests.remove(&id);
+    pub fn untrack_request(&mut self, owner: SocketAddr, id: u64) {
+        self.pending_requests.remove(&(owner, id));
+    }
+
+    /// Fails every fetch waiting on `client` — as its requester or as the peer
+    /// that owed the reply — when it disconnects.
+    pub fn drop_requests_for(&mut self, client: SocketAddr) {
+        self.pending_requests.retain(|(owner, _), fetch| {
+            *owner != client
+                && !matches!(fetch, PendingFetch::Relay { client: c, .. } if *c == client)
+        });
     }
 
     pub fn pending_request_count(&self) -> usize {
         self.pending_requests.len()
     }
 
-    /// Drops fetches whose requester already gave up.
+    /// Drops fetches whose requester already gave up. Only local fetches can
+    /// be detected this way; a relay's requester is watched by the roster
+    /// instead (see drop_requests_for).
     pub fn prune_requests(&mut self) {
-        self.pending_requests.retain(|_, tx| !tx.is_closed());
+        self.pending_requests.retain(|_, fetch| match fetch {
+            PendingFetch::Local(tx) => !tx.is_closed(),
+            PendingFetch::Relay { .. } => true,
+        });
     }
 
     /// Fails every pending fetch at once: dropping the senders errors their
@@ -335,24 +376,75 @@ mod tests {
     #[test]
     fn request_ids_are_unique_and_reclaimed() {
         let mut r = ClipboardRouter::new(None);
+        let owner = addr("10.0.0.1:1");
         let (tx1, _rx1) = oneshot::channel();
         let (tx2, _rx2) = oneshot::channel();
-        let id1 = r.track_request(tx1);
-        let id2 = r.track_request(tx2);
+        let id1 = r.track_request(owner, PendingFetch::Local(tx1));
+        let id2 = r.track_request(owner, PendingFetch::Local(tx2));
         assert_ne!(id1, id2);
         assert_eq!(r.pending_request_count(), 2);
 
         // A reply claims exactly its own request.
-        assert!(r.take_request(id1).is_some());
-        assert!(r.take_request(id1).is_none(), "claimed only once");
+        assert!(r.take_request(owner, id1).is_some());
+        assert!(r.take_request(owner, id1).is_none(), "claimed only once");
         assert_eq!(r.pending_request_count(), 1);
 
         // A requester that gave up is pruned rather than leaked.
         let (tx3, rx3) = oneshot::channel();
-        let id3 = r.track_request(tx3);
+        let id3 = r.track_request(owner, PendingFetch::Local(tx3));
         drop(rx3);
         r.prune_requests();
-        assert!(r.take_request(id3).is_none());
+        assert!(r.take_request(owner, id3).is_none());
+    }
+
+    /// The routing key is (peer, id), so a fetch can only be answered by the
+    /// peer it was actually sent to. Keyed on the id alone — as it was — any
+    /// approved-but-hostile client could claim another machine's pending
+    /// paste by guessing a small counter, and feed it bytes of its choosing.
+    #[test]
+    fn only_the_peer_a_fetch_was_sent_to_can_answer_it() {
+        let mut r = ClipboardRouter::new(None);
+        let owner = addr("10.0.0.1:1");
+        let impostor = addr("10.0.0.2:2");
+        let (tx, _rx) = oneshot::channel();
+        let id = r.track_request(owner, PendingFetch::Local(tx));
+
+        assert!(
+            r.take_request(impostor, id).is_none(),
+            "a peer that was never asked must not be able to answer"
+        );
+        // ...and the real reply still lands.
+        assert!(r.take_request(owner, id).is_some());
+    }
+
+    /// A disconnecting client takes both directions with it: the fetches it
+    /// owed answers to, and the ones made on its behalf. Relay entries carry
+    /// no closed-channel signal, so prune_requests alone would leak them.
+    #[test]
+    fn a_departing_client_drops_the_fetches_on_both_sides_of_it() {
+        let mut r = ClipboardRouter::new(None);
+        let owner = addr("10.0.0.1:1");
+        let asker = addr("10.0.0.2:2");
+        let bystander = addr("10.0.0.3:3");
+        let (tx, _rx) = oneshot::channel();
+
+        let owed = r.track_request(owner, PendingFetch::Local(tx));
+        let on_behalf = r.track_request(
+            bystander,
+            PendingFetch::Relay {
+                client: asker,
+                client_request_id: 7,
+            },
+        );
+        assert_eq!(r.pending_request_count(), 2);
+
+        r.drop_requests_for(owner);
+        assert!(r.take_request(owner, owed).is_none());
+        assert_eq!(r.pending_request_count(), 1);
+
+        r.drop_requests_for(asker);
+        assert!(r.take_request(bystander, on_behalf).is_none());
+        assert_eq!(r.pending_request_count(), 0);
     }
 
     #[test]

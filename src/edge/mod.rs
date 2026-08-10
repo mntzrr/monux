@@ -27,12 +27,15 @@
 //! (blocking socket IO), forwarding positions to the edge manager task.
 //!
 //! The monitor layout comes from Hyprland's IPC (the only compositor
-//! supported in this phase); if it's unavailable the feature disables itself
-//! with a warning. The layout is re-queried periodically so monitor
-//! (un)plugs and resolution changes recompute the trigger zones.
+//! supported in this phase); while it is unavailable the manager waits for
+//! it (see wait_for_hyprland — a daemon autostarted at login is up before
+//! the compositor), and in client mode gives that wait up as soon as the
+//! connection it serves is gone. The layout is re-queried periodically so
+//! monitor (un)plugs and resolution changes recompute the trigger zones.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -319,6 +322,14 @@ pub(crate) struct EdgeSegment {
     pub len: i32,
 }
 
+/// How far apart two output boundaries may sit and still count as abutting.
+/// Fractional scales round each output's dimensions independently, so
+/// neighbouring monitors can be off by a pixel; an exact equality would
+/// manufacture a mid-desktop trigger zone in the gap. The same tolerance is
+/// the slack zone_contains allows past an edge line, which is what makes
+/// "further out than this is another monitor" true there.
+pub(crate) const EDGE_ABUT_TOLERANCE_PX: i32 = 1;
+
 /// Computes the exposed edge segments of a monitor layout: for each output
 /// boundary, the intervals not abutted by another output. Two 1920x1080
 /// monitors side by side at (0,0) and (1920,0) yield the right edge only on
@@ -348,15 +359,12 @@ pub(crate) fn exposed_segments(outputs: &[OutputRect]) -> Vec<EdgeSegment> {
                 if i == j || q.width <= 0 || q.height <= 0 {
                     continue;
                 }
-                // Tolerate ±1px: fractional scales round each output's
-                // dimensions independently, so abutting monitors can be off
-                // by a pixel — an exact equality would manufacture a
-                // mid-desktop trigger zone in the gap.
+                // Abutment is tolerant by EDGE_ABUT_TOLERANCE_PX (see there).
                 let shares_boundary = match direction {
-                    Direction::Right => (q.x - (r.x + r.width)).abs() <= 1,
-                    Direction::Left => ((q.x + q.width) - r.x).abs() <= 1,
-                    Direction::Bottom => (q.y - (r.y + r.height)).abs() <= 1,
-                    Direction::Top => ((q.y + q.height) - r.y).abs() <= 1,
+                    Direction::Right => (q.x - (r.x + r.width)).abs() <= EDGE_ABUT_TOLERANCE_PX,
+                    Direction::Left => ((q.x + q.width) - r.x).abs() <= EDGE_ABUT_TOLERANCE_PX,
+                    Direction::Bottom => (q.y - (r.y + r.height)).abs() <= EDGE_ABUT_TOLERANCE_PX,
+                    Direction::Top => ((q.y + q.height) - r.y).abs() <= EDGE_ABUT_TOLERANCE_PX,
                 };
                 if !shares_boundary {
                     continue;
@@ -723,6 +731,15 @@ struct EdgeZone {
 }
 
 /// Whether the cursor at (x, y) is on this zone's edge.
+///
+/// Across the edge the test is a BAND, not a half-plane: the cursor must be
+/// within EDGE_TRIGGER_PX inside the edge line and no further than
+/// EDGE_ABUT_TOLERANCE_PX outside it. Beyond that slack there is no desktop
+/// left on this output, so the cursor is sitting on a different monitor —
+/// which only happens when the layout has a gap or an overlap wider than the
+/// abutment tolerance (hand-written monitor positions do that). A half-plane
+/// counted every pixel of that far monitor as edge contact, so a cursor
+/// merely resting mid-screen there fired a switch once the dwell elapsed.
 fn zone_contains(zone: &EdgeZone, x: i32, y: i32) -> bool {
     let along = match zone.direction {
         Direction::Left | Direction::Right => y,
@@ -731,11 +748,17 @@ fn zone_contains(zone: &EdgeZone, x: i32, y: i32) -> bool {
     if along < zone.start || along >= zone.start + zone.len {
         return false;
     }
+    let across = match zone.direction {
+        Direction::Left | Direction::Right => x,
+        Direction::Top | Direction::Bottom => y,
+    };
     match zone.direction {
-        Direction::Left => x <= zone.edge + EDGE_TRIGGER_PX,
-        Direction::Right => x >= zone.edge - EDGE_TRIGGER_PX,
-        Direction::Top => y <= zone.edge + EDGE_TRIGGER_PX,
-        Direction::Bottom => y >= zone.edge - EDGE_TRIGGER_PX,
+        Direction::Left | Direction::Top => {
+            across <= zone.edge + EDGE_TRIGGER_PX && across >= zone.edge - EDGE_ABUT_TOLERANCE_PX
+        }
+        Direction::Right | Direction::Bottom => {
+            across >= zone.edge - EDGE_TRIGGER_PX && across <= zone.edge + EDGE_ABUT_TOLERANCE_PX
+        }
     }
 }
 
@@ -928,10 +951,39 @@ enum Fire {
     Request(mpsc::UnboundedSender<f64>),
 }
 
+/// Resolves when this manager has nothing left to serve: in client mode when
+/// the connection's request receiver is dropped, never in server mode (that
+/// manager lives as long as the rotation, which the client-list arm watches).
+async fn fire_gone(fire: &Fire) {
+    match fire {
+        Fire::Request(request_tx) => request_tx.closed().await,
+        Fire::Event(_) => std::future::pending().await,
+    }
+}
+
+/// wait_for_hyprland, abandoned when the connection behind a client-mode
+/// manager goes away first — None means "stop, Hyprland never answered".
+///
+/// The wait is unbounded and runs BEFORE the manager's select loop, so
+/// without this race the loop's shutdown arm is unreachable on a machine
+/// that has no Hyprland at all (a TTY client, or another compositor): every
+/// connection spawns a manager (the server advertises EdgeInfo to any mapped
+/// client), and each one parked here forever, holding an EdgeMap clone and
+/// re-probing every HYPRLAND_WAIT_INTERVAL, one more per reconnect.
+async fn wait_for_hyprland_or_gone(fire: &Fire) -> Option<(PathBuf, Vec<OutputRect>)> {
+    tokio::select! {
+        // Biased so an already-dead connection wins deterministically:
+        // probing the compositor on behalf of one is pure waste.
+        biased;
+        _ = fire_gone(fire) => None,
+        ready = wait_for_hyprland() => Some(ready),
+    }
+}
+
 /// The edge manager task, server mode: spawns the cursor poller, owns the
 /// trigger zones, the dwell state machines, target resolution, and the
-/// periodic layout re-query. Exits (disabling the feature) when Hyprland's
-/// IPC is unavailable; otherwise runs until the server shuts down.
+/// periodic layout re-query. Waits for Hyprland when it isn't up yet (see
+/// wait_for_hyprland) and then runs until the server shuts down.
 pub async fn run(
     map: EdgeMap,
     dwell: Duration,
@@ -944,8 +996,9 @@ pub async fn run(
 /// The edge manager task, client mode: same detection as the server, but a
 /// completed dwell sends the server a return request (the fraction along the
 /// edge) instead of switching to a client. Spawned per connection: it exits
-/// when the connection's request receiver is dropped, so detection is quiet
-/// while disconnected.
+/// when the connection's request receiver is dropped — including while it is
+/// still waiting for Hyprland — so detection is quiet while disconnected and
+/// a machine that never gets a compositor accumulates nothing.
 pub async fn run_client(map: EdgeMap, dwell: Duration, request_tx: mpsc::UnboundedSender<f64>) {
     run_inner(map, dwell, Fire::Request(request_tx), None).await
 }
@@ -961,8 +1014,12 @@ async fn run_inner(
 ) {
     // The socket path is resolved once here, at manager start, instead of on
     // every 40ms cursor poll (what it derives from is fixed for the lifetime
-    // of the session).
-    let (socket, layout) = wait_for_hyprland().await;
+    // of the session). The wait races the shutdown signal because it can
+    // last forever (see wait_for_hyprland_or_gone).
+    let Some((socket, layout)) = wait_for_hyprland_or_gone(&fire).await else {
+        debug!("Screen-edge switching: connection gone while waiting for Hyprland");
+        return;
+    };
     // Shared with the cursor poller, which re-resolves it across compositor
     // restarts (see run_cursor_poller); the layout requery below follows the
     // same path so both talk to the live instance.
@@ -1081,12 +1138,7 @@ async fn run_inner(
             }
             // Client mode only: the request receiver was dropped with the
             // connection — go quiet until a new connection respawns us.
-            _ = async {
-                match &fire {
-                    Fire::Request(request_tx) => request_tx.closed().await,
-                    Fire::Event(_) => std::future::pending().await,
-                }
-            } => {
+            _ = fire_gone(&fire) => {
                 debug!("Screen-edge switching: connection gone, edge detection off");
                 return;
             }
@@ -2251,6 +2303,51 @@ pub(crate) mod tests {
         assert!(zone_contains(&bottom_edp, 4000, 1439));
     }
 
+    /// A hand-written layout whose outputs are 120 px apart on the vertical
+    /// axis: nothing abuts DP-1's bottom, so it keeps a bottom zone while
+    /// the desktop still continues below the gap.
+    fn gapped_layout() -> Vec<OutputRect> {
+        vec![
+            rect("DP-1", 0, 0, 1920, 1080),
+            rect("HDMI-A-1", 0, 1200, 1920, 1080),
+        ]
+    }
+
+    #[test]
+    fn zones_do_not_reach_across_a_layout_gap_or_overlap() {
+        let zones = edge_zones(&all_mapped(), &gapped_layout());
+        // 8% of 1920 = 153 trimmed per end → x in [153, 1767).
+        let bottom = zone_of(&zones, Direction::Bottom, "DP-1");
+        assert_eq!((bottom.edge, bottom.start, bottom.len), (1079, 153, 1614));
+        assert!(zone_contains(&bottom, 900, 1079));
+        // One pixel past the edge line still counts: that is the rounding
+        // slack exposed_segments already grants abutting outputs.
+        assert!(zone_contains(&bottom, 900, 1080));
+        // Anything further out is on the monitor across the gap. Resting
+        // there — mid-screen or at its top row — is not edge contact, so no
+        // dwell completes and no switch fires.
+        assert!(!zone_contains(&bottom, 900, 1200));
+        assert!(!zone_contains(&bottom, 900, 1700));
+        // The far output's top edge is exposed for the same reason, and
+        // reaches back up no further than the tolerance either.
+        let top = zone_of(&zones, Direction::Top, "HDMI-A-1");
+        assert_eq!(top.edge, 1200);
+        assert!(zone_contains(&top, 900, 1199));
+        assert!(!zone_contains(&top, 900, 1079));
+
+        // The mirror case, on the horizontal axis: outputs overlapping by
+        // more than the tolerance leave reachable desktop beyond DP-1's
+        // right edge line.
+        let overlapping = vec![
+            rect("DP-1", 0, 0, 1920, 1080),
+            rect("HDMI-A-1", 1000, 0, 1920, 1080),
+        ];
+        let right = zone_of(&edge_zones(&all_mapped(), &overlapping), Direction::Right, "DP-1");
+        assert_eq!(right.edge, 1919);
+        assert!(zone_contains(&right, 1919, 500));
+        assert!(!zone_contains(&right, 2500, 500));
+    }
+
     #[test]
     fn debounce_ignores_single_poll_jitter() {
         let mut debounce = EdgeDebounce::new();
@@ -2280,4 +2377,17 @@ pub(crate) mod tests {
         assert_eq!(debounce.poll(true), Some(true));
     }
 
+    #[tokio::test]
+    async fn the_hyprland_wait_gives_up_once_the_connection_is_gone() {
+        // Client mode with nothing left to serve: the wait must lose the
+        // race and the manager stop there. It sits in front of the select
+        // loop that carries the only other shutdown arm, so parking in it
+        // strands one task per spawn on a machine that has no Hyprland at
+        // all — and every reconnect spawns another.
+        let (request_tx, request_rx) = mpsc::unbounded_channel::<f64>();
+        drop(request_rx);
+        assert!(wait_for_hyprland_or_gone(&Fire::Request(request_tx))
+            .await
+            .is_none());
+    }
 }

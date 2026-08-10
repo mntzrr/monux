@@ -31,6 +31,23 @@ pub fn repo_url() -> String {
     DEFAULT_REPO.to_string()
 }
 
+/// The source checkout the updater fetches into and builds from.
+///
+/// MONUX_UPDATE_CACHE overrides it in DEBUG BUILDS ONLY, on the same reasoning
+/// as MONUX_UPDATE_REPO above: it selects the directory this path compiles,
+/// and `sudo -E` forwards the environment into a root process.
+fn default_src_dir() -> Result<PathBuf> {
+    #[cfg(debug_assertions)]
+    if let Some(dir) = std::env::var_os("MONUX_UPDATE_CACHE") {
+        return Ok(PathBuf::from(dir));
+    }
+    Ok(home::home_dir()
+        .context("No home dir found")?
+        .join(".cache")
+        .join("monux")
+        .join("src"))
+}
+
 /// The public half of the key that signs monux releases, in OpenSSH format
 /// (`ssh-ed25519 AAAA...`). Empty here means release signing is NOT configured
 /// for this build — see `verify_release_signature`.
@@ -352,14 +369,12 @@ pub fn run(
     trust: Trust,
 ) -> Result<UpdateStatus> {
     let repo = repo_url();
-    let src_dir = match std::env::var_os("MONUX_UPDATE_CACHE") {
-        Some(dir) => PathBuf::from(dir),
-        None => home::home_dir()
-            .context("No home dir found")?
-            .join(".cache")
-            .join("monux")
-            .join("src"),
-    };
+    // MONUX_UPDATE_CACHE is DEBUG-ONLY for the same reason MONUX_UPDATE_REPO
+    // is (see repo_url): it names the directory this path compiles from, and
+    // `sudo -E` forwards the environment into a root process, so honoring it
+    // in a release build would let anything that can set the daemon's
+    // environment choose what root builds.
+    let src_dir = default_src_dir()?;
     // Serialize against other updaters before touching the checkout: the
     // other daemon on a dual-daemon machine, or a manual 'monux update'
     // mid-build. The second contender waits, then sees AlreadyCurrent
@@ -434,6 +449,16 @@ pub fn run(
             .context("Failed to run git: is it installed?")?;
         if !status.success() {
             bail!("git clone {} failed", repo);
+        }
+        // `--depth 1` implies --single-branch and brings only the tags that
+        // point into the fetched history, so a fresh shallow clone can land
+        // with no release tags at all whenever master's tip is untagged. The
+        // repairing fetch on the existing-checkout path above never runs for a
+        // clone, so ask here too — otherwise the FIRST update on a new machine
+        // fails the signature gate for want of a tag, and an --auto-install
+        // daemon records the attempt and skips that release entirely.
+        if signing_configured() {
+            let _ = git(&src_dir, &["fetch", "--tags"]);
         }
     }
 
@@ -615,8 +640,32 @@ pub fn run(
                 }
                 let _ = std::fs::remove_dir_all(entry.path());
             }
+            if let Some(pid_str) = entry
+                .file_name()
+                .to_string_lossy()
+                .strip_prefix(".monux-verified-src-")
+            {
+                if let Ok(pid) = pid_str.trim_end_matches(".tar").parse::<i32>() {
+                    if pid != our_pid && std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+                        continue;
+                    }
+                }
+                let path = entry.path();
+                let _ = std::fs::remove_dir_all(&path);
+                let _ = std::fs::remove_file(&path);
+            }
         }
     }
+    // Build from the verified objects rather than from the working tree the
+    // checkout above left in the invoking user's home (see
+    // export_verified_tree). build.rs reads the revision out of .git, which an
+    // exported tree has none of, so it is passed in explicitly.
+    let build_dir = root.join(format!(".monux-verified-src-{}", std::process::id()));
+    export_verified_tree(&src_dir, &target_sha, &build_dir)?;
+    let build_sha = target_sha
+        .get(..12)
+        .unwrap_or(target_sha.as_str())
+        .to_string();
     // Install into a staging dir on the same filesystem, then rename the
     // binary into place atomically. 'cargo install' copies into bin/ in
     // place, so a kill mid-copy could leave a truncated monux binary;
@@ -635,12 +684,11 @@ pub fn run(
     } else {
         Command::new(cargo)
     };
-    let status = cmd
-        .arg("install")
+    cmd.arg("install")
         // Build exactly the locked dependencies (Cargo.lock is committed).
         .arg("--locked")
         .arg("--path")
-        .arg(&src_dir)
+        .arg(&build_dir)
         .arg("--root")
         .arg(&staging)
         .arg("--force")
@@ -648,12 +696,21 @@ pub fn run(
         // root is transient (the binary is renamed out of it below), so put it
         // on PATH just for this subprocess to silence the misleading warning.
         .env("PATH", path_with(staging.join("bin")))
-        .status()
-        .context("Failed to run cargo install")?;
+        .env("MONUX_BUILD_SHA", &build_sha);
+    // A root build must not read the invoking user's ~/.cargo: its
+    // config.toml sets rustc-wrapper and per-target linker, which is arbitrary
+    // code execution as root with no race required. Costs a fresh registry
+    // download per root update; correctness wins.
+    if unsafe { libc::geteuid() } == 0 {
+        cmd.env("CARGO_HOME", root.join(".monux-cargo-home"));
+    }
+    let status = cmd.status().context("Failed to run cargo install")?;
     if !status.success() {
         let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_dir_all(&build_dir);
         bail!("cargo install failed");
     }
+    let _ = std::fs::remove_dir_all(&build_dir);
     place_binary_atomically(
         &staging.join("bin").join("monux"),
         &root.join("bin").join("monux"),
@@ -1080,9 +1137,26 @@ pub fn clear_protocol_constraint(config_dir: &Path) {
 /// negotiation-era pair (see pair_works), so this value is the pair's floor,
 /// not a demanded exact match. Never fails: discovery is best-effort. Blocks
 /// for up to the mDNS discovery timeout: call it from a blocking context.
+/// The update gate after a discovery: an mDNS observation may RAISE it, never
+/// lower it below what a real, authenticated handshake recorded.
+///
+/// Discovery is attributed by fingerprint now, so a stranger's advertisement
+/// is already ignored. This is the second line: the path both gates AND
+/// persists, so any value that did get through would outlive the advertisement
+/// that planted it and go on silently skipping every update — including the
+/// one that would fix whatever let it through.
+fn gate_floor(recorded: Option<u64>, discovered: u64) -> u64 {
+    match recorded {
+        Some(recorded) if discovered < recorded => recorded,
+        _ => discovered,
+    }
+}
+
 pub fn refresh_protocol_constraint(config_dir: Option<&Path>) -> Option<u64> {
     let recorded = config_dir.and_then(server_protocol_constraint);
-    let discovered = match crate::discovery::discover_server_protocol_versions() {
+    let discovered = match crate::discovery::discover_server_protocol_versions(
+        &config_dir.map(crate::known_servers::load).unwrap_or_default(),
+    ) {
         Ok(versions) => versions,
         Err(e) => {
             debug!(
@@ -1097,6 +1171,14 @@ pub fn refresh_protocol_constraint(config_dir: Option<&Path>) -> Option<u64> {
         // No server answered: fall back to the last recorded version.
         None => return recorded,
     };
+    if gate_floor(recorded, constraint) != constraint {
+        let recorded = recorded.expect("gate_floor only holds the line when something was recorded");
+        info!(
+            "Ignoring the mDNS-advertised protocol gate v{}: the last handshake recorded v{}, and a discovery may not lower it",
+            constraint, recorded
+        );
+        return Some(recorded);
+    }
     if discovered.len() > 1 {
         info!(
             "Monux servers advertise different protocol versions ({}); gating on the oldest, v{}",
@@ -1183,6 +1265,9 @@ fn find_cargo() -> Result<PathBuf> {
         .map(|out| out.status.success())
         .unwrap_or(false);
     if in_path {
+        if let Some(resolved) = resolve_on_path("cargo") {
+            ensure_root_owned_when_root(&resolved, "the cargo binary")?;
+        }
         return Ok(PathBuf::from("cargo"));
     }
     let fallback = home::home_dir()
@@ -1191,9 +1276,95 @@ fn find_cargo() -> Result<PathBuf> {
         .join("bin")
         .join("cargo");
     if fallback.exists() {
+        // The dangerous one: sudo's secure_path strips ~/.cargo/bin from PATH,
+        // so a root daemon reaches this fallback and would exec a binary the
+        // unprivileged user can rewrite. The signature gate attests the
+        // SOURCE, never the toolchain that compiles it.
+        ensure_root_owned_when_root(&fallback, "the cargo binary")?;
         return Ok(fallback);
     }
     bail!("cargo not found: install a Rust toolchain via https://rustup.rs/")
+}
+
+/// The first executable named `name` on PATH, so its ownership can be checked.
+fn resolve_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Refuses a path that root would execute or read but an unprivileged user can
+/// rewrite.
+///
+/// Only meaningful when running as root: `sudo -E monux server --auto-install`
+/// is a documented way to run the daemon, and it keeps the invoking user's
+/// HOME, so every default the updater derives from it points into a directory
+/// that user still controls. A no-op for an ordinary user install, where the
+/// user IS the trust boundary.
+fn ensure_root_owned_when_root(path: &Path, what: &str) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+    let owner = std::fs::metadata(path)
+        .with_context(|| format!("could not stat {}", path.display()))?
+        .uid();
+    if owner != 0 {
+        bail!(
+            "refusing to run as root with {} at {}: it is owned by uid {}, which could replace it between this check and the build",
+            what,
+            path.display(),
+            owner
+        );
+    }
+    Ok(())
+}
+
+/// Extracts the verified commit's tree into `dest`, straight from git's object
+/// database.
+///
+/// The signature gate attests a COMMIT, not a working tree. `git checkout`
+/// leaves that commit's content in a directory the invoking user can still
+/// rewrite — and under `sudo -E monux server --auto-install` the builder is
+/// root while that user is not — so between the check and `cargo install`
+/// anything could swap `build.rs` or a source file and have it compiled and
+/// run as root. Git objects are content-addressed, so an archive of the
+/// verified sha is exactly the bytes that were signed; extracting them into a
+/// directory under the install root (which is root-owned wherever root
+/// installs) closes the window.
+fn export_verified_tree(src_dir: &Path, sha: &str, dest: &Path) -> Result<()> {
+    let _ = std::fs::remove_dir_all(dest);
+    std::fs::create_dir_all(dest)
+        .with_context(|| format!("could not create {}", dest.display()))?;
+    let tarball = dest.with_file_name(format!(
+        "{}.tar",
+        dest.file_name().and_then(|n| n.to_str()).unwrap_or("src")
+    ));
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(src_dir)
+        .args(["archive", "--format=tar", "--output"])
+        .arg(&tarball)
+        .arg(sha)
+        .status()
+        .context("Failed to run git archive")?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&tarball);
+        bail!("could not export the verified source of {}", sha);
+    }
+    let status = Command::new("tar")
+        .arg("-xf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(dest)
+        .status()
+        .context("Failed to run tar")?;
+    let _ = std::fs::remove_file(&tarball);
+    if !status.success() {
+        bail!("could not unpack the verified source of {}", sha);
+    }
+    Ok(())
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<()> {
@@ -1721,6 +1892,20 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/before-the-rewrite
         assert_eq!(mode, 0o666);
     }
 
+    /// An mDNS observation may raise the update gate but never lower it below
+    /// what an authenticated handshake recorded — the gate is both consulted
+    /// and persisted, so a lowered value outlives whatever planted it.
+    #[test]
+    fn a_discovery_may_raise_the_update_gate_but_never_lower_it() {
+        // Nothing recorded yet: whatever was discovered stands.
+        assert_eq!(gate_floor(None, 15), 15);
+        // A newer server on the LAN raises it.
+        assert_eq!(gate_floor(Some(16), 17), 17);
+        // The attack: an advertisement below the recorded value is refused.
+        assert_eq!(gate_floor(Some(16), 15), 16);
+        assert_eq!(gate_floor(Some(16), 16), 16);
+    }
+
     #[test]
     fn cargo_toml_version_extraction() {
         assert_eq!(
@@ -1846,6 +2031,39 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/before-the-rewrite
 
     fn test_repo(dir: &Path) {
         test_git(dir, &["-c", "init.defaultBranch=master", "init"]);
+    }
+
+    /// The signature gate attests a COMMIT, so the build must consume that
+    /// commit's objects — not the working tree, which the invoking user can
+    /// still rewrite after the check passes (the updater runs as root under
+    /// the documented `sudo -E monux server --auto-install`).
+    #[test]
+    fn the_export_takes_its_content_from_objects_not_the_working_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        test_repo(&repo);
+        let sha = test_commit_version(&repo, "13.0.0");
+
+        // Exactly the attack: the verified commit is checked out, and then the
+        // working tree is tampered before the build reads it.
+        std::fs::write(repo.join("Cargo.toml"), "pwned").unwrap();
+        std::fs::write(repo.join("build.rs"), "fn main() { /* pwned */ }").unwrap();
+
+        let dest = tmp.path().join("verified-src");
+        export_verified_tree(&repo, &sha, &dest).unwrap();
+
+        // The signed content, not what was on disk a moment ago.
+        assert_eq!(
+            std::fs::read_to_string(dest.join("Cargo.toml")).unwrap(),
+            "[package]\nname = \"monux\"\nversion = \"13.0.0\"\n"
+        );
+        assert!(
+            !dest.join("build.rs").exists(),
+            "a file absent from the commit must not appear in the export"
+        );
+        // The intermediate tarball is not left behind next to the export.
+        assert!(!dest.with_file_name("verified-src.tar").exists());
     }
 
     /// A force-pushed upstream (a rewritten or amended commit) leaves every
