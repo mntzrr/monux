@@ -197,11 +197,26 @@ async fn apply_grab_transition(
             },
         )
     };
+    if ok && target {
+        drain_pending_events(stream).await;
+    }
     if ok {
         None
     } else {
         Some(target)
     }
+}
+
+/// Discards events already pending on a freshly grabbed device. Input typed
+/// before the grab landed (e.g. during the pre-grab quiescence wait) was
+/// delivered to the local system AND piled up in the evdev fd's buffer;
+/// left in place, the reader loop would read it back now and forward it
+/// stamped as grabbed — duplicating input the local system already
+/// processed.
+async fn drain_pending_events(stream: &mut EventStream) {
+    // A zero-length timeout polls next_event exactly once: Ready when an
+    // event was buffered, Elapsed once the fd is drained.
+    while let Ok(Ok(_)) = time::timeout(Duration::ZERO, stream.next_event()).await {}
 }
 
 /// The backoff timer for a failed (un)grab. MissedTickBehavior::Delay is an
@@ -231,6 +246,11 @@ async fn read_device_or_grab_events(
 ) {
     let mut input_events_batch = Vec::new();
     let mut combo_events_batch = Vec::new();
+    // Grab state as of the first event collected into input_events_batch
+    // (valid only while that batch is non-empty). Sampling at flush time
+    // instead would mislabel the whole batch when a grab lands mid-frame:
+    // events read before the grab were already delivered locally.
+    let mut batch_is_grabbed = false;
     // Apply the current grab state right away: this device may have been (re)added
     // while a client is already active or while input is paused, so we can't wait
     // for the next state change. If the (un)grab fails, keep retrying in the
@@ -250,7 +270,7 @@ async fn read_device_or_grab_events(
             event = stream.next_event() => {
                 match event {
                     Ok(event) => {
-                        handle_input_event(stream, &mut handler_config, event, &device_info, &mut input_events_batch, &mut combo_events_batch).await
+                        handle_input_event(stream, &mut handler_config, event, &device_info, &mut input_events_batch, &mut combo_events_batch, &mut batch_is_grabbed).await
                     }
                     Err(e) => {
                         // Common when the device has been unplugged.
@@ -363,6 +383,7 @@ async fn handle_input_event(
     device_info: &util::DeviceInfo,
     input_events_batch: &mut Vec<event::InputEvent>,
     combo_events_batch: &mut Vec<Event>,
+    batch_is_grabbed: &mut bool,
 ) {
     let step = batch_step(
         event.event_type(),
@@ -379,7 +400,7 @@ async fn handle_input_event(
                     input_events_batch,
                     Vec::with_capacity(input_events_batch.capacity()),
                 ),
-                is_grabbed: device_info.is_grabbed,
+                is_grabbed: *batch_is_grabbed,
                 class: device_info.class,
             });
             if let Err(e) = c.event_tx.send(event).await {
@@ -439,6 +460,12 @@ async fn handle_input_event(
                 util::log_event(&event)
             );
         } else {
+            // The batch's grab state is the state as of its FIRST event: a
+            // grab landing mid-frame must not retroactively mark events the
+            // local system already delivered as grabbed.
+            if input_events_batch.is_empty() {
+                *batch_is_grabbed = device_info.is_grabbed;
+            }
             input_events_batch.push(convert_device_event(event, stream.device(), device_info))
         }
         if event.event_type() == EventType::KEY {

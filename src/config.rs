@@ -41,9 +41,10 @@
 //! plain toml, which simply ignores comments. `mx config history` shows the
 //! stacks; `mx config revert` restores an entry and banks the current
 //! value, so a revert is itself undoable. A was-block left by `unset`
-//! carries no key name, so it is attributed to an absent key by validator
-//! fit (first match in file order) — exact for a single unset key; revert
-//! one key at a time to keep it exact.
+//! carries an `# unset: <flag>` tag naming the key it belongs to, and
+//! history/revert attribute it by that tag. Blocks written before the tag
+//! existed fall back to validator fit (first match in file order) —
+//! best-effort when several untagged blocks have compatible value shapes.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -219,7 +220,7 @@ pub static REGISTRY: &[KeySpec] = &[
         key: "server.fingerprint",
         section: Section::Server,
         flag: "fingerprint",
-        expects: "certificate fingerprint (hex, ':' allowed)",
+        expects: "certificate fingerprint (64 hex chars, ':' allowed)",
         default_display: "none",
         help: "client certificate fingerprint pre-approved without prompting",
         kind: Kind::StrArray,
@@ -352,7 +353,7 @@ pub static REGISTRY: &[KeySpec] = &[
         key: "client.fingerprint",
         section: Section::Client,
         flag: "fingerprint",
-        expects: "certificate fingerprint (hex, ':' allowed)",
+        expects: "certificate fingerprint (64 hex chars, ':' allowed)",
         default_display: "none",
         help: "server certificate fingerprint pre-approved without prompting",
         kind: Kind::StrArray,
@@ -729,6 +730,21 @@ impl WasEntry {
     }
 }
 
+/// The companion comment `unset` writes directly above the was-block it
+/// leaves behind, naming the key the block belongs to: `# unset: <flag>`.
+/// Strict like WAS_PREFIX: column 0, exact spacing, nothing else on the
+/// line.
+const UNSET_PREFIX: &str = "# unset: ";
+
+/// Parses a comment line as an orphan-block tag, returning the flag name.
+fn parse_unset_tag(line: &str) -> Option<&str> {
+    let flag = line.strip_prefix(UNSET_PREFIX)?;
+    if flag.is_empty() || flag.bytes().any(|b| b.is_ascii_whitespace()) {
+        return None;
+    }
+    Some(flag)
+}
+
 /// Parses a comment line as a history entry. The shape is strict: exactly
 /// `# was: <value> @ <timestamp>` at column 0, a plausible timestamp, and a
 /// value that parses as TOML. Anything less is a human comment and is never
@@ -919,6 +935,25 @@ fn render_stack_block(head: &str, stack: &[WasEntry], indent: &str) -> String {
     out
 }
 
+/// Renders the was-block `unset` leaves in place of a removed key: the
+/// key's head comments, an `# unset: <flag>` tag naming the block's key,
+/// then the was-stack. The tag sits directly above the stack so
+/// `run_block_range` carries it with the block, and orphan attribution
+/// keys on it (see `find_orphan`).
+fn render_orphan_block(head: &str, flag: &str, stack: &[WasEntry]) -> String {
+    let mut out = String::from(head);
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(UNSET_PREFIX);
+    out.push_str(flag);
+    out.push('\n');
+    for entry in stack {
+        out.push_str(&entry.render());
+    }
+    out
+}
+
 /// Where an orphan was-block (left by `unset`) is stored.
 #[derive(Debug)]
 enum OrphanHolder {
@@ -934,6 +969,9 @@ enum OrphanHolder {
 /// An orphan was-block and where to find it.
 #[derive(Debug)]
 struct Orphan {
+    /// The `# unset: <flag>` tag directly above the block, when the unset
+    /// that left it wrote one (blocks predating the tag have none).
+    tag: Option<String>,
     entries: Vec<WasEntry>,
     holder: OrphanHolder,
     /// Index among the strict runs in the holder's text.
@@ -949,18 +987,31 @@ fn key_prefix<'a>(table: &'a toml_edit::Table, flag: &str) -> &'a str {
         .unwrap_or("")
 }
 
+/// The `# unset: <flag>` tag line directly above the run starting at byte
+/// `start` in `text`, if there is one. Runs start at a line boundary, so
+/// the previous line ends at `start - 1`.
+fn unset_tag_at(text: &str, start: usize) -> Option<String> {
+    if start == 0 {
+        return None;
+    }
+    let prev_end = start - 1; // the '\n' ending the previous line
+    let prev_start = text[..prev_end].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    parse_unset_tag(&text[prev_start..prev_end]).map(str::to_string)
+}
+
 /// All orphan was-blocks of a section, in file order: strict was-runs in a
 /// managed position that don't sit directly above a managed key — above a
 /// following key's own comments/stack, in the next section's header decor,
-/// or in the document trailing for the last section.
+/// or in the document trailing.
 fn gather_orphans(doc: &toml_edit::DocumentMut, section: &'static str) -> Vec<Orphan> {
     let mut out = vec![];
     if let Some(table) = doc.get(section).and_then(|i| i.as_table()) {
         for (flag, _) in table.iter() {
             let prefix = key_prefix(table, flag);
             let managed = find(&format!("{}.{}", section, flag)).is_some();
-            for (run_index, (_, _, entries)) in orphan_runs_in(prefix, managed).into_iter().enumerate() {
+            for (run_index, (start, _, entries)) in orphan_runs_in(prefix, managed).into_iter().enumerate() {
                 out.push(Orphan {
+                    tag: unset_tag_at(prefix, start),
                     entries,
                     holder: OrphanHolder::KeyPrefix(section, flag.to_string()),
                     run_index,
@@ -969,39 +1020,50 @@ fn gather_orphans(doc: &toml_edit::DocumentMut, section: &'static str) -> Vec<Or
         }
     }
     // The section tail: the following section's header decor, or the
-    // document trailing when this is the last section.
+    // document trailing — both when this is the last section and when the
+    // successor exists but is not a [section] table (an array-of-tables
+    // header has no decor a comment can live in, so attach_tail writes to
+    // the trailing; gather must read everywhere attach_tail writes).
     let sections: Vec<&str> = doc.iter().map(|(name, _)| name).collect();
     match sections.iter().position(|name| *name == section) {
         Some(i) if i + 1 < sections.len() => {
             let next = sections[i + 1];
-            if let Some(table) = doc.get(next).and_then(|i| i.as_table()) {
-                let prefix = table
-                    .decor()
-                    .prefix()
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-                for (run_index, (_, _, entries)) in scan_runs(prefix).into_iter().enumerate() {
-                    out.push(Orphan {
-                        entries,
-                        holder: OrphanHolder::NextHeader(next.to_string()),
-                        run_index,
-                    });
+            match doc.get(next).and_then(|i| i.as_table()) {
+                Some(table) => {
+                    let prefix = table
+                        .decor()
+                        .prefix()
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("");
+                    for (run_index, (start, _, entries)) in scan_runs(prefix).into_iter().enumerate() {
+                        out.push(Orphan {
+                            tag: unset_tag_at(prefix, start),
+                            entries,
+                            holder: OrphanHolder::NextHeader(next.to_string()),
+                            run_index,
+                        });
+                    }
                 }
+                None => gather_trailing_orphans(doc, &mut out),
             }
         }
-        Some(_) => {
-            let trailing = doc.trailing().as_str().unwrap_or("");
-            for (run_index, (_, _, entries)) in scan_runs(trailing).into_iter().enumerate() {
-                out.push(Orphan {
-                    entries,
-                    holder: OrphanHolder::DocTrailing,
-                    run_index,
-                });
-            }
-        }
+        Some(_) => gather_trailing_orphans(doc, &mut out),
         None => {}
     }
     out
+}
+
+/// The orphan was-blocks in the document trailing.
+fn gather_trailing_orphans(doc: &toml_edit::DocumentMut, out: &mut Vec<Orphan>) {
+    let trailing = doc.trailing().as_str().unwrap_or("");
+    for (run_index, (start, _, entries)) in scan_runs(trailing).into_iter().enumerate() {
+        out.push(Orphan {
+            tag: unset_tag_at(trailing, start),
+            entries,
+            holder: OrphanHolder::DocTrailing,
+            run_index,
+        });
+    }
 }
 
 /// Whether every entry of an orphan block passes the key's validator.
@@ -1016,15 +1078,24 @@ fn orphan_fits(orphan: &Orphan, spec: &KeySpec) -> bool {
     })
 }
 
-/// The orphan block attributed to an absent managed key: orphan blocks
-/// whose entries all pass the key's validator, the first in file order —
-/// exact for a single unset key. With several unset keys of compatible
-/// value shapes the match is best-effort (the file order usually keeps the
-/// original key order); unset/revert one key at a time to keep it exact.
+/// The orphan block attributed to an absent managed key: the block tagged
+/// `# unset: <flag>` for this key, or — for blocks left before the tag
+/// existed — the first untagged block in file order whose entries all pass
+/// the key's validator. A block tagged for another key is never claimed
+/// here, so reverting one key cannot install another key's value; with
+/// several untagged blocks of compatible value shapes the fallback stays
+/// best-effort (the file order usually keeps the original key order).
 fn find_orphan(doc: &toml_edit::DocumentMut, spec: &KeySpec) -> Option<Orphan> {
-    gather_orphans(doc, spec.section.as_str())
-        .into_iter()
-        .find(|o| orphan_fits(o, spec))
+    let orphans = gather_orphans(doc, spec.section.as_str());
+    let index = orphans
+        .iter()
+        .position(|o| o.tag.as_deref() == Some(spec.flag))
+        .or_else(|| {
+            orphans
+                .iter()
+                .position(|o| o.tag.is_none() && orphan_fits(o, spec))
+        })?;
+    Some(orphans.into_iter().nth(index).expect("position found above"))
 }
 
 /// The byte range of the run `run_index` together with the comment lines
@@ -1105,6 +1176,7 @@ fn rewrite_holder(doc: &mut toml_edit::DocumentMut, holder: &OrphanHolder, f: im
 
 /// Removes an absent key's orphan block from wherever it lives and returns
 /// its text (comments + was-lines), for re-attaching above a recreated key.
+/// The `# unset:` tag has served its purpose and is stripped.
 fn adopt_orphan(doc: &mut toml_edit::DocumentMut, spec: &KeySpec) -> Option<String> {
     let orphan = find_orphan(doc, spec)?;
     let mut block = String::new();
@@ -1113,7 +1185,11 @@ fn adopt_orphan(doc: &mut toml_edit::DocumentMut, spec: &KeySpec) -> Option<Stri
         block = taken;
         without
     });
-    if block.is_empty() { None } else { Some(block) }
+    if block.is_empty() {
+        None
+    } else {
+        Some(block.replacen(&format!("{}{}\n", UNSET_PREFIX, spec.flag), "", 1))
+    }
 }
 
 /// Converts an editable TOML value into the plain `toml` model the load
@@ -1199,7 +1275,10 @@ fn section_table<'a>(
 }
 
 /// Appends a comment block at the end of a section: into the following
-/// section's header decor, or the document trailing for the last section.
+/// section's header decor, or the document trailing when there is no
+/// following [section] table to hold it (the section is last, or the
+/// successor is a non-table like an inline-table section).
+/// `gather_orphans` reads exactly these two places.
 fn attach_tail(doc: &mut toml_edit::DocumentMut, section: &str, block: &str) {
     let sections: Vec<String> = doc.iter().map(|(name, _)| name.to_string()).collect();
     let next = sections
@@ -1423,9 +1502,10 @@ pub enum UnsetOutcome {
 }
 
 /// Removes a config value, banking it as a `# was:` history entry: the
-/// was-block stays where the key was. Unknown keys error out — unless they
-/// are actually present in the file, which is exactly the stale-key cleanup
-/// case (no history: unknown keys are not managed).
+/// was-block stays where the key was, tagged `# unset: <flag>` so
+/// history/revert can attribute it to this key. Unknown keys error out —
+/// unless they are actually present in the file, which is exactly the
+/// stale-key cleanup case (no history: unknown keys are not managed).
 pub fn unset_value(path: &Path, key: &str) -> Result<UnsetOutcome> {
     let mut doc = read_doc(path)?;
     let spec = find(key);
@@ -1478,15 +1558,22 @@ pub fn unset_value(path: &Path, key: &str) -> Result<UnsetOutcome> {
     match (spec, removed) {
         (Some(spec), Some(old)) => {
             // Bank the removed value at the bottom of the key's own
-            // was-stack; the block stays in place in the section.
+            // was-stack; the block stays in place in the section, tagged
+            // with the key's flag so history/revert attribute it to this
+            // key and no other.
             let block = match old.as_value().and_then(render_entry_value) {
-                Some(value) => push_stack(
-                    &prefix,
-                    WasEntry {
-                        value,
-                        timestamp: now_timestamp(),
-                    },
-                ),
+                Some(value) => {
+                    let (head, mut stack, _) = split_bottom_stack(&prefix);
+                    stack.insert(
+                        0,
+                        WasEntry {
+                            value,
+                            timestamp: now_timestamp(),
+                        },
+                    );
+                    stack.truncate(HISTORY_CAP);
+                    render_orphan_block(head, spec.flag, &stack)
+                }
                 None => prefix,
             };
             attach_block(&mut doc, &section, next_flag.as_deref(), &block);
@@ -1676,8 +1763,9 @@ struct KeyHistory {
 }
 
 /// Every registry key's current value and was-stack. Orphan blocks are
-/// attributed greedily in registry order — each block is listed under at
-/// most one absent key.
+/// attributed to an absent key by their `# unset:` tag first; untagged
+/// blocks (left before the tag existed) fall back to greedy validator fit
+/// in registry order. Each block is listed under at most one absent key.
 fn read_history(path: &Path) -> Result<Vec<KeyHistory>> {
     let text = match fs::read_to_string(path) {
         Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -1727,7 +1815,11 @@ fn read_history(path: &Path) -> Result<Vec<KeyHistory>> {
                     .get_mut(spec.section.as_str())
                     .expect("both sections pooled");
                 pool.iter()
-                    .position(|o| orphan_fits(o, spec))
+                    .position(|o| o.tag.as_deref() == Some(spec.flag))
+                    .or_else(|| {
+                        pool.iter()
+                            .position(|o| o.tag.is_none() && orphan_fits(o, spec))
+                    })
                     .map(|i| pool.remove(i).entries)
                     .unwrap_or_default()
             };
@@ -1886,14 +1978,21 @@ pub fn validate_file(path: &Path) -> Result<Vec<Issue>> {
     Ok(issues)
 }
 
-/// The 1-based line of `flag =` inside `[section]`, if found.
+/// The 1-based line of `flag =` inside `[section]`, if found. Section
+/// headers are matched tolerantly — `[server] # note` and `[ server ]`
+/// both count: the TOML parser accepts them, so validate must find the
+/// keys under them too.
 fn key_line(text: &str, key: &str) -> Option<usize> {
     let (section, flag) = key.split_once('.')?;
     let mut in_section = false;
     for (i, line) in text.lines().enumerate() {
         let t = line.trim();
         if t.starts_with('[') {
-            in_section = t == format!("[{}]", section);
+            let header = t.split('#').next().unwrap_or(t).trim();
+            in_section = header
+                .strip_prefix('[')
+                .and_then(|h| h.strip_suffix(']'))
+                .is_some_and(|name| name.trim() == section);
             continue;
         }
         if in_section && !t.starts_with('#') {
@@ -2119,13 +2218,13 @@ fn v_bulk_throttle(values: &[&str]) -> std::result::Result<(), String> {
 
 fn v_fingerprints(values: &[&str]) -> std::result::Result<(), String> {
     for v in values {
-        let hex: String = v.chars().filter(|c| *c != ':').collect();
-        if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(format!(
-                "'{}' is not a certificate fingerprint (hex digits, ':' allowed)",
-                v
-            ));
-        }
+        // The exact rule the daemon enforces at startup
+        // (MonuxCertVerification::new in network/approval.rs): normalized
+        // (lowercase, colons stripped), then one full SHA-256 digest.
+        // Anything laxer passes `set`/`validate` but makes the daemon
+        // refuse to start — a config problem must never do that.
+        let normalized = crate::network::approval::normalize_fingerprint(v);
+        crate::network::approval::validate_fingerprint(&normalized).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -2252,14 +2351,19 @@ fn cli_set(path: &Path, key: &str, values: &[String]) -> Result<()> {
         .old_value
         .unwrap_or_else(|| format!("{} (default)", spec.default_display));
     println!("{} = {} (was: {})", outcome.key, outcome.new_value, was);
-    // Daemons read the file once at startup; a live one needs a restart.
-    if single_instance::live_holder(spec.section.as_str()).is_some() {
+    note_live_daemon(spec.section.as_str());
+    Ok(())
+}
+
+/// Daemons read the file once at startup; when one is live, a config change
+/// only takes effect after a restart — say so.
+fn note_live_daemon(section: &str) {
+    if single_instance::live_holder(section).is_some() {
         println!(
             "note: a {} daemon is running — restart to apply: mx daemon restart",
-            spec.section.as_str()
+            section
         );
     }
-    Ok(())
 }
 
 /// `set <key>` with no value: the key's reference card. Changes nothing.
@@ -2284,16 +2388,22 @@ fn print_key_card(path: &Path, spec: &KeySpec) -> Result<()> {
 
 fn cli_unset(path: &Path, key: &str) -> Result<()> {
     match unset_value(path, key)? {
-        UnsetOutcome::Removed(spec, old) => println!(
-            "removed {} = {}; reverts to {} (default)",
-            spec.key, old, spec.default_display
-        ),
+        UnsetOutcome::Removed(spec, old) => {
+            println!(
+                "removed {} = {}; reverts to {} (default)",
+                spec.key, old, spec.default_display
+            );
+            note_live_daemon(spec.section.as_str());
+        }
         UnsetOutcome::AlreadyDefault(spec) => println!(
             "{} is not set in the config file; already at default: {}",
             spec.key, spec.default_display
         ),
         UnsetOutcome::RemovedUnknown(key, old) => {
-            println!("removed unknown key {} = {}", key, old)
+            println!("removed unknown key {} = {}", key, old);
+            if let Some((section, _)) = key.split_once('.') {
+                note_live_daemon(section);
+            }
         }
     }
     Ok(())
@@ -2355,14 +2465,8 @@ fn cli_revert(path: &Path, key: &str, to: Option<&str>) -> Result<()> {
     let outcome = revert_value(path, key, to)?;
     let was = outcome.replaced.unwrap_or_else(|| "unset".to_string());
     println!("{} = {} (was: {})", outcome.key, outcome.restored, was);
-    // Daemons read the file once at startup; a live one needs a restart.
     let spec = find(key).expect("revert_value validated the key");
-    if single_instance::live_holder(spec.section.as_str()).is_some() {
-        println!(
-            "note: a {} daemon is running — restart to apply: mx daemon restart",
-            spec.section.as_str()
-        );
-    }
+    note_live_daemon(spec.section.as_str());
     Ok(())
 }
 
@@ -2530,16 +2634,21 @@ fn inject_edit_history(path: &Path, scratch: &Path) -> Result<String> {
                 ));
             }
             None => {
-                // Removed key: leave the was-block at the end of the section.
+                // Removed key: leave the was-block at the end of the
+                // section, tagged like an `unset` block so history/revert
+                // attribute it to this key and no other.
                 section_table(&mut new_doc, section, scratch)?;
                 attach_tail(
                     &mut new_doc,
                     section,
-                    &WasEntry {
-                        value: entry_value,
-                        timestamp: timestamp.clone(),
-                    }
-                    .render(),
+                    &render_orphan_block(
+                        "",
+                        spec.flag,
+                        &[WasEntry {
+                            value: entry_value,
+                            timestamp: timestamp.clone(),
+                        }],
+                    ),
                 );
             }
         }
@@ -3331,5 +3440,151 @@ mod tests {
         set_value(&path, "server.port", &["2000".to_string()]).unwrap();
         let ts = &stack_of(&path, "server.port")[0].1;
         assert!(valid_timestamp(ts));
+    }
+
+    #[test]
+    fn fingerprint_validation_matches_the_daemon_startup_rule() {
+        // The daemon hard-fails on anything but a normalized 64-hex SHA-256
+        // digest (MonuxCertVerification::new); the validator must not accept
+        // what the daemon then refuses — a config problem must never prevent
+        // a daemon from starting.
+        let fp = "ab".repeat(32);
+        let colon_fp = (0..32).map(|_| "AB").collect::<Vec<_>>().join(":");
+        assert!(v_fingerprints(&[&fp]).is_ok());
+        assert!(v_fingerprints(&[&colon_fp]).is_ok(), "colons and uppercase normalize");
+        assert!(v_fingerprints(&[&fp, &colon_fp]).is_ok());
+        for bad in [
+            String::new(),
+            "aa11bbcc".to_string(), // a prefix, not a digest: the old validator took it
+            "ab".repeat(31),
+            "ab".repeat(33),
+            "zz".repeat(32),
+        ] {
+            assert!(v_fingerprints(&[&bad]).is_err(), "accepted {:?}", bad);
+        }
+        // `set` rejects the short prefix, `validate` flags it in the file.
+        let (_dir, path) = tmp_config();
+        assert!(set_value(&path, "server.fingerprint", &["aa11bbcc".to_string()]).is_err());
+        set_value(&path, "server.fingerprint", std::slice::from_ref(&fp)).unwrap();
+        assert_eq!(
+            load(&path).unwrap().get_str_vec("server.fingerprint").unwrap(),
+            vec![fp]
+        );
+        fs::write(&path, "[server]\nfingerprint = [\"aa11bbcc\"]\n").unwrap();
+        let issues = validate_file(&path).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.contains("server.fingerprint"), "{}", issues[0].message);
+        assert!(matches!(issues[0].severity, Severity::Error));
+    }
+
+    #[test]
+    fn orphan_blocks_are_attributed_by_their_unset_tag() {
+        let (_dir, path) = tmp_config();
+        // Two overlapping value shapes, banked in reverse registry order:
+        // motion-hz's 500 also passes the port validator, so a greedy
+        // validator-fit attributed it to port (registry order) — a plain
+        // `mx config revert server.port` then installed 500 as the port.
+        set_value(&path, "server.motion-hz", &["500".to_string()]).unwrap();
+        unset_value(&path, "server.motion-hz").unwrap();
+        set_value(&path, "server.port", &["4321".to_string()]).unwrap();
+        unset_value(&path, "server.port").unwrap();
+        let text = read_text(&path);
+        assert!(text.contains("# unset: motion-hz\n"), "tag in:\n{}", text);
+        assert!(text.contains("# unset: port\n"), "tag in:\n{}", text);
+        let port_stack: Vec<String> = stack_of(&path, "server.port")
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect();
+        assert_eq!(port_stack, vec!["4321"]);
+        let hz_stack: Vec<String> = stack_of(&path, "server.motion-hz")
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect();
+        assert_eq!(hz_stack, vec!["500"]);
+        // Reverting restores each key's own value.
+        let outcome = revert_value(&path, "server.port", None).unwrap();
+        assert_eq!(outcome.restored, "4321");
+        let outcome = revert_value(&path, "server.motion-hz", None).unwrap();
+        assert_eq!(outcome.restored, "500");
+        assert_eq!(load(&path).unwrap().get_int::<u32>("server.motion-hz"), Some(500));
+        // The tag has served its purpose: it does not linger above the
+        // recreated key.
+        let text = read_text(&path);
+        assert!(!text.contains("# unset:"), "tag stripped:\n{}", text);
+    }
+
+    #[test]
+    fn a_tagged_orphan_is_invisible_to_other_keys() {
+        let (_dir, path) = tmp_config();
+        // Only motion-hz was ever set; its value fits the port validator.
+        set_value(&path, "server.motion-hz", &["500".to_string()]).unwrap();
+        unset_value(&path, "server.motion-hz").unwrap();
+        // Port must not claim motion-hz's block: no history, and `set` does
+        // not adopt it.
+        let err = revert_value(&path, "server.port", None).unwrap_err();
+        assert!(err.to_string().contains("no history"), "{}", err);
+        set_value(&path, "server.port", &["4321".to_string()]).unwrap();
+        assert!(stack_of(&path, "server.port").is_empty());
+        // Motion-hz still reverts to its own value.
+        let outcome = revert_value(&path, "server.motion-hz", None).unwrap();
+        assert_eq!(outcome.restored, "500");
+    }
+
+    #[test]
+    fn untagged_orphan_blocks_still_attribute_by_validator_fit() {
+        // Blocks written before the `# unset:` tag existed keep working:
+        // the first registry key whose validator takes the value claims the
+        // block, exactly once.
+        let (_dir, path) = tmp_config();
+        fs::write(
+            &path,
+            "[server]\nwww = true\n\n# was: 500 @ 2026-07-25T01:12:03Z\n\n[client]\nwww = true\n",
+        )
+        .unwrap();
+        let port_stack: Vec<String> = stack_of(&path, "server.port")
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect();
+        assert_eq!(port_stack, vec!["500"]);
+        // ...and no second key lists the same block.
+        assert!(stack_of(&path, "server.motion-hz").is_empty());
+        let outcome = revert_value(&path, "server.port", None).unwrap();
+        assert_eq!(outcome.restored, "500");
+        assert_eq!(load(&path).unwrap().get_int::<u16>("server.port"), Some(500));
+    }
+
+    #[test]
+    fn orphan_before_a_non_table_successor_is_found() {
+        // The item after [server] is an array of tables: it has no header
+        // decor a comment can live in, so attach_tail writes the was-block
+        // to the document trailing — gather_orphans must look there too, or
+        // unset writes a block history/revert never see. (A bare
+        // `client = { ... }` after a [server] header would be nested INSIDE
+        // [server]; an array of tables is the non-table successor a valid
+        // file can actually have.)
+        let (_dir, path) = tmp_config();
+        fs::write(&path, "[server]\nport = 4321\n\n[[extras]]\nx = 1\n").unwrap();
+        unset_value(&path, "server.port").unwrap();
+        let stack = stack_of(&path, "server.port");
+        assert_eq!(stack.len(), 1, "block in the doc trailing must be found:\n{}", read_text(&path));
+        assert_eq!(stack[0].0, "4321");
+        let outcome = revert_value(&path, "server.port", None).unwrap();
+        assert_eq!(outcome.restored, "4321");
+        assert_eq!(load(&path).unwrap().get_int::<u16>("server.port"), Some(4321));
+        // The untouched array-of-tables section survives the round-trip.
+        assert!(read_text(&path).contains("[[extras]]"), "{}", read_text(&path));
+    }
+
+    #[test]
+    fn key_line_tolerates_commented_and_spaced_section_headers() {
+        let (_dir, path) = tmp_config();
+        fs::write(&path, "[server] # server side\nport = 99999\n").unwrap();
+        let issues = validate_file(&path).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].line, Some(2), "line despite a trailing comment");
+        fs::write(&path, "[ server ]\nport = 99999\n").unwrap();
+        let issues = validate_file(&path).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].line, Some(2), "line despite spaces in the header");
     }
 }

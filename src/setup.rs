@@ -92,16 +92,17 @@ fn unit_content(role: Role) -> String {
     )
 }
 
-/// A command to spawn, in test-inspectable form.
+/// A command to spawn, in test-inspectable form. pub(crate) so uninstall.rs
+/// can drive the same runuser-wrapped systemctl invocations.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CmdSpec {
+pub(crate) struct CmdSpec {
     program: String,
     args: Vec<String>,
     env: Vec<(String, String)>,
 }
 
 impl CmdSpec {
-    fn run(&self) -> Result<()> {
+    pub(crate) fn run(&self) -> Result<()> {
         let status = Command::new(&self.program)
             .args(&self.args)
             .envs(self.env.iter().cloned())
@@ -137,7 +138,7 @@ impl CmdSpec {
     /// The equivalent command for the user to run in their own session: for a
     /// runuser-wrapped invocation that's the inner command (the session
     /// environment is already right there).
-    fn manual_line(&self) -> String {
+    pub(crate) fn manual_line(&self) -> String {
         match self.args.iter().position(|a| a == "--") {
             Some(pos) if self.program == "runuser" => self.args[pos + 1..].join(" "),
             _ => std::iter::once(self.program.as_str())
@@ -149,22 +150,23 @@ impl CmdSpec {
 }
 
 /// A user to run `systemctl --user` as, when setup runs as root via sudo.
+/// pub(crate) so uninstall.rs can target the same user's manager.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct UserCtx {
-    name: String,
-    uid: u32,
+pub(crate) struct UserCtx {
+    pub(crate) name: String,
+    pub(crate) uid: u32,
 }
 
 /// Builds `systemctl --user` invocations for the autostart target user: plain
 /// when running as that user, or wrapped in `runuser` with the session
 /// environment pointed at the user's runtime dir when running as root.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Systemctl {
-    user: Option<UserCtx>,
+pub(crate) struct Systemctl {
+    pub(crate) user: Option<UserCtx>,
 }
 
 impl Systemctl {
-    fn spec(&self, args: &[&str]) -> CmdSpec {
+    pub(crate) fn spec(&self, args: &[&str]) -> CmdSpec {
         let mut full: Vec<String> = std::iter::once("--user".to_string())
             .chain(args.iter().map(|s| s.to_string()))
             .collect();
@@ -393,6 +395,11 @@ fn write_unit_file(path: &Path, role: Role, owner: Option<(u32, u32)>) -> Result
         // reports which ones those were.
         let created = create_dir_all_tracked(parent)
             .with_context(|| format!("could not create {}", parent.display()))?;
+        // Check again after creating: a process running as the invoking user
+        // could have swapped a component for a symlink in between (create_dir
+        // reports EEXIST for a symlinked component, which reads as "raced,
+        // not ours", while children would still be created through it).
+        ensure_no_symlink_components(parent)?;
         if let Some((uid, gid)) = owner {
             for dir in &created {
                 chown_best_effort(dir, uid, gid);
@@ -472,6 +479,21 @@ fn apply_autostart(
     }
 }
 
+/// A warning when the binary the autostart unit's ExecStart points at
+/// (%h/.local/bin/monux) doesn't exist — a cargo-only install keeps monux in
+/// ~/.cargo/bin, and an enabled unit pointing at a missing binary
+/// restart-loops at every login. None when the binary is there.
+fn autostart_binary_warning(home: &Path) -> Option<String> {
+    let binary = home.join(".local/bin/monux");
+    if binary.exists() {
+        return None;
+    }
+    Some(format!(
+        "{} does not exist — the enabled unit would restart-loop at every login. Install monux there (install.sh / 'monux update' install to ~/.local/bin), or point the unit's ExecStart at your binary.",
+        binary.display()
+    ))
+}
+
 fn enable_role(
     role: Role,
     target: &AutostartTarget,
@@ -479,6 +501,16 @@ fn enable_role(
     run: &mut dyn FnMut(&CmdSpec) -> Result<()>,
 ) {
     let unit_path = target.unit_dir.join(role.unit_name());
+    // unit_dir is $HOME/.config/systemd/user by construction (see
+    // display_unit_path), so the 4th ancestor (0-based 3) is the home.
+    if let Some(warning) = target
+        .unit_dir
+        .ancestors()
+        .nth(3)
+        .and_then(autostart_binary_warning)
+    {
+        println!("[warn] autostart: {}", warning);
+    }
     if let Err(e) = write_unit_file(&unit_path, role, target.owner) {
         *failures += 1;
         println!("[fail] autostart: {}", e);
@@ -835,6 +867,8 @@ fn write_desktop_shortcut(path: &Path, owner: Option<(u32, u32)>) -> Result<()> 
         ensure_no_symlink_components(parent)?;
         let created = create_dir_all_tracked(parent)
             .with_context(|| format!("could not create {}", parent.display()))?;
+        // Same check/act race as in write_unit_file: re-check after creating.
+        ensure_no_symlink_components(parent)?;
         if let Some((uid, gid)) = owner {
             for dir in &created {
                 chown_best_effort(dir, uid, gid);
@@ -1084,10 +1118,20 @@ fn setup_input_group(failures: &mut u32) {
     }
 }
 
-/// Checks whether a path's permissions grant the group read+write.
-fn group_has_rw(meta: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    meta.permissions().mode() & 0o060 == 0o060
+/// Whether a device node's mode and owning group grant the `input` group
+/// read+write. The permission bits alone don't suffice: root:root 0660 passes
+/// a pure bit check while 'input' members still can't open the device. An
+/// unknown `input` gid counts as NOT accessible — the rule gets written, and
+/// udev logs if the group is truly absent.
+fn group_accessible(mode: u32, gid: u32, input_gid: Option<u32>) -> bool {
+    mode & 0o060 == 0o060 && Some(gid) == input_gid
+}
+
+/// The gid of the `input` group (via `id`, the same tool setup_input_group
+/// queries membership with), so group_accessible can tell the right group
+/// from just any group with rw bits.
+fn input_group_gid() -> Option<u32> {
+    run_cmd("id", &["-g", "input"]).ok()?.trim().parse().ok()
 }
 
 fn setup_uinput_access(failures: &mut u32) {
@@ -1126,8 +1170,12 @@ fn setup_uinput_access(failures: &mut u32) {
             return;
         }
     };
-    if group_has_rw(&meta) {
-        println!("[ok]   uinput: /dev/uinput is already group-accessible");
+    let accessible = {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        group_accessible(meta.permissions().mode(), meta.gid(), input_group_gid())
+    };
+    if accessible {
+        println!("[ok]   uinput: /dev/uinput is already accessible to the 'input' group");
         return;
     }
     match std::fs::write(UDEV_RULE_PATH, udev_rule_content()) {
@@ -1411,10 +1459,26 @@ mod tests {
     }
 
     #[test]
-    fn group_rw_mode_check() {
-        // rw for group means at least 0o060 in the group bits
-        assert_eq!(0o660 & 0o060, 0o060);
-        assert_ne!(0o600 & 0o060, 0o060);
+    fn group_accessibility_check() {
+        // rw for the group, and the owning group really is 'input'.
+        assert!(group_accessible(0o660, 42, Some(42)));
+        // The bits alone don't suffice: root:root 0660 still denies 'input'
+        // members, so the rule must be written.
+        assert!(!group_accessible(0o660, 0, Some(42)));
+        assert!(!group_accessible(0o600, 42, Some(42)));
+        // The 'input' gid unknown: not proven accessible, write the rule.
+        assert!(!group_accessible(0o660, 42, None));
+    }
+
+    #[test]
+    fn autostart_binary_warning_only_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No ~/.local/bin/monux: the unit would restart-loop, so warn.
+        let warning = autostart_binary_warning(tmp.path()).unwrap();
+        assert!(warning.contains(".local/bin/monux"), "{}", warning);
+        std::fs::create_dir_all(tmp.path().join(".local/bin")).unwrap();
+        std::fs::write(tmp.path().join(".local/bin/monux"), b"binary").unwrap();
+        assert!(autostart_binary_warning(tmp.path()).is_none());
     }
 
     /// A target rooted at a tempdir, managing the current user directly.

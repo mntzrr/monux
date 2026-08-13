@@ -100,16 +100,19 @@ impl Drop for DiscoveryRegistration {
     fn drop(&mut self) {
         // Wait for each response (with a timeout) instead of dropping the
         // receivers: the daemon thread error-logs "failed to send response"
-        // when it can't deliver the status to a dropped receiver.
+        // when it can't deliver the status to a dropped receiver. The timeout
+        // is short: the daemon is local, so half a second is ample for an ack,
+        // and this Drop runs on an async worker at server shutdown (main.rs),
+        // where a stuck daemon must not park the runtime for seconds.
         match self.daemon.unregister(&self.fullname) {
             Ok(resp) => {
-                let _ = resp.recv_timeout(std::time::Duration::from_secs(2));
+                let _ = resp.recv_timeout(Duration::from_millis(500));
             }
             Err(e) => warn!("Failed to unregister mDNS service: {}", e),
         }
         match self.daemon.shutdown() {
             Ok(resp) => {
-                let _ = resp.recv_timeout(std::time::Duration::from_secs(2));
+                let _ = resp.recv_timeout(Duration::from_millis(500));
             }
             Err(e) => warn!("Failed to shutdown mDNS daemon: {}", e),
         }
@@ -173,7 +176,13 @@ pub fn discover_servers_blocking(timeout: Option<Duration>) -> Result<Vec<Discov
             // resolve arriving in its last moments must not fail discovery
             // AFTER finding a server — return what we have.
             None if keep_found_past_deadline(&instances) => break,
-            None => bail!("{}", DISCOVERY_TIMEOUT_HINT),
+            // Shut down before bailing, like the sibling paths below:
+            // ServiceDaemon has no Drop, so leaking it strands its threads
+            // and sockets until process exit.
+            None => {
+                let _ = daemon.shutdown();
+                bail!("{}", DISCOVERY_TIMEOUT_HINT)
+            }
         };
         let wait = match grace_deadline {
             Some(grace) => match grace.checked_duration_since(Instant::now()) {
@@ -323,9 +332,11 @@ fn protocol_version_of(properties: &TxtProperties) -> Option<u64> {
 /// properties: `None` when the property is absent (servers predate the
 /// advertisement) — "no information", never an error.
 /// Whether an advertisement carries the certificate fingerprint of a server
-/// this client already trusts. An absent `fp` property is not trusted: the
-/// point is attribution, and an advertisement that declines to identify itself
-/// has none.
+/// this client already trusts. This is a filter, NOT authentication: the
+/// fingerprint is broadcast publicly in this same TXT record, so any host on
+/// the LAN can copy it (the actual protections are downstream — see
+/// protocol_version_constraint and update.rs's gate_floor). An absent `fp`
+/// property doesn't even clear the filter.
 fn is_remembered(
     properties: &TxtProperties,
     remembered: &[crate::known_servers::RememberedServer],
@@ -346,9 +357,18 @@ fn fingerprint_of(properties: &TxtProperties) -> Option<String> {
 
 /// Picks the update-gate constraint from the protocol versions discovered on
 /// the LAN: the minimum, so a client never upgrades beyond any server it
-/// might pair with. `None` when nothing was discovered.
+/// might pair with, clamped to at least PROTOCOL_VERSION_NEGOTIATION. The
+/// gate only distinguishes pre-/post-negotiation pairs (update.rs pair_works),
+/// so the clamp preserves every legitimate decision while making an injected
+/// `pv=15` a no-op: mDNS records take no credentials, and the `fp` property
+/// the attribution filter keys on is broadcast publicly, so a LAN attacker
+/// could otherwise pin the gate below the negotiation floor and silently skip
+/// every update. `None` when nothing was discovered.
 pub fn protocol_version_constraint(discovered: &[u64]) -> Option<u64> {
-    discovered.iter().min().copied()
+    discovered
+        .iter()
+        .min()
+        .map(|min| (*min).max(crate::msgs::shared::PROTOCOL_VERSION_NEGOTIATION))
 }
 
 /// Synchronously collects the distinct protocol versions (sorted) advertised
@@ -356,10 +376,12 @@ pub fn protocol_version_constraint(discovered: &[u64]) -> Option<u64> {
 /// runs before the tokio runtime exists, hence the blocking API. Best-effort
 /// within a short timeout; servers without the property are skipped.
 ///
-/// Only advertisements attributable to an already-trusted server count (see
-/// collect_server_protocol_versions): the gate decides whether this machine
-/// may install a security fix, and advertising on the LAN takes no
-/// credentials at all.
+/// Advertisements are filtered to those naming the fingerprint of a server
+/// this client has paired with (a filter, not authentication — the
+/// fingerprint is broadcast publicly in this same TXT record). The hard stops
+/// are downstream: a discovered value is clamped to the negotiation floor
+/// (protocol_version_constraint), may never lower what a real handshake
+/// recorded (update.rs gate_floor), and is never persisted.
 pub fn discover_server_protocol_versions(
     remembered: &[crate::known_servers::RememberedServer],
 ) -> Result<Vec<u64>> {
@@ -372,11 +394,14 @@ pub fn discover_server_protocol_versions(
 }
 
 /// Advertisements are only counted when their `fp` property matches a server
-/// this client has already paired with. Without that check any host on the
-/// LAN can publish `pv=15`, and because the gate takes the MINIMUM across
-/// everything discovered — and persists it — a single unauthenticated record
-/// pins the machine below the negotiation floor and silently skips every
-/// update, including the one that would fix it.
+/// this client has already paired with. That narrows who can feed the gate,
+/// but it is NOT authentication: the fingerprint is broadcast publicly in this
+/// same TXT record, so a LAN attacker can copy a legit server's `fp` and
+/// republish. What makes that harmless is downstream — the discovered value
+/// is clamped to the negotiation floor (protocol_version_constraint, so a
+/// forged `pv=15` is a no-op), it may never lower what a real handshake
+/// recorded (update.rs gate_floor), and it is never persisted, so it cannot
+/// outlive the advertisement that planted it.
 fn collect_server_protocol_versions(
     daemon: &ServiceDaemon,
     remembered: &[crate::known_servers::RememberedServer],
@@ -638,11 +663,12 @@ mod tests {
         assert_eq!(fingerprint_of(&empty), None);
     }
 
-    /// The update gate may only be moved by servers this machine has actually
-    /// paired with: advertising on the LAN takes no credentials, and the gate
-    /// decides whether a security fix gets installed.
+    /// The update gate filters out advertisements not naming a paired server's
+    /// fingerprint — a filter, not authentication, since that fingerprint is
+    /// broadcast publicly; the hard stops are the negotiation-floor clamp and
+    /// the recorded-handshake floor (see protocol_version_constraint).
     #[test]
-    fn only_a_remembered_server_can_move_the_update_gate() {
+    fn only_a_remembered_servers_advertisement_passes_the_gate_filter() {
         use mdns_sd::IntoTxtProperties;
         let remembered = vec![crate::known_servers::RememberedServer {
             addr: "10.0.0.5:1213".parse().unwrap(),
@@ -678,10 +704,20 @@ mod tests {
     }
 
     #[test]
-    fn constraint_is_the_minimum_discovered_version() {
+    fn constraint_is_the_minimum_discovered_version_clamped_to_the_negotiation_floor() {
+        let floor = crate::msgs::shared::PROTOCOL_VERSION_NEGOTIATION;
         assert_eq!(protocol_version_constraint(&[]), None);
-        assert_eq!(protocol_version_constraint(&[8]), Some(8));
-        assert_eq!(protocol_version_constraint(&[8, 7, 9]), Some(7));
+        assert_eq!(protocol_version_constraint(&[floor + 2]), Some(floor + 2));
+        assert_eq!(
+            protocol_version_constraint(&[floor + 2, floor, floor + 3]),
+            Some(floor)
+        );
+        // Anything at or below the negotiation floor clamps up to it: the
+        // gate only distinguishes pre-/post-negotiation pairs, so a forged
+        // pre-negotiation advertisement (mDNS is unauthenticated) is a no-op
+        // rather than a pin that skips every update.
+        assert_eq!(protocol_version_constraint(&[floor - 1]), Some(floor));
+        assert_eq!(protocol_version_constraint(&[floor]), Some(floor));
     }
 
     #[test]

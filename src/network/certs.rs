@@ -9,9 +9,24 @@ use tracing::{info, warn};
 
 pub fn load_known_certs(config_dir: &Path) -> Result<Vec<rustls_pki_types::CertificateDer<'static>>> {
     let mut certs = vec![];
-    for path in fs::read_dir(init_known_certs_dir(config_dir)?)? {
-        let path = path?;
-        let filetype = path.file_type()?;
+    let dir = init_known_certs_dir(config_dir)?;
+    for entry in fs::read_dir(&dir)? {
+        // A single bad entry must not abort the whole load, matching the
+        // per-file warn-and-skip policy below.
+        let path = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                warn!("Skipping unreadable entry in {}: {:?}", dir.display(), e);
+                continue;
+            }
+        };
+        let filetype = match path.file_type() {
+            Ok(filetype) => filetype,
+            Err(e) => {
+                warn!("Skipping {}: {:?}", path.path().display(), e);
+                continue;
+            }
+        };
         if !filetype.is_file() {
             continue;
         }
@@ -42,15 +57,39 @@ pub fn load_keypair<'a>(
 ) -> Result<(rustls_pki_types::CertificateDer<'a>, rustls_pki_types::PrivateKeyDer<'a>)> {
     let file_path = config_dir.join("private.pem");
     if file_path.is_file() {
-        let keypair = read_existing_keypair(splash_label, &file_path)?;
-        // Repair permissions on existing keypairs that were left at the umask default.
-        ensure_permissions(&file_path, 0o600).with_context(|| {
-            format!(
-                "Failed to set permissions on keypair file: {}",
-                file_path.display()
-            )
-        })?;
-        Ok(keypair)
+        match read_existing_keypair(splash_label, &file_path) {
+            Ok(keypair) => {
+                // Repair permissions on existing keypairs that were left at the umask default.
+                ensure_permissions(&file_path, 0o600).with_context(|| {
+                    format!(
+                        "Failed to set permissions on keypair file: {}",
+                        file_path.display()
+                    )
+                })?;
+                Ok(keypair)
+            }
+            // A corrupt keypair (truncated by a crash, clobbered by a copy)
+            // must not be fatal: the daemon would never start again without
+            // manual deletion. Move it aside and regenerate. Our fingerprint
+            // changes, so peers will ask for approval once more.
+            Err(e) => {
+                let backup_path = file_path.with_extension("pem.corrupt");
+                warn!(
+                    "Existing keypair at {} is unreadable ({}); moving it aside to {} and generating a fresh one",
+                    file_path.display(),
+                    e,
+                    backup_path.display()
+                );
+                fs::rename(&file_path, &backup_path).with_context(|| {
+                    format!(
+                        "Failed to move corrupt keypair {} aside to {}",
+                        file_path.display(),
+                        backup_path.display()
+                    )
+                })?;
+                write_new_keypair(splash_label, &file_path)
+            }
+        }
     } else {
         write_new_keypair(splash_label, &file_path)
     }
@@ -97,30 +136,42 @@ fn write_new_keypair<'a>(
         .context("Failed to generate self-signed cert")?;
 
     info!("Writing a new keypair to {}", file_path.display());
+    // Atomic install (same-dir tmp + rename, the idiom of config.rs and
+    // known_servers.rs): a crash mid-write must never leave a truncated
+    // private.pem behind, and two processes generating at once rename whole
+    // pairs over each other instead of interleaving a mismatched cert/key.
+    let tmp_path = file_path.with_extension("pem.tmp");
     let mut outfile = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(file_path)
+        .open(&tmp_path)
         .with_context(|| {
             format!(
                 "Failed to open keypair file for writing: {}",
-                file_path.display()
+                tmp_path.display()
             )
         })?;
-    ensure_permissions(file_path, 0o600).with_context(|| {
+    // A leftover tmp from a crashed run may carry wider perms.
+    ensure_permissions(&tmp_path, 0o600).with_context(|| {
         format!(
             "Failed to set permissions on keypair file: {}",
-            file_path.display()
+            tmp_path.display()
         )
     })?;
     outfile
         .write_all(pair.cert.pem().as_bytes())
-        .with_context(|| format!("Failed to write public key to file: {}", file_path.display()))?;
+        .with_context(|| format!("Failed to write public key to file: {}", tmp_path.display()))?;
     outfile
         .write_all(pair.signing_key.serialize_pem().as_bytes())
-        .with_context(|| format!("Failed to write private key to file: {}", file_path.display()))?;
+        .with_context(|| format!("Failed to write private key to file: {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, file_path).with_context(|| {
+        format!(
+            "Failed to install keypair file: {}",
+            file_path.display()
+        )
+    })?;
 
     let rustls_cert = rustls_pki_types::CertificateDer::from(pair.cert.der().to_vec());
     splash(splash_label, &fingerprint(&rustls_cert));
@@ -226,5 +277,22 @@ mod tests {
         assert!(fingerprint(&cert1) == fingerprint(&cert2));
         assert!(cert1 == cert2);
         assert!(privkey1 == privkey2);
+        // The atomic tmp+rename must not leave scratch files behind.
+        assert!(!dir.path().join("private.pem.tmp").exists());
+    }
+
+    #[test]
+    fn corrupt_keypair_is_backed_up_and_regenerated() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert1, _) = load_keypair("foo", dir.path()).expect("couldn't load");
+        // Simulate a crash mid-write: a truncated keypair must not be fatal.
+        fs::write(dir.path().join("private.pem"), b"-----BEGIN CERTIFICATE-----\ntruncated")
+            .unwrap();
+        let (cert2, _) = load_keypair("foo", dir.path()).expect("corrupt keypair must regenerate");
+        assert!(fingerprint(&cert1) != fingerprint(&cert2));
+        assert!(dir.path().join("private.pem.corrupt").is_file());
+        // The regenerated keypair loads cleanly from then on.
+        let (cert3, _) = load_keypair("foo", dir.path()).expect("couldn't reload");
+        assert!(cert2 == cert3);
     }
 }

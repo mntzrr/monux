@@ -42,11 +42,14 @@ pub(crate) fn hyprland_socket_path() -> Result<PathBuf> {
 fn socket_path_in(hypr_dir: &Path, signature: Option<&std::ffi::OsStr>) -> Result<PathBuf> {
     if let Some(signature) = signature {
         let from_signature = hypr_dir.join(signature).join(".socket.sock");
-        // The signature is only worth trusting while its socket is there: a
-        // daemon outlives compositor restarts, and every restart mints a new
-        // signature, so the inherited one goes stale — following it then
-        // would poll a socket no compositor is behind.
-        if from_signature.exists() {
+        // The signature is only worth trusting while a compositor answers on
+        // its socket: a daemon outlives compositor restarts, and every
+        // restart mints a new signature, so the inherited one goes stale —
+        // and a crashed compositor leaves the socket FILE behind with
+        // nothing listening on it. Trusting mere existence would resolve to
+        // that dead path and poll it forever, so probe it with a connect
+        // instead (the socket gets connected to for every query anyway).
+        if UnixStream::connect(&from_signature).is_ok() {
             return Ok(from_signature);
         }
     }
@@ -67,7 +70,9 @@ fn socket_path_in(hypr_dir: &Path, signature: Option<&std::ffi::OsStr>) -> Resul
 /// live instance, if it isn't the one already in use. Hyprland restarts
 /// under a running daemon (a compositor crash, or a deliberate restart)
 /// leave the old path dead forever, which used to strand screen-edge
-/// switching silently until monux itself was restarted.
+/// switching silently until monux itself was restarted. A stale inherited
+/// signature doesn't defeat this: socket_path_in probes the signature's
+/// socket and falls through to the live instance when it is the dead one.
 pub(crate) fn rebound_hyprland_socket(current: &Path) -> Option<PathBuf> {
     hyprland_socket_path()
         .ok()
@@ -339,11 +344,23 @@ mod tests {
             .unwrap();
     }
 
+    /// An instance whose socket a listener is actually bound to, as the
+    /// runtime dir looks while the compositor is alive. The returned
+    /// listener must be kept for as long as the resolution under test runs:
+    /// dropping it turns the instance into a crashed one's leftover. The
+    /// bound socket's mtime is its bind time (now), so it outranks the
+    /// UNIX_EPOCH-relative fixtures as the newest instance.
+    fn live_hyprland_instance(hypr_dir: &Path, signature: &str) -> std::os::unix::net::UnixListener {
+        let dir = hypr_dir.join(signature);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::net::UnixListener::bind(dir.join(".socket.sock")).unwrap()
+    }
+
     #[test]
     fn a_stale_signature_falls_back_to_the_live_instance() {
         let tmp = tempfile::tempdir().unwrap();
         let hypr_dir = tmp.path().join("hypr");
-        hyprland_instance(&hypr_dir, "live_instance", 2_000);
+        let _live = live_hyprland_instance(&hypr_dir, "live_instance");
 
         assert_eq!(
             socket_path_in(&hypr_dir, Some(OsStr::new("live_instance"))).unwrap(),
@@ -356,6 +373,23 @@ mod tests {
         // Nothing live at all: an error, so the caller keeps waiting.
         std::fs::remove_dir_all(hypr_dir.join("live_instance")).unwrap();
         assert!(socket_path_in(&hypr_dir, Some(OsStr::new("live_instance"))).is_err());
+    }
+
+    #[test]
+    fn a_dead_signature_socket_falls_back_to_the_live_instance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hypr_dir = tmp.path().join("hypr");
+        // What a crashed compositor leaves behind: the socket FILE is still
+        // there, with nothing listening on it. A daemon carrying this
+        // instance's signature must not resolve to the dead path — it would
+        // poll a socket no compositor is behind forever.
+        hyprland_instance(&hypr_dir, "crashed_instance", 1_000);
+        let _live = live_hyprland_instance(&hypr_dir, "live_instance");
+
+        assert_eq!(
+            socket_path_in(&hypr_dir, Some(OsStr::new("crashed_instance"))).unwrap(),
+            hypr_dir.join("live_instance").join(".socket.sock")
+        );
     }
 
     #[test]

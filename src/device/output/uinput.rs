@@ -36,10 +36,11 @@ pub struct VirtualUInputDevices {
     mouse_device: uinput::VirtualDevice,
     touchpad_device: uinput::VirtualDevice,
 
-    /// Currently held keys/buttons with when each press was emitted, so they
-    /// can be released on deactivation/disconnect and so delivery anomalies
-    /// (duplicated presses, catch-up bursts) can be logged.
-    pressed_keys: HashMap<u16, Instant>,
+    /// Currently held keys/buttons with when each press was emitted and the
+    /// device the press was routed to, so the release can go to that same
+    /// device on deactivation/disconnect (release_all) and so delivery
+    /// anomalies (duplicated presses, catch-up bursts) can be logged.
+    pressed_keys: HashMap<u16, (Instant, EventDest)>,
     /// When the last key event was emitted; used to detect catch-up bursts
     /// (a large batch of key events arriving right after a gap = stall flush,
     /// which presents to the user as repeated characters).
@@ -342,7 +343,7 @@ fn write_all_vectored(fd: libc::c_int, first: &[u8], second: &[u8]) -> std::io::
     Ok(())
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum EventDest {
     Keyboard,
     Mouse,
@@ -361,29 +362,16 @@ impl OutputHandler for VirtualUInputDevices {
             "Releasing {} held keys/buttons on virtual devices",
             self.pressed_keys.len()
         );
-        // Pre-size to pressed-keys plus the trailing SYN event: an exact-fit
-        // collect would just reallocate on the push below.
-        let mut releases: Vec<event::InputEvent> = Vec::with_capacity(self.pressed_keys.len() + 1);
-        releases.extend(self.pressed_keys.keys().map(|code| event::InputEvent {
-            inputi32: Some(event::InputI32 {
-                type_: evdev::EventType::KEY.0,
-                code: *code,
-                value: 0,
-            }),
-            inputf64: None,
-        }));
-        releases.push(event::InputEvent {
-            inputi32: Some(event::InputI32 {
-                type_: evdev::EventType::SYNCHRONIZATION.0,
-                code: 0,
-                value: 0,
-            }),
-            inputf64: None,
-        });
-        // write() routes the releases to the right devices and clears them from
-        // the tracking set (on failure it keeps them tracked, so a later
-        // release_all can retry).
-        self.write(releases).await
+        // Each release goes to the device its press went to (tracked with the
+        // press). Re-routing them through write() would drop the class tag a
+        // v17+ frame carried, and the count heuristic resolves an ambiguous
+        // BTN_LEFT tie to the mouse — leaving the button held on the virtual
+        // touchpad it was actually pressed on.
+        let releases = held_key_releases(&self.pressed_keys);
+        // On failure keep the keys tracked, so a later release_all can retry.
+        self.emit_routed_events(&releases)?;
+        self.pressed_keys.clear();
+        Ok(())
     }
 
     async fn write(&mut self, events: Vec<event::InputEvent>) -> Result<()> {
@@ -423,10 +411,32 @@ impl OutputHandler for VirtualUInputDevices {
 /// Whether this event is a SYN_REPORT, the evdev frame terminator (see
 /// VirtualUInputDevices::write).
 fn is_frame_separator(event: &event::InputEvent) -> bool {
-    event.inputi32.as_ref().is_some_and(|e| {
-        e.type_ == evdev::EventType::SYNCHRONIZATION.0
-            && e.code == evdev::SynchronizationCode::SYN_REPORT.0
-    })
+    // An event carrying an f64 is never a separator: the f64 is canonical
+    // when both payloads are set (write_frame drops the i32), and a scaled
+    // absolute axis is never a SYN. Checking the i32 unconditionally would
+    // split a frame at an event the emit side doesn't treat as a SYN.
+    event.inputf64.is_none()
+        && event.inputi32.as_ref().is_some_and(|e| {
+            e.type_ == evdev::EventType::SYNCHRONIZATION.0
+                && e.code == evdev::SynchronizationCode::SYN_REPORT.0
+        })
+}
+
+/// Builds the release batch for the currently held keys/buttons: a KEY
+/// release per press, routed back to the device the press went to (see
+/// release_all).
+fn held_key_releases(
+    pressed_keys: &HashMap<u16, (Instant, EventDest)>,
+) -> Vec<(evdev::InputEvent, EventDest)> {
+    pressed_keys
+        .iter()
+        .map(|(code, (_, dest))| {
+            (
+                evdev::InputEvent::new(evdev::EventType::KEY.0, *code, 0),
+                *dest,
+            )
+        })
+        .collect()
 }
 
 impl VirtualUInputDevices {
@@ -442,6 +452,13 @@ impl VirtualUInputDevices {
         let mut routed: Vec<(evdev::InputEvent, EventDest)> = Vec::with_capacity(events.len());
         routed.extend(events.iter().filter_map(|event| {
             if let Some(e) = &event.inputf64 {
+                // The f64 is canonical: when both payloads are set the i32
+                // is dropped (is_frame_separator and the Display impl treat
+                // it the same way), but a both-Some event means a sender
+                // bug, so make it loud.
+                if event.inputi32.is_some() {
+                    warn!("Event carries both an f64 and an i32 value; using the f64: {}", event);
+                }
                 let evdev_event = e.to_evdev(SCALED_DIM_MIN, SCALED_DIM_MAX);
                 self.route_event(evdev_event, class).map(|dest| (evdev_event, dest))
             } else if let Some(e) = &event.inputi32 {
@@ -463,10 +480,11 @@ impl VirtualUInputDevices {
         // duplicated presses (event delivered twice) and catch-up bursts (a
         // backlog flushed after a stall).
         let mut key_events_in_batch = 0u32;
-        // Releases untracked by this batch, with their original press time. If
-        // the emit below fails, these are re-tracked so the kernel's still-held
-        // keys stay visible to a later release_all retry.
-        let mut removed_releases: Vec<(u16, Instant)> = Vec::new();
+        // Releases untracked by this batch, with their original press time
+        // and destination. If the emit below fails, these are re-tracked so
+        // the kernel's still-held keys stay visible to a later release_all
+        // retry.
+        let mut removed_releases: Vec<(u16, Instant, EventDest)> = Vec::new();
         let mut filtered_events: Vec<(evdev::InputEvent, EventDest)> =
             Vec::with_capacity(events.len());
         for (e, dest) in events {
@@ -474,8 +492,8 @@ impl VirtualUInputDevices {
                 key_events_in_batch += 1;
                 match e.value() {
                     0 => {
-                        if let Some(since) = self.pressed_keys.remove(&e.code()) {
-                            removed_releases.push((e.code(), since));
+                        if let Some((since, dest)) = self.pressed_keys.remove(&e.code()) {
+                            removed_releases.push((e.code(), since, dest));
                             let held = since.elapsed();
                             if held > Duration::from_millis(600) {
                                 // No code: these lines reach the log ring and
@@ -489,7 +507,11 @@ impl VirtualUInputDevices {
                         }
                     }
                     1 => {
-                        if self.pressed_keys.insert(e.code(), Instant::now()).is_some() {
+                        if self
+                            .pressed_keys
+                            .insert(e.code(), (Instant::now(), dest))
+                            .is_some()
+                        {
                             warn!(
                                 "Duplicate key press with no release in between (event duplicated?)"
                             );
@@ -550,8 +572,8 @@ impl VirtualUInputDevices {
         // their original press times) so the keys don't stay pressed in the
         // kernel while invisible to a later release_all retry.
         if let Err(e) = self.emit_routed_events(&events) {
-            for (code, since) in removed_releases {
-                self.pressed_keys.insert(code, since);
+            for (code, since, dest) in removed_releases {
+                self.pressed_keys.insert(code, (since, dest));
             }
             return Err(e.into());
         }
@@ -1135,6 +1157,56 @@ mod tests {
         // ...and in order, with the boundary between the two buffers intact.
         assert!(got[..first.len()].iter().all(|b| *b == b'a'));
         assert!(got[first.len()..].iter().all(|b| *b == b'b'));
+    }
+
+    /// A release must go back to the device its press went to: a
+    /// touchpad-classed BTN_LEFT press (protocol v17+) tracked as Touchpad
+    /// must not have its release re-resolved by the class-less count
+    /// heuristic — a tie goes to the mouse, leaving the button held on the
+    /// virtual touchpad (stuck left-click during tap-and-drag).
+    #[test]
+    fn a_release_goes_to_the_device_its_press_went_to() {
+        let mut pressed = HashMap::new();
+        pressed.insert(KeyCode::BTN_LEFT.0, (Instant::now(), EventDest::Touchpad));
+        pressed.insert(KeyCode::KEY_A.0, (Instant::now(), EventDest::Keyboard));
+
+        let releases = held_key_releases(&pressed);
+
+        assert_eq!(releases.len(), 2);
+        let dest_of: HashMap<u16, EventDest> =
+            releases.iter().map(|(e, dest)| (e.code(), *dest)).collect();
+        assert_eq!(dest_of[&KeyCode::BTN_LEFT.0], EventDest::Touchpad);
+        assert_eq!(dest_of[&KeyCode::KEY_A.0], EventDest::Keyboard);
+        for (e, _) in &releases {
+            assert_eq!(e.event_type(), evdev::EventType::KEY);
+            assert_eq!(e.value(), 0);
+        }
+    }
+
+    /// An event carrying both payloads is not a frame separator even when
+    /// its i32 half is a SYN_REPORT: the f64 is canonical on the emit side
+    /// (write_frame drops the i32, and the SYN with it), so treating the
+    /// i32 as authoritative here would split a frame at an event that is
+    /// not emitted as a SYN.
+    #[test]
+    fn a_both_some_event_is_not_a_frame_separator() {
+        let mut e = ev(
+            evdev::EventType::SYNCHRONIZATION.0,
+            evdev::SynchronizationCode::SYN_REPORT.0,
+            0,
+        );
+        e.inputf64 = Some(event::InputF64 {
+            type_: evdev::EventType::ABSOLUTE.0,
+            code: evdev::AbsoluteAxisCode::ABS_MT_POSITION_X.0,
+            value: 0.5,
+        });
+        assert!(!is_frame_separator(&e));
+        // An i32-only SYN_REPORT still separates.
+        assert!(is_frame_separator(&ev(
+            evdev::EventType::SYNCHRONIZATION.0,
+            evdev::SynchronizationCode::SYN_REPORT.0,
+            0
+        )));
     }
 
     #[test]

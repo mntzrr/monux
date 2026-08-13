@@ -18,16 +18,6 @@ use crate::network::{approval, link_quality::LinkQuality, link_quality::Tier, th
 use crate::rotation::ThrottleMode;
 use crate::notify;
 
-/// Client-side scaling for relative pointer/scroll deltas (--mouse-scale,
-/// --scroll-scale), applied on injection into this machine's virtual devices.
-///
-/// Deltas arrive as integers but scales are fractional: rounding each event
-/// independently would turn every sub-1.0 scaled delta into zero and motion
-/// would die (0.5x would emit nothing, ever). Instead each axis carries its
-/// fractional remainder across events, so N input ticks emit floor(N*scale)
-/// output ticks over time with no drift. Remainders are per-axis: X, Y, and
-/// each wheel axis accumulate independently. Applied ONLY here, on the client
-/// injection path — the server's local re-emit (rotation.rs) stays 1:1.
 /// Whether this frame must be written on its own rather than coalesced with
 /// its neighbours.
 ///
@@ -55,6 +45,16 @@ fn frame_needs_own_syn(events: &[event::InputEvent]) -> bool {
     })
 }
 
+/// Client-side scaling for relative pointer/scroll deltas (--mouse-scale,
+/// --scroll-scale), applied on injection into this machine's virtual devices.
+///
+/// Deltas arrive as integers but scales are fractional: rounding each event
+/// independently would turn every sub-1.0 scaled delta into zero and motion
+/// would die (0.5x would emit nothing, ever). Instead each axis carries its
+/// fractional remainder across events, so N input ticks emit floor(N*scale)
+/// output ticks over time with no drift. Remainders are per-axis: X, Y, and
+/// each wheel axis accumulate independently. Applied ONLY here, on the client
+/// injection path — the server's local re-emit (rotation.rs) stays 1:1.
 struct DeltaScaler {
     mouse_scale: f64,
     scroll_scale: f64,
@@ -288,14 +288,9 @@ struct Connection {
     /// re-announcement on activation (see the Switch handler) only fires on the
     /// FIRST activation of each connection — i.e. on a fresh (re)connect.
     fresh_activation: bool,
-    /// True when a Switch(false) deferred its clipboard re-announce: the
-    /// server's release_current_target_keys sends Switch(false)+Switch(true)
-    /// in quick succession (a no-op key release, not a real deactivation).
-    /// The re-announce is deferred so that an immediate Switch(true) can
-    /// suppress it entirely (preventing clipboard-ownership flap). If a
-    /// non-Switch event arrives instead, the deactivation was real and the
-    /// re-announce is flushed.
-    pending_deactivate: bool,
+    /// Deferred clipboard re-announce after a Switch(false), armed on a short
+    /// timer (see DeactivateAnnounce).
+    deactivate_announce: DeactivateAnnounce,
     /// Pointer/scroll delta scaling applied on injection (see DeltaScaler).
     scaler: DeltaScaler,
     /// Live-state mirror for the control socket (control.rs): Switch events
@@ -365,6 +360,74 @@ impl EdgeInference {
         }
         self.map.targets.remove(&direction.opposite());
         Some(self.map.clone())
+    }
+}
+
+/// Grace period between a Switch(false) and the deferred clipboard
+/// re-announce it armed (see DeactivateAnnounce). Must comfortably exceed
+/// the gap inside the server's release_current_target_keys Switch(false)
+/// +Switch(true) pair — which is sent back-to-back (rotation/mod.rs), so
+/// the real gap is two stream writes, i.e. effectively zero — while still
+/// being short enough that a copied clipboard appears on the rotation
+/// promptly after a real switch away.
+const DEACTIVATE_ANNOUNCE_DELAY: Duration = Duration::from_millis(500);
+
+/// Timer-based deferral of the clipboard re-announce on deactivation.
+///
+/// A Switch(false) means one of two things: a real switch away (this
+/// client must re-announce its local clipboard types so the rotation can
+/// serve them), or the server's release_current_target_keys no-op key
+/// release, which follows Switch(false) with Switch(true) immediately and
+/// must NOT re-announce (it would flap clipboard ownership). The two are
+/// indistinguishable at Switch(false) time, so the announce is deferred
+/// onto a short timer that Switch(true) cancels. The flush cannot key off
+/// the next arriving message instead: after a real switch away the server
+/// sends this client nothing more (pings and clipboard pushes go to the
+/// newly active target), so a message-arrival flush never fires; and when
+/// it finally did fire — on the NEXT activation — it announced stale types
+/// before the server's pushed current types were applied
+/// (set_remote_clipboard), overwriting a genuinely newer clipboard.
+///
+/// Per-connection state: a reconnect starts disarmed, and a timer left
+/// armed by a dying connection is covered by the fresh connection's
+/// first-activation re-announce (see the Switch handler).
+#[derive(Default)]
+struct DeactivateAnnounce {
+    /// When the deferred re-announce fires, None while disarmed.
+    fire_at: Option<tokio::time::Instant>,
+}
+
+impl DeactivateAnnounce {
+    /// Switch(false) arms the timer, Switch(true) cancels it. Returns
+    /// whether a timer was pending: a cancelled timer means the deactivation
+    /// was the no-op key-release pair, so the caller suppresses the
+    /// re-announce it would otherwise run on activation.
+    fn on_switch(&mut self, enabled: bool) -> bool {
+        let was_pending = self.fire_at.take().is_some();
+        if !enabled {
+            self.fire_at = Some(tokio::time::Instant::now() + DEACTIVATE_ANNOUNCE_DELAY);
+        }
+        was_pending
+    }
+
+    /// The future the select loop waits on: completes at fire_at, or pends
+    /// forever while disarmed. Associated function taking a copied fire_at
+    /// so the select arm doesn't borrow the Connection (see
+    /// note_output_result).
+    async fn wait(fire_at: Option<tokio::time::Instant>) {
+        match fire_at {
+            Some(at) => tokio::time::sleep_until(at).await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Called when wait completed: disarms, and reports whether the
+    /// re-announce should actually go out. It must not fire while this
+    /// client is active — the rotation then owns the clipboard and an
+    /// announce would steal a genuinely newer one.
+    fn take_expired(&mut self, active: bool) -> bool {
+        self.fire_at = None;
+        !active
     }
 }
 
@@ -568,7 +631,7 @@ impl Connection {
                 motion_applied_mask: 0,
                 output_write_failing: false,
                 fresh_activation: true,
-                pending_deactivate: false,
+                deactivate_announce: DeactivateAnnounce::default(),
                 scaler: DeltaScaler::new(*mouse_scale, *scroll_scale),
                 control_state: control_state.clone(),
                 switch_request_rx: None,
@@ -793,6 +856,16 @@ impl Connection {
                 let bytes = datagram_result.context("Lost datagram connection")?;
                 self.handle_motion_datagram(&bytes, output_handler).await?;
             },
+            _ = DeactivateAnnounce::wait(self.deactivate_announce.fire_at) => {
+                // The grace period elapsed with no Switch(true): the
+                // deactivation was real, so flush the deferred clipboard
+                // re-announce (see DeactivateAnnounce).
+                if self.deactivate_announce.take_expired(self.active) {
+                    if let Some(local_clipboard) = local_clipboard.as_mut() {
+                        self.send_local_clipboard_types(local_clipboard).await?;
+                    }
+                }
+            },
             bulk_result = self.bulk_recv.read_chunk(65536, true) => {
                 let resp = bulk_result
                     .with_context(|| if is_new_connection(connect_time) {
@@ -839,6 +912,31 @@ impl Connection {
             .context("Failed to send switch request message")
     }
 
+    /// Announces the local clipboard's types to the server on the events
+    /// stream. Fires on the first activation of a connection (see the Switch
+    /// handler) and when the deferred deactivation re-announce timer expires
+    /// (see DeactivateAnnounce). A no-op when the local clipboard is empty.
+    async fn send_local_clipboard_types(
+        &mut self,
+        local_clipboard: &mut client::LocalClipboard,
+    ) -> Result<()> {
+        if let Some(types) = local_clipboard.get_local_clipboard_types() {
+            let types = types.join(" ");
+            debug!("Sending clipboard types to server: {}", types);
+            let msg = event::ClientEvent::ClipboardTypes(event::ClipboardTypes {
+                types: &types,
+                max_size_bytes: self.max_clipboard_size_bytes,
+            });
+            let serializedmsg = postcard::to_stdvec_cobs(&msg)
+                .map_err(|e| anyhow!("Failed to serialize clipboard types message: {:?}", e))?;
+            self.events_send
+                .write_all(&serializedmsg)
+                .await
+                .context("Failed to send clipboard types message")?;
+        }
+        Ok(())
+    }
+
     async fn handle_event_messages<O: output::OutputHandler>(
         &mut self,
         mut local_clipboard: Option<&mut client::LocalClipboard>,
@@ -876,30 +974,6 @@ impl Connection {
                 msg,
                 consumed
             );
-            // Flush a deferred clipboard re-announce (from a preceding
-            // Switch(false)) if this message isn't Switch(true): the
-            // deactivation was real, not a no-op key-release pair.
-            if self.pending_deactivate && !matches!(msg, event::ServerEvent::Switch(_)) {
-                self.pending_deactivate = false;
-                if let Some(local_clipboard) = &mut local_clipboard {
-                    if let Some(types) = local_clipboard.get_local_clipboard_types() {
-                        let types = types.join(" ");
-                        debug!("Sending clipboard types to server: {}", types);
-                        let msg =
-                            event::ClientEvent::ClipboardTypes(event::ClipboardTypes {
-                                types: &types,
-                                max_size_bytes: self.max_clipboard_size_bytes,
-                            });
-                        let serializedmsg = postcard::to_stdvec_cobs(&msg).map_err(|e| {
-                            anyhow!("Failed to serialize clipboard types message: {:?}", e)
-                        })?;
-                        self.events_send
-                            .write_all(&serializedmsg)
-                            .await
-                            .context("Failed to send clipboard types message")?;
-                    }
-                }
-            }
             match msg {
                 event::ServerEvent::Switch(e) => {
                     // Preserve ordering: apply queued input before handling this.
@@ -927,17 +1001,14 @@ impl Connection {
                             &mut self.output_write_failing,
                             output_handler.release_all().await,
                         );
-                        // Defer the clipboard re-announce: the server's
-                        // release_current_target_keys sends Switch(false)
-                        // immediately followed by Switch(true) (a no-op key
-                        // release, not a real deactivation). If Switch(true)
-                        // comes next, we suppress the re-announce entirely.
-                        self.pending_deactivate = true;
-                    } else if self.pending_deactivate {
+                        // Defer the clipboard re-announce onto a short timer
+                        // (see DeactivateAnnounce): an immediate Switch(true)
+                        // cancels it, a real deactivation lets it fire.
+                        self.deactivate_announce.on_switch(false);
+                    } else if self.deactivate_announce.on_switch(true) {
                         // Switch(true) right after Switch(false): no-op key
-                        // release pair. Clear the deferred flag and skip the
-                        // clipboard re-announce (it would flap ownership).
-                        self.pending_deactivate = false;
+                        // release pair. The timer was cancelled above; skip
+                        // the clipboard re-announce (it would flap ownership).
                     } else if first_activation {
                         // First activation of a connection: re-announce local
                         // clipboard types so a pre-drop copy survives. See the
@@ -960,28 +1031,7 @@ impl Connection {
                         // deactivate/activate handoff keeps the rotation
                         // current there.
                         if let Some(local_clipboard) = &mut local_clipboard {
-                            if let Some(types) = local_clipboard.get_local_clipboard_types() {
-                                let types = types.join(" ");
-                                debug!("Sending clipboard types to server: {}", types);
-                                let msg = event::ClientEvent::ClipboardTypes(
-                                    event::ClipboardTypes {
-                                        types: &types,
-                                        max_size_bytes: self.max_clipboard_size_bytes,
-                                    },
-                                );
-                                let serializedmsg = postcard::to_stdvec_cobs(&msg).map_err(
-                                    |e| {
-                                        anyhow!(
-                                            "Failed to serialize clipboard types message: {:?}",
-                                            e
-                                        )
-                                    },
-                                )?;
-                                self.events_send
-                                    .write_all(&serializedmsg)
-                                    .await
-                                    .context("Failed to send clipboard types message")?;
-                            }
+                            self.send_local_clipboard_types(local_clipboard).await?;
                         }
                     }
                 }
@@ -1124,8 +1174,17 @@ impl Connection {
         bytes: &[u8],
         output_handler: &mut O,
     ) -> Result<()> {
-        let msg = postcard::from_bytes::<event::MotionDatagram>(bytes)
-            .map_err(|e| anyhow!("Failed to deserialize motion datagram: {:?}", e))?;
+        let msg = match postcard::from_bytes::<event::MotionDatagram>(bytes) {
+            Ok(msg) => msg,
+            Err(e) => {
+                // The datagram path is deliberately lossy — stale,
+                // empty-history and inactive datagrams are all
+                // drop-and-continue below — so one malformed datagram must
+                // not tear down the whole connection either.
+                warn!("Dropping malformed motion datagram: {:?}", e);
+                return Ok(());
+            }
+        };
         if !self.active {
             // We're not the switched-active client; the datagram raced a switch.
             return Ok(());
@@ -2056,6 +2115,62 @@ mod tests {
         assert_eq!(
             map.targets[&event::Direction::Top],
             crate::edge::EdgeTarget::Auto
+        );
+    }
+
+    /// The no-op key-release pair (Switch(false) then Switch(true), sent
+    /// back-to-back by the server's release_current_target_keys) must leave
+    /// the announce disarmed; the Switch(true) reports that it cancelled one.
+    #[test]
+    fn deactivate_announce_pair_cancels_before_firing() {
+        let mut d = DeactivateAnnounce::default();
+        assert!(d.fire_at.is_none());
+        assert!(!d.on_switch(false));
+        assert!(d.fire_at.is_some());
+        assert!(d.on_switch(true));
+        assert!(d.fire_at.is_none());
+    }
+
+    /// A real deactivation is followed by silence, so the timer stays armed
+    /// until it expires; expiry disarms it and reports that the re-announce
+    /// should go out — but only while this client is inactive.
+    #[test]
+    fn deactivate_announce_expires_only_while_inactive() {
+        let mut d = DeactivateAnnounce::default();
+        d.on_switch(false);
+        assert!(d.take_expired(false));
+        assert!(d.fire_at.is_none());
+        d.on_switch(false);
+        assert!(!d.take_expired(true));
+        assert!(d.fire_at.is_none());
+    }
+
+    /// The wait future pends forever while disarmed and completes at the
+    /// armed deadline. (A short injected deadline keeps the test off the
+    /// real grace period and off tokio's test-util paused clock.)
+    #[tokio::test]
+    async fn deactivate_announce_wait_tracks_the_timer() {
+        // Disarmed: outlasts a generous timeout.
+        let disarmed = DeactivateAnnounce::wait(None);
+        tokio::pin!(disarmed);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut disarmed)
+                .await
+                .is_err()
+        );
+        // Armed: fires at the deadline, not before.
+        let at = tokio::time::Instant::now() + Duration::from_millis(100);
+        let armed = DeactivateAnnounce::wait(Some(at));
+        tokio::pin!(armed);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut armed)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), &mut armed)
+                .await
+                .is_ok()
         );
     }
 }

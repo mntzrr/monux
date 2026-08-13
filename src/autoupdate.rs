@@ -180,6 +180,21 @@ fn decide(newer: bool, requested: bool, mode: Mode, attempted: bool, notified: b
     Action::Notify
 }
 
+/// The trust level for an install the loop is about to run (see
+/// update::Trust). What decides it is whether a PERSON asked, not how the
+/// daemon is configured: an explicit request (`mx daemon update`, the tray)
+/// is Interactive even on an --auto-install daemon — the person who just
+/// asked is the review gate — while the timer's own installs in
+/// --auto-install mode are Unattended. Notify mode only ever installs on
+/// request, so it is always Interactive.
+fn install_trust(requested: bool, mode: Mode) -> update::Trust {
+    if requested || mode == Mode::Notify {
+        update::Trust::Interactive
+    } else {
+        update::Trust::Unattended
+    }
+}
+
 /// Runs the auto-update loop; spawn it on the tokio runtime.
 /// `gate_config_dir`: for clients, the config dir holding the server's
 /// protocol version record — refreshed via mDNS on every check, so updates
@@ -219,6 +234,15 @@ pub async fn run(gate_config_dir: Option<std::path::PathBuf>, mode: Mode) {
         // (and never unpins — a plain 'monux update' does that), so a pinned
         // machine skips every check until then.
         if let Some((version, _commit)) = pin_dir.as_deref().and_then(update::update_pin) {
+            // Consume an explicit install request even while pinned: leaving
+            // it set would defer it silently until some future unpin, long
+            // after the person who asked walked away.
+            if INSTALL_REQUESTED.swap(false, Ordering::SeqCst) {
+                info!(
+                    "Ignoring the install request: updates are pinned at v{}; run 'monux update' to return to latest",
+                    version
+                );
+            }
             info!(
                 "update pinned at v{} (manual downgrade); skipping — return to latest with 'monux update'",
                 version
@@ -264,14 +288,7 @@ pub async fn run(gate_config_dir: Option<std::path::PathBuf>, mode: Mode) {
                     // stale record) inside the blocking task: discovery is
                     // synchronous IO with a timeout.
                     let gate_dir = gate_config_dir.clone();
-                    // An explicit request is Interactive: a person asked for
-                    // it just now, so an unsigned build warns instead of
-                    // refusing. The timer's own installs stay Unattended.
-                    let trust = if mode == Mode::AutoInstall {
-                        update::Trust::Unattended
-                    } else {
-                        update::Trust::Interactive
-                    };
+                    let trust = install_trust(requested, mode);
                     let result = tokio::task::spawn_blocking(move || {
                         let constraint = gate_dir
                             .as_deref()
@@ -446,6 +463,21 @@ mod tests {
             decide(true, true, Mode::AutoInstall, true, false),
             Action::Install
         );
+    }
+
+    #[test]
+    fn trust_keys_on_who_asked_not_on_the_daemon_mode() {
+        use update::Trust;
+        // The regression: `mx daemon update` on an --auto-install daemon used
+        // to get Unattended — keyed on the mode — and was refused an
+        // unverifiable build the person had just explicitly asked for.
+        assert_eq!(install_trust(true, Mode::AutoInstall), Trust::Interactive);
+        assert_eq!(install_trust(true, Mode::Notify), Trust::Interactive);
+        // The timer's own installs stay fail-closed, on either mode: nobody
+        // is watching those. (Notify mode never installs unrequested; the
+        // mapping is defensive.)
+        assert_eq!(install_trust(false, Mode::AutoInstall), Trust::Unattended);
+        assert_eq!(install_trust(false, Mode::Notify), Trust::Interactive);
     }
 
     #[test]

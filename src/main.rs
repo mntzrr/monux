@@ -446,6 +446,33 @@ fn main() -> Result<()> {
                 Some(specs) => Some(monux::edge::parse_edge_map(specs)?),
                 None => None,
             };
+            // The shortcut chords are plain strings on the command line, so
+            // clap accepts anything; reject typos here (mirroring --edge-map
+            // above), not in parse_key_combos after the takeover.
+            shortcut::validate_chord(
+                args.shortcut
+                    .as_deref()
+                    .unwrap_or(monux::config::DEFAULT_SHORTCUT),
+            )?;
+            shortcut::validate_chord(
+                args.shortcut_prev
+                    .as_deref()
+                    .unwrap_or(monux::config::DEFAULT_SHORTCUT_PREV),
+            )?;
+            for spec in args.shortcut_goto.as_deref().unwrap_or_default() {
+                shortcut::validate_goto(spec)?;
+            }
+            // An empty --pause-shortcut disables pause/resume.
+            let pause_shortcut = args
+                .pause_shortcut
+                .as_deref()
+                .unwrap_or(monux::config::DEFAULT_PAUSE_SHORTCUT);
+            let pause_shortcut = if pause_shortcut.trim().is_empty() {
+                None
+            } else {
+                shortcut::validate_chord(pause_shortcut)?;
+                Some(pause_shortcut)
+            };
             let server_lock = single_instance::acquire("server")?;
             settle_after_takeover(&server_lock);
             // Before the indicator supervisor spawns anything (see the note
@@ -464,6 +491,9 @@ fn main() -> Result<()> {
                 // The server leads protocol upgrades: no compatibility gate.
                 rt.spawn(monux::autoupdate::run(None, update_mode));
             }
+            // Constructed after the takeover on purpose: new() writes a fresh
+            // keypair when none exists (write_new_keypair is not atomic), and
+            // the single-instance lock serializes that between contenders.
             let verifier = approval::MonuxCertVerification::new(
                 "server",
                 args.fingerprint.take().unwrap_or(vec![]),
@@ -513,16 +543,6 @@ fn main() -> Result<()> {
                     info!("Pacing bulk transfers to {} Mbps (pinned)", mbps);
                     monux::rotation::ThrottleMode::Pinned(Some(mbps))
                 }
-            };
-            // An empty --pause-shortcut disables pause/resume.
-            let pause_shortcut = args
-                .pause_shortcut
-                .as_deref()
-                .unwrap_or(monux::config::DEFAULT_PAUSE_SHORTCUT);
-            let pause_shortcut = if pause_shortcut.trim().is_empty() {
-                None
-            } else {
-                Some(pause_shortcut)
             };
             rt.block_on(async {
                 server(ServerDaemonArgs {
@@ -616,6 +636,10 @@ fn main() -> Result<()> {
             if auto_update {
                 rt.spawn(monux::autoupdate::run(Some(config_dir.clone()), update_mode));
             }
+            // Constructed after the takeover on purpose, as on the server
+            // path: new() writes a fresh keypair when none exists
+            // (write_new_keypair is not atomic), and the single-instance lock
+            // serializes that between contenders.
             let verifier = approval::MonuxCertVerification::new(
                 "client",
                 args.fingerprint.take().unwrap_or(vec![]),
@@ -976,7 +1000,7 @@ async fn server(args: ServerDaemonArgs<'_>) -> Result<()> {
                 auto_update,
                 indicator: indicator.handle(),
             });
-            task::spawn(listener.run(handler));
+            spawn_control_listener(listener, handler);
         }
         Err(e) => warn!("Control socket unavailable: {:?}", e),
     }
@@ -1092,56 +1116,67 @@ async fn server(args: ServerDaemonArgs<'_>) -> Result<()> {
     // The daemon is up (listening, rotation running): start the tray
     // indicator alongside it.
     indicator.launch();
-    if let Some(exit_secs) = exit_secs {
+    // Every exit from the select funnels through close_loops below — signal,
+    // --exit-secs timeout, and loop failure alike. A plain return would drop
+    // the QUIC endpoint without close frames, leaving clients to wait out
+    // their ~25s idle timeout instead of reconnecting at once.
+    let shutdown: Result<()> = if let Some(exit_secs) = exit_secs {
         info!("Exiting in {} seconds...", exit_secs);
         tokio::select! {
             watch_exit = &mut watch_handle => {
-                watch_exit?.context("Failed to watch input events, exiting early")?
+                watch_exit
+                    .map_err(anyhow::Error::from)
+                    .and_then(|exit| exit.context("Failed to watch input events, exiting early"))
             },
             server_events_exit = &mut server_events_handle => {
-                server_events_exit?.context("Server events loop failed, exiting early")?
+                server_events_exit
+                    .map_err(anyhow::Error::from)
+                    .and_then(|exit| exit.context("Server events loop failed, exiting early"))
             },
             server_connections_exit = &mut server_connections_handle => {
-                server_connections_exit?.context("Server connections loop failed, exiting early")?
+                server_connections_exit
+                    .map_err(anyhow::Error::from)
+                    .and_then(|exit| exit.context("Server connections loop failed, exiting early"))
             },
             _timeout = time::sleep(Duration::from_secs(exit_secs as u64)) => {
                 info!("Exiting automatically as requested (--exit-secs={})", exit_secs);
+                Ok(())
             },
             _signal = shutdown_signal() => {
-                close_loops(watch_handle, server_events_handle, server_connections_handle, server_endpoint).await;
-                // Dropping _mdns_registration here sends the mDNS goodbye.
-                // The active-client state file is deliberately left in place:
-                // a restart (e.g. after 'monux update') resumes the session
-                // automatically when the client reconnects (bounded by
-                // ACTIVE_CLIENT_MAX_AGE).
                 info!("Shutting down...");
-                return Ok(());
+                Ok(())
             },
-        };
+        }
     } else {
         tokio::select! {
             watch_exit = &mut watch_handle => {
-                watch_exit?.context("Failed to watch input events, exiting")?
+                watch_exit
+                    .map_err(anyhow::Error::from)
+                    .and_then(|exit| exit.context("Failed to watch input events, exiting"))
             },
             server_events_exit = &mut server_events_handle => {
-                server_events_exit?.context("Server events loop failed, exiting early")?
+                server_events_exit
+                    .map_err(anyhow::Error::from)
+                    .and_then(|exit| exit.context("Server events loop failed, exiting early"))
             },
             server_connections_exit = &mut server_connections_handle => {
-                server_connections_exit?.context("Server connections loop failed, exiting early")?
+                server_connections_exit
+                    .map_err(anyhow::Error::from)
+                    .and_then(|exit| exit.context("Server connections loop failed, exiting early"))
             },
             _signal = shutdown_signal() => {
-                close_loops(watch_handle, server_events_handle, server_connections_handle, server_endpoint).await;
-                // Dropping _mdns_registration here sends the mDNS goodbye.
-                // The active-client state file is deliberately left in place:
-                // a restart (e.g. after 'monux update') resumes the session
-                // automatically when the client reconnects (bounded by
-                // ACTIVE_CLIENT_MAX_AGE).
                 info!("Shutting down...");
-                return Ok(());
+                Ok(())
             },
         }
-    }
-    Ok(())
+    };
+    close_loops(watch_handle, server_events_handle, server_connections_handle, server_endpoint).await;
+    // Dropping _mdns_registration here sends the mDNS goodbye.
+    // The active-client state file is deliberately left in place:
+    // a restart (e.g. after 'monux update') resumes the session
+    // automatically when the client reconnects (bounded by
+    // ACTIVE_CLIENT_MAX_AGE).
+    shutdown
 }
 
 /// How long the shutdown path lets the QUIC endpoint drain its close frames
@@ -1192,6 +1227,18 @@ async fn close_loops(
     let _ = watch_handle.await;
     let _ = server_events_handle.await;
     let _ = server_connections_handle.await;
+}
+
+/// Spawns the control-socket accept loop on the runtime. The JoinHandle is
+/// deliberately dropped — the listener is an optional sidecar, not a daemon
+/// loop — so without this wrapper a fatal exit (Listener::run returning Err)
+/// would vanish unlogged.
+fn spawn_control_listener(listener: monux::control::Listener, handler: monux::control::Handler) {
+    task::spawn(async move {
+        if let Err(e) = listener.run(handler).await {
+            warn!("Control socket listener exited: {:?}", e);
+        }
+    });
 }
 
 /// A failed connection that had survived beyond this was a healthy session: its
@@ -1350,7 +1397,7 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
                 auto_update,
                 indicator: indicator.handle(),
             });
-            task::spawn(listener.run(handler));
+            spawn_control_listener(listener, handler);
         }
         Err(e) => warn!("Control socket unavailable: {:?}", e),
     }

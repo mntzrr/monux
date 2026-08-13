@@ -28,7 +28,9 @@
 //! spec, the /tmp fallback is created 0700, and bind() refuses a socket dir
 //! owned by another user (a pre-existing /tmp/monux-<uid> must never be
 //! trusted) or reached through a symlink, treating a failed 0700 chmod as
-//! fatal. There is no authentication beyond identity — any process running as
+//! fatal. Under the documented `sudo -E` fallback the root daemon first hands
+//! the dir to the invoking user, exactly so that check passes for the socket
+//! the user's own tools then reach. There is no authentication beyond identity — any process running as
 //! the same user can drive switches, pause, updates and shutdown, exactly as
 //! it already could via signals (SIGUSR1/SIGUSR2/SIGTERM).
 //!
@@ -186,6 +188,13 @@ pub fn socket_path(role: Role) -> PathBuf {
 /// feeding fake acks/state to `monux status` — and locked down to 0700. A
 /// failed chmod is a hard error for the same reason.
 ///
+/// One exception to "owned by us": the documented `sudo -E` fallback puts a
+/// ROOT daemon behind a socket the invoking user must be able to reach, so
+/// when euid is 0 and SUDO_UID is set the dir is handed to that user (a
+/// root-owned 0700 dir would lock them out of the socket entirely, and a
+/// pre-existing user-owned one would fail the owner check, leaving the
+/// daemon with no control IPC either way).
+///
 /// The ownership check and the chmod run against a DESCRIPTOR opened
 /// O_NOFOLLOW, never against the path. The /tmp fallback dir sits in a
 /// world-writable directory, so a path-based check can be aimed elsewhere by
@@ -218,11 +227,29 @@ fn prepare_socket_dir(dir: &Path) -> Result<()> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
         .open(dir)
         .with_context(|| format!("Failed to open control socket dir {}", dir.display()))?;
+    let euid = unsafe { libc::geteuid() };
+    // The `sudo -E` fallback (see above): hand the dir to the invoking user.
+    // fchown on the O_NOFOLLOW descriptor, never the path — the same threat
+    // setup.rs's lchown defends against for root-written files in user homes.
+    let invoker = if euid == 0 { invoking_uid() } else { None };
+    if let Some(uid) = invoker {
+        use std::os::unix::io::AsRawFd;
+        // gid -1: leave the group alone, only the owner matters here.
+        if unsafe { libc::fchown(handle.as_raw_fd(), uid, libc::gid_t::MAX) } != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "Failed to hand control socket dir {} to the invoking user (uid {})",
+                    dir.display(),
+                    uid
+                )
+            });
+        }
+    }
     let owner = handle
         .metadata()
         .with_context(|| format!("Failed to stat control socket dir {}", dir.display()))?
         .uid();
-    ensure_dir_owner(dir, owner, unsafe { libc::geteuid() })?;
+    ensure_dir_owner(dir, owner, euid, invoker)?;
     // 0700 even if the dir pre-existed with looser perms: the socket is
     // same-user only (see module docs).
     handle
@@ -231,17 +258,23 @@ fn prepare_socket_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Bails unless `owner` is `expected_uid` (the dir's uid from an fstat of the
-/// opened dir, and the euid at the call site; both are parameters so the
-/// mismatch branch is testable without root). `dir` is only used in the
-/// message.
-fn ensure_dir_owner(dir: &Path, owner: libc::uid_t, expected_uid: libc::uid_t) -> Result<()> {
-    if owner != expected_uid {
+/// Bails unless `owner` is `euid` — or, for a root daemon under the `sudo
+/// -E` fallback, the invoking user the dir was just handed to (the dir's uid
+/// from an fstat of the opened dir, and the euid/invoker at the call site;
+/// all are parameters so the mismatch branch is testable without root).
+/// `dir` is only used in the message.
+fn ensure_dir_owner(
+    dir: &Path,
+    owner: libc::uid_t,
+    euid: libc::uid_t,
+    invoker: Option<libc::uid_t>,
+) -> Result<()> {
+    if owner != euid && Some(owner) != invoker {
         bail!(
             "Control socket dir {} is owned by uid {}, not by us (uid {}): refusing to trust it — remove it or fix its ownership",
             dir.display(),
             owner,
-            expected_uid
+            euid
         );
     }
     Ok(())
@@ -848,12 +881,18 @@ impl Response {
     }
 
     fn ok_state(state: impl Serialize) -> Self {
-        Response {
-            ok: true,
-            state: serde_json::to_value(state).ok(),
-            diagnostics: None,
-            peers: Vec::new(),
-            error: None,
+        // A state that fails to serialize must surface as an error, not as
+        // {"ok":true} with no state — the CLI reads that as a daemon that
+        // answered with nothing.
+        match serde_json::to_value(state) {
+            Ok(value) => Response {
+                ok: true,
+                state: Some(value),
+                diagnostics: None,
+                peers: Vec::new(),
+                error: None,
+            },
+            Err(e) => Response::err(format!("failed to serialize the state: {}", e)),
         }
     }
 
@@ -1124,7 +1163,20 @@ impl Listener {
         let handler = Arc::new(handler);
         let euid = unsafe { libc::geteuid() };
         loop {
-            let (stream, _) = self.listener.accept().await?;
+            let (stream, _) = match self.listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(e) if accept_error_is_transient(&e) => {
+                    // Log and retry: a returned error would propagate out of
+                    // the task, and Listener's Drop would then unlink the
+                    // socket — a healthy daemon looking dead. The brief pause
+                    // keeps a persistent condition (fd exhaustion) from
+                    // spinning the loop.
+                    warn!("Control socket accept failed (retrying): {:#}", e);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(e) => return Err(e).context("Control socket accept failed"),
+            };
             // Identity comes from the kernel, not from the directory the
             // socket sits in (see the module docs' Security section). A
             // stranger reaching us at all is worth a WARN: on a correctly
@@ -1162,6 +1214,22 @@ impl Drop for Listener {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// accept() failures the listener must survive rather than propagate: fd
+/// exhaustion (EMFILE/ENFILE) clears when something closes, ENOBUFS/ENOMEM
+/// are similarly transient, and ECONNABORTED is just a peer that hung up
+/// between connect and accept. Anything else (EBADF, ...) is a real fault
+/// and still unwinds the task.
+fn accept_error_is_transient(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EMFILE)
+            | Some(libc::ENFILE)
+            | Some(libc::ENOBUFS)
+            | Some(libc::ENOMEM)
+            | Some(libc::ECONNABORTED)
+    )
 }
 
 /// Serves one control connection: newline-delimited requests in, one response
@@ -1208,10 +1276,16 @@ async fn serve_connection(stream: tokio::net::UnixStream, handler: Arc<Handler>)
                     libc::kill(std::process::id() as i32, libc::SIGTERM);
                 }
             }
-            Some(PostAction::IndicatorHide) => match &*handler {
-                Handler::Server(h) => h.indicator.hide(),
-                Handler::Client(h) => h.indicator.hide(),
-            },
+            Some(PostAction::IndicatorHide) => {
+                // hide() reaps the indicator child with a blocking wait (up
+                // to TERM_GRACE of thread::sleep in terminate_and_reap), so
+                // it must not run on this connection's async task.
+                let indicator = match &*handler {
+                    Handler::Server(h) => h.indicator.clone(),
+                    Handler::Client(h) => h.indicator.clone(),
+                };
+                tokio::task::spawn_blocking(move || indicator.hide());
+            }
             None => {}
         }
     }
@@ -1244,13 +1318,15 @@ pub fn request_line(socket: &Path, request: &str) -> Result<String> {
 }
 
 /// [`request_line`] with a caller-chosen budget, for the requests the daemon
-/// cannot answer out of its mirrors (see PEER_SOCKET_TIMEOUT).
+/// cannot answer out of its mirrors (see PEER_SOCKET_TIMEOUT). The budget is
+/// OVERALL, not per syscall: a same-user peer dribbling one byte per syscall
+/// window must not hold the exchange open forever.
 pub fn request_line_with_timeout(
     socket: &Path,
     request: &str,
     timeout: std::time::Duration,
 ) -> Result<String> {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufReader, Read, Write};
     use std::os::unix::io::AsRawFd;
     let stream = std::os::unix::net::UnixStream::connect(socket)
         .with_context(|| format!("Failed to connect to {}", socket.display()))?;
@@ -1274,17 +1350,58 @@ pub fn request_line_with_timeout(
     stream
         .set_write_timeout(Some(timeout))
         .context("Failed to set control socket write timeout")?;
+    let started = Instant::now();
     let mut writer = stream
         .try_clone()
         .context("Failed to clone control socket stream")?;
     writer.write_all(request.as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()?;
-    let mut response = String::new();
-    let n = BufReader::new(stream).read_line(&mut response)?;
-    if n == 0 {
-        bail!("{} closed without a response", socket.display());
+    // The read deadline is OVERALL: a socket timeout expires per SYSCALL, so
+    // a peer feeding us a byte per window would never trip it. Each read
+    // gets only the budget that remains and elapsed is re-checked after
+    // every return, so the deadline bounds the whole exchange no matter how
+    // slowly the bytes trickle in.
+    let mut response: Vec<u8> = Vec::new();
+    let mut reader = BufReader::new(stream);
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            bail!(
+                "{} sent no complete response within {:?}",
+                socket.display(),
+                timeout
+            );
+        }
+        reader
+            .get_ref()
+            .set_read_timeout(Some(timeout - elapsed))
+            .context("Failed to re-arm control socket read timeout")?;
+        let mut chunk = [0u8; 4096];
+        match reader.read(&mut chunk) {
+            // EOF mid-line keeps the partial response, as read_line did.
+            Ok(0) if !response.is_empty() => break,
+            Ok(0) => bail!("{} closed without a response", socket.display()),
+            Ok(n) => {
+                response.extend_from_slice(&chunk[..n]);
+                if let Some(end) = response.iter().position(|&b| b == b'\n') {
+                    // Anything past the first line is not ours to consume.
+                    response.truncate(end + 1);
+                    break;
+                }
+            }
+            // A window expired with nothing read: loop and re-check the
+            // deadline rather than failing on the spot.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => return Err(e).context("Failed to read the control socket response"),
+        }
     }
+    let response =
+        String::from_utf8(response).context("The control socket response was not valid UTF-8")?;
     Ok(response.trim_end().to_string())
 }
 
@@ -1639,12 +1756,26 @@ mod tests {
             0o700
         );
         let owner = std::fs::metadata(&socket_dir).unwrap().uid();
-        ensure_dir_owner(&socket_dir, owner, unsafe { libc::geteuid() }).unwrap();
+        ensure_dir_owner(&socket_dir, owner, unsafe { libc::geteuid() }, None).unwrap();
 
         // A dir owned by another user must be refused. (A foreign-owned dir
         // can't be chowned into existence without root, so the mismatch
         // branch is exercised with a uid that isn't the dir's owner.)
-        let err = ensure_dir_owner(&socket_dir, owner, owner.wrapping_add(1)).unwrap_err();
+        let err = ensure_dir_owner(&socket_dir, owner, owner.wrapping_add(1), None).unwrap_err();
+        assert!(
+            format!("{:#}", err).contains("refusing to trust"),
+            "unexpected error: {:#}",
+            err
+        );
+
+        // The `sudo -E` fallback: a root daemon accepts a dir owned by the
+        // INVOKING user (prepare_socket_dir fchowns it to them, which needs
+        // root, so only the acceptance rule is exercised here) — but still
+        // refuses everyone else.
+        let invoker = owner.wrapping_add(2);
+        ensure_dir_owner(&socket_dir, invoker, 0, Some(invoker)).unwrap();
+        let err = ensure_dir_owner(&socket_dir, owner.wrapping_add(3), 0, Some(invoker))
+            .unwrap_err();
         assert!(
             format!("{:#}", err).contains("refusing to trust"),
             "unexpected error: {:#}",
@@ -1706,6 +1837,44 @@ mod tests {
         // peer is us.
         assert!(!peer_uid_trusted(1001, 1000, None));
         assert!(!peer_uid_trusted(1000, 1001, Some(1000)));
+    }
+
+    #[test]
+    fn transient_accept_errors_are_distinguished_from_fatal_ones() {
+        for errno in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::ECONNABORTED,
+        ] {
+            assert!(
+                accept_error_is_transient(&std::io::Error::from_raw_os_error(errno)),
+                "errno {} must be treated as transient",
+                errno
+            );
+        }
+        // A real fault (or no errno at all) must still unwind the task.
+        assert!(!accept_error_is_transient(&std::io::Error::from_raw_os_error(
+            libc::EBADF
+        )));
+        assert!(!accept_error_is_transient(&std::io::Error::other("no errno")));
+    }
+
+    #[test]
+    fn a_state_that_fails_to_serialize_becomes_an_error_response() {
+        struct Unserializable;
+        impl Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("boom"))
+            }
+        }
+        // Not {"ok":true} with no state: the CLI would read that as a daemon
+        // that answered with nothing.
+        let resp = Response::ok_state(Unserializable);
+        assert!(!resp.ok);
+        assert!(resp.state.is_none());
+        assert!(resp.error.unwrap().contains("serialize"));
     }
 
     #[test]
@@ -2089,6 +2258,46 @@ mod tests {
 
         task.abort();
         let _ = task.await;
+    }
+
+    /// A peer feeding us one byte per syscall window never trips a
+    /// PER-SYSCALL timeout, so the request budget has to be overall: the
+    /// exchange must fail at the deadline no matter how slowly the bytes
+    /// trickle in.
+    #[test]
+    fn a_dribbling_peer_cannot_hold_the_exchange_past_its_budget() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let dribbler = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Read the request off, then answer one byte at a time, forever
+            // (well within a per-syscall window) and never terminate the line.
+            let mut sink = [0u8; 64];
+            let _ = std::io::Read::read(&mut stream, &mut sink);
+            loop {
+                if stream.write_all(b"x").is_err() {
+                    return; // the client gave up, as it should
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+
+        let budget = std::time::Duration::from_millis(300);
+        let started = Instant::now();
+        let err = request_line_with_timeout(&path, r#"{"cmd":"status"}"#, budget).unwrap_err();
+        assert!(
+            format!("{:#}", err).contains("no complete response"),
+            "unexpected error: {:#}",
+            err
+        );
+        assert!(
+            started.elapsed() < budget * 4,
+            "the exchange outlived its budget: {:?}",
+            started.elapsed()
+        );
+        dribbler.join().unwrap();
     }
 
     #[test]

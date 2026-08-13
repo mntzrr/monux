@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{bail, Context, Result};
 use rustix::fs::{fcntl_setfl, OFlags};
@@ -15,7 +15,7 @@ use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_seat;
 use wayland_client::{event_created_child, Dispatch, EventQueue};
 
-use crate::clipboard::{ClipboardWriter as ClipboardWriterTrait, data};
+use crate::clipboard::{ClipboardWriter as ClipboardWriterTrait, convert, data};
 use crate::clipboard::wayland::{common, state};
 use crate::clipboard::wayland::data_control::{
     self, impl_dispatch_device, impl_dispatch_manager, impl_dispatch_offer, impl_dispatch_source,
@@ -39,9 +39,9 @@ type ClipboardCache = std::sync::Arc<std::sync::Mutex<HashMap<String, std::sync:
 /// managers (wl-clip-persist, wl-paste --watch) can fire dozens of Send
 /// events per second and every serve is a thread plus a network fetch that
 /// can live for seconds, so unbounded serving lets a storm pile up threads
-/// faster than they drain. Past the cap the NEWEST request is dropped: its
-/// fd closes unanswered, the requester times out and retries — the same
-/// outcome as a slow serve today.
+/// faster than they drain. Past the cap the NEWEST request is dropped:
+/// returning from the Send handler closes its fd instantly, so the requester
+/// reads an immediate EOF — an empty paste, not a timeout.
 const MAX_CONCURRENT_SERVES: usize = 4;
 
 /// A held serve slot (see MAX_CONCURRENT_SERVES); dropping it frees the slot
@@ -78,10 +78,11 @@ impl Drop for ServePermit {
     }
 }
 
-/// Mime types whose payload is a list of local file paths — the same types
-/// convert.rs packs into a zip of the files' contents for the peer.
+/// Mime types whose payload is a list of local file paths — the types
+/// convert.rs packs into a zip of the files' contents for the peer. Defers to
+/// convert::is_file_list_type so the two sides can never drift apart.
 fn is_file_list_mime_type(mime_type: &str) -> bool {
-    mime_type == "text/uri-list" || mime_type == "x-special/gnome-copied-files"
+    convert::is_file_list_type(mime_type)
 }
 
 struct PreparedCopyState {
@@ -226,9 +227,9 @@ impl_dispatch_source!(State, |state: &mut Self, source: data_control::Source, ev
             debug!("Serving paste request for type {}", mime_type);
 
             // Bound serve concurrency (see MAX_CONCURRENT_SERVES): at the
-            // cap, drop the newest request — returning here closes its fd,
-            // so the requester times out and retries exactly as it would
-            // after a slow serve.
+            // cap, drop the newest request — returning here closes its fd
+            // instantly, so the requester gets an immediate EOF (an empty
+            // paste) rather than an answer.
             let permit = match ServePermit::try_acquire(prepared_state.serve_in_flight.clone()) {
                 Some(permit) => permit,
                 None => {
@@ -357,7 +358,8 @@ fn write_paste_fd(fd: std::os::fd::OwnedFd, bytes: &[u8]) -> io::Result<u64> {
     Ok(written as u64)
 }
 
-/// Connects to the wayland environment, or returns Ok(None) if wayland isn't available
+/// Connects to the wayland environment, failing if wayland or its clipboard
+/// protocols aren't available
 fn init_state() -> Result<(State, data_control::Manager, EventQueue<State>)> {
     let conn = super::connect::connect()?;
     let (globals, queue) = registry_queue_init::<State>(&conn)?;
@@ -392,9 +394,18 @@ fn write_clipboard(
     fetch_data_tx: mpsc::Sender<data::ClipboardFetch>,
     config_dir: PathBuf,
     max_uncompressed_size_bytes: u64,
+    superseded: Arc<AtomicBool>,
 ) -> Result<()> {
     let (mut state, clipboard_manager, mut queue) = init_state()
         .context("Failed to init wayland session for clipboard write")?;
+
+    // A store abandoned by the dispatcher (wedged compositor) can complete
+    // late, after a NEWER store has started: publishing now would clobber the
+    // newer selection, last-setter-wins at the compositor. Back out instead.
+    if superseded.load(Ordering::SeqCst) {
+        debug!("Skipping stale clipboard advertisement: a newer store has started");
+        return Ok(());
+    }
 
     // Sources stay empty when clearing the clipboard.
     let mut sources = vec![];
@@ -543,12 +554,13 @@ impl ClipboardWriter {
 
 impl ClipboardWriterTrait for ClipboardWriter {
     /// Advertises with the local environment that we have a new clipboard entry available
-    fn store_types(&self, types: Vec<String>) -> Result<()> {
+    fn store_types(&self, types: Vec<String>, superseded: Arc<AtomicBool>) -> Result<()> {
         write_clipboard(
             types,
             self.clipboard_fetch_tx.clone(),
             self.config_dir.clone(),
             self.max_uncompressed_size_bytes,
+            superseded,
         )
     }
 }

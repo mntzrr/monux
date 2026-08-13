@@ -346,8 +346,6 @@ pub async fn send_version(send: &mut SendStream, version: u64) -> Result<()> {
 }
 
 /// The wire bytes of the version bootstrap for `version` (postcard + COBS).
-/// Callers normally pass PROTOCOL_VERSION; a client clamping to an older
-/// server passes the clamped version instead (see client.rs).
 fn version_bootstrap_bytes(version: u64) -> Result<Vec<u8>> {
     let msg = shared::VersionBootstrapMessage { version };
     postcard::to_stdvec_cobs(&msg)

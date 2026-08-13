@@ -314,7 +314,13 @@ fn execute(plan: &Plan) {
     remove_root_owned(&plan.root_owned, &mut sudo_status);
     remove_qos_marking();
     remove_hotspot_profile();
-    remove_autostart_units(&plan.autostart_unit_dir, &mut systemctl_user);
+    let systemctl = autostart_systemctl(
+        unsafe { libc::geteuid() },
+        std::env::var("SUDO_USER").ok().as_deref(),
+    );
+    remove_autostart_units(&plan.autostart_unit_dir, &systemctl, &mut |spec| {
+        spec.run().is_ok()
+    });
 
     // The desktop shortcut (user-level file, no sudo; absence is fine).
     match fs::remove_file(&plan.desktop_shortcut) {
@@ -526,22 +532,33 @@ fn remove_hotspot_profile() {
 
 /// Removes the per-user autostart units 'monux setup --autostart' installs:
 /// left in place and enabled, systemd would retry the deleted binary at every
-/// login. Best-effort and user-level (no sudo): disable+stop both services
-/// via the user's manager (tolerating its absence — e.g. uninstall run from a
-/// root shell — with a note), remove the unit files, then daemon-reload so
-/// systemd forgets them. Nothing happens at all when no unit files exist.
-/// The systemctl runner is a seam so tests stay off the real systemd.
-fn remove_autostart_units(unit_dir: &Path, systemctl: &mut dyn FnMut(&[&str]) -> bool) {
+/// login. Best-effort and user-level: disable+stop both services via the
+/// target user's manager (the Systemctl driver — runuser-wrapped under sudo,
+/// since a plain `systemctl --user` would talk to ROOT's manager and leave
+/// the user's enablement symlinks dangling), tolerating its absence with a
+/// note. The enablement symlinks are also unlinked directly, so a manager
+/// that couldn't be reached still leaves no failed unit behind at the next
+/// login. Nothing happens at all when no unit files exist.
+/// The runner is a seam so tests stay off the real systemd.
+fn remove_autostart_units(
+    unit_dir: &Path,
+    systemctl: &setup::Systemctl,
+    run: &mut dyn FnMut(&setup::CmdSpec) -> bool,
+) {
     const UNITS: [&str; 2] = ["monux-server.service", "monux-client.service"];
     if !UNITS.iter().any(|unit| unit_dir.join(unit).exists()) {
         return;
     }
-    let mut disable: Vec<&str> = vec!["disable", "--now"];
-    disable.extend(UNITS);
-    if !systemctl(&disable) {
+    let disable = systemctl.spec(&[
+        "disable",
+        "--now",
+        "monux-server.service",
+        "monux-client.service",
+    ]);
+    if !run(&disable) {
         println!(
-            "note: couldn't disable the monux user services (no reachable user manager); after the next login, run: systemctl --user disable --now {}",
-            UNITS.join(" ")
+            "note: couldn't disable the monux user services (no reachable user manager); after the next login, run: {}",
+            disable.manual_line()
         );
     }
     for unit in UNITS {
@@ -551,20 +568,39 @@ fn remove_autostart_units(unit_dir: &Path, systemctl: &mut dyn FnMut(&[&str]) ->
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => println!("note: couldn't remove {}: {}", path.display(), e),
         }
+        // The enablement symlink (~/.config/systemd/user/default.target.wants/):
+        // `disable` removes it when the manager answered, but when it didn't
+        // the link would dangle into a failed unit at every login.
+        let wants = unit_dir.join("default.target.wants").join(unit);
+        match fs::remove_file(&wants) {
+            Ok(()) => println!("Removed {}", wants.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => println!("note: couldn't remove {}: {}", wants.display(), e),
+        }
     }
     // Forget the removed units; a failure here is harmless.
-    let _ = systemctl(&["daemon-reload"]);
+    let _ = run(&systemctl.spec(&["daemon-reload"]));
 }
 
-/// `systemctl --user <args>` for the autostart cleanup; false when the
-/// command can't run or fails (the cleanup tolerates either and moves on).
-fn systemctl_user(args: &[&str]) -> bool {
-    Command::new("systemctl")
-        .arg("--user")
-        .args(args)
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+/// The systemctl driver for the autostart cleanup: plain `systemctl --user`
+/// for a user-run uninstall, runuser-wrapped against the INVOKING user's
+/// manager when running as root via sudo (mirroring target_home's SUDO_USER
+/// resolution) — a plain call there would manage ROOT's user services and
+/// leave the user's units untouched.
+fn autostart_systemctl(euid: u32, sudo_user: Option<&str>) -> setup::Systemctl {
+    let user = if euid == 0 {
+        sudo_user
+            .filter(|name| !name.is_empty() && *name != "root")
+            .and_then(|name| {
+                setup::passwd_entry(name).ok().map(|(_home, uid, _gid)| setup::UserCtx {
+                    name: name.to_string(),
+                    uid,
+                })
+            })
+    } else {
+        None
+    };
+    setup::Systemctl { user }
 }
 
 /// `sudo <args>` for the root-owned removal, inheriting stdio so sudo can
@@ -588,21 +624,124 @@ fn sudo_output(args: &[&str]) -> Option<String> {
     }
 }
 
+/// The lock file single_instance uses for `kind`, duplicated here (its
+/// lock_path is private): /tmp/monux-<kind>.lock. The MONUX_LOCK_DIR override
+/// is debug-builds-only, exactly as in single_instance, so debug runs and
+/// tests point both sides at the same directory.
+fn lock_path(kind: &str) -> PathBuf {
+    #[cfg(debug_assertions)]
+    if let Some(dir) = std::env::var_os("MONUX_LOCK_DIR") {
+        return PathBuf::from(dir).join(format!("monux-{}.lock", kind));
+    }
+    PathBuf::from(format!("/tmp/monux-{}.lock", kind))
+}
+
+/// The pid a lock file's contents record ("pid N"), if any.
+fn pid_from_lock(contents: &str) -> Option<i32> {
+    contents.trim().strip_prefix("pid ")?.parse().ok()
+}
+
+/// The basename of /proc/<pid>/exe (the kernel resolves it through symlinks,
+/// so wrapper shells don't pass), with the " (deleted)" suffix of a binary
+/// replaced while running trimmed off.
+fn proc_exe_name(pid: i32) -> Option<String> {
+    let target = fs::read_link(format!("/proc/{}/exe", pid)).ok()?;
+    let name = target.file_name()?.to_str()?.trim_end_matches(" (deleted)");
+    Some(name.to_string())
+}
+
+/// Whether /proc/<pid> shows a monux `kind` daemon owned by `uid` (root
+/// counts too: the documented sudo fallback runs the daemon as root). Only a
+/// process passing this is ever signaled — the pid file can be stale or the
+/// pid reused. Mirrors single_instance's exe+cmdline verification.
+fn process_matches(pid: i32, kind: &str, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let owned = fs::metadata(format!("/proc/{}", pid))
+        .map(|meta| meta.uid() == uid || meta.uid() == 0)
+        .unwrap_or(false);
+    let is_monux = proc_exe_name(pid).as_deref() == Some("monux");
+    let runs_kind = fs::read_to_string(format!("/proc/{}/cmdline", pid))
+        .map(|cmdline| cmdline.split('\0').any(|tok| tok == kind))
+        .unwrap_or(false);
+    owned && is_monux && runs_kind
+}
+
+/// Stops the monux `kind` daemon recorded in `path` from a root-run (`sudo`)
+/// uninstall, on behalf of the invoking user's uid: verifies the pid really
+/// is that user's monux, SIGTERMs it and waits for it to exit. Ok(true) when
+/// a daemon was stopped.
+fn stop_instance_at(path: &Path, kind: &str, uid: u32) -> Result<bool> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(e).with_context(|| format!("Failed to read {}", path.display()))
+        }
+    };
+    let Some(pid) = pid_from_lock(&contents) else {
+        return Ok(false);
+    };
+    if !process_matches(pid, kind, uid) {
+        return Ok(false);
+    }
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            // Exited between the check and the signal: nothing left to stop.
+            return Ok(false);
+        }
+        anyhow::bail!("Failed to SIGTERM monux {} (pid {}): {}", kind, pid, err);
+    }
+    // Mirrors single_instance's takeover timeout.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let proc = format!("/proc/{}", pid);
+    while Path::new(&proc).exists() {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "monux {} (pid {}) did not exit within 5s of SIGTERM; kill it manually: kill -9 {}",
+                kind,
+                pid,
+                pid
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Ok(true)
+}
+
 /// Asks any running monux server and client to shut down gracefully, waiting
-/// for them to exit. Reuses the single-instance machinery: acquiring the lock
-/// SIGTERMs a live holder and waits for it to release; the lock is dropped
-/// right away since uninstall itself needs no instance protection. Honors
-/// MONUX_LOCK_DIR. Best-effort: a holder we can't signal (e.g. one running as
-/// root) only warrants a note — the files are removed regardless.
+/// for them to exit. As an unprivileged user this reuses the single-instance
+/// machinery: acquiring the lock SIGTERMs a live holder and waits for it to
+/// release; the lock is dropped right away since uninstall itself needs no
+/// instance protection (MONUX_LOCK_DIR is honored in debug builds only — see
+/// single_instance). Under `sudo` (euid 0) acquire would refuse the invoking
+/// user's lock file instead (single_instance::ensure_lock_file_owner: owned
+/// by that user, not by us or root), which used to leave the daemon — and a
+/// server's input grab — running while its binary was deleted; the user's
+/// daemon is then stopped directly (stop_instance_at). Best-effort: a holder
+/// we can't signal only warrants a note — the files are removed regardless.
 fn stop_running_instances() {
+    // The uid whose daemons a root-run uninstall must stop: SUDO_USER's,
+    // mirroring target_home's resolution. None when not root (the acquire
+    // path applies) or when there is no invoking user to aim at.
+    let sudo_uid = if unsafe { libc::geteuid() } == 0 {
+        std::env::var("SUDO_USER")
+            .ok()
+            .as_deref()
+            .filter(|name| !name.is_empty() && *name != "root")
+            .and_then(|name| setup::passwd_entry(name).ok())
+            .map(|(_home, uid, _gid)| uid)
+    } else {
+        None
+    };
     for kind in ["server", "client"] {
-        match single_instance::acquire(kind) {
-            Ok(lock) => {
-                if lock.took_over {
-                    println!("Stopped the running monux {}", kind);
-                }
-                drop(lock);
-            }
+        let result = match sudo_uid {
+            Some(uid) => stop_instance_at(&lock_path(kind), kind, uid),
+            None => single_instance::acquire(kind).map(|lock| lock.took_over),
+        };
+        match result {
+            Ok(true) => println!("Stopped the running monux {}", kind),
+            Ok(false) => {}
             Err(e) => println!("note: couldn't stop the running monux {}: {}", kind, e),
         }
     }
@@ -653,21 +792,33 @@ fn answered_yes(answer: &str) -> bool {
     matches!(answer.trim_start().chars().next(), Some('y' | 'Y'))
 }
 
+/// The user the group hint is about: SUDO_USER when running via sudo (their
+/// membership is what setup.rs granted — checking root's groups would print
+/// `gpasswd -d root input`), else the current user. None when there is no
+/// invoking user to name (a bare root shell: no hint then).
+fn hint_subject(euid: u32, sudo_user: Option<&str>, user: Option<&str>) -> Option<String> {
+    let name = if euid == 0 { sudo_user } else { user };
+    name.filter(|n| !n.is_empty() && *n != "root").map(str::to_string)
+}
+
 /// The `input` group membership is left alone (it may predate monux); print
 /// the undo command instead, mirroring uninstall.sh.
 fn print_group_hint() {
+    let Some(user) = hint_subject(
+        unsafe { libc::geteuid() },
+        std::env::var("SUDO_USER").ok().as_deref(),
+        std::env::var("USER").ok().as_deref(),
+    ) else {
+        return;
+    };
     let in_input_group = Command::new("id")
         .arg("-nG")
+        .arg(&user)
         .output()
-        .map(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .split_whitespace()
-                .any(|g| g == "input")
-        })
+        .map(|out| setup::groups_contain(&String::from_utf8_lossy(&out.stdout), "input"))
         .unwrap_or(false);
     if in_input_group {
-        let user = std::env::var("USER").unwrap_or_else(|_| "$USER".to_string());
-        println!("note: your user is still in the 'input' group. If you added it only");
+        println!("note: user '{}' is still in the 'input' group. If it was added only", user);
         println!("for monux, remove it with: sudo gpasswd -d {} input", user);
     }
 }
@@ -897,24 +1048,31 @@ mod tests {
         let unit_dir = tmp.path().join("systemd-user");
         write_file(&unit_dir.join("monux-server.service"), b"unit");
         write_file(&unit_dir.join("monux-client.service"), b"unit");
-        let recorded: std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>> =
+        // The enablement symlinks `systemctl --user enable` would have made.
+        write_file(&unit_dir.join("default.target.wants/monux-server.service"), b"");
+        write_file(&unit_dir.join("default.target.wants/monux-client.service"), b"");
+        let recorded: std::rc::Rc<std::cell::RefCell<Vec<setup::CmdSpec>>> =
             std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let rec = recorded.clone();
-        let mut systemctl = move |args: &[&str]| -> bool {
-            rec.borrow_mut()
-                .push(args.iter().map(|s| s.to_string()).collect());
+        let mut run = move |spec: &setup::CmdSpec| -> bool {
+            rec.borrow_mut().push(spec.clone());
             true
         };
-        remove_autostart_units(&unit_dir, &mut systemctl);
+        let systemctl = setup::Systemctl { user: None };
+        remove_autostart_units(&unit_dir, &systemctl, &mut run);
         assert!(!unit_dir.join("monux-server.service").exists());
         assert!(!unit_dir.join("monux-client.service").exists());
+        // The wants symlinks are gone too, even though systemd wasn't asked
+        // about them directly.
+        assert!(!unit_dir.join("default.target.wants/monux-server.service").exists());
+        assert!(!unit_dir.join("default.target.wants/monux-client.service").exists());
         // Disabled first, then a daemon-reload after the files are gone.
         let calls = recorded.borrow();
         assert_eq!(
             calls.as_slice(),
-            vec![
-                vec!["disable", "--now", "monux-server.service", "monux-client.service"],
-                vec!["daemon-reload"],
+            &[
+                systemctl.spec(&["disable", "--now", "monux-server.service", "monux-client.service"]),
+                systemctl.spec(&["daemon-reload"]),
             ]
         );
     }
@@ -924,14 +1082,102 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let unit_dir = tmp.path().join("systemd-user");
         write_file(&unit_dir.join("monux-server.service"), b"unit");
+        write_file(&unit_dir.join("default.target.wants/monux-server.service"), b"");
+        let systemctl = setup::Systemctl { user: None };
         // A failing systemctl (no reachable user manager) must not stop the
-        // unit files from being removed.
-        let mut failing = |_: &[&str]| false;
-        remove_autostart_units(&unit_dir, &mut failing);
+        // unit files — or the wants symlinks — from being removed.
+        let mut failing = |_: &setup::CmdSpec| false;
+        remove_autostart_units(&unit_dir, &systemctl, &mut failing);
         assert!(!unit_dir.join("monux-server.service").exists());
+        assert!(!unit_dir.join("default.target.wants/monux-server.service").exists());
         // No unit files planted: systemctl is never invoked.
-        let mut panicking = |_: &[&str]| -> bool { panic!("no systemctl calls without unit files") };
-        remove_autostart_units(&unit_dir, &mut panicking);
+        let mut panicking = |_: &setup::CmdSpec| -> bool { panic!("no systemctl calls without unit files") };
+        remove_autostart_units(&unit_dir, &systemctl, &mut panicking);
+    }
+
+    #[test]
+    fn autostart_systemctl_targets_the_invoking_user_under_sudo() {
+        // A user-run uninstall drives its own manager directly.
+        assert_eq!(
+            autostart_systemctl(1000, Some("alice")),
+            setup::Systemctl { user: None }
+        );
+        // Root without an invoking user: nothing to wrap for.
+        assert_eq!(autostart_systemctl(0, None), setup::Systemctl { user: None });
+        assert_eq!(
+            autostart_systemctl(0, Some("root")),
+            setup::Systemctl { user: None }
+        );
+        // Root via sudo: runuser-wrapped for SUDO_USER's manager. Needs a real
+        // non-root user for the passwd lookup — our own, as in target_home's
+        // test; when the suite itself runs as root there is none to use.
+        let name = unsafe {
+            let pw = libc::getpwuid(libc::geteuid());
+            assert!(!pw.is_null(), "current uid must have a passwd entry");
+            std::ffi::CStr::from_ptr((*pw).pw_name)
+                .to_string_lossy()
+                .into_owned()
+        };
+        if name == "root" {
+            return;
+        }
+        let (_home, uid, _gid) = setup::passwd_entry(&name).unwrap();
+        assert_eq!(
+            autostart_systemctl(0, Some(&name)),
+            setup::Systemctl {
+                user: Some(setup::UserCtx { name, uid })
+            }
+        );
+    }
+
+    #[test]
+    fn group_hint_subject_is_the_invoking_user() {
+        // A plain user run hints at that user.
+        assert_eq!(
+            hint_subject(1000, None, Some("alice")).as_deref(),
+            Some("alice")
+        );
+        // Under sudo the subject is SUDO_USER, never root: the hint must not
+        // become `gpasswd -d root input`.
+        assert_eq!(
+            hint_subject(0, Some("alice"), Some("root")).as_deref(),
+            Some("alice")
+        );
+        // A bare root shell has no invoking user to name: no hint.
+        assert_eq!(hint_subject(0, None, None), None);
+        assert_eq!(hint_subject(0, Some("root"), Some("root")), None);
+        assert_eq!(hint_subject(0, Some(""), None), None);
+    }
+
+    #[test]
+    fn lock_pid_parsing() {
+        assert_eq!(pid_from_lock("pid 417077\n"), Some(417077));
+        assert_eq!(pid_from_lock("pid 417077"), Some(417077));
+        assert_eq!(pid_from_lock(""), None);
+        assert_eq!(pid_from_lock("garbage"), None);
+        assert_eq!(pid_from_lock("pid not-a-number"), None);
+    }
+
+    #[test]
+    fn stop_instance_at_without_a_live_monux_stops_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        // No lock file at all.
+        assert!(!stop_instance_at(&tmp.path().join("absent.lock"), "server", uid).unwrap());
+        // A lock file without a pid.
+        let empty = tmp.path().join("empty.lock");
+        write_file(&empty, b"");
+        assert!(!stop_instance_at(&empty, "server", uid).unwrap());
+        // A pid that isn't a monux process (ourselves — the test binary's exe
+        // name isn't "monux") must NOT be signaled; this test still running
+        // afterwards is the assertion.
+        let ours = tmp.path().join("ours.lock");
+        write_file(&ours, format!("pid {}\n", std::process::id()).as_bytes());
+        assert!(!stop_instance_at(&ours, "server", uid).unwrap());
+        // A nonexistent pid.
+        let stale = tmp.path().join("stale.lock");
+        write_file(&stale, b"pid 4194304\n");
+        assert!(!stop_instance_at(&stale, "server", uid).unwrap());
     }
 
     #[test]

@@ -104,6 +104,7 @@ fn verify_release_signature(src_dir: &Path, sha: &str) -> Signature {
 /// signer — can be exercised with a throwaway key in a test. The shipped key
 /// is a const; the mechanism is not.
 fn verify_against_key(src_dir: &Path, sha: &str, trusted_key: &str) -> Signature {
+    use std::os::unix::fs::OpenOptionsExt;
     if trusted_key.trim().is_empty() {
         return Signature::Unconfigured;
     }
@@ -114,7 +115,19 @@ fn verify_against_key(src_dir: &Path, sha: &str, trusted_key: &str) -> Signature
         .unwrap_or_else(|| Path::new("."))
         .join("monux-allowed-signers");
     let entry = format!("{} {}\n", RELEASE_SIGNING_PRINCIPAL, trusted_key.trim());
-    if let Err(e) = std::fs::write(&allowed, entry) {
+    // O_NOFOLLOW: this write can run as root into a directory the invoking
+    // user controls (their cache dir under `sudo -E`), where a planted
+    // symlink would clobber an arbitrary file. A symlink at the path fails
+    // the open instead, reported as a rejection below.
+    let staged = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&allowed)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, entry.as_bytes()));
+    if let Err(e) = staged {
         return Signature::Rejected {
             reason: format!("could not stage the release signing key at {}: {}", allowed.display(), e),
         };
@@ -137,7 +150,7 @@ fn verify_against_key(src_dir: &Path, sha: &str, trusted_key: &str) -> Signature
         };
     }
     for tag in &tags {
-        let out = Command::new("git")
+        let out = base_git_command()
             .arg("-C")
             .arg(src_dir)
             .arg("-c")
@@ -210,7 +223,18 @@ fn newest_release_tag(listing: &str) -> Option<(String, String)> {
         // The peeled commit is authoritative when the tag has one.
         let sha = peeled.get(name).unwrap_or(sha);
         let candidate = (version, name.clone(), sha.clone());
-        if best.as_ref().is_none_or(|(best, _, _)| version > *best) {
+        // Two tag names can parse to the same version ("13.0.1" and
+        // "v13.0.1"); break the tie deterministically — the v-prefixed name
+        // wins, then the lexicographically greater one — rather than leaving
+        // it to HashMap iteration order.
+        let better = match &best {
+            None => true,
+            Some((best_version, best_name, _)) => {
+                (version, name.starts_with('v'), name)
+                    > (*best_version, best_name.starts_with('v'), best_name)
+            }
+        };
+        if better {
             best = Some(candidate);
         }
     }
@@ -231,7 +255,7 @@ pub fn latest_remote_sha(repo: &str) -> Result<String> {
     if signing_configured() {
         return latest_remote_release(repo).map(|(_, sha)| sha);
     }
-    let out = git_network_command()
+    let out = base_git_command()
         .args(["ls-remote", repo, "HEAD"])
         .output()
         .context("Failed to run git: is it installed?")?;
@@ -249,7 +273,7 @@ pub fn latest_remote_sha(repo: &str) -> Result<String> {
 
 /// The newest release tag published by the repo, as (tag, commit).
 fn latest_remote_release(repo: &str) -> Result<(String, String)> {
-    let out = git_network_command()
+    let out = base_git_command()
         .args(["ls-remote", "--tags", repo])
         .output()
         .context("Failed to run git: is it installed?")?;
@@ -267,11 +291,24 @@ fn latest_remote_release(repo: &str) -> Result<(String, String)> {
 
 /// The newest release tag in the local checkout, as (tag, commit).
 fn newest_local_release(src_dir: &Path) -> Result<(String, String)> {
+    let out = base_git_command()
+        .arg("-C")
+        .arg(src_dir)
+        .args(["show-ref", "--tags", "-d"])
+        .output()
+        .context("Failed to run git: is it installed?")?;
     // show-ref exits 1 with no output when there are no tags at all, which is
-    // "nothing to install", not a failure to report.
-    let listing = git_output(src_dir, &["show-ref", "--tags", "-d"]).unwrap_or_default();
-    newest_release_tag(&listing)
-        .context("the source checkout carries no release tag to install")
+    // "nothing to install", not a failure to report. Any other failure (a
+    // broken repo, a missing git) must surface, not read as "no release tag".
+    if !out.status.success() && !(out.status.code() == Some(1) && out.stdout.is_empty()) {
+        bail!(
+            "git show-ref --tags failed in {}: {}",
+            src_dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let listing = String::from_utf8(out.stdout)?;
+    newest_release_tag(&listing).context("the source checkout carries no release tag to install")
 }
 
 /// Whether the remote HEAD sha means there's an update for a build with the
@@ -306,7 +343,7 @@ fn is_rewound_remote(src_dir: &Path, current_base: &str) -> bool {
 /// when git could decide, None when it can't (the commit isn't in the
 /// checkout, e.g. beyond the shallow clone's boundary).
 fn is_ancestor_of_head(src_dir: &Path, base: &str) -> Option<bool> {
-    let out = Command::new("git")
+    let out = base_git_command()
         .arg("-C")
         .arg(src_dir)
         .args(["merge-base", "--is-ancestor", base, "HEAD"])
@@ -381,7 +418,25 @@ pub fn run(
     // instead of colliding with the first on git locks.
     let _update_lock = acquire_update_lock(&src_dir)?;
 
-    if src_dir.join(".git").exists() {
+    // Running as root (the documented `sudo -E` setup keeps the invoking
+    // user's HOME), the checkout is user-writable and git would honor its
+    // repo-local config — core.sshCommand, url.insteadOf, gpg.ssh.program,
+    // tar.<format>.command, and whatever else turns up next: an unbounded
+    // list no set of -c overrides can close. So root never runs git against
+    // the checkout at all; every git operation below runs against a fresh
+    // root-owned bare mirror of it (see root_git_mirror), whose config git
+    // itself wrote as root. Objects are content-addressed and the release
+    // gate verifies a signed tag, so mirroring the user's bytes imports no
+    // trust. The mirror replaces the fetch/pull below: it is synced from the
+    // real remote as it is built.
+    let mirror = if unsafe { libc::geteuid() } == 0 {
+        Some(root_git_mirror(&src_dir, &repo, to.is_some())?)
+    } else {
+        None
+    };
+    let git_dir: &Path = mirror.as_ref().map_or(&src_dir, RootMirror::path);
+
+    if mirror.is_none() && src_dir.join(".git").exists() {
         if to.is_some() {
             // Resolving a version scans Cargo.toml history, so fetch first
             // (the newest commits must resolve too) and deepen the initial
@@ -429,7 +484,7 @@ pub fn run(
                 })?;
             }
         }
-    } else {
+    } else if mirror.is_none() {
         info!("Cloning {} into {}...", repo, src_dir.display());
         if let Some(parent) = src_dir.parent() {
             std::fs::create_dir_all(parent)
@@ -441,7 +496,7 @@ pub fn run(
         if to.is_none() {
             args.extend(["--depth", "1"]);
         }
-        let status = git_network_command()
+        let status = base_git_command()
             .args(args)
             .arg(&repo)
             .arg(&src_dir)
@@ -470,8 +525,8 @@ pub fn run(
     // (sha, short sha, human label for logs, whether it needs a checkout)
     let (target_sha, latest, target_label, needs_checkout) = match to {
         Some(target) => {
-            let sha = resolve_target(&src_dir, target)?;
-            let short = git_output(&src_dir, &["rev-parse", "--short=12", &sha])?;
+            let sha = resolve_target(git_dir, target)?;
+            let short = git_output(git_dir, &["rev-parse", "--short=12", &sha])?;
             (sha, short, target.to_string(), true)
         }
         None if signing_configured() => {
@@ -481,23 +536,23 @@ pub fn run(
             // after a full checkout. This is also what the daily check
             // reported (latest_remote_sha), so the two agree on what "an
             // update is available" means.
-            let (tag, sha) = newest_local_release(&src_dir)?;
-            let short = git_output(&src_dir, &["rev-parse", "--short=12", &sha])?;
+            let (tag, sha) = newest_local_release(git_dir)?;
+            let short = git_output(git_dir, &["rev-parse", "--short=12", &sha])?;
             (sha, short, tag, true)
         }
         None => {
-            let sha = git_output(&src_dir, &["rev-parse", "HEAD"])?;
-            let short = git_output(&src_dir, &["rev-parse", "--short=12", "HEAD"])?;
+            let sha = git_output(git_dir, &["rev-parse", "HEAD"])?;
+            let short = git_output(git_dir, &["rev-parse", "--short=12", "HEAD"])?;
             (sha, short, "HEAD".to_string(), false)
         }
     };
 
     // The target's declared version and protocol, both read from git objects.
-    let manifest = git_output(&src_dir, &["show", &format!("{}:Cargo.toml", target_sha)])?;
+    let manifest = git_output(git_dir, &["show", &format!("{}:Cargo.toml", target_sha)])?;
     let target_crate_version = cargo_toml_version(&manifest)
         .with_context(|| format!("No package version in Cargo.toml at {}", target_label))?;
     let shared = git_output(
-        &src_dir,
+        git_dir,
         &["show", &format!("{}:src/msgs/shared.rs", target_sha)],
     )?;
     let target_protocol = protocol_version_in(&shared)
@@ -556,7 +611,7 @@ pub fn run(
             }
         } else if current_base != "unknown"
             && !current_base.is_empty()
-            && is_rewound_remote(&src_dir, current_base)
+            && is_rewound_remote(git_dir, current_base)
         {
             // No signing key, so the target is the branch head and there are
             // no version tags to compare: fall back to ancestry, which does
@@ -593,7 +648,7 @@ pub fn run(
     // gate, never about running code we can't attribute. It reads tag objects
     // (git tag --points-at / verify-tag), so it needs no working tree — which
     // is what lets it run before the checkout rather than after it.
-    match check_release_signature(&src_dir, &target_sha, trust) {
+    match check_release_signature(git_dir, &target_sha, trust) {
         SignatureGate::Proceed => {}
         SignatureGate::Refuse(reason) => {
             info!("{}", reason);
@@ -601,10 +656,12 @@ pub fn run(
         }
     }
 
-    // Every gate passed: now move the checkout onto the target.
-    if needs_checkout {
+    // Every gate passed: now move the checkout onto the target. The root
+    // mirror is bare and never gets a working tree — the build reads the
+    // commit's objects (export_verified_tree), not a checkout.
+    if needs_checkout && mirror.is_none() {
         info!("Checking out v{} ({})...", target_crate_version, latest);
-        git(&src_dir, &["checkout", &target_sha])?;
+        git(git_dir, &["checkout", &target_sha])?;
     }
     // A '--to' install pins auto-update at the version it just placed.
     let pinned: Option<(String, u64)> = to.map(|_| (target_crate_version.clone(), target_protocol));
@@ -623,45 +680,21 @@ pub fn run(
 
     let root = install_root();
     let cargo = find_cargo()?;
-    // Clean staging leftovers from previously killed installs. Skip dirs whose
-    // pid suffix is a live process: a concurrent updater is building there.
-    let our_pid = std::process::id() as i32;
-    if let Ok(entries) = std::fs::read_dir(&root) {
-        for entry in entries.flatten() {
-            if let Some(pid_str) = entry
-                .file_name()
-                .to_string_lossy()
-                .strip_prefix(".monux-install-staging-")
-            {
-                if let Ok(pid) = pid_str.parse::<i32>() {
-                    if pid != our_pid && std::path::Path::new(&format!("/proc/{}", pid)).exists() {
-                        continue;
-                    }
-                }
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
-            if let Some(pid_str) = entry
-                .file_name()
-                .to_string_lossy()
-                .strip_prefix(".monux-verified-src-")
-            {
-                if let Ok(pid) = pid_str.trim_end_matches(".tar").parse::<i32>() {
-                    if pid != our_pid && std::path::Path::new(&format!("/proc/{}", pid)).exists() {
-                        continue;
-                    }
-                }
-                let path = entry.path();
-                let _ = std::fs::remove_dir_all(&path);
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-    }
-    // Build from the verified objects rather than from the working tree the
-    // checkout above left in the invoking user's home (see
-    // export_verified_tree). build.rs reads the revision out of .git, which an
-    // exported tree has none of, so it is passed in explicitly.
-    let build_dir = root.join(format!(".monux-verified-src-{}", std::process::id()));
-    export_verified_tree(&src_dir, &target_sha, &build_dir)?;
+    // Where the verified source is exported and built: the install root for a
+    // normal user install, a root-owned dir when running as root with a
+    // user-writable install root (see build_scratch_root).
+    let scratch = build_scratch_root()?;
+    // Clean leftovers from previously killed installs. Skip entries whose pid
+    // suffix is a live process: a concurrent updater is using them.
+    clean_stale_leftovers(&root, ".monux-install-staging-");
+    clean_stale_leftovers(&scratch, ".monux-verified-src-");
+    clean_stale_leftovers(&scratch, ".monux-git-mirror-");
+    // Build from the verified objects rather than from a working tree in the
+    // invoking user's home (see export_verified_tree). build.rs reads the
+    // revision out of .git, which an exported tree has none of, so it is
+    // passed in explicitly.
+    let build_dir = scratch.join(format!(".monux-verified-src-{}", std::process::id()));
+    export_verified_tree(git_dir, &target_sha, &build_dir)?;
     let build_sha = target_sha
         .get(..12)
         .unwrap_or(target_sha.as_str())
@@ -699,10 +732,12 @@ pub fn run(
         .env("MONUX_BUILD_SHA", &build_sha);
     // A root build must not read the invoking user's ~/.cargo: its
     // config.toml sets rustc-wrapper and per-target linker, which is arbitrary
-    // code execution as root with no race required. Costs a fresh registry
-    // download per root update; correctness wins.
+    // code execution as root with no race required. For the same reason the
+    // isolated CARGO_HOME lives in the root-owned scratch dir, never in a
+    // user-writable install root (see build_scratch_root). Costs a fresh
+    // registry download per root update; correctness wins.
     if unsafe { libc::geteuid() } == 0 {
-        cmd.env("CARGO_HOME", root.join(".monux-cargo-home"));
+        cmd.env("CARGO_HOME", scratch.join(".monux-cargo-home"));
     }
     let status = cmd.status().context("Failed to run cargo install")?;
     if !status.success() {
@@ -844,9 +879,22 @@ fn acquire_update_lock(src_dir: &Path) -> Result<UpdateLock> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
+    // The lock file sits in the invoking user's cache dir, which that user
+    // controls while the updater may be running as root (`sudo -E`): a
+    // planted symlink would be created/followed and chmodded 0666 below, an
+    // arbitrary chmod as root. Refuse it up front; O_NOFOLLOW on the open
+    // covers the swap-after-check race (same idiom as single_instance.rs).
+    if std::fs::symlink_metadata(&path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        bail!(
+            "Refusing to use the update lock {}: it is a symlink",
+            path.display()
+        );
+    }
     // 0666 like the single-instance locks: a root-run daemon and the user's
-    // own updater must share the file; flock itself is the authority. chmod
-    // too since umask may restrict the create mode.
+    // own updater must share the file; flock itself is the authority.
     let file = std::fs::OpenOptions::new()
         .create(true)
         // Explicitly NOT truncating: nothing ever reads this file's contents
@@ -856,9 +904,13 @@ fn acquire_update_lock(src_dir: &Path) -> Result<UpdateLock> {
         .truncate(false)
         .write(true)
         .mode(0o666)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
         .with_context(|| format!("Failed to open the update lock {}", path.display()))?;
-    let _ = std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o666));
+    // chmod too since umask may restrict the create mode — via the open
+    // descriptor (File::set_permissions is fchmod), so the mode lands on the
+    // file we actually locked, never on a path swapped in afterwards.
+    let _ = file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666));
     let fd = file.as_raw_fd();
     if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         info!("Waiting for another monux update to finish...");
@@ -1117,7 +1169,7 @@ fn server_protocol_constraint_fresh(config_dir: &Path, max_age: Duration) -> Opt
 /// Called at server startup when no client runs on this machine: on a pure
 /// server the record is stale history that cannot heal by itself — nothing
 /// ever rewrites it — and it vetoes manual updates while the daemon happens
-/// to be down (mDNS finds no live server to refresh it then).
+/// to be down (mDNS finds no live server to raise the gate then).
 pub fn clear_protocol_constraint(config_dir: &Path) {
     let path = config_dir.join(SERVER_PROTOCOL_VERSION_FILE);
     match std::fs::remove_file(&path) {
@@ -1130,21 +1182,22 @@ pub fn clear_protocol_constraint(config_dir: &Path) {
 }
 
 /// The server protocol version to gate an update on: the minimum of the
-/// versions Monux servers currently advertise via mDNS (also recorded, healing
-/// a stale gate file), falling back to the version this client recorded at its
-/// last handshake when no server answers (offline, another subnet, or a build
-/// predating the advertisement). Since protocol v16 the gate accepts any
-/// negotiation-era pair (see pair_works), so this value is the pair's floor,
-/// not a demanded exact match. Never fails: discovery is best-effort. Blocks
-/// for up to the mDNS discovery timeout: call it from a blocking context.
+/// versions Monux servers currently advertise via mDNS, falling back to the
+/// version this client recorded at its last handshake when no server answers
+/// (offline, another subnet, or a build predating the advertisement). Since
+/// protocol v16 the gate accepts any negotiation-era pair (see pair_works), so
+/// this value is the pair's floor, not a demanded exact match. Never fails:
+/// discovery is best-effort. Blocks for up to the mDNS discovery timeout:
+/// call it from a blocking context.
 /// The update gate after a discovery: an mDNS observation may RAISE it, never
 /// lower it below what a real, authenticated handshake recorded.
 ///
-/// Discovery is attributed by fingerprint now, so a stranger's advertisement
-/// is already ignored. This is the second line: the path both gates AND
-/// persists, so any value that did get through would outlive the advertisement
-/// that planted it and go on silently skipping every update — including the
-/// one that would fix whatever let it through.
+/// Discovery's fingerprint filter is not authentication — the fingerprint is
+/// broadcast publicly in the same TXT record — so this floor is the second
+/// line of defense, alongside the negotiation-floor clamp in
+/// discovery::protocol_version_constraint and the fact that a discovered value
+/// is never persisted (refresh_protocol_constraint): nothing the LAN says can
+/// pin the machine or outlive the advertisement that planted it.
 fn gate_floor(recorded: Option<u64>, discovered: u64) -> u64 {
     match recorded {
         Some(recorded) if discovered < recorded => recorded,
@@ -1199,10 +1252,11 @@ pub fn refresh_protocol_constraint(config_dir: Option<&Path>) -> Option<u64> {
             constraint
         );
     }
-    if let Some(dir) = config_dir {
-        let _ = std::fs::create_dir_all(dir);
-        record_server_protocol_version(dir, constraint);
-    }
+    // The discovered constraint gates THIS run only and is deliberately not
+    // persisted: mDNS is unauthenticated (the fingerprint filter is not
+    // authentication — the fingerprint is broadcast publicly), so a planted
+    // value must not outlive its advertisement. The gate file is written by
+    // real, authenticated handshakes (client.rs record_server_protocol_version).
     Some(constraint)
 }
 
@@ -1321,6 +1375,144 @@ fn ensure_root_owned_when_root(path: &Path, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// The directory update work happens in: the verified-source export, the
+/// isolated CARGO_HOME, and the root git mirror.
+///
+/// For an ordinary user install this is the install root itself. Running as
+/// root it must NOT be a user-writable install root: the documented
+/// `sudo -E` setup keeps the invoking user's HOME, so install_root()
+/// resolves through it, and building as root from a directory that user can
+/// write — or reading a CARGO_HOME from one — hands them code execution as
+/// root between the signature check and the build. Root then falls back to
+/// /var/cache/monux (created 0700, root-owned; it is all re-downloadable
+/// cache, so /var/cache rather than /var/lib), mirroring the policy of
+/// ensure_root_owned_when_root rather than trusting the user's tree.
+fn build_scratch_root() -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(install_root());
+    }
+    let root = install_root();
+    if std::fs::metadata(&root).map(|m| m.uid() == 0).unwrap_or(false) {
+        return Ok(root);
+    }
+    let dir = PathBuf::from("/var/cache/monux");
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("could not create {}", dir.display()))?;
+    }
+    // Only root can create entries in /var/cache, so this can only fail if
+    // something is genuinely wrong — but check rather than assume.
+    ensure_root_owned_when_root(&dir, "the update scratch dir")?;
+    Ok(dir)
+}
+
+/// A root-owned temporary bare repo (see root_git_mirror) that removes
+/// itself when dropped, so every exit from run() — a refused gate, a failed
+/// build, an early return — cleans it up instead of leaving one copy of the
+/// repo behind per attempt. clean_stale_leftovers covers the kill -9 case.
+struct RootMirror(PathBuf);
+
+impl RootMirror {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for RootMirror {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A fresh root-owned bare mirror of the source checkout, synced from the
+/// real remote: the repository every git operation runs against when running
+/// as root (see run).
+///
+/// The checkout is user-writable (the invoking user's HOME survives
+/// `sudo -E`), so git running there as root would honor its repo-local
+/// config — core.sshCommand, url.insteadOf, gpg.ssh.program,
+/// tar.<format>.command, an unbounded list no set of -c overrides can
+/// enumerate. The mirror closes the whole class instead of the keys: its
+/// config is written by git running as root, and the scrubbed command
+/// environment (base_git_command) keeps the user's global config and
+/// GIT_* environment out. The local clone is given a plain path (never
+/// file://) so it copies the object store directly instead of running
+/// git-upload-pack inside the user-owned repo as root; objects are
+/// content-addressed and the release gate verifies a signed tag, so the
+/// copied bytes import no trust.
+///
+/// `full_history` deepens a shallow mirror for a '--to' install, which
+/// resolves versions from Cargo.toml history. The mirror is rebuilt per run
+/// (see RootMirror for its lifetime).
+fn root_git_mirror(src_dir: &Path, repo: &str, full_history: bool) -> Result<RootMirror> {
+    let mirror = build_scratch_root()?.join(format!(".monux-git-mirror-{}", std::process::id()));
+    // A stale leftover from a killed run whose pid got recycled.
+    let _ = std::fs::remove_dir_all(&mirror);
+    if src_dir.join(".git").exists() {
+        let status = base_git_command()
+            .args(["clone", "--bare"])
+            .arg(src_dir)
+            .arg(&mirror)
+            .status()
+            .context("Failed to run git: is it installed?")?;
+        if !status.success() {
+            bail!("could not mirror the source checkout {}", src_dir.display());
+        }
+        if full_history
+            && git_output(&mirror, &["rev-parse", "--is-shallow-repository"])? == "true"
+        {
+            git(&mirror, &["fetch", repo, "--unshallow"])?;
+        }
+        // Sync from the real remote, forced: an upstream force-push must
+        // update the mirror rather than strand it (the user's checkout has
+        // resync_to_remote for the same situation). The mirror's remote is
+        // the local path it was cloned from, so the URL is passed explicitly.
+        git(&mirror, &["fetch", repo, "--tags", "+refs/heads/*:refs/heads/*"])?;
+    } else {
+        // No local checkout to mirror: clone from the remote outright.
+        info!("Cloning {}...", repo);
+        let status = base_git_command()
+            .args(["clone", "--bare"])
+            .arg(repo)
+            .arg(&mirror)
+            .status()
+            .context("Failed to run git: is it installed?")?;
+        if !status.success() {
+            bail!("git clone {} failed", repo);
+        }
+    }
+    Ok(RootMirror(mirror))
+}
+
+/// Removes `.monux-<prefix><pid>` leftovers of killed installs from `dir`,
+/// skipping entries whose pid suffix is a live process: a concurrent updater
+/// is using those. The optional ".tar" suffix marks the export's intermediate
+/// tarball (see export_verified_tree).
+fn clean_stale_leftovers(dir: &Path, prefix: &str) {
+    let our_pid = std::process::id() as i32;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(pid_str) = name.strip_prefix(prefix) else {
+                continue;
+            };
+            if let Ok(pid) = pid_str.trim_end_matches(".tar").parse::<i32>() {
+                if pid != our_pid && std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+                    continue;
+                }
+            }
+            let path = entry.path();
+            let _ = std::fs::remove_dir_all(&path);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// Extracts the verified commit's tree into `dest`, straight from git's object
 /// database.
 ///
@@ -1331,8 +1523,8 @@ fn ensure_root_owned_when_root(path: &Path, what: &str) -> Result<()> {
 /// anything could swap `build.rs` or a source file and have it compiled and
 /// run as root. Git objects are content-addressed, so an archive of the
 /// verified sha is exactly the bytes that were signed; extracting them into a
-/// directory under the install root (which is root-owned wherever root
-/// installs) closes the window.
+/// directory under the build scratch root (root-owned whenever the builder
+/// is root — see build_scratch_root) closes the window.
 fn export_verified_tree(src_dir: &Path, sha: &str, dest: &Path) -> Result<()> {
     let _ = std::fs::remove_dir_all(dest);
     std::fs::create_dir_all(dest)
@@ -1341,7 +1533,7 @@ fn export_verified_tree(src_dir: &Path, sha: &str, dest: &Path) -> Result<()> {
         "{}.tar",
         dest.file_name().and_then(|n| n.to_str()).unwrap_or("src")
     ));
-    let status = Command::new("git")
+    let status = base_git_command()
         .arg("-C")
         .arg(src_dir)
         .args(["archive", "--format=tar", "--output"])
@@ -1368,7 +1560,7 @@ fn export_verified_tree(src_dir: &Path, sha: &str, dest: &Path) -> Result<()> {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<()> {
-    let status = git_network_command()
+    let status = base_git_command()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -1380,19 +1572,44 @@ fn git(dir: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// A git command for network operations (ls-remote/clone/pull), bounded so a
-/// dead route or hung connection fails in ~30s instead of blocking for
-/// minutes: git aborts when the transfer rate stays below
-/// GIT_HTTP_LOW_SPEED_LIMIT bytes/sec for GIT_HTTP_LOW_SPEED_TIME seconds.
-fn git_network_command() -> Command {
-    let mut cmd = Command::new("git");
+/// The command every updater git invocation starts from.
+///
+/// Network operations are bounded so a dead route or hung connection fails in
+/// ~30s instead of blocking for minutes: git aborts when the transfer rate
+/// stays below GIT_HTTP_LOW_SPEED_LIMIT bytes/sec for
+/// GIT_HTTP_LOW_SPEED_TIME seconds.
+///
+/// When running as root the environment is scrubbed: the documented `sudo -E`
+/// setup forwards the invoking user's whole environment, and git turns
+/// several variables (GIT_CONFIG_PARAMETERS, GIT_CONFIG_COUNT/KEY/VALUE,
+/// GIT_SSH_COMMAND, ...) into configuration — arbitrary commands as root when
+/// that configuration says so. System and global config are disabled and HOME
+/// points at the root-owned scratch dir, so the user's ~/.gitconfig is not
+/// read either. Repo-local config is handled separately: as root, git only
+/// ever runs against the root-owned mirror (see root_git_mirror).
+fn base_git_command() -> Command {
+    let mut cmd = match resolve_on_path("git") {
+        Some(git) if unsafe { libc::geteuid() } == 0 => Command::new(git),
+        _ => Command::new("git"),
+    };
+    if unsafe { libc::geteuid() } == 0 {
+        cmd.env_clear();
+        if let Some(path) = std::env::var_os("PATH") {
+            cmd.env("PATH", path);
+        }
+        if let Ok(scratch) = build_scratch_root() {
+            cmd.env("HOME", scratch);
+        }
+        cmd.env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    }
     cmd.env("GIT_HTTP_LOW_SPEED_LIMIT", "1000")
         .env("GIT_HTTP_LOW_SPEED_TIME", "30");
     cmd
 }
 
 fn git_output(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
+    let out = base_git_command()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -1716,6 +1933,29 @@ cccccccccccccccccccccccccccccccccccccccc\trefs/tags/v13.2.0
         assert_eq!(tag, "v13.2.0");
     }
 
+    /// Two tag names can parse to the same version ("13.0.1" and "v13.0.1").
+    /// The winner must not depend on HashMap iteration order: the v-prefixed
+    /// name wins, whichever order the listing presents them in.
+    #[test]
+    fn equal_version_tags_break_the_tie_deterministically() {
+        let bare = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/13.0.1\n";
+        let prefixed = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/v13.0.1\n";
+        for listing in [
+            format!("{}{}", bare, prefixed),
+            format!("{}{}", prefixed, bare),
+        ] {
+            assert_eq!(
+                newest_release_tag(&listing),
+                Some((
+                    "v13.0.1".to_string(),
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()
+                )),
+                "listing order must not decide the winner: {:?}",
+                listing
+            );
+        }
+    }
+
     #[test]
     fn non_version_tags_and_empty_listings_are_ignored() {
         // A personal marker is not a release; monux releases are versions.
@@ -1776,6 +2016,16 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/before-the-rewrite
         // a full checkout.
         let err = newest_local_release(&repo).unwrap_err().to_string();
         assert!(err.contains("no release tag"), "{}", err);
+    }
+
+    /// A REAL git failure (here: not a repo at all) is an error, distinct
+    /// from the no-tags case — swallowing it as "no release tag" used to
+    /// misreport a broken checkout as merely having nothing to install.
+    #[test]
+    fn a_broken_checkout_is_an_error_not_an_empty_listing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = newest_local_release(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("show-ref"), "{}", err);
     }
 
     #[test]
@@ -1892,9 +2142,55 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/before-the-rewrite
         assert_eq!(mode, 0o666);
     }
 
+    /// A planted symlink at the lock path is refused, never followed: the
+    /// updater can run as root in a directory the invoking user controls, and
+    /// the old follow-then-chmod was an arbitrary chmod as root.
+    #[test]
+    fn a_symlink_at_the_lock_path_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("cache").join("monux").join("src");
+        std::fs::create_dir_all(src_dir.parent().unwrap()).unwrap();
+        let target = tmp.path().join("target");
+        std::fs::write(&target, b"x").unwrap();
+        std::os::unix::fs::symlink(&target, update_lock_path(&src_dir)).unwrap();
+        let err = acquire_update_lock(&src_dir)
+            .err()
+            .expect("a symlink lock path must be refused")
+            .to_string();
+        assert!(err.contains("symlink"), "{}", err);
+    }
+
+    /// Same shape, one door down: the allowed-signers file is staged into a
+    /// directory the invoking user controls, so a symlink there must fail the
+    /// staging (a rejection), not be written through (an arbitrary file
+    /// clobber as root).
+    #[test]
+    fn a_symlink_at_the_allowed_signers_path_is_not_written_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("cache").join("src");
+        std::fs::create_dir_all(&repo).unwrap();
+        let target = tmp.path().join("target");
+        std::fs::write(&target, b"precious").unwrap();
+        std::os::unix::fs::symlink(
+            &target,
+            tmp.path().join("cache").join("monux-allowed-signers"),
+        )
+        .unwrap();
+        let (_key, public) = throwaway_key(tmp.path(), "release");
+        match verify_against_key(&repo, "deadbeefdeadbeef", &public) {
+            Signature::Rejected { reason } => {
+                assert!(reason.contains("could not stage"), "{}", reason)
+            }
+            other => panic!("a planted symlink must reject, not be followed: {:?}", other),
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"precious");
+    }
+
     /// An mDNS observation may raise the update gate but never lower it below
-    /// what an authenticated handshake recorded — the gate is both consulted
-    /// and persisted, so a lowered value outlives whatever planted it.
+    /// what an authenticated handshake recorded. Discovered values also arrive
+    /// pre-clamped to the negotiation floor (discovery::protocol_version_constraint)
+    /// and are never persisted, so a planted advertisement can neither pin the
+    /// gate nor outlive itself.
     #[test]
     fn a_discovery_may_raise_the_update_gate_but_never_lower_it() {
         // Nothing recorded yet: whatever was discovered stands.

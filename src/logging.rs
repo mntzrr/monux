@@ -131,8 +131,13 @@ impl<S: tracing::Subscriber> Layer<S> for RingBufferLayer {
 
 pub fn init_logging() {
     let filter_layer = EnvFilter::try_from_env("LOG_LEVEL")
-        .or_else(|_| EnvFilter::try_new("info"))
-        .expect("Failed to initialize filter layer")
+        .unwrap_or_else(|_| {
+            eprintln!(
+                "Ignoring invalid LOG_LEVEL value {:?}; falling back to 'info'",
+                std::env::var("LOG_LEVEL").unwrap_or_default()
+            );
+            EnvFilter::try_new("info").expect("Failed to initialize filter layer")
+        })
         // quinn_proto: Gets very noisy when LOG_LEVEL=trace
         .add_directive(
             "quinn_proto=info"

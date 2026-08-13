@@ -423,13 +423,14 @@ fn trim_corner_dead_zones(segment: EdgeSegment) -> Option<EdgeSegment> {
 }
 
 /// Minimum spacing between two fires of the same edge: after a completed
-/// dwell fires the switch, enters inside the cooldown are ignored so parking
-/// on (or bouncing against) the edge can't machine-gun switches.
+/// dwell fires the switch, an enter inside the cooldown is deferred to the
+/// cooldown's end (see DwellTimer::enter) so parking on (or bouncing
+/// against) the edge can't machine-gun switches.
 const REARM_COOLDOWN: Duration = Duration::from_secs(1);
 
 /// Edge-resistance state machine for one direction: an enter starts a dwell
 /// timer, a leave before the deadline cancels it, a completed dwell fires
-/// once and the re-arm cooldown blocks immediate refires. Pure over `now`
+/// once and the re-arm cooldown defers the next dwell. Pure over `now`
 /// instants so the state machine is testable without sleeping.
 pub(crate) struct DwellTimer {
     dwell: Duration,
@@ -450,16 +451,19 @@ impl DwellTimer {
         }
     }
 
-    /// The cursor entered the edge. Returns the fire deadline, or None when
-    /// the enter is ignored because the re-arm cooldown is still running.
-    pub fn enter(&mut self, now: Instant) -> Option<Instant> {
-        if let Some(fired) = self.last_fired {
-            if now.duration_since(fired) < self.cooldown {
-                return None;
-            }
-        }
-        self.entered_at = Some(now);
-        Some(now + self.dwell)
+    /// The cursor entered the edge; returns the fire deadline. An enter
+    /// inside the re-arm cooldown is DEFERRED, not dropped — it is armed as
+    /// if the cursor entered when the cooldown ends. Dropping it would
+    /// suppress the edge for as long as the cursor then parks there: the
+    /// debouncer has already committed "on", so no new enter would ever
+    /// reach the timer again.
+    pub fn enter(&mut self, now: Instant) -> Instant {
+        let entered = match self.last_fired {
+            Some(fired) if now.duration_since(fired) < self.cooldown => fired + self.cooldown,
+            _ => now,
+        };
+        self.entered_at = Some(entered);
+        entered + self.dwell
     }
 
     /// The cursor left the edge: cancel any pending dwell.
@@ -764,9 +768,11 @@ fn zone_contains(zone: &EdgeZone, x: i32, y: i32) -> bool {
 
 /// Where along a zone's range the cursor at (x, y) sits, as a fraction
 /// (0.0..=1.0): the y fraction for left/right edges, the x fraction for
-/// top/bottom. Sent with the client's return request (see
-/// ClientEvent::SwitchRequest; reserved for future cursor warping — the
-/// server ignores it for now).
+/// top/bottom. Sent with the client's return request in SwitchRequest's
+/// `y_fraction` field — despite the name it carries this along-edge
+/// fraction, so for top/bottom edges it holds the X fraction (the field
+/// can't be renamed without a protocol break). Reserved for future cursor
+/// warping — the server ignores it for now.
 fn edge_fraction(zone: &EdgeZone, x: i32, y: i32) -> f64 {
     let along = match zone.direction {
         Direction::Left | Direction::Right => y,
@@ -1108,7 +1114,7 @@ async fn run_inner(
                             // re-arm the dwell while the last switch is still
                             // waiting for the cursor to actually leave.
                             if !state.latched {
-                                state.deadline = state.timer.enter(now);
+                                state.deadline = Some(state.timer.enter(now));
                             }
                         }
                         Some(false) => {
@@ -1255,8 +1261,13 @@ async fn run_inner(
                         Fire::Request(request_tx) => {
                             // Where along the edge the cursor crossed, off the
                             // last polled position inside this direction's
-                            // zone (0.5 if it slipped out between polls).
-                            let y_fraction = last_pos
+                            // zone (0.5 if it slipped out between polls). Goes
+                            // out as SwitchRequest's `y_fraction`, which despite
+                            // the name carries the ALONG-edge fraction — the x
+                            // fraction for top/bottom edges (see edge_fraction;
+                            // the wire field can't be renamed without a
+                            // protocol break).
+                            let fraction = last_pos
                                 .and_then(|(x, y)| {
                                     zones
                                         .iter()
@@ -1265,7 +1276,7 @@ async fn run_inner(
                                 })
                                 .unwrap_or(0.5);
                             info!("Edge switch request to server via {} edge", dir.as_str());
-                            if request_tx.send(y_fraction).is_err() {
+                            if request_tx.send(fraction).is_err() {
                                 // The connection (and its receiver) is gone.
                                 debug!("Screen-edge switching: connection gone, edge detection off");
                                 return;
@@ -1777,7 +1788,7 @@ pub(crate) mod tests {
     fn dwell_fires_at_deadline_once() {
         let now = Instant::now();
         let mut timer = DwellTimer::new(Duration::from_millis(250), Duration::from_secs(1));
-        let deadline = timer.enter(now).expect("enter should arm the dwell");
+        let deadline = timer.enter(now);
         assert_eq!(deadline, now + Duration::from_millis(250));
         assert!(!timer.poll(now + Duration::from_millis(249)));
         assert!(timer.poll(now + Duration::from_millis(250)));
@@ -1795,19 +1806,67 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn dwell_cooldown_then_rearm() {
+    fn dwell_cooldown_defers_then_rearms() {
         let now = Instant::now();
         let mut timer = DwellTimer::new(Duration::from_millis(250), Duration::from_secs(1));
         timer.enter(now);
         assert!(timer.poll(now + Duration::from_millis(250)));
-        // Re-entering inside the 1s re-arm cooldown is ignored.
+        // Re-entering inside the 1s re-arm cooldown is deferred, not dropped
+        // (a dropped enter is never retried — see enter): the dwell is armed
+        // from the cooldown's end, so it fires at cooldown + dwell past the
+        // last fire.
         let during = now + Duration::from_millis(500);
-        assert!(timer.enter(during).is_none());
-        assert!(!timer.poll(during + Duration::from_secs(5)));
-        // After the cooldown the edge re-arms and a fresh dwell fires.
-        let after = now + Duration::from_millis(1500);
-        let deadline = timer.enter(after).expect("cooldown over, should re-arm");
+        let deadline = timer.enter(during);
+        assert_eq!(deadline, now + Duration::from_millis(1500));
+        assert!(!timer.poll(now + Duration::from_millis(1499)));
+        assert!(timer.poll(deadline));
+        // After the cooldown an enter re-arms immediately.
+        let after = now + Duration::from_secs(3);
+        let deadline = timer.enter(after);
         assert_eq!(deadline, after + Duration::from_millis(250));
+        assert!(timer.poll(deadline));
+    }
+
+    #[test]
+    fn bounce_then_park_fires_once_the_cooldown_passes() {
+        // The manager-level regression: a fire, a committed leave, and a
+        // re-enter inside the re-arm cooldown, after which the cursor PARKS
+        // on the edge. The debouncer committed "on" at the re-enter, so it
+        // never produces another enter; an enter dropped by the cooldown
+        // used to suppress the edge indefinitely.
+        let dwell = Duration::from_millis(250);
+        let cooldown = Duration::from_secs(1);
+        let start = Instant::now();
+        let mut timer = DwellTimer::new(dwell, cooldown);
+        let mut debounce = EdgeDebounce::new();
+
+        // Enter, dwell, fire (at start + dwell).
+        assert_eq!(debounce.poll(true), None);
+        assert_eq!(debounce.poll(true), Some(true));
+        let deadline = timer.enter(start);
+        let fired_at = deadline;
+        assert!(timer.poll(fired_at));
+
+        // Bounce off and straight back on, still inside the cooldown; the
+        // committed leave is what clears the manager's fire latch.
+        assert_eq!(debounce.poll(false), None);
+        assert_eq!(debounce.poll(false), Some(false));
+        timer.leave();
+        let reentered = fired_at + cooldown / 2;
+        assert_eq!(debounce.poll(true), None);
+        assert_eq!(debounce.poll(true), Some(true));
+        let deadline = timer.enter(reentered);
+
+        // The cursor parks: every later poll reports "on", which the
+        // committed debouncer turns into nothing — no new enter ever
+        // reaches the timer.
+        assert_eq!(debounce.poll(true), None);
+        assert_eq!(debounce.poll(true), None);
+
+        // The deferred dwell still fires, a full dwell past the cooldown's
+        // end — the edge is not suppressed forever.
+        assert_eq!(deadline, fired_at + cooldown + dwell);
+        assert!(!timer.poll(fired_at + cooldown));
         assert!(timer.poll(deadline));
     }
 

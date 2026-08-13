@@ -53,14 +53,8 @@ pub async fn read(
         ))
     } else if buf.len() >= 100 && !UNCOMPRESSIBLE_TYPES.contains(&requested_type) {
         let requested_type = requested_type.to_string();
-        let converted = task::spawn_blocking(move || {
-            read_zstd(buf, max_compressed_size_bytes, &requested_type)
-        })
-        .await??;
-        Ok((
-            converted,
-            Some(MONUX_ZSTD_TARGET_DATATYPE.to_string()),
-        ))
+        task::spawn_blocking(move || read_zstd(buf, max_compressed_size_bytes, &requested_type))
+            .await?
     } else {
         // Don't bother compressing small or incompressible data
         Ok((buf, None))
@@ -141,20 +135,16 @@ pub async fn write(
 ///   cut\n...
 fn read_gnome_file_paths(buf: Vec<u8>, max_compressed_size_bytes: u64) -> Result<Vec<u8>> {
     let buf = String::from_utf8(buf)?;
-    let mut lines: Vec<&str> = buf.split("\n").collect();
+    // lines(), mirroring read_uri_file_paths: a CRLF source would otherwise
+    // leave a \r on every URI (and on the cut/copy line), failing
+    // url::Url::parse and aborting the whole serve. Empty entries (blank
+    // lines) are skipped by build_zip_payload.
+    let mut lines: Vec<&str> = buf.lines().collect();
     // Remove the "cut"/"copy" operation line — but only when it IS one: some
     // sources omit it, and dropping an assumed first line would lose the
     // first URI of an operation-less payload.
     if lines.first().is_some_and(|first| *first == "cut" || *first == "copy") {
         lines.remove(0);
-    }
-    // Strip trailing empty entries from a trailing newline, mirroring
-    // read_uri_file_paths — an empty entry fails url::Url::parse and would
-    // abort the entire serve.
-    if let Some(last) = lines.last() {
-        if last.is_empty() {
-            lines.pop();
-        }
     }
     build_zip_payload(lines, max_compressed_size_bytes)
 }
@@ -194,23 +184,50 @@ fn write_uri_file_paths(paths: Vec<PathBuf>) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Compresses the provided payload using zstd
+/// Compresses the provided payload using zstd. Falls back to the uncompressed
+/// payload (no wrapper datatype) when compression fails against the size cap
+/// or doesn't shrink the data: the caller reuses the RAW payload's size cap
+/// for the compressed output, and incompressible data above the 100-byte
+/// floor gains zstd framing overhead, so a raw payload just under the cap
+/// would compress to over it — and propagating that error would fail (and
+/// negatively cache) a serve whose raw payload was legal.
 fn read_zstd(
-    mut buf: Vec<u8>,
+    buf: Vec<u8>,
     max_compressed_size_bytes: u64,
     requested_type: &str,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Option<String>)> {
     let orig_len = buf.len();
     let mut limited = limited::LimitedCursor::new(max_compressed_size_bytes);
-    zstd::stream::copy_encode(buf.as_slice(), &mut limited, 0)?;
-    buf = limited.into_inner();
+    if let Err(e) = zstd::stream::copy_encode(buf.as_slice(), &mut limited, 0) {
+        // Only a raw payload that itself fits the cap may fall back; an
+        // oversized raw payload is a genuine size error.
+        if buf.len() as u64 <= max_compressed_size_bytes {
+            debug!(
+                "Serving {} uncompressed: compression overshot the size cap: {}",
+                requested_type, e
+            );
+            return Ok((buf, None));
+        }
+        return Err(e.into());
+    }
+    let compressed = limited.into_inner();
+    if compressed.len() >= orig_len {
+        // Incompressible data only gains framing overhead: serve it as-is.
+        debug!(
+            "Serving {} uncompressed: zstd gained nothing ({} => {} bytes)",
+            requested_type,
+            orig_len,
+            compressed.len()
+        );
+        return Ok((buf, None));
+    }
     debug!(
         "Compressed {}: {} => {} bytes",
         requested_type,
         orig_len,
-        buf.len()
+        compressed.len()
     );
-    Ok(buf)
+    Ok((compressed, Some(MONUX_ZSTD_TARGET_DATATYPE.to_string())))
 }
 
 /// Decompresses the provided payload using zstd
@@ -297,7 +314,7 @@ static UNPACK_DIR_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 /// Unzips a zip file to a temporary directory under config_dir and returns the list of files.
 fn unpack_zip_payload(
     zipdata: Vec<u8>,
-    mut max_uncompressed_size_bytes: u64,
+    max_uncompressed_size_bytes: u64,
     config_dir: &Path,
 ) -> Result<Vec<PathBuf>> {
     // Use a unique temp directory per unpack rather than wiping a shared one:
@@ -308,12 +325,6 @@ fn unpack_zip_payload(
         std::process::id(),
         dir_id
     ));
-    debug!("Creating temp directory: {}", clipboard_dir.display());
-    std::fs::create_dir_all(&clipboard_dir)?;
-
-    // Clean up old temp dirs (see sweep_stale_unpack_dirs).
-    sweep_stale_unpack_dirs(config_dir, dir_id);
-
     // Unzip payload into temp directory
     let mut ziparchive = zip::read::ZipArchive::new(std::io::Cursor::new(zipdata))?;
     if ziparchive.len() > MAX_ZIP_ENTRIES {
@@ -323,10 +334,41 @@ fn unpack_zip_payload(
             MAX_ZIP_ENTRIES
         );
     }
+    debug!("Creating temp directory: {}", clipboard_dir.display());
+    std::fs::create_dir_all(&clipboard_dir)?;
+
+    // Clean up old temp dirs (see sweep_stale_unpack_dirs).
+    sweep_stale_unpack_dirs(config_dir, dir_id);
+
+    match unpack_zip_entries(&mut ziparchive, &clipboard_dir, max_uncompressed_size_bytes) {
+        Ok(files) => Ok(files),
+        Err(e) => {
+            // A failed unpack must not strand the temp dir and its partial
+            // files (the sweep would only reclaim them generations later).
+            let _ = std::fs::remove_dir_all(&clipboard_dir);
+            Err(e)
+        }
+    }
+}
+
+/// Extracts every entry of the zip archive into clipboard_dir, enforcing the
+/// cumulative uncompressed size budget across entries.
+fn unpack_zip_entries(
+    ziparchive: &mut zip::read::ZipArchive<std::io::Cursor<Vec<u8>>>,
+    clipboard_dir: &Path,
+    mut max_uncompressed_size_bytes: u64,
+) -> Result<Vec<PathBuf>> {
     let mut files = vec![];
     for i in 0..ziparchive.len() {
         let mut zipfile = ziparchive.by_index(i)?;
-        let mut destpath = clipboard_dir.clone();
+        if zipfile.is_dir() {
+            // Directory entries only carry directory existence; creating one
+            // as a regular file would make a later entry underneath fail
+            // create_dir_all and abort the whole paste.
+            debug!("Skipping directory entry in clipboard zip: {}", zipfile.name());
+            continue;
+        }
+        let mut destpath = clipboard_dir.to_path_buf();
         for component in Path::new(zipfile.name()).components() {
             if let std::path::Component::Normal(n) = component {
                 destpath = destpath.join(n);
@@ -341,7 +383,9 @@ fn unpack_zip_payload(
                 format!("Failed to create temp directory: {}", parent.display())
             })?;
         }
-        let outfile = File::create(&destpath)
+        // create_new: a duplicate entry name must fail the unpack rather than
+        // silently truncate the file an earlier entry already wrote.
+        let outfile = File::create_new(&destpath)
             .with_context(|| format!("Failed to create temp file: {}", destpath.display()))?;
         let mut limited_outfile = limited::LimitedWrite::new(outfile, max_uncompressed_size_bytes);
         std::io::copy(&mut zipfile, &mut limited_outfile)
@@ -357,7 +401,10 @@ fn build_zip_payload(file_uri_strs: Vec<&str>, max_compressed_size_bytes: u64) -
     // Start by collecting all of the filenames, including any needed recursive scanning.
     let mut files_to_zip = vec![];
     for uri_str in file_uri_strs {
-        if uri_str.is_empty() {
+        // RFC 2483 allows '#' comment lines in a text/uri-list; skip them
+        // alongside empty lines rather than failing Url::parse (which would
+        // abort the whole serve).
+        if uri_str.is_empty() || uri_str.starts_with('#') {
             continue;
         }
         if files_to_zip.len() >= MAX_ZIP_ENTRIES {
@@ -423,15 +470,26 @@ fn zip_files(
         let options =
             zip::write::FileOptions::<()>::default().compression_method(zip::CompressionMethod::ZSTD);
         let mut buf = vec![0; 65536];
+        let mut used_names = std::collections::HashSet::new();
         for file_to_zip in files_to_zip {
-            let file_name = match file_to_zip.canonicalize() {
-                Ok(path) => path.to_string_lossy().to_string(),
-                Err(e) => {
-                    // File vanished between listing and zipping: skip it instead of aborting
-                    warn!("Skipping file that can't be read for zipping: {:?}: {}", file_to_zip, e);
+            // Entry names are the bare leaf names: the source machine's
+            // canonicalized absolute path would leak its username and
+            // directory layout to the peer, and recreate the deep tree on
+            // unpack.
+            let file_name = match file_to_zip.file_name() {
+                Some(name) => name.to_string_lossy().to_string(),
+                None => {
+                    warn!("Skipping file with no leaf name: {:?}", file_to_zip);
                     continue;
                 }
             };
+            // Two files from different directories can share a leaf name; the
+            // zip (and the unpack dir) can only hold one of them. Keep the
+            // first rather than letting the second truncate it.
+            if !used_names.insert(file_name.clone()) {
+                warn!("Skipping duplicate file name in clipboard zip: {}", file_name);
+                continue;
+            }
             let mut file = match std::fs::File::open(file_to_zip) {
                 Ok(file) => file,
                 Err(e) => {
@@ -594,9 +652,38 @@ mod tests {
 
     #[tokio::test]
     async fn compressed_payload_over_cap_errors() {
-        // The LimitedCursor must error rather than write past the cap.
+        // The LimitedCursor must error rather than write past the cap, and a
+        // raw payload that doesn't fit the cap itself is a genuine size
+        // error (no uncompressed fallback — see read_zstd).
         let payload = "some text that will be compressed".repeat(20).into_bytes();
         assert!(read(payload, 4, "text/plain").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn incompressible_payload_at_the_cap_falls_back_to_uncompressed() {
+        // Incompressible data above the 100-byte floor gains zstd framing
+        // overhead, so a raw payload that fits the cap can compress to over
+        // it. The serve must fall back to the (legal) raw payload instead of
+        // failing — and being negatively cached for 10s.
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let original: Vec<u8> = (0..1000)
+            .map(|_| {
+                // xorshift64*: deterministic incompressible bytes
+                seed ^= seed >> 12;
+                seed ^= seed << 25;
+                seed ^= seed >> 27;
+                (seed.wrapping_mul(0x2545F4914F6CDD1D) >> 56) as u8
+            })
+            .collect();
+        let (payload, data_type) = read(
+            original.clone(),
+            original.len() as u64,
+            "application/octet-stream",
+        )
+        .await
+        .unwrap();
+        assert_eq!(data_type, None);
+        assert_eq!(payload, original);
     }
 
     #[tokio::test]
@@ -879,6 +966,103 @@ mod tests {
         assert!(
             unpack_zip_payload(zip, GENEROUS_CAP, unpack_root.path()).is_err()
         );
+    }
+
+    #[test]
+    fn gnome_payload_accepts_crlf_endings() {
+        // A CRLF source must parse: splitting on "\n" alone used to leave a
+        // \r on the cut/copy line and every URI, aborting the serve.
+        let src = tempfile::tempdir().unwrap();
+        let a = temp_file(src.path(), "a.txt", b"a");
+        let zip = read_gnome_file_paths(
+            format!("copy\r\n{}\r\n", file_uri(&a)).into_bytes(),
+            GENEROUS_CAP,
+        )
+        .unwrap();
+        let unpack_root = tempfile::tempdir().unwrap();
+        let paths = unpack_zip_payload(zip, GENEROUS_CAP, unpack_root.path()).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"a");
+    }
+
+    #[test]
+    fn uri_list_skips_comment_lines() {
+        // RFC 2483 allows '#' comment lines in a text/uri-list; they must not
+        // abort the serve via a failed Url::parse.
+        let src = tempfile::tempdir().unwrap();
+        let a = temp_file(src.path(), "a.txt", b"a");
+        let zip = read_uri_file_paths(
+            format!("# copied from the file manager\r\n{}\r\n", file_uri(&a)).into_bytes(),
+            GENEROUS_CAP,
+        )
+        .unwrap();
+        let unpack_root = tempfile::tempdir().unwrap();
+        let paths = unpack_zip_payload(zip, GENEROUS_CAP, unpack_root.path()).unwrap();
+        assert_eq!(paths.len(), 1);
+    }
+
+    #[test]
+    fn zip_entries_use_leaf_names_not_source_paths() {
+        // Entry names must not be the source machine's absolute paths (those
+        // leak its username/directory layout to the peer and recreate the
+        // deep tree on unpack).
+        let src = tempfile::tempdir().unwrap();
+        let file = temp_file(src.path(), "deep/nested/secret.txt", b"x");
+        let files = vec![file];
+        let (_len, zipdata) = zip_files(&files, GENEROUS_CAP, GENEROUS_CAP).unwrap();
+        let mut archive = zip::read::ZipArchive::new(std::io::Cursor::new(zipdata)).unwrap();
+        assert_eq!(archive.by_index(0).unwrap().name(), "secret.txt");
+    }
+
+    #[test]
+    fn zip_keeps_only_the_first_of_duplicate_leaf_names() {
+        // Two files from different directories can share a leaf name; the zip
+        // can only hold one of them.
+        let src = tempfile::tempdir().unwrap();
+        let a = temp_file(src.path(), "one/same.txt", b"first");
+        let b = temp_file(src.path(), "two/same.txt", b"second");
+        let files = vec![a, b];
+        let (_len, zipdata) = zip_files(&files, GENEROUS_CAP, GENEROUS_CAP).unwrap();
+        let mut archive = zip::read::ZipArchive::new(std::io::Cursor::new(zipdata)).unwrap();
+        assert_eq!(archive.len(), 1);
+        let mut contents = String::new();
+        std::io::Read::read_to_string(&mut archive.by_index(0).unwrap(), &mut contents).unwrap();
+        assert_eq!(contents, "first");
+    }
+
+    #[test]
+    fn unpack_skips_directory_entries() {
+        // A directory entry must not be File::create'd as a regular file —
+        // a later entry underneath it would fail create_dir_all and abort
+        // the whole paste.
+        let unpack_root = tempfile::tempdir().unwrap();
+        let mut cursor = std::io::Cursor::new(vec![]);
+        {
+            let mut zipwriter = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::FileOptions::<()>::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zipwriter.add_directory("subdir/", options).unwrap();
+            zipwriter.start_file("subdir/file.txt", options).unwrap();
+            zipwriter.write_all(b"content").unwrap();
+            zipwriter.finish().unwrap();
+        }
+        let paths = unpack_zip_payload(cursor.into_inner(), GENEROUS_CAP, unpack_root.path())
+            .unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"content");
+    }
+
+    #[test]
+    fn unpack_rejects_colliding_entry_names_and_cleans_up() {
+        // Two entries whose sanitized paths collide ("../dup.txt" loses its
+        // ParentDir component) must fail the unpack rather than truncate the
+        // file the first entry wrote, and the failed unpack must not strand
+        // its temp dir. (The zip writer refuses exact duplicate names, so
+        // only a collision through sanitization can reach create_new.)
+        let unpack_root = tempfile::tempdir().unwrap();
+        let zip = build_test_zip(&[("../dup.txt", b"first"), ("dup.txt", b"second")]);
+        assert!(unpack_zip_payload(zip, GENEROUS_CAP, unpack_root.path()).is_err());
+        assert_eq!(std::fs::read_dir(unpack_root.path()).unwrap().count(), 0);
     }
 
     #[test]

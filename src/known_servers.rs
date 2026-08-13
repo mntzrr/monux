@@ -186,18 +186,31 @@ fn find_by_hostname<'a>(
 }
 
 /// Finds a remembered server by a certificate fingerprint prefix
-/// (case-insensitive; fingerprints are stored lowercase).
+/// (case-insensitive; fingerprints are stored lowercase). A prefix matching
+/// more than one server is an error, never a silent first match: connecting
+/// to the wrong (trusted) server without a word is worse than asking the user
+/// for more characters.
 fn find_by_fingerprint_prefix<'a>(
     remembered: &'a [RememberedServer],
     prefix: &str,
-) -> Option<&'a RememberedServer> {
+) -> Result<Option<&'a RememberedServer>> {
     if prefix.is_empty() {
-        return None;
+        return Ok(None);
     }
     let prefix = prefix.to_lowercase();
-    remembered
+    let matches: Vec<&RememberedServer> = remembered
         .iter()
-        .find(|s| s.fingerprint.starts_with(&prefix))
+        .filter(|s| s.fingerprint.starts_with(&prefix))
+        .collect();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(matches[0])),
+        n => bail!(
+            "Fingerprint prefix '{}' is ambiguous, matches {} remembered servers",
+            prefix,
+            n
+        ),
+    }
 }
 
 /// Applies an explicitly requested port to a remembered server's address.
@@ -253,8 +266,10 @@ pub fn resolve_host(
     if let Ok(Some(addr)) = &resolved {
         return Ok(*addr);
     }
-    // 4) A remembered server's fingerprint prefix.
-    if let Some(server) = find_by_fingerprint_prefix(remembered, host) {
+    // 4) A remembered server's fingerprint prefix. An ambiguous prefix errors
+    // out here rather than falling through to the generic "didn't resolve"
+    // message below: the user named real servers, just not uniquely.
+    if let Some(server) = find_by_fingerprint_prefix(remembered, host)? {
         let addr = with_requested_port(server.addr, port);
         info!(
             "Resolved '{}' to {} via the remembered servers (fingerprint-prefix match)",
@@ -507,5 +522,25 @@ not-an-addr  aabbccdd  myhost  1000
         })
         .unwrap_err();
         assert!(format!("{:?}", err).contains("dns down"));
+    }
+
+    /// A fingerprint prefix matching several remembered servers must not
+    /// silently connect to the first one: it is an error naming the
+    /// ambiguity, and more characters disambiguate.
+    #[test]
+    fn an_ambiguous_fingerprint_prefix_is_an_error() {
+        let remembered = vec![
+            server("10.1.1.1:1213", "aabbccdd1122", Some("one"), 100),
+            server("10.2.2.2:1213", "aabbccdd3344", Some("two"), 90),
+        ];
+        let err = resolve_host("aabb", 1213, &remembered, |_| Ok(None)).unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("ambiguous"), "{}", msg);
+        assert!(msg.contains("2 remembered servers"), "{}", msg);
+        // More characters pick one uniquely again.
+        assert_eq!(
+            resolve_host("aabbccdd33", 1213, &remembered, |_| Ok(None)).unwrap(),
+            "10.2.2.2:1213".parse().unwrap()
+        );
     }
 }

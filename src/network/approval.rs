@@ -148,6 +148,13 @@ pub struct MonuxCertVerification<'a> {
     /// candidates, so a name learned for the machine reached last time must
     /// never caption the prompt for the machine being approved now.
     server_attempt: Mutex<Option<ServerAttempt>>,
+    /// The remote address of the incoming connection currently being verified
+    /// (server side only), shown in the approval prompt so the user can see
+    /// where an unknown client is connecting from. Recorded per Incoming via
+    /// record_incoming_attempt; simultaneous incomings can overwrite each
+    /// other before the prompt reads the slot, and the address itself is
+    /// unauthenticated transport info — a hint, never proof.
+    incoming_attempt: Mutex<Option<SocketAddr>>,
     /// The server certificate's fingerprint as learned during the client-side
     /// handshake, read after a successful connect for the remembered-servers
     /// store (known_servers.rs). Server side, the client's fingerprint is
@@ -197,6 +204,16 @@ impl<'a> MonuxCertVerification<'a> {
             if let Some(attempt) = slot.as_mut() {
                 attempt.name = sanitized_prompt_name(&name);
             }
+        }
+    }
+
+    /// Records the remote address of the Incoming currently being accepted
+    /// (server side only), so the approval prompt can say where the unknown
+    /// client is connecting from. Called once per accepted Incoming, before
+    /// the handshake resolves the cert verification.
+    pub fn record_incoming_attempt(&self, addr: SocketAddr) {
+        if let Ok(mut slot) = self.incoming_attempt.lock() {
+            *slot = Some(addr);
         }
     }
 
@@ -251,6 +268,7 @@ impl<'a> MonuxCertVerification<'a> {
             })),
             allow_interactive_prompts,
             server_attempt: Mutex::new(None),
+            incoming_attempt: Mutex::new(None),
             peer_fingerprint: Mutex::new(None),
             crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
             rejection_cooldown: Duration::from_secs(REJECTION_COOLDOWN_SECS),
@@ -347,6 +365,7 @@ impl<'a> MonuxCertVerification<'a> {
             cert: their_cert.clone().into_owned(),
             we_are_server,
             server_attempt: self.server_attempt.lock().ok().and_then(|slot| slot.clone()),
+            incoming_attempt: self.incoming_attempt.lock().ok().and_then(|slot| *slot),
             config_dir: self.config_dir.clone(),
             rejection_cooldown: self.rejection_cooldown,
             global_backoff_base: self.global_backoff_base,
@@ -466,8 +485,7 @@ fn record_rejection(
     cooldown: Duration,
     backoff_base: Duration,
 ) {
-    state.rejection_cooldowns.retain(|_, until| *until > now);
-    state.rejection_cooldowns.insert(fingerprint, now + cooldown);
+    record_prompt_failure(state, fingerprint, now, cooldown);
     state.unanswered_prompts = state.unanswered_prompts.saturating_add(1);
     let backoff = global_backoff(state.unanswered_prompts, backoff_base);
     state.prompt_backoff_until = Some(now + backoff);
@@ -480,12 +498,30 @@ fn record_rejection(
     }
 }
 
+/// Records that a prompt could not run at all (no /dev/tty, EMFILE, ...):
+/// the fingerprint still gets the per-fingerprint cooldown so a fast retry
+/// loop can't spin failing prompts, but the global unanswered-prompt backoff
+/// is NOT armed — a broken console is not a user declining, and the backoff
+/// exists to stop attackers, not to punish local faults.
+fn record_prompt_failure(
+    state: &mut ApprovalState,
+    fingerprint: String,
+    now: Instant,
+    cooldown: Duration,
+) {
+    state.rejection_cooldowns.retain(|_, until| *until > now);
+    state.rejection_cooldowns.insert(fingerprint, now + cooldown);
+}
+
 /// Everything the approval prompt thread needs, bundled so the spawn step is
 /// injectable in tests.
 struct PromptJob {
     cert: rustls_pki_types::CertificateDer<'static>,
     we_are_server: bool,
     server_attempt: Option<ServerAttempt>,
+    /// Remote address of the incoming connection (server side only; None on
+    /// the client, where server_attempt carries the dialed address instead).
+    incoming_attempt: Option<SocketAddr>,
     config_dir: PathBuf,
     rejection_cooldown: Duration,
     global_backoff_base: Duration,
@@ -521,35 +557,57 @@ fn prompt_thread_main(job: PromptJob) {
     };
     let their_name = if job.we_are_server { "Client" } else { "Server" };
     let their_cert_fingerprint = certs::fingerprint(&job.cert);
-    if prompt_unknown_cert(&job.cert, job.we_are_server, job.server_attempt.as_ref()) {
-        info!("{} cert approved: {}", their_name, their_cert_fingerprint);
-        if let Err(e) =
-            certs::write_approved_cert(&job.cert, &their_cert_fingerprint, &job.config_dir)
-        {
-            warn!(
-                "{} approved, but couldn't save cert to disk: {}",
-                their_name, e
+    match prompt_unknown_cert(
+        &job.cert,
+        job.we_are_server,
+        job.server_attempt.as_ref(),
+        job.incoming_attempt,
+    ) {
+        PromptOutcome::Approved => {
+            info!("{} cert approved: {}", their_name, their_cert_fingerprint);
+            if let Err(e) =
+                certs::write_approved_cert(&job.cert, &their_cert_fingerprint, &job.config_dir)
+            {
+                warn!(
+                    "{} approved, but couldn't save cert to disk: {}",
+                    their_name, e
+                );
+            }
+            // Store the approved cert locally too, so the peer's retry passes
+            // the known-certs check right away without re-prompting (a restart
+            // would see the disk write above).
+            record_approval(
+                &mut job.approval_state.write().unwrap_or_else(|e| e.into_inner()),
+                job.cert,
             );
         }
-        // Store the approved cert locally too, so the peer's retry passes
-        // the known-certs check right away without re-prompting (a restart
-        // would see the disk write above).
-        record_approval(
-            &mut job.approval_state.write().unwrap_or_else(|e| e.into_inner()),
-            job.cert,
-        );
-    } else {
-        info!(
-            "{} cert not approved: {}",
-            their_name, their_cert_fingerprint
-        );
-        record_rejection(
-            &mut job.approval_state.write().unwrap_or_else(|e| e.into_inner()),
-            their_cert_fingerprint,
-            Instant::now(),
-            job.rejection_cooldown,
-            job.global_backoff_base,
-        );
+        PromptOutcome::Refused => {
+            info!(
+                "{} cert not approved: {}",
+                their_name, their_cert_fingerprint
+            );
+            record_rejection(
+                &mut job.approval_state.write().unwrap_or_else(|e| e.into_inner()),
+                their_cert_fingerprint,
+                Instant::now(),
+                job.rejection_cooldown,
+                job.global_backoff_base,
+            );
+        }
+        // The prompt itself could not run: still reject the handshake, but a
+        // local fault is not an unanswered prompt — no backoff escalation.
+        PromptOutcome::Failed => {
+            info!(
+                "{} cert not approved (approval prompt could not run): {}",
+                their_name, their_cert_fingerprint
+            );
+            record_prompt_failure(
+                &mut job.approval_state.write().unwrap_or_else(|e| e.into_inner()),
+                their_cert_fingerprint,
+                Instant::now(),
+                job.rejection_cooldown,
+            );
+        }
     }
 }
 
@@ -699,23 +757,56 @@ fn sanitized_prompt_name(name: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// The result of asking the user, with the failure mode kept distinct: a
+/// refusal or a timeout is a user signal and feeds the unanswered-prompt
+/// backoff (record_rejection), while a prompt that could not run at all
+/// (no /dev/tty, EMFILE, ...) says nothing about the user and must not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptOutcome {
+    Approved,
+    /// Answered no, or never answered before the timeout.
+    Refused,
+    /// The prompt itself failed to run.
+    Failed,
+}
+
+/// Why prompt_internal produced no answer. The timeout is kept distinct
+/// from a genuine failure: a timeout means the user didn't respond (which
+/// the unanswered-prompt backoff cares about), a failure means the prompt
+/// never ran (which it must not be punished for).
+#[derive(Debug)]
+enum PromptFailure {
+    TimedOut,
+    Error(anyhow::Error),
+}
+
 fn prompt_unknown_cert(
     their_cert: &rustls_pki_types::CertificateDer,
     we_are_server: bool,
     server_attempt: Option<&ServerAttempt>,
-) -> bool {
+    incoming_attempt: Option<SocketAddr>,
+) -> PromptOutcome {
     let their_cert_fingerprint = certs::fingerprint(their_cert);
     if !io::stdin().is_terminal() {
         warn!("Stdin is not a TTY, skipping user certificate approval prompt. Approve this cert by running the {} with '--fingerprints {}'", if we_are_server { "server" } else { "client" }, their_cert_fingerprint);
-        return false;
+        return PromptOutcome::Failed;
     }
 
     let message = if we_are_server {
+        // The transport address is the one fact the server has about the
+        // connecting machine, so it is shown — labelled as unauthenticated.
+        let from_line = match incoming_attempt {
+            Some(addr) => format!(
+                "It connects from: {} (remote transport address — unauthenticated)\n",
+                addr
+            ),
+            None => String::new(),
+        };
         format!(
             "APPROVAL NEEDED: New unknown client connection
 
 The server has received a connection from a new unknown client.
-Only approve this if you are expecting a new client.
+{}Only approve this if you are expecting a new client.
 You will also likely need to confirm this connection on the client as well.
 
 Confirm that the client startup image has this fingerprint:
@@ -723,7 +814,7 @@ Confirm that the client startup image has this fingerprint:
 
 Allow this new client and save its certificate for future connections? ({}s timeout) [y/N]
 > ",
-            their_cert_fingerprint, PROMPT_TIMEOUT_SECS
+            from_line, their_cert_fingerprint, PROMPT_TIMEOUT_SECS
         )
     } else {
         // The address is the one fact the client knows for certain, so it
@@ -762,27 +853,38 @@ Allow this new server and save its certificate for future connections? ({}s time
     prompt_yn(&message, false)
 }
 
-fn prompt_yn(msg: &str, default: bool) -> bool {
+fn prompt_yn(msg: &str, default: bool) -> PromptOutcome {
     match prompt_internal(msg) {
         Ok(char_) => {
             match char_ {
                 // Check for [yY]es or [tT]rue
-                b'y' | b'Y' | b't' | b'T' => true,
-                _ => false,
+                b'y' | b'Y' | b't' | b'T' => PromptOutcome::Approved,
+                _ => PromptOutcome::Refused,
             }
         }
-        Err(e) => {
+        Err(PromptFailure::TimedOut) => {
+            warn!(
+                "Confirmation prompt timed out after {}s, assuming 'no'",
+                PROMPT_TIMEOUT_SECS
+            );
+            PromptOutcome::Refused
+        }
+        Err(PromptFailure::Error(e)) => {
             warn!(
                 "Confirmation prompt failed, assuming '{}': {}",
                 if default { "yes" } else { "no" },
                 e
             );
-            default
+            if default {
+                PromptOutcome::Approved
+            } else {
+                PromptOutcome::Failed
+            }
         }
     }
 }
 
-fn prompt_internal(msg: &str) -> Result<u8> {
+fn prompt_internal(msg: &str) -> Result<u8, PromptFailure> {
     // Read the answer from our OWN open file description on the controlling
     // terminal, never from fd 0.
     //
@@ -803,27 +905,35 @@ fn prompt_internal(msg: &str) -> Result<u8> {
         .read(true)
         .write(true)
         .open("/dev/tty")
-        .context("Failed to open /dev/tty for the approval prompt")?;
+        .context("Failed to open /dev/tty for the approval prompt")
+        .map_err(PromptFailure::Error)?;
     let mut prompt_out = tty
         .try_clone()
-        .context("Failed to duplicate /dev/tty for prompt output")?;
+        .context("Failed to duplicate /dev/tty for prompt output")
+        .map_err(PromptFailure::Error)?;
     let mut tty_in = nonblock::NonBlockingReader::from_fd(tty)
-        .context("Failed to set up nonblocking reader for /dev/tty")?;
+        .context("Failed to set up nonblocking reader for /dev/tty")
+        .map_err(PromptFailure::Error)?;
 
     // Flush any preceding input before prompt
     {
         let mut discard = vec![];
         tty_in
             .read_available(&mut discard)
-            .context("Failed to flush initial input")?;
+            .context("Failed to flush initial input")
+            .map_err(PromptFailure::Error)?;
     }
 
     // Send the prompt to the terminal itself, so it is visible even when the
     // daemon's stdout is redirected to a log file.
     prompt_out
         .write_all(msg.as_bytes())
-        .context("Failed to write prompt to the terminal")?;
-    prompt_out.flush().context("Failed to flush the prompt")?;
+        .context("Failed to write prompt to the terminal")
+        .map_err(PromptFailure::Error)?;
+    prompt_out
+        .flush()
+        .context("Failed to flush the prompt")
+        .map_err(PromptFailure::Error)?;
 
     // Wait for first char, or time out. Use blocking APIs.
     let end_at = Instant::now()
@@ -834,7 +944,8 @@ fn prompt_internal(msg: &str) -> Result<u8> {
         thread::sleep(Duration::from_millis(50));
         tty_in
             .read_available(&mut content)
-            .context("Failed to check for user input")?;
+            .context("Failed to check for user input")
+            .map_err(PromptFailure::Error)?;
 
         // Check and return first character
         if let Some(c) = content.first() {
@@ -844,7 +955,7 @@ fn prompt_internal(msg: &str) -> Result<u8> {
         // Still nothing, check for timeout
         if Instant::now() >= end_at {
             let _ = prompt_out.write_all(b"\n");
-            bail!("Prompt timed out after {}s", PROMPT_TIMEOUT_SECS)
+            return Err(PromptFailure::TimedOut);
         }
     }
 }
@@ -1001,8 +1112,9 @@ mod tests {
             .expect_err("first attempt is rejected while the prompt is pending");
         assert_eq!(COOLDOWN_SPAWNS.load(Ordering::SeqCst), 1);
 
-        // Simulate the prompt thread recording a rejection (answer "no",
-        // timeout, or prompt error all take this path).
+        // Simulate the prompt thread recording a rejection (an answered
+        // "no" or a timeout takes this path; a prompt that failed to run
+        // records only the cooldown, see record_prompt_failure).
         {
             let mut state = verifier.approval_state.write().unwrap();
             record_rejection(
@@ -1093,6 +1205,33 @@ mod tests {
         // Once it lapses, prompting resumes.
         assert_eq!(
             prompt_decision(&state, "fp-2-brand-new", now + base + Duration::from_secs(1)),
+            PromptDecision::Prompt
+        );
+    }
+
+    /// A prompt that could not run at all (no /dev/tty, EMFILE) must still
+    /// reject the handshake and cool down the fingerprint, but must not arm
+    /// the global unanswered-prompt backoff: a local fault is not a user
+    /// walking away, let alone an attacker minting fresh certs.
+    #[test]
+    fn a_prompt_that_could_not_run_does_not_arm_the_global_backoff() {
+        let mut state = empty_state();
+        let now = Instant::now();
+        let cooldown = Duration::from_secs(60);
+
+        record_prompt_failure(&mut state, "fp-1".to_string(), now, cooldown);
+        // The failed prompt's own fingerprint is cooled down so a fast retry
+        // loop can't spin failing prompts...
+        assert_eq!(
+            prompt_decision(&state, "fp-1", now + Duration::from_secs(1)),
+            PromptDecision::Cooldown
+        );
+        // ...but the global backoff is untouched, so a different fingerprint
+        // prompts immediately.
+        assert_eq!(state.unanswered_prompts, 0);
+        assert!(state.prompt_backoff_until.is_none());
+        assert_eq!(
+            prompt_decision(&state, "fp-2-brand-new", now + Duration::from_secs(1)),
             PromptDecision::Prompt
         );
     }

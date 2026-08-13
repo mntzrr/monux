@@ -186,7 +186,11 @@ impl_dispatch_device!(State, wl_seat::WlSeat, |state: &mut Self, event, seat: &w
                     }
                 }
             } else {
+                // A Selection offer with no pending entry (its DataOffer was
+                // never seen, or already consumed): nothing tracks it, so
+                // destroy it here or the server-side object leaks.
                 error!("Missing pending mime types for regular clipboard offer");
+                offer.destroy();
             }
         }
         Event::PrimarySelection { id } => {
@@ -210,7 +214,11 @@ impl_dispatch_device!(State, wl_seat::WlSeat, |state: &mut Self, event, seat: &w
             offer.destroy();
         }
         Event::Finished => {
-            // Destroy the device stored in the seat as it's no longer valid.
+            // Destroy the device stored in the seat as it's no longer valid,
+            // and drop all of its offer state: pending offers will never
+            // complete (their map entries would leak), and the regular offer
+            // belongs to a dead seat — keeping it would keep serving a
+            // clipboard nothing can fetch.
             let seat_data = if let Some(seat) = state.seats.get_mut(seat) {
                 seat
             } else {
@@ -219,6 +227,18 @@ impl_dispatch_device!(State, wl_seat::WlSeat, |state: &mut Self, event, seat: &w
             };
             if let Some(old_device) = seat_data.device.take() {
                 old_device.destroy();
+            }
+            let pending: Vec<data_control::Offer> = seat_data
+                .pending_offer_types
+                .drain()
+                .map(|(offer, _)| offer)
+                .collect();
+            for offer in pending {
+                state.pending_offer_seats.remove(&offer);
+                offer.destroy();
+            }
+            if let Some(old_offer_data) = seat_data.regular_offer.take() {
+                old_offer_data.offer.destroy();
             }
         }
         _ => {},

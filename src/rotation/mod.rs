@@ -30,7 +30,7 @@ use liveness::{Heard, LivenessTracker};
 use clipboard::{types_equal, ClipboardRouter, ClipboardTarget, Update as ClipboardUpdate};
 use edges::{edge_info_directions, EdgeDirectionsCache};
 use motion::{is_pure_pointer_motion, MotionCoalescer};
-use roster::{ClientRoster, GotoResolution};
+use roster::{ClientRoster, GotoResolution, Placement};
 
 use crate::clipboard::{CLIPBOARD_SERVE_TIMEOUT_SECS, data, server};
 use crate::device;
@@ -741,8 +741,12 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         if old == directions {
             return;
         }
-        self.edge_info_sent.insert(*endpoint, directions.clone());
-        // Revoke directions that dropped out, then advertise new ones.
+        // Revoke directions that dropped out, then advertise new ones. The
+        // send record is updated only after EVERY send landed: recording
+        // first would let a mid-loop failure leave directions marked as sent
+        // that never went out, and the dedup above would suppress the retry
+        // forever. Re-sends are idempotent on the client, so re-running the
+        // full diff after a partial failure is safe.
         let to_revoke: BTreeSet<event::Direction> = old.difference(&directions).copied().collect();
         let to_advertise: BTreeSet<event::Direction> = directions.difference(&old).copied().collect();
         for direction in to_revoke.iter().copied().chain(to_advertise.iter().copied()) {
@@ -774,6 +778,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 return;
             }
         }
+        self.edge_info_sent.insert(*endpoint, directions);
     }
 
     /// The current client list as (endpoint, fingerprint) pairs, in the
@@ -960,8 +965,19 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         // instead of inserting a duplicate (a later removal would clear only the
         // first copy, leaving a dead one behind). The old connection's late
         // removal is then ignored via its stale conn_token (see RemoveClient),
-        // and its advertised-EdgeInfo record is forgotten (see reconnect_slot).
-        self.roster.insert_or_replace(info, &mut self.edge_info_sent);
+        // and its advertised-EdgeInfo record is forgotten (see
+        // ClientRoster::insert_or_replace).
+        let placement = self.roster.insert_or_replace(info, &mut self.edge_info_sent);
+        if placement == Placement::Replaced {
+            // A replace is a removal that never passed through
+            // handle_client_removal: the OLD connection's per-endpoint
+            // clipboard state must not carry over to the new one. A stale
+            // debounce entry could misclassify the new connection's first
+            // announce, and Relay fetch entries would linger with nowhere to
+            // go.
+            self.clipboard.forget_source(&endpoint);
+            self.clipboard.drop_requests_for(endpoint);
+        }
         // Fresh liveness bookkeeping for the (re)connection, kept in lockstep
         // with the clients entry (see handle_client_removal). The new client
         // gets the full miss window before the silence detector can fire.
@@ -1031,6 +1047,17 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             }
         }
 
+        // A reconnect that REPLACED the still-current client's entry needs
+        // more than update_current_client can give: the endpoint is already
+        // current, so that call would no-op — but the replacement is a
+        // brand-new connection, and a client starts every connection with
+        // active=false until a Switch(true) arrives on ITS stream. Without
+        // the forced push below, the reconnected client would stay inactive
+        // (motion dropped, clipboard dead) while liveness keeps the link
+        // green, so nothing would ever self-heal.
+        let replaced_current =
+            placement == Placement::Replaced && self.current_client == Some(endpoint);
+
         // If the new client has the same IP as the currently enabled client, it's probably a fast retry
         // where we haven't removed the prior session yet. Mark the new client as enabled/current.
         // If two clients were connected from the same IP then this will result in spurious switches,
@@ -1038,7 +1065,35 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         if let Some(current_client) = &self.current_client {
             // Only check IP: port is expected to change between sessions
             if current_client.ip() == endpoint.ip() {
-                self.update_current_client(Some(endpoint)).await;
+                if replaced_current {
+                    // Push the clipboard and the activation onto the fresh
+                    // stream directly, in update_current_client's order
+                    // (types BEFORE Switch(true) on the ordered stream). No
+                    // Switch(false) goes to the replaced connection: it is
+                    // dead or dying, and a failed write to this endpoint would
+                    // remove the healthy NEW entry (see send_event).
+                    if let Err(e) = self.update_current_client_clipboard().await {
+                        warn!(
+                            "Failed to send clipboard update to reconnected client: {:?}",
+                            e
+                        );
+                    }
+                    info!(
+                        "Re-activating current client {} on its replacement connection",
+                        endpoint
+                    );
+                    if let Err(e) = self
+                        .send_event(
+                            &endpoint,
+                            event::ServerEvent::Switch(event::SwitchEvent { enabled: true }),
+                        )
+                        .await
+                    {
+                        warn!("Failed to activate reconnected client {}: {:?}", endpoint, e);
+                    }
+                } else {
+                    self.update_current_client(Some(endpoint)).await;
+                }
             }
         }
 
@@ -1307,8 +1362,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// raw evdev input with monux's uinput re-emit fully out of the way
     /// (games, raw-input apps). monux keeps listening ungrabbed, so the pause
     /// chord itself is still seen and resumes. While paused nothing is
-    /// forwarded to clients and rotation switches (including SIGUSR1/SIGUSR2)
-    /// are ignored; clipboard sharing continues untouched. Resuming re-grabs
+    /// forwarded to clients and rotation switches (including SIGUSR1/SIGUSR2
+    /// and client-initiated edge returns) are ignored; clipboard sharing
+    /// continues untouched. Resuming re-grabs
     /// per the current rotation state: keyboards always, mice iff a client is
     /// current. `source` names the trigger ("pause chord", "control socket")
     /// in the log line and the notification, so an unexpected pause is
@@ -1385,6 +1441,17 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         // and fetching them stalls the serving side. A token-only clipboard
         // filters down to no types — a clear.
         let types = crate::clipboard::filter_shareable_mime_types(types);
+        // By convention only the current client announces a non-empty
+        // clipboard; the server deliberately doesn't gate on that (transition
+        // windows legitimately disagree), but an off-current announce is where
+        // a stale-shadows-newer race would show up — log it so it's visible.
+        if !types.is_empty() {
+            if let Some(addr) = source {
+                if self.current_client != Some(addr) {
+                    warn!("Clipboard announce from non-current client {} (current: {:?})", addr, self.current_client);
+                }
+            }
+        }
         debug!("Announcing new clipboard source: source={:?} current={:?} with max_size_bytes={} has types={:?}", source, self.current_client, max_size_bytes, types);
         // An update with no types means the selection is gone — locally (the
         // compositor revoked it) or on a client. Clear right away, bypassing
@@ -1990,26 +2057,33 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 .await
             {
                 if self.current_client != Some(new_client) {
+                    // The clipboard push above removed the new client on a
+                    // failed write (resetting current_client to None), or the
+                    // endpoint was unknown to begin with. FALL THROUGH rather
+                    // than return: the old client is still due its
+                    // Switch(false) below — returning here would leave it
+                    // active (grabbing its devices) while the server
+                    // considers input local.
                     warn!(
                         "Switch to {} did not take effect; input stays on this machine",
                         new_client
                     );
-                    return;
-                }
-                info!(
-                    "Switched to client: {} (clients: {})",
-                    new_client,
-                    self.roster
-                        .iter()
-                        .map(|c| c.endpoint.to_string())
-                        .collect::<Vec<String>>()
-                        .join(", ")
-                );
-                // No "Input on X" notification while paused: input isn't going
-                // anywhere. The resume notification already announces the
-                // return to the active target.
-                if !self.paused {
-                    notify_switch(&format!("Input on {}", new_client.ip()));
+                } else {
+                    info!(
+                        "Switched to client: {} (clients: {})",
+                        new_client,
+                        self.roster
+                            .iter()
+                            .map(|c| c.endpoint.to_string())
+                            .collect::<Vec<String>>()
+                            .join(", ")
+                    );
+                    // No "Input on X" notification while paused: input isn't going
+                    // anywhere. The resume notification already announces the
+                    // return to the active target.
+                    if !self.paused {
+                        notify_switch(&format!("Input on {}", new_client.ip()));
+                    }
                 }
             }
         } else {
@@ -2121,8 +2195,6 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 }
             }
         }
-        // Reverse: Avoid issues with idx moving as entries are removed
-        clients_to_remove.reverse();
         let mut should_clear_clipboard = false;
         for endpoint in clients_to_remove {
             if self.handle_client_removal(&endpoint).await {
@@ -2200,7 +2272,20 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// Switch(false) to the client, so it releases its keys); the server's
     /// cursor is already parked at the edge the switch out left from, so
     /// cursor continuity needs nothing else.
+    ///
+    /// Like every other rotation move this is suspended while paused (see
+    /// toggle_pause): the user parked input on this machine, and an edge
+    /// return arriving mid-pause must not silently move current_client to
+    /// None — the resume would then land on the local machine instead of the
+    /// target the user paused on.
     async fn switch_request_from_client(&mut self, endpoint: SocketAddr) {
+        if self.paused {
+            debug!(
+                "Ignoring switch request from {}: input is paused",
+                endpoint
+            );
+            return;
+        }
         if self.current_client != Some(endpoint) {
             debug!(
                 "Ignoring switch request from {}: not the current client (current: {:?})",
@@ -2603,8 +2688,10 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 return;
             }
             MotionSend::Retry => {
-                // Keep the deltas pending; they retry (with any newer motion
-                // accumulated on top) at the next flush opportunity.
+                // The frame was refused as SendDatagramError::TooLarge (see
+                // try_send_motion_datagram). Keep the deltas pending; they
+                // retry (with any newer motion accumulated on top) at the
+                // next flush opportunity.
                 self.motion.restore_pending((dx, dy, source_count));
                 return;
             }
@@ -2632,8 +2719,10 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// repeats recent frames so the receiver can heal losses (coalesced mode);
     /// full-rate motion skips it, since a lost frame is superseded anyway.
     /// Fallback means the peer can't do datagrams at all (permanently); Retry
-    /// means the send buffer is momentarily full and the caller should keep
-    /// the deltas pending.
+    /// means the frame was refused as SendDatagramError::TooLarge — the only
+    /// Retry source, and effectively unreachable for our ~300-byte frames:
+    /// quinn has no "send buffer full" error, it drops the oldest queued
+    /// datagram instead. The caller keeps the deltas pending.
     fn try_send_motion_datagram(
         &mut self,
         endpoint: &SocketAddr,
@@ -2799,8 +2888,10 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                         return Ok(());
                     }
                     MotionSend::Retry => {
-                        // Send buffer full: skip this update entirely; the next
-                        // poll supersedes it (full-rate motion is lossy by design).
+                        // Refused as TooLarge (effectively unreachable; see
+                        // try_send_motion_datagram): skip this update entirely;
+                        // the next poll supersedes it (full-rate motion is
+                        // lossy by design).
                         return Ok(());
                     }
                     MotionSend::Fallback => {}
@@ -4765,6 +4856,176 @@ mod tests {
         rotation.remove_client_and_clear_clipboard(a, old_token + 1).await;
         assert!(rotation.roster.is_empty());
         assert!(probe.events_as_strings().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A reconnect that replaces the CURRENT client's entry in place must
+    /// still activate the fresh connection: update_current_client no-ops when
+    /// the endpoint is already current, but a client starts every connection
+    /// with active=false and only a Switch(true) on ITS stream flips it.
+    /// Without the forced push the new connection never activates — motion
+    /// dropped, clipboard dead — while liveness keeps the link green.
+    #[tokio::test]
+    async fn a_reconnect_of_the_current_client_activates_the_replacement_connection() {
+        let (mut rotation, _grab_rx, dir) = test_rotation("reconnect-current").await;
+        let a = addr("10.0.0.1:1001");
+        let old_probe = add_fake_client(&mut rotation, a, "aaaa1111").await;
+        rotation.update_current_client(Some(a)).await;
+        assert_eq!(old_probe.events_as_strings(), vec!["SwitchEvent(enabled=true)"]);
+
+        // The same endpoint reconnects before the old connection's teardown:
+        // the entry is replaced in place while it is still current.
+        let fresh = FakeLink::new();
+        let new_probe = fresh.probe();
+        let old_token = rotation.roster.conn_token(&a).unwrap();
+        rotation
+            .register_client(a, "aaaa1111".to_string(), Box::new(fresh), old_token + 1, shared::PROTOCOL_VERSION)
+            .await;
+
+        assert_eq!(rotation.current_client, Some(a), "still the current client");
+        assert_eq!(
+            new_probe.events_as_strings(),
+            vec!["SwitchEvent(enabled=true)"],
+            "the replacement connection must be activated on its own stream"
+        );
+        // The replaced connection is dead or dying; nothing more goes to it
+        // (a failed write to the endpoint would remove the healthy NEW entry).
+        assert_eq!(old_probe.events_as_strings(), vec!["SwitchEvent(enabled=true)"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The in-place replace path never passes through handle_client_removal,
+    /// so it must do the per-endpoint clipboard cleanup itself: a stale
+    /// debounce entry would misclassify the new connection's first announce,
+    /// and a fetch the old connection owed a reply to would linger forever.
+    #[tokio::test]
+    async fn a_reconnect_replaces_in_place_and_clears_its_clipboard_state() {
+        let (mut rotation, _grab_rx, dir) = test_rotation("reconnect-clipboard").await;
+        let a = addr("10.0.0.1:1001");
+        add_fake_client(&mut rotation, a, "aaaa1111").await;
+
+        // Give the old connection clipboard state: a processed update still
+        // inside its debounce window, and a fetch it still owes a reply to.
+        let t0 = Instant::now();
+        rotation.clipboard.note_processed(Some(a), t0);
+        let (tx, _rx) = oneshot::channel();
+        rotation
+            .clipboard
+            .track_request(a, clipboard::PendingFetch::Local(tx));
+        assert_eq!(rotation.clipboard.pending_request_count(), 1);
+
+        // The same endpoint reconnects; the replacement must inherit neither.
+        let fresh = FakeLink::new();
+        let old_token = rotation.roster.conn_token(&a).unwrap();
+        rotation
+            .register_client(a, "aaaa1111".to_string(), Box::new(fresh), old_token + 1, shared::PROTOCOL_VERSION)
+            .await;
+        assert_eq!(rotation.roster.len(), 1, "replaced, not duplicated");
+        assert_eq!(rotation.clipboard.pending_request_count(), 0);
+        assert_eq!(
+            rotation
+                .clipboard
+                .classify(Some(a), &["text/plain".to_string()], t0),
+            ClipboardUpdate::Process,
+            "the fresh connection's first announce must not be debounced away"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// If the clipboard push mid-switch kills the new client's connection
+    /// (current_client resets to None), the switch cannot complete — but the
+    /// OLD client must still be told it is inactive. The early return used to
+    /// skip that, leaving the old client active (grabbing its devices) while
+    /// the server considered input local.
+    #[tokio::test]
+    async fn a_failed_switch_still_deactivates_the_old_client() {
+        let (mut rotation, _grab_rx, dir) = test_rotation("switch-push-fails").await;
+        let a = addr("10.0.0.1:1001");
+        let b = addr("10.0.0.2:1002");
+        let probe_a = add_fake_client(&mut rotation, a, "aaaa1111").await;
+        let probe_b = add_fake_client(&mut rotation, b, "bbbb2222").await;
+        rotation.update_current_client(Some(a)).await;
+        assert_eq!(probe_a.events_as_strings(), vec!["SwitchEvent(enabled=true)"]);
+
+        // A server-owned clipboard is pushed to the new client mid-switch;
+        // its stream dies just before, so the push fails and removes it.
+        rotation
+            .clipboard
+            .set_target(None, vec!["text/plain".to_string()], 1024);
+        probe_b.events_fail.store(true, Ordering::SeqCst);
+        rotation.update_current_client(Some(b)).await;
+
+        assert_eq!(rotation.current_client, None, "the switch did not take effect");
+        assert!(rotation.roster.get(&b).is_none(), "the dead client was removed");
+        assert_eq!(
+            probe_a.events_as_strings(),
+            vec!["SwitchEvent(enabled=true)", "SwitchEvent(enabled=false)"],
+            "the old client must still learn it is inactive"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A client-initiated edge return is a rotation move like any other:
+    /// while paused it is suspended, so resuming lands on the target the user
+    /// paused on rather than the local machine.
+    #[tokio::test]
+    async fn a_switch_request_is_ignored_while_paused() {
+        let (mut rotation, _grab_rx, dir) = test_rotation("paused-switch-request").await;
+        let a = addr("10.0.0.1:1001");
+        add_fake_client(&mut rotation, a, "aaaa1111").await;
+        rotation.update_current_client(Some(a)).await;
+
+        rotation.set_paused(true, "test").await;
+        rotation.switch_request_from_client(a).await;
+        assert_eq!(
+            rotation.current_client,
+            Some(a),
+            "paused: the edge return must not move input"
+        );
+
+        rotation.set_paused(false, "test").await;
+        rotation.switch_request_from_client(a).await;
+        assert_eq!(rotation.current_client, None, "resumed: the edge return is honored");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A failed EdgeInfo send must not be recorded as sent: recording first
+    /// let a mid-loop failure mark directions as advertised that never went
+    /// out, and the dedup then suppressed every later re-advertise.
+    #[tokio::test]
+    async fn a_failed_edge_info_send_does_not_suppress_the_retry() {
+        let (mut rotation, _grab_rx, dir) = test_rotation("edge-info-retry").await;
+        rotation.set_edge_map(edge_map_of(&["right=aaaa"]));
+        let a = addr("10.0.0.1:1001");
+        let probe = add_fake_client(&mut rotation, a, "aaaa1111").await;
+        // The initial advertisement went out and is recorded as sent.
+        assert_eq!(probe.events_sent().len(), 1);
+        assert_eq!(
+            rotation.edge_info_sent.get(&a),
+            Some(&BTreeSet::from([event::Direction::Right]))
+        );
+
+        // The topology changes (the client now sits beyond the left edge),
+        // but the connection dies before the first frame of the diff goes out.
+        rotation.set_edge_map(edge_map_of(&["left=aaaa"]));
+        probe.events_fail.store(true, Ordering::SeqCst);
+        rotation.advertise_edge_info(&a, "aaaa1111").await;
+        assert_eq!(
+            rotation.edge_info_sent.get(&a),
+            Some(&BTreeSet::from([event::Direction::Right])),
+            "a failed send must not be recorded as sent"
+        );
+
+        // The connection recovers: the retry runs the full diff again
+        // (re-sends are idempotent on the client).
+        probe.events_fail.store(false, Ordering::SeqCst);
+        rotation.advertise_edge_info(&a, "aaaa1111").await;
+        assert_eq!(
+            rotation.edge_info_sent.get(&a),
+            Some(&BTreeSet::from([event::Direction::Left]))
+        );
+        // Revoke(right) + EdgeInfo(left) on top of the initial EdgeInfo(right).
+        assert_eq!(probe.events_sent().len(), 3);
         let _ = fs::remove_dir_all(&dir);
     }
 

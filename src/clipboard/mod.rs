@@ -114,7 +114,8 @@ impl WedgeGate {
 /// flight, newer advertisements drain and replace older queued ones (a stale
 /// clipboard type list is pointless once a fresher one exists). A hung
 /// store_types call (wedged compositor) is abandoned after WRITER_DISPATCH_TIMEOUT
-/// so the dispatcher doesn't deadlock.
+/// so the dispatcher doesn't deadlock, and flagged superseded so a late
+/// completion can't publish its stale type list over a newer advertisement.
 pub(crate) fn spawn_writer_dispatcher(
     writer: Box<dyn ClipboardWriter>,
 ) -> std::sync::mpsc::Sender<Vec<String>> {
@@ -122,6 +123,11 @@ pub(crate) fn spawn_writer_dispatcher(
     let (tx, rx) = std::sync::mpsc::channel::<Vec<String>>();
     std::thread::spawn(move || {
         let mut wedge_gate = WedgeGate::new();
+        // The in-flight store's superseded flag: set when a NEWER store
+        // starts while an earlier one is still running (i.e. was abandoned on
+        // the dispatch timeout). A late-completing store checks it before
+        // publishing, since last-setter-wins at the compositor.
+        let mut in_flight: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
         while let Ok(mut types) = rx.recv() {
             // Drain stale advertisements: only the latest matters. This
             // bounds the queue under burst churn and skips pointless serves.
@@ -141,11 +147,18 @@ pub(crate) fn spawn_writer_dispatcher(
             // wayland roundtrips; the timeout thread is abandoned (the
             // serving thread it spawned will exit on its own when the
             // connection drops).
+            if let Some(stale) = in_flight.take() {
+                // A newer store is starting: the previous one, if still
+                // running, must not publish its stale type list over it.
+                stale.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let superseded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            in_flight = Some(superseded.clone());
             let writer = writer.clone();
             let (result_tx, result_rx) =
                 std::sync::mpsc::channel::<anyhow::Result<()>>();
             let handle = std::thread::spawn(move || {
-                let _ = result_tx.send(writer.store_types(types));
+                let _ = result_tx.send(writer.store_types(types, superseded));
             });
             match result_rx.recv_timeout(WRITER_DISPATCH_TIMEOUT) {
                 Ok(Ok(())) => {
@@ -186,8 +199,16 @@ pub trait ClipboardReader: Send {
 
 /// Trait for advertising clipboard data to the local environment
 pub trait ClipboardWriter: Send + Sync {
-    /// Advertises with the local environment that we have a new clipboard entry available
-    fn store_types(&self, types: Vec<String>) -> Result<()>;
+    /// Advertises with the local environment that we have a new clipboard entry available.
+    /// `superseded` is set by the dispatcher when a newer store starts while
+    /// this one is still running: a store that notices must back out before
+    /// publishing, or its stale type list clobbers the newer advertisement
+    /// (last-setter-wins at the compositor).
+    fn store_types(
+        &self,
+        types: Vec<String>,
+        superseded: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<()>;
 }
 
 #[cfg(test)]

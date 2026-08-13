@@ -7,13 +7,23 @@
 //! commands a CLI would. It never spawns or blocks on the daemon's event
 //! loops — the daemon serves each control connection on its own task and
 //! dispatch only reads mirrors, and the indicator's own socket reads carry a
-//! short timeout, so a wedged daemon degrades the icon instead of hanging
-//! the tray. When no daemon answers, the indicator keeps running and shows
-//! the "not running" state, whose menu doubles as a launcher: "Start
-//! server"/"Start client" (via the autostart systemd unit when installed,
-//! otherwise a detached `monux <role>` spawn) and "Hide tray" (exits the
-//! standalone indicator). When there is no D-Bus session bus or SNI host
-//! (headless TTY), run() fails with a clean error and exit code 1.
+//! short timeout (SOCKET_TIMEOUT), so a wedged daemon degrades the icon
+//! instead of hanging the tray for good. Bounded, though, not free: the
+//! poll and every menu callback run on ksni's single service thread with
+//! blocking I/O, so a wedged daemon can freeze the tray for up to
+//! SOCKET_TIMEOUT per socket tried, and "Copy diagnostics" additionally
+//! shells out to journalctl and a clipboard tool synchronously — a menu
+//! action can stall the tray for seconds before the icon degrades. When no
+//! daemon answers, the indicator keeps running and shows the "not running"
+//! state, whose menu doubles as a launcher: "Start server"/"Start client"
+//! (via the autostart systemd unit when installed, otherwise a detached
+//! `monux <role>` spawn) and "Hide tray" (exits the standalone indicator).
+//! A daemon that ANSWERS without a usable state (ok:false, e.g. "state not
+//! available yet") is alive: it gets a starting view WITHOUT the launcher
+//! rows — "Start server" there would spawn a second daemon whose
+//! single-instance takeover SIGTERMs the one that just answered. When there
+//! is no D-Bus session bus or SNI host (headless TTY), run() fails with a
+//! clean error and exit code 1.
 //!
 //! # Icon colors (the dot is a programmatically generated ARGB pixmap — SNI
 //! supports pixmaps, so no icon-theme lookup is involved)
@@ -29,7 +39,8 @@
 //!
 //!   RED outranks GREY — a degraded link is a problem worth seeing even while
 //!   paused.
-//! - Unknown (no daemon answers): a hollow grey "?" instead of the dot.
+//! - Unknown (no daemon answers, or it answered without a usable state
+//!   yet): a hollow grey "?" instead of the dot.
 //!
 //! The tooltip carries the details ("monux: input on 192.168.1.102", per-client
 //! rtt/uptime, clipboard owner, update availability, the last action's error).
@@ -108,6 +119,21 @@ fn color_of(state: &State) -> IconColor {
     }
 }
 
+/// How the last status poll went, as far as the view and the menu care.
+enum DaemonStatus {
+    /// A full snapshot to render.
+    Up(State),
+    /// The socket ANSWERED but had no usable state (ok:false, e.g. "state
+    /// not available yet (rotation loop has not run)", or a body we cannot
+    /// parse): the daemon is ALIVE, so the menu must NOT offer the launcher
+    /// rows — "Start server" would spawn a second daemon whose
+    /// single-instance takeover SIGTERMs the one that just answered.
+    /// Carries the reason, for the tooltip and the menu.
+    NoState(String),
+    /// No socket answered: the standalone tray doubles as a launcher.
+    Silent,
+}
+
 /// What the indicator renders right now.
 struct View {
     color: IconColor,
@@ -115,8 +141,8 @@ struct View {
     title: String,
     /// Tooltip body: role/version plus per-connection details.
     details: String,
-    /// The last status, for the menu; None when no daemon answers.
-    state: Option<State>,
+    /// The last poll's outcome, for the menu.
+    status: DaemonStatus,
 }
 
 impl View {
@@ -125,7 +151,7 @@ impl View {
             color: color_of(&state),
             title: title_of(&state),
             details: details_of(&state),
-            state: Some(state),
+            status: DaemonStatus::Up(state),
         }
     }
 
@@ -134,7 +160,22 @@ impl View {
             color: IconColor::Unknown,
             title: "monux: not running".to_string(),
             details: "No monux daemon is answering its control socket.".to_string(),
-            state: None,
+            status: DaemonStatus::Silent,
+        }
+    }
+
+    /// The daemon answered but reported no usable state (see DaemonStatus::
+    /// NoState): rendered like the unknown icon, but it is NOT the
+    /// not-running launcher view.
+    fn no_state(reason: String) -> View {
+        View {
+            color: IconColor::Unknown,
+            title: "monux: starting".to_string(),
+            details: format!(
+                "The daemon answers its control socket but has no status yet: {}",
+                reason
+            ),
+            status: DaemonStatus::NoState(reason),
         }
     }
 }
@@ -287,13 +328,13 @@ impl MenuAction {
     }
 }
 
-/// Builds the menu model for the current state (see the module docs and the
-/// phase spec: dynamic per state, switch/pause rows on the server socket
-/// only).
-fn menu_rows(state: Option<&State>) -> Vec<MenuRow> {
+/// Builds the menu model for the current poll outcome (see the module docs
+/// and the phase spec: dynamic per state, switch/pause rows on the server
+/// socket only).
+fn menu_rows(status: &DaemonStatus) -> Vec<MenuRow> {
     let mut rows = Vec::new();
-    match state {
-        None => {
+    match status {
+        DaemonStatus::Silent => {
             rows.push(MenuRow::Label("monux is not running".to_string()));
             rows.push(MenuRow::Separator);
             // The standalone tray doubles as a launcher: start a daemon
@@ -318,7 +359,20 @@ fn menu_rows(state: Option<&State>) -> Vec<MenuRow> {
                 enabled: true,
             });
         }
-        Some(State::Server(s)) => {
+        DaemonStatus::NoState(reason) => {
+            rows.push(MenuRow::Label("monux is starting".to_string()));
+            rows.push(MenuRow::Label(reason.clone()));
+            rows.push(MenuRow::Separator);
+            // NO launcher rows here: the daemon answered, so a "Start
+            // server" click would spawn a SECOND daemon that takes over the
+            // single-instance lock and SIGTERMs the one that just answered.
+            rows.push(MenuRow::Action {
+                label: "Hide tray icon".to_string(),
+                action: MenuAction::HideTray,
+                enabled: true,
+            });
+        }
+        DaemonStatus::Up(State::Server(s)) => {
             rows.push(MenuRow::Label(format!("Input: {}", s.current_target)));
             rows.push(MenuRow::Separator);
             // While paused, rotation drops switch events (the paused guard),
@@ -398,7 +452,7 @@ fn menu_rows(state: Option<&State>) -> Vec<MenuRow> {
                 enabled: true,
             });
         }
-        Some(State::Client(c)) => {
+        DaemonStatus::Up(State::Client(c)) => {
             rows.push(MenuRow::Label(format!("Server: {}", c.server)));
             rows.push(MenuRow::Label(format!(
                 "Connection: {}",
@@ -610,7 +664,7 @@ impl ksni::Tray for MonuxTray {
     }
 
     fn menu(&self) -> Vec<ksni::menu::MenuItem<Self>> {
-        to_ksni_menu(menu_rows(self.view.state.as_ref()))
+        to_ksni_menu(menu_rows(&self.view.status))
     }
 
     fn menu_about_to_show(&mut self) {
@@ -621,31 +675,45 @@ impl ksni::Tray for MonuxTray {
 
 /// Queries server.sock first, then client.sock; the first socket answering
 /// with a parseable status wins (a machine usually runs one role, and the
-/// server view is the richer one). (None, not-running view) when no daemon
-/// answers.
+/// server view is the richer one). A socket that ANSWERS without a usable
+/// state (ok:false, e.g. "state not available yet") yields the starting
+/// view with the socket kept bound — the daemon is alive, just not ready.
+/// (None, not-running view) only when no daemon answers at all.
 fn poll() -> (Option<PathBuf>, View) {
     for role in [Role::Server, Role::Client] {
         let path = control::socket_path(role);
         if !path.exists() {
             continue;
         }
-        match control::request_line(&path, r#"{"cmd":"status"}"#)
-            .and_then(|raw| parse_ok(&raw, &path))
-        {
-            Ok(v) => match serde_json::from_value::<State>(v["state"].clone()) {
-                Ok(state) => return (Some(path), View::from_state(state)),
-                Err(e) => debug!(
-                    "Indicator: unrecognized state from {}: {:?}",
+        let raw = match control::request_line(&path, r#"{"cmd":"status"}"#) {
+            Ok(raw) => raw,
+            Err(e) => {
+                debug!(
+                    "Indicator: status from {} failed: {:?}",
                     path.display(),
                     e
-                ),
-            },
-            Err(e) => debug!(
-                "Indicator: status from {} failed: {:?}",
-                path.display(),
-                e
-            ),
-        }
+                );
+                continue;
+            }
+        };
+        // The socket ANSWERED: the daemon is alive, so whatever is wrong
+        // with the body must NOT fall through to the launcher view (see
+        // DaemonStatus::NoState).
+        let state = parse_ok(&raw, &path).and_then(|v| {
+            serde_json::from_value::<State>(v["state"].clone())
+                .with_context(|| format!("Unrecognized state from {}", path.display()))
+        });
+        return match state {
+            Ok(state) => (Some(path), View::from_state(state)),
+            Err(e) => {
+                debug!(
+                    "Indicator: {} answered without a usable state: {:?}",
+                    path.display(),
+                    e
+                );
+                (Some(path.clone()), View::no_state(format!("{:#}", e)))
+            }
+        };
     }
     (None, View::not_running())
 }
@@ -1051,7 +1119,7 @@ mod tests {
             "local",
             vec![("10.0.0.2:1213", Some(3)), ("10.0.0.3:1213", Some(7))],
         );
-        let rows = menu_rows(Some(&state));
+        let rows = menu_rows(&DaemonStatus::Up(state));
         // Header row names the current input owner.
         assert!(rows.contains(&MenuRow::Label("Input: local".to_string())));
         // Local input: no "Switch to local", one switch row per client
@@ -1096,7 +1164,7 @@ mod tests {
             s.clipboard.types = vec!["text/plain".to_string()];
             s.update_available = Some("abc123".to_string());
         }
-        let rows = menu_rows(Some(&state));
+        let rows = menu_rows(&DaemonStatus::Up(state));
         assert!(rows.contains(&MenuRow::Label("Input: 10.0.0.2:1213".to_string())));
         // Remote input: switching back to local is listed...
         assert!(rows.contains(&action_row("Switch to local", MenuAction::SwitchLocal, false)));
@@ -1131,7 +1199,7 @@ mod tests {
             "10.0.0.2:1213",
             vec![("10.0.0.2:1213", Some(3)), ("10.0.0.3:1213", Some(7))],
         );
-        let rows = menu_rows(Some(&state));
+        let rows = menu_rows(&DaemonStatus::Up(state));
         assert!(rows.contains(&action_row("Switch to local", MenuAction::SwitchLocal, true)));
         assert!(rows.contains(&action_row(
             "Switch to 10.0.0.3:1213",
@@ -1151,7 +1219,7 @@ mod tests {
 
     #[test]
     fn menu_for_a_client_has_no_server_only_actions() {
-        let rows = menu_rows(Some(&client_state(true, true)));
+        let rows = menu_rows(&DaemonStatus::Up(client_state(true, true)));
         assert!(rows.contains(&MenuRow::Label("Server: 10.0.0.1:1213".to_string())));
         assert!(rows.contains(&MenuRow::Label("Connection: rtt 3ms, up 42s".to_string())));
         assert!(rows.contains(&MenuRow::Label("Input: here".to_string())));
@@ -1170,14 +1238,14 @@ mod tests {
             }
         }
         // A disconnected client still gets the lifecycle actions.
-        let rows = menu_rows(Some(&client_state(false, false)));
+        let rows = menu_rows(&DaemonStatus::Up(client_state(false, false)));
         assert!(rows.contains(&MenuRow::Label("Connection: not connected".to_string())));
         assert!(rows.contains(&MenuRow::Label("Input: server".to_string())));
     }
 
     #[test]
     fn menu_without_a_daemon_offers_start_actions_and_hide() {
-        let rows = menu_rows(None);
+        let rows = menu_rows(&DaemonStatus::Silent);
         assert_eq!(
             rows,
             vec![
@@ -1187,6 +1255,28 @@ mod tests {
                 action_row("Start client", MenuAction::StartClient, true),
                 MenuRow::Separator,
                 action_row("Hide tray", MenuAction::HideTray, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_answered_without_state_gets_no_launcher_rows() {
+        // The socket ANSWERED (ok:false — e.g. "state not available yet
+        // (rotation loop has not run)"): the daemon is alive, so offering
+        // "Start server" would spawn a second daemon whose single-instance
+        // takeover SIGTERMs the one that just answered.
+        let rows = menu_rows(&DaemonStatus::NoState(
+            "state not available yet (rotation loop has not run)".to_string(),
+        ));
+        assert_eq!(
+            rows,
+            vec![
+                MenuRow::Label("monux is starting".to_string()),
+                MenuRow::Label(
+                    "state not available yet (rotation loop has not run)".to_string()
+                ),
+                MenuRow::Separator,
+                action_row("Hide tray icon", MenuAction::HideTray, true),
             ]
         );
     }

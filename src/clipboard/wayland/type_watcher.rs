@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -41,6 +43,12 @@ pub fn start(
     // hand. The reconnect loop below picks the compositor up whenever it
     // appears (first start, or a crash and restart later).
     let (thread_ready_tx, thread_ready_rx) = std::sync::mpsc::sync_channel(1);
+    // Set when start() gives up on the readiness handshake: the caller drops
+    // its end of the types channel on Ok(None), so a watcher left running
+    // would, once connected, error-log on every Selection send to a
+    // receiver-less channel forever.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let thread_shutdown = shutdown.clone();
     let _ = std::thread::spawn(move || {
         let mut backoff = Duration::from_secs(1);
         let mut signalled_ready = false;
@@ -50,13 +58,19 @@ pub fn start(
         // warning each time would bury the log in thousands of daily lines.
         let mut reported_failure = false;
         loop {
+            if thread_shutdown.load(Ordering::SeqCst) {
+                debug!("Wayland clipboard type watcher stopping: start() gave up on the readiness handshake");
+                return;
+            }
             let mut connected = false;
             match connect_and_watch(
                 &regular_types_tx,
                 &thread_ready_tx,
                 &mut signalled_ready,
                 &mut connected,
+                &thread_shutdown,
             ) {
+                WatchOutcome::Shutdown => return,
                 WatchOutcome::Unavailable => {
                     // Reachable compositor, but no clipboard protocol or no
                     // seat. Usually permanent (a compositor without
@@ -118,6 +132,11 @@ pub fn start(
                 "Wayland clipboard type watcher did not report readiness ({}); clipboard sharing disabled",
                 e
             );
+            // The caller drops the types receiver on Ok(None): stop the
+            // watcher thread rather than leaving it retrying (and, once
+            // connected, logging an error per clipboard change on a
+            // receiver-less channel).
+            shutdown.store(true, Ordering::SeqCst);
             Ok(None)
         }
     }
@@ -125,10 +144,14 @@ pub fn start(
 
 /// Result of one connect + watch cycle.
 enum WatchOutcome {
-    /// Wayland or its clipboard protocols aren't available — don't reconnect.
+    /// Wayland or its clipboard protocols aren't available. Usually permanent
+    /// (a compositor without data-control), but possibly just a seat that
+    /// hasn't appeared yet — the caller retries at the slow rate.
     Unavailable,
     /// A dispatch error occurred (e.g. compositor crash) — reconnect.
     Error(anyhow::Error),
+    /// start() gave up waiting for readiness — stop watching entirely.
+    Shutdown,
 }
 
 /// Connects to wayland, sets up the clipboard registry, and dispatches events
@@ -143,6 +166,7 @@ fn connect_and_watch(
     thread_ready_tx: &std::sync::mpsc::SyncSender<()>,
     signalled_ready: &mut bool,
     connected: &mut bool,
+    shutdown: &AtomicBool,
 ) -> WatchOutcome {
     let conn = match connect::connect() {
         Ok(conn) => conn,
@@ -191,6 +215,11 @@ fn connect_and_watch(
         let _ = thread_ready_tx.send(());
     }
     loop {
+        // Checked per dispatch (i.e. per event batch): a parked
+        // blocking_dispatch wakes on the next compositor event and exits here.
+        if shutdown.load(Ordering::SeqCst) {
+            return WatchOutcome::Shutdown;
+        }
         if let Err(e) = queue.blocking_dispatch(&mut state) {
             return WatchOutcome::Error(anyhow::anyhow!(
                 "Wayland clipboard type watcher queue dispatch error: {}",

@@ -185,8 +185,17 @@ fn compatible_device(d: &Device, path: &Path, device_info: &util::DeviceInfo) ->
     }
     // We care about these kinds of devices: keyboard, mouse, and touchpad
     let evts = d.supported_events();
-    if evts.contains(EventType::ABSOLUTE) || evts.contains(EventType::RELATIVE) {
-        // absolute: probably a touchpad or joystick
+    if evts.contains(EventType::ABSOLUTE)
+        && d
+            .supported_absolute_axes()
+            .is_some_and(|axes| abs_axes_show_a_pointer(axes, d.supported_keys()))
+    {
+        // absolute with pointer evidence: a touchpad or touchscreen. Without
+        // the evidence check an accelerometer (EV_ABS with ABS_X/Y/Z and no
+        // keys) qualifies too, gets classified as a touchpad, and is grabbed
+        // while a client is active — pointer jitter with no user input.
+        true
+    } else if evts.contains(EventType::RELATIVE) {
         // relative: probably a mouse
         true
     } else if evts.contains(EventType::KEY) {
@@ -209,6 +218,15 @@ fn compatible_device(d: &Device, path: &Path, device_info: &util::DeviceInfo) ->
             );
             false
         }
+    } else if evts.contains(EventType::ABSOLUTE) {
+        util::log_device_info(
+            d,
+            path,
+            device_info,
+            "Ignoring ABS device without pointer evidence (accelerometer?)",
+            false,
+        );
+        false
     } else {
         // For example this might be an audio device
         util::log_device_info(
@@ -220,6 +238,24 @@ fn compatible_device(d: &Device, path: &Path, device_info: &util::DeviceInfo) ->
         );
         false
     }
+}
+
+/// Whether a device's absolute axes look like a pointing device: a
+/// multitouch position axis (touchpad/touchscreen), or single-touch ABS_X
+/// together with any button/touch key. An accelerometer advertises
+/// ABS_X/Y/Z and no keys at all, and must not qualify (see
+/// compatible_device).
+fn abs_axes_show_a_pointer(
+    axes: &evdev::AttributeSetRef<evdev::AbsoluteAxisCode>,
+    keys: Option<&evdev::AttributeSetRef<KeyCode>>,
+) -> bool {
+    axes.contains(evdev::AbsoluteAxisCode::ABS_MT_POSITION_X)
+        || (axes.contains(evdev::AbsoluteAxisCode::ABS_X)
+            && keys.is_some_and(|keys| {
+                // BTN_0 (0x100) is the first of the kernel's BTN_* block:
+                // any button or touch code counts as pointer evidence.
+                keys.iter().any(|key| key.0 >= KeyCode::BTN_0.0)
+            }))
 }
 
 fn matches_filters(
@@ -276,5 +312,72 @@ fn send_device_events(event: notify::Event, device_event_tx: &mpsc::UnboundedSen
             }
         }
         _ => trace!("Other filesystem event: {:?}", event),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use evdev::{AbsoluteAxisCode, AttributeSet};
+
+    fn abs_set(codes: &[AbsoluteAxisCode]) -> AttributeSet<AbsoluteAxisCode> {
+        let mut set = AttributeSet::new();
+        for code in codes {
+            set.insert(*code);
+        }
+        set
+    }
+
+    fn key_set(codes: &[KeyCode]) -> AttributeSet<KeyCode> {
+        let mut set = AttributeSet::new();
+        for code in codes {
+            set.insert(*code);
+        }
+        set
+    }
+
+    /// An accelerometer advertises EV_ABS with ABS_X/Y/Z and no keys: no
+    /// pointer evidence, so it must not become a monux device (it would be
+    /// classified as a touchpad and grabbed, injecting pointer jitter).
+    #[test]
+    fn an_accelerometer_shows_no_pointer_evidence() {
+        let axes = abs_set(&[
+            AbsoluteAxisCode::ABS_X,
+            AbsoluteAxisCode::ABS_Y,
+            AbsoluteAxisCode::ABS_Z,
+        ]);
+        assert!(!abs_axes_show_a_pointer(&axes, None));
+        let keys = key_set(&[]);
+        assert!(!abs_axes_show_a_pointer(&axes, Some(&keys)));
+    }
+
+    /// A multitouch position axis is pointer evidence on its own (a
+    /// touchscreen may advertise no keys at all).
+    #[test]
+    fn a_multitouch_position_axis_is_pointer_evidence() {
+        let axes = abs_set(&[
+            AbsoluteAxisCode::ABS_MT_POSITION_X,
+            AbsoluteAxisCode::ABS_MT_POSITION_Y,
+        ]);
+        assert!(abs_axes_show_a_pointer(&axes, None));
+    }
+
+    /// Single-touch ABS_X counts only alongside a touch or button key
+    /// (touchpads: BTN_TOUCH/BTN_TOOL_FINGER; absolute mice: BTN_LEFT).
+    #[test]
+    fn single_touch_abs_x_needs_a_touch_or_button_key() {
+        let axes = abs_set(&[AbsoluteAxisCode::ABS_X, AbsoluteAxisCode::ABS_Y]);
+        assert!(!abs_axes_show_a_pointer(&axes, None));
+        for key in [KeyCode::BTN_TOUCH, KeyCode::BTN_TOOL_FINGER, KeyCode::BTN_LEFT] {
+            let keys = key_set(&[key]);
+            assert!(
+                abs_axes_show_a_pointer(&axes, Some(&keys)),
+                "{:?} should count as pointer evidence",
+                key
+            );
+        }
+        // Keys outside the BTN_* block (ordinary KEY_* codes) do not.
+        let keys = key_set(&[KeyCode::KEY_A, KeyCode::KEY_POWER]);
+        assert!(!abs_axes_show_a_pointer(&axes, Some(&keys)));
     }
 }

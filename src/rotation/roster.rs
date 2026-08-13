@@ -176,12 +176,15 @@ impl ClientRoster {
         let Some(current) = current else {
             return clients.first().copied();
         };
+        // For a current that is not in the roster (it vanished without a
+        // removal landing) binary_search yields where it WOULD sit, and the
+        // client after that phantom position is clients[idx] itself.
         let idx = match clients.binary_search(&current) {
-            Ok(idx) => idx,
+            Ok(idx) => idx + 1,
             Err(idx) => idx,
         };
         // Off the end falls back to the local machine.
-        clients.get(idx + 1).copied()
+        clients.get(idx).copied()
     }
 
     /// Resolves a goto fingerprint to a switch target. A prefix is enough:
@@ -252,6 +255,20 @@ mod tests {
         let stale = addr("10.0.0.9:9");
         assert_eq!(r.next_target(Some(stale)), None);
         assert_eq!(r.prev_target(Some(stale)), None);
+    }
+
+    #[test]
+    fn next_from_a_vanished_current_resumes_where_it_sat() {
+        let r = roster(&[("10.0.0.1:1", "aa"), ("10.0.0.3:3", "cc")]);
+        let (a, b, c) = (addr("10.0.0.1:1"), addr("10.0.0.2:2"), addr("10.0.0.3:3"));
+        // b vanished from the roster while still recorded as current: it sat
+        // between a and c, so next resumes at c — the client after its
+        // phantom position — not one past it at the local machine (and prev
+        // at a, the client before it).
+        assert_eq!(r.next_target(Some(b)), Some(c));
+        assert_eq!(r.prev_target(Some(b)), Some(a));
+        // A phantom past the end still wraps to the local machine.
+        assert_eq!(r.next_target(Some(addr("10.0.0.9:9"))), None);
     }
 
     #[test]

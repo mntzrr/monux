@@ -178,7 +178,12 @@ pub fn acquire(kind: &str) -> Result<InstanceLock> {
                 .with_context(|| format!("Failed to open {} lock file: {}", kind, path.display()))
         }
     };
-    let _ = fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o666));
+    // fchmod on the already-open O_NOFOLLOW-verified fd, NOT the path:
+    // re-resolving a path in a world-writable dir could follow a swapped-in
+    // symlink and reopen the race the opens above close. Best-effort: on the
+    // read-only fallback fd it fails (EBADF) — the same silent no-op the
+    // path-based chmod produced for a foreign-owned file.
+    let _ = file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666));
     if try_lock(&file) {
         write_pid(&file);
         return Ok(InstanceLock {
@@ -201,17 +206,17 @@ pub fn acquire(kind: &str) -> Result<InstanceLock> {
     }
     // Guard against pid reuse or a stale/poisoned pid file: only signal a
     // process whose executable is actually monux running the matching kind.
-    // comm (exact exe name) rules out wrapper shells whose cmdline merely
-    // contains the monux invocation.
-    let comm = fs::read_to_string(format!("/proc/{}/comm", pid));
+    // The executable name (resolved through symlinks by the kernel) rules
+    // out wrapper shells whose cmdline merely contains the monux invocation.
+    let exe = proc_exe_name(pid);
     let cmdline =
         fs::read_to_string(format!("/proc/{}/cmdline", pid)).map(|s| s.replace('\0', " "));
     let verified = matches!(
-        (&comm, &cmdline),
-        (Ok(c), Ok(cl)) if c.trim() == "monux" && cl.split_whitespace().any(|tok| tok == kind)
+        (&exe, &cmdline),
+        (Ok(e), Ok(cl)) if e == "monux" && cl.split_whitespace().any(|tok| tok == kind)
     );
     if !verified {
-        if comm.is_err() && cmdline.is_err() {
+        if exe.is_err() && cmdline.is_err() {
             // /proc/<pid> is unreadable for another user's process (hidepid):
             // the holder is likely root, and we can neither verify nor signal it.
             bail!(
@@ -220,11 +225,11 @@ pub fn acquire(kind: &str) -> Result<InstanceLock> {
             );
         }
         bail!(
-            "Another monux {0} is already running, but the pid recorded in {1} ({2}) doesn't look like a monux {0} process (comm: '{3}'). Refusing to kill it; stop the old instance manually.",
+            "Another monux {0} is already running, but the pid recorded in {1} ({2}) doesn't look like a monux {0} process (exe: '{3}'). Refusing to kill it; stop the old instance manually.",
             kind,
             path.display(),
             pid,
-            comm.map(|c| c.trim().to_string()).unwrap_or_default()
+            exe.as_deref().unwrap_or_default()
         );
     }
     info!("Asking existing monux {} (pid {}) to shut down...", kind, pid);
@@ -303,6 +308,24 @@ fn read_pid(path: &PathBuf) -> Option<i32> {
     fs::read_to_string(path).ok()?.trim().strip_prefix("pid ")?.parse().ok()
 }
 
+/// Basename of a process's executable, read via /proc/<pid>/exe. The kernel
+/// resolves that link through symlinks, so the name is "monux" even when the
+/// daemon was launched through the `mx` alias — /proc/<pid>/comm, the obvious
+/// alternative, is set to the basename of the exec'd path and would read "mx"
+/// there, misidentifying an alias-started daemon as not-monux. Using the
+/// executable name rather than the cmdline also rules out wrapper shells that
+/// merely contain the monux invocation.
+fn proc_exe_name(pid: i32) -> std::io::Result<String> {
+    let target = fs::read_link(format!("/proc/{}/exe", pid))?;
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // A daemon whose binary was replaced on disk after exec (an auto-update
+    // downloaded while it keeps running) reads back as "monux (deleted)".
+    Ok(name.strip_suffix(" (deleted)").map(str::to_owned).unwrap_or(name))
+}
+
 /// The pid of the live holder of the `kind` lock, if there is one: the lock
 /// file records a pid and that process is alive and looks like monux running
 /// the matching kind. Read-only role detection (e.g. the update gate decides
@@ -347,13 +370,13 @@ pub fn live_holder(kind: &str) -> Option<i32> {
     if pid == std::process::id() as i32 {
         return None;
     }
-    let comm = fs::read_to_string(format!("/proc/{}/comm", pid)).ok()?;
+    let exe = proc_exe_name(pid).ok()?;
     let cmdline = fs::read_to_string(format!("/proc/{}/cmdline", pid))
         .map(|s| s.replace('\0', " "))
         .ok()?;
     // Exact argv-token match: `monux client my-server-host` must NOT match
     // live_holder("server") — a bare substring check would.
-    if comm.trim() == "monux" && cmdline.split_whitespace().any(|tok| tok == kind) {
+    if exe == "monux" && cmdline.split_whitespace().any(|tok| tok == kind) {
         Some(pid)
     } else {
         None
@@ -451,5 +474,37 @@ mod tests {
         // A pre-existing regular file is reused, not refused.
         let lock = acquire("regulartest").unwrap();
         assert!(!lock.took_over);
+    }
+
+    /// A daemon launched through the `mx` alias symlink must still verify as
+    /// monux: the kernel sets comm to the basename of the exec'd path ("mx"),
+    /// while /proc/<pid>/exe is resolved through symlinks and keeps the real
+    /// name. Demonstrated with a copy of `sleep` named "monux" spawned via an
+    /// "mx" symlink; the proc checks aren't stubbed, so this runs against the
+    /// real /proc.
+    #[test]
+    fn proc_exe_name_sees_through_the_alias_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        // Find sleep's real path through a throwaway child (PATH lookup).
+        let mut probe = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let sleep = fs::read_link(format!("/proc/{}/exe", probe.id())).unwrap();
+        probe.kill().unwrap();
+        let _ = probe.wait();
+
+        let monux = dir.path().join("monux");
+        fs::copy(&sleep, &monux).unwrap();
+        std::os::unix::fs::symlink(&monux, dir.path().join("mx")).unwrap();
+
+        let mut child = std::process::Command::new(dir.path().join("mx")).arg("30").spawn().unwrap();
+        let pid = child.id() as i32;
+        // comm is the alias — this is why the old comm check rejected it.
+        assert_eq!(
+            fs::read_to_string(format!("/proc/{}/comm", pid)).unwrap().trim(),
+            "mx"
+        );
+        // /proc/<pid>/exe resolves through the symlink to the real name.
+        assert_eq!(proc_exe_name(pid).unwrap(), "monux");
+        child.kill().unwrap();
+        let _ = child.wait();
     }
 }

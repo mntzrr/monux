@@ -27,8 +27,9 @@ pub enum ServerEvent<'a> {
     /// edge.rs). Sent on connect, before the first Switch(true), to mapped
     /// clients only, so the client can infer the OPPOSITE edge for the return
     /// trip without needing its own --edge-map. Appended variant (protocol
-    /// v12): mixed versions refuse at the handshake anyway, so a pre-v12
-    /// client never sees it.
+    /// v12): the v16 negotiation floor (shared::PROTOCOL_VERSION_NEGOTIATION)
+    /// refuses any pre-v16 peer outright, so a client old enough to fail on
+    /// this variant can never pair and thus never sees it.
     EdgeInfo { direction: Direction },
 
     /// Tells the client to stop watching the OPPOSITE edge that a prior
@@ -152,8 +153,11 @@ pub enum ClientEvent<'a> {
     /// Asks the server to switch input back to the local machine, sent by
     /// the client's own screen-edge detection when the cursor dwells on a
     /// mapped edge of the client machine (see edge.rs). `y_fraction`
-    /// (0.0..=1.0) is where along the edge the cursor crossed, reserved for
-    /// future cursor warping — the server ignores it for now. The server
+    /// (0.0..=1.0) is where along the edge the cursor crossed — the
+    /// ALONG-edge fraction: the y fraction for left/right edges but the X
+    /// fraction for top/bottom edges (see edge::edge_fraction; the field
+    /// can't be renamed without a protocol break). Reserved for future
+    /// cursor warping — the server ignores it for now. The server
     /// honors the request only when this client is the current one.
     /// Appended variant (protocol v11).
     SwitchRequest { y_fraction: f64 },
@@ -331,10 +335,17 @@ pub struct InputEvent {
 
 impl std::fmt::Display for InputEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        if let Some(evt) = &self.inputi32 {
-            write!(f, "InputEvent(inputi32={})", evt)
-        } else if let Some(evt) = &self.inputf64 {
+        // f64 first: the canonical precedence, matching the emit path
+        // (VirtualUInputDevices::write_frame in device/output/uinput.rs
+        // prefers inputf64 too), so a rendering shows the value that would
+        // actually be emitted. Producers never set both fields — an event is
+        // either discrete (i32) or scaled (f64) — so this ordering only
+        // matters for the never-should-happen both-Some case, and
+        // consistency with the emit path is the tiebreaker there.
+        if let Some(evt) = &self.inputf64 {
             write!(f, "InputEvent(inputf64={})", evt)
+        } else if let Some(evt) = &self.inputi32 {
+            write!(f, "InputEvent(inputi32={})", evt)
         } else {
             f.write_str("InputEvent(?)")
         }
@@ -467,8 +478,14 @@ impl InputF64 {
             // For example: min=-10, max=10, vali=5 -> valf=0.75
             // A broken device advertising min==max would divide by zero;
             // clamp to 0.0 instead of emitting NaN/inf onto the wire.
+            //
+            // Widen to i64 before subtracting: min/max come unvalidated from
+            // kernel absinfo, so a broken device (or any local uinput
+            // process) can advertise min=i32::MIN, max=i32::MAX, and the
+            // i32 subtractions would overflow (debug panic, wrapped garbage
+            // scale factor in release).
             value: if max > min {
-                ((e.value() - min) as f64) / ((max - min) as f64)
+                ((e.value() as i64 - min as i64) as f64) / ((max as i64 - min as i64) as f64)
             } else {
                 0.0
             },
@@ -476,11 +493,19 @@ impl InputF64 {
     }
 
     pub fn to_evdev(&self, min: i32, max: i32) -> evdev::InputEvent {
+        // Inverse of from_evdev math. The value is remote-controlled, so
+        // enforce the scaled 0.0..=1.0 invariant before unscaling: a buggy
+        // peer sending NaN/inf/huge would otherwise pin the pointer at a
+        // saturating-cast extreme. clamp handles ±inf (to 1.0/0.0) but
+        // passes NaN through, so NaN maps to 0.0 explicitly.
+        let value = {
+            let clamped = self.value.clamp(0.0, 1.0);
+            if clamped.is_nan() { 0.0 } else { clamped }
+        };
         evdev::InputEvent::new(
             self.type_,
             self.code,
-            // Inverse of from_evdev math:
-            (self.value * ((max - min) as f64)) as i32 + min,
+            (value * ((max - min) as f64)) as i32 + min,
         )
     }
 }
@@ -937,5 +962,53 @@ mod tests {
         assert_eq!(InputF64::from_evdev(e, 3, 3).value, 0.0);
         // And the normal case keeps its math.
         assert_eq!(InputF64::from_evdev(e, -10, 10).value, 0.75);
+    }
+
+    #[test]
+    fn inputf64_from_evdev_extreme_absinfo_does_not_overflow() {
+        // min/max come unvalidated from kernel absinfo: a broken device (or
+        // any local uinput process) can advertise the full i32 range, where
+        // i32 subtraction would overflow. The widened i64 math must hold.
+        let e = evdev::InputEvent::new(evdev::EventType::ABSOLUTE.0, 0, i32::MAX);
+        assert_eq!(InputF64::from_evdev(e, i32::MIN, i32::MAX).value, 1.0);
+        let e = evdev::InputEvent::new(evdev::EventType::ABSOLUTE.0, 0, i32::MIN);
+        assert_eq!(InputF64::from_evdev(e, i32::MIN, i32::MAX).value, 0.0);
+        let e = evdev::InputEvent::new(evdev::EventType::ABSOLUTE.0, 0, 0);
+        let v = InputF64::from_evdev(e, i32::MIN, i32::MAX).value;
+        assert!((v - 0.5).abs() < 1e-9, "{}", v);
+    }
+
+    #[test]
+    fn inputf64_to_evdev_clamps_remote_values_to_the_scaled_range() {
+        // The value is remote-controlled: NaN/inf/out-of-range must clamp
+        // into the scaled 0.0..=1.0 invariant instead of pinning the pointer
+        // at a saturating-cast extreme.
+        let f = |value: f64| InputF64 { type_: 3, code: 53, value }.to_evdev(-10, 10).value();
+        assert_eq!(f(f64::NAN), -10);
+        assert_eq!(f(f64::INFINITY), 10);
+        assert_eq!(f(f64::NEG_INFINITY), -10);
+        assert_eq!(f(-0.5), -10);
+        assert_eq!(f(1.5), 10);
+        assert_eq!(f(1e300), 10);
+        // In-range values keep their math.
+        assert_eq!(f(0.75), 5);
+        assert_eq!(f(0.0), -10);
+        assert_eq!(f(1.0), 10);
+    }
+
+    #[test]
+    fn input_event_display_prefers_f64_like_the_emit_path() {
+        // Both fields set never happens (an event is either discrete or
+        // scaled), but if it did, Display must render the value the emit
+        // path would write: write_frame prefers inputf64, so Display does
+        // too (see the Display impl).
+        let both = InputEvent {
+            inputi32: Some(InputI32 { type_: 2, code: 0, value: 8 }),
+            inputf64: Some(InputF64 { type_: 3, code: 53, value: 0.5 }),
+        };
+        assert_eq!(
+            format!("{}", both),
+            "InputEvent(inputf64=InputF64(type=3, code=53, value=0.5))"
+        );
     }
 }

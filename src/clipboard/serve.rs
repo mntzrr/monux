@@ -56,11 +56,15 @@ struct Inner {
     /// The last successful serve. Single slot: requests within a burst are
     /// for the same clipboard.
     last_served: Option<ServedEntry>,
-    /// (cache epoch, requested_type, when) of the last failed or empty serve.
-    /// A matching request within NEGATIVE_SERVE_CACHE_TTL gets an empty
-    /// answer without re-reading; an epoch bump (clipboard changed) or a TTL
-    /// expiry lets the next request read again.
-    last_failed: Option<(u64, String, Instant)>,
+    /// (cache epoch, requested_type, size cap, when) of the last failed or
+    /// empty serve. A matching request within NEGATIVE_SERVE_CACHE_TTL gets
+    /// an empty answer without re-reading; an epoch bump (clipboard changed)
+    /// or a TTL expiry lets the next request read again. The cap is part of
+    /// the replay condition because a failure can BE the cap (payload too
+    /// big): replaying it to a larger-cap requester would poison that
+    /// requester for the whole TTL, so only a request whose cap is no larger
+    /// than the failed one gets the empty replay.
+    last_failed: Option<(u64, String, u64, Instant)>,
 }
 
 impl SharedClipboardReader {
@@ -130,9 +134,10 @@ impl SharedClipboardReader {
         // as an empty answer within the TTL, so a retry burst (e.g. a
         // clipboard manager fetching every advertised type after a timeout)
         // doesn't pay the slow read — and its stall — again.
-        if let Some((failed_epoch, failed_type, when)) = &inner.last_failed {
+        if let Some((failed_epoch, failed_type, failed_cap, when)) = &inner.last_failed {
             if *failed_epoch == epoch
                 && failed_type == requested_type
+                && max_size_bytes <= *failed_cap
                 && when.elapsed() < self.negative_ttl
             {
                 debug!(
@@ -156,7 +161,8 @@ impl SharedClipboardReader {
         };
         match result {
             Err(e) => {
-                inner.last_failed = Some((epoch, requested_type.to_string(), Instant::now()));
+                inner.last_failed =
+                    Some((epoch, requested_type.to_string(), max_size_bytes, Instant::now()));
                 Err(e)
             }
             Ok((content, data_type)) => {
@@ -165,7 +171,8 @@ impl SharedClipboardReader {
                     // negatively cached, never in the positive slot: after the
                     // TTL the next request reads again — the app may answer
                     // then.
-                    inner.last_failed = Some((epoch, requested_type.to_string(), Instant::now()));
+                    inner.last_failed =
+                        Some((epoch, requested_type.to_string(), max_size_bytes, Instant::now()));
                     Ok((Default::default(), data_type))
                 } else {
                     // Arc the payload once; the cache slot and this answer
@@ -358,6 +365,31 @@ mod tests {
         // replayed, the next request reads again even within the TTL.
         reader.invalidate();
         assert!(reader.read("text/plain", u64::MAX, "test").await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn negative_cache_does_not_poison_a_larger_cap_requester() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        // 50 bytes: under the 100-byte compression floor, so a successful
+        // serve is exactly the reader's payload.
+        let reader = SharedClipboardReader::new_with_negative_ttl(
+            Box::new(SizedReader {
+                calls: calls.clone(),
+                len: 50,
+            }),
+            Duration::from_secs(10),
+        );
+        // A requester whose cap the payload exceeds fails, and a retry at the
+        // same cap gets the cached empty answer without re-reading.
+        assert!(reader.read("text/plain", 49, "test").await.is_err());
+        let (content, _) = reader.read("text/plain", 49, "test").await.unwrap();
+        assert!(content.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // But the failure was keyed to that cap: a larger-cap requester the
+        // payload fits must get a real read, not the replayed empty answer.
+        let (content, _) = reader.read("text/plain", 50, "test").await.unwrap();
+        assert_eq!(content.len(), 50);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 

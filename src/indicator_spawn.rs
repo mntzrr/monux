@@ -272,9 +272,10 @@ fn terminate_and_reap(mut child: Child) {
 }
 
 /// The supervisor's mutable state, shared between the monitor task (which
-/// respawns into it), the Supervisor's Drop (which reaps out of it) and the
-/// control socket's SupervisorHandle (which hides/shows). A std Child, not
-/// tokio's, so Drop and hide() can reap synchronously.
+/// respawns into it), the Supervisor's Drop (which takes its child out of
+/// it — to ORPHAN it, not reap it) and the control socket's SupervisorHandle
+/// (which hides/shows). A std Child, not tokio's, so hide() can reap
+/// synchronously without a runtime.
 struct Shared {
     /// The supervisor's own spawned child; None when hidden, not yet
     /// spawned, or given up on. NEVER a manually-started indicator.
@@ -442,20 +443,36 @@ fn exit_action(shared: &mut Shared, exit: ChildExit, uptime: Duration) -> ExitAc
 /// Spawns the indicator and stores it as the supervised child; returns its
 /// pid. Callers have already decided a spawn is wanted (not hidden, no live
 /// child). Takes the lock before spawning so concurrent callers can't
-/// displace each other's child (which would leak an unreaped zombie).
+/// displace each other's child (which would leak an unreaped zombie), and
+/// does the whole state transition in that ONE critical section (see
+/// store_fresh_child): a hide() or a monitor TakenOver/GiveUp interleaving
+/// between a store and a separate hidden=false could strand the fresh child
+/// — hidden==false with an empty slot is unrecoverable, observe_exit only
+/// reacting to a child IN the slot.
 fn spawn_and_store(shared: &Arc<Mutex<Shared>>) -> Result<u32> {
     let mut shared = crate::lock(shared);
     let child = spawn_indicator()?;
     let pid = child.id();
-    // A prior child that's somehow still here (concurrent spawn raced in):
-    // reap it instead of orphaning it as a zombie.
+    store_fresh_child(&mut shared, child);
+    Ok(pid)
+}
+
+/// Stores a freshly spawned child and makes the matching state transition
+/// atomically with the store: the respawn budget resets (a fresh start
+/// after give-up/takeover comes with a fresh budget) and hidden clears. A
+/// prior child that's somehow still here (a concurrent spawn raced in) is
+/// reaped instead of orphaned as a zombie. The monitor's respawn path does
+/// NOT go through here — a respawn keeps the spent budget and never clears
+/// hidden.
+fn store_fresh_child(shared: &mut Shared, child: Child) {
     if let Some(mut old) = shared.child.take() {
         let _ = old.kill();
         let _ = old.wait();
     }
     shared.child = Some(child);
     shared.spawned_at = Instant::now();
-    Ok(pid)
+    shared.policy = RespawnPolicy::new();
+    shared.hidden = false;
 }
 
 /// The control socket's view of the supervisor: hide/show by request. Cheap
@@ -500,11 +517,11 @@ impl SupervisorHandle {
             ),
             ShowDecision::AlreadyRunning => Ok(()),
             ShowDecision::Spawn => {
+                // The store and the show-side state reset (fresh budget,
+                // hidden cleared) are one critical section: a raced hide()
+                // runs either before (the store overwrites its hidden) or
+                // after (it takes and reaps THIS child), never in between.
                 let pid = spawn_and_store(&self.shared)?;
-                // A fresh start after give-up/takeover gets a fresh budget.
-                let mut shared = crate::lock(&self.shared);
-                shared.policy = RespawnPolicy::new();
-                shared.hidden = false;
                 info!("Showed the tray indicator on request (pid {})", pid);
                 Ok(())
             }
@@ -515,8 +532,9 @@ impl SupervisorHandle {
 /// Guard for the auto-spawned tray indicator. Created early (new) so the
 /// control socket gets a handle, launched once the daemon is up (launch:
 /// server listening, client control socket bound) and kept alive; on drop —
-/// every daemon exit path unwinds past it — the child is SIGTERM'd and
-/// reaped.
+/// every daemon exit path unwinds past it — the child is deliberately
+/// ORPHANED, not reaped: it stays up as the standalone launcher (see the
+/// Drop impl).
 pub struct Supervisor {
     shared: Arc<Mutex<Shared>>,
     shutdown: Arc<AtomicBool>,
@@ -609,8 +627,9 @@ impl Drop for Supervisor {
 
 /// Watches the supervised child and respawns it on unexpected exit, bounded
 /// by the RespawnPolicy in the shared state. Dormant while hidden; ends when
-/// the Supervisor's Drop sets `shutdown` (the Drop has already reaped the
-/// child by then).
+/// the Supervisor's Drop sets `shutdown` (the Drop has already taken the
+/// child out of the slot by then — orphaned, not reaped, so nothing waits
+/// on it here).
 async fn monitor_loop(shared: Arc<Mutex<Shared>>, shutdown: Arc<AtomicBool>) {
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -671,8 +690,9 @@ async fn monitor_loop(shared: Arc<Mutex<Shared>>, shutdown: Arc<AtomicBool>) {
         {
             let mut shared = crate::lock(&shared);
             // Shutdown (or hidden/shown, which spawns directly) during the
-            // delay or before this final lock? A spawn after the Drop's reap
-            // would be orphaned — no supervisor is left to ever reap it.
+            // delay or before this final lock? A spawn after the Drop has
+            // taken the child would be orphaned — no supervisor is left to
+            // ever reap it.
             if shutdown.load(Ordering::Relaxed) || shared.hidden || shared.child.is_some() {
                 continue;
             }
@@ -970,6 +990,25 @@ mod tests {
         assert!(shutting_down.show().is_err());
         // (The show-spawns-a-fresh-child path needs a real monux binary and
         // a session bus; it is covered by the E2E tests.)
+    }
+
+    #[test]
+    fn storing_a_fresh_child_resets_the_show_state_atomically() {
+        // show()'s whole state transition rides with the child store in one
+        // critical section (spawn_and_store): split across two acquisitions,
+        // a raced hide() could reap the fresh child and leave hidden==false
+        // with an empty slot — a state observe_exit can never recover from.
+        let mut shared = shared_for_test();
+        shared.hidden = true;
+        assert!(shared.policy.on_exit(Duration::from_secs(5)).is_some());
+        store_fresh_child(&mut shared, spawn_sh("sleep 30"));
+        assert!(!shared.hidden);
+        assert_eq!(shared.policy.respawns, 0);
+        assert!(shared.child_running());
+        // A child displaced by a raced spawn is reaped, not leaked.
+        store_fresh_child(&mut shared, spawn_sh("sleep 30"));
+        assert!(shared.child_running());
+        terminate_and_reap(shared.child.take().unwrap());
     }
 
     /// Shared state as the monitor sees it between events.

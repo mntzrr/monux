@@ -866,7 +866,7 @@ fn redact_names(text: &str, names: &Names) -> String {
     // Home paths before the usernames: /home/alice must become ~ rather than
     // /home/<user>, and the bare-username pass would otherwise get there first.
     for home in names.home_paths() {
-        out = out.replace(&home, "~");
+        out = replace_home_path(&out, &home);
     }
     for (name, placeholder) in names.substitutions() {
         out = replace_whole_words(&out, name, placeholder);
@@ -1028,6 +1028,26 @@ fn replace_whole_words(haystack: &str, needle: &str, replacement: &str) -> Strin
     out
 }
 
+/// Folds a home directory to `~`, but only where the match IS the whole
+/// directory: a bare substring replace turns /home/alice2/... into ~2/...,
+/// misreading a stranger's path as the user's home. A match followed by
+/// another path-component character (alice2, alice.bak) is a longer path and
+/// stays; a `/` or any non-component character ends the directory name.
+fn replace_home_path(haystack: &str, home: &str) -> String {
+    let is_component_char = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '+');
+    let mut out = String::with_capacity(haystack.len());
+    let mut rest = haystack;
+    while let Some(pos) = rest.find(home) {
+        let after = &rest[pos + home.len()..];
+        let whole = after.chars().next().is_none_or(|c| !is_component_char(c));
+        out.push_str(&rest[..pos]);
+        out.push_str(if whole { "~" } else { home });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 fn hostname() -> Option<String> {
     read_trimmed("/proc/sys/kernel/hostname")
 }
@@ -1095,7 +1115,14 @@ fn pipe_into(tool: &str, args: &[&str], text: &str) -> Result<()> {
             }
         },
         Ok(Err(e)) => {
-            let _ = child.wait();
+            // The write failed, but the tool may still be running — or
+            // wedged, in which case a bare wait() blocks the tray's service
+            // thread for good. Reap under the same deadline as the sibling
+            // paths, and kill on expiry.
+            if wait_with_timeout(&mut child, CLIPBOARD_TOOL_TIMEOUT)?.is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
             Err(e).with_context(|| format!("failed to write to {}", tool))
         }
         Err(_) => {
@@ -1157,7 +1184,14 @@ fn probe_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Result
     });
     match rx.recv_timeout(timeout) {
         Ok(Ok(out)) => {
-            let _ = wait_with_timeout(&mut child, timeout);
+            // A closed stdout only proves the READ finished. A probe that
+            // closed it and kept running must still be killed and reaped —
+            // Child's drop does neither, and the caller is a long-lived
+            // daemon that would keep the zombie.
+            if wait_with_timeout(&mut child, timeout)?.is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
             Ok(out)
         }
         Ok(Err(e)) => {
@@ -1315,17 +1349,38 @@ fn default_report_path() -> PathBuf {
 /// known_servers.rs, certs.rs).
 ///
 /// Exclusive creation first, so a name somebody else got to is not written
-/// through. A file that is already there is still truncated — a recycled pid,
+/// through. A file that is already there is still replaced — a recycled pid,
 /// or a second `record --out <path>` over the same file, must keep working —
-/// but only after the chmod succeeds, which is what stops the bundle from
-/// being written into a file this user does not own.
+/// but only after it has proven to be a regular file this user owns, and the
+/// re-open passes O_NOFOLLOW: truncation happens at open() time, so a
+/// pre-planted symlink (or someone else's writable file) at this predictable
+/// path must fail BEFORE it, not be caught afterwards.
 fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let mut options = std::fs::OpenOptions::new();
     options.write(true).mode(0o600);
     let file = match options.create_new(true).open(path) {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            options.create_new(false).create(true).truncate(true).open(path)?
+            // The path is taken. Reusing it is legitimate only when it is
+            // this user's own earlier artifact — in a world-writable
+            // directory, anything else is somebody's trap or property.
+            // lstat, not metadata: a symlink must be refused, not followed.
+            let meta = std::fs::symlink_metadata(path)?;
+            if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to reuse {}: it is not a regular file owned by this user",
+                        path.display()
+                    ),
+                ));
+            }
+            options
+                .create_new(false)
+                .create(true)
+                .truncate(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)?
         }
         other => other?,
     };
@@ -1333,6 +1388,14 @@ fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
     // there keeps whatever permissions it was given.
     file.set_permissions(PermissionsExt::from_mode(0o600))?;
     Ok(file)
+}
+
+/// Single-quotes a string for a shell command line, with the standard
+/// `'` → `'\''` escape — the one quoting rule every POSIX shell agrees on.
+/// Rust's `{:?}` is NOT shell quoting: inside its double quotes, `$(...)`
+/// and backticks still expand, so a title would become a command.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Gets a report to the point of filing — and stops there.
@@ -1384,15 +1447,16 @@ fn prepare_issue(text: &str, title: Option<&str>, d: &Diagnostics, path: &Path) 
     out.push_str("\nFile it with:\n");
     match (which("gh"), wrote.is_ok()) {
         (Some(_), true) => out.push_str(&format!(
-            "    gh issue create --repo {} --title {:?} --body-file {}\n",
+            "    gh issue create --repo {} --title {} --body-file {}\n",
             ISSUE_REPO,
-            title,
+            shell_quote(title),
             path.display()
         )),
         // No file to point at: gh can still read the body from stdin.
         (Some(_), false) => out.push_str(&format!(
-            "    monux diagnostics --markdown | gh issue create --repo {} --title {:?} --body-file -\n",
-            ISSUE_REPO, title
+            "    monux diagnostics --markdown | gh issue create --repo {} --title {} --body-file -\n",
+            ISSUE_REPO,
+            shell_quote(title)
         )),
         (None, _) => out.push_str(&format!(
             "    {} — then paste the report into the body\n\
@@ -1580,10 +1644,19 @@ fn default_capture_path(role: Role) -> PathBuf {
     ))
 }
 
-/// Why `--peer` came back with nothing. Three causes look identical in the
+/// Why `--peer` came back with nothing. Four causes look identical in the
 /// output and lead to completely different next steps, so the note names the
 /// one that actually applies.
 fn empty_peers_reason(role: Role, diagnostics: &Diagnostics) -> String {
+    // No daemon answered at all: the offline fallback is stamped with the
+    // CURRENT protocol version, so without checking for it first the version
+    // branch below walks straight past and reports "no connected clients"
+    // for a daemon that was never asked.
+    if diagnostics.environment.caveat.is_some() {
+        return "no daemon answered on the control socket, so there was nobody to ask for \
+                peers — the bundle covers this machine's environment and journal only."
+            .to_string();
+    }
     if role == Role::Client {
         return "--peer only applies to a server daemon — a client has no peers to poll. \
                 Run it on the server to cover both machines."
@@ -1833,6 +1906,35 @@ mod tests {
         assert_eq!(replace_whole_words("none here", "alice", "<user>"), "none here");
     }
 
+    /// A bare substring replace folded /home/alice2/... into ~2/... —
+    /// misreading a stranger's path as the user's home. Only the whole
+    /// directory name folds.
+    #[test]
+    fn home_path_redaction_only_folds_the_whole_directory() {
+        let names = Names {
+            hostnames: Vec::new(),
+            usernames: vec!["alice".to_string()],
+        };
+        assert_eq!(
+            redact_names("cp /home/alice2/src /home/alice/docs", &names),
+            "cp /home/alice2/src ~/docs"
+        );
+        // A lookalike directory is not folded to ~.bak by the home pass; the
+        // username pass still scrubs the name inside it, so nothing leaks.
+        assert_eq!(
+            redact_names("ls /home/alice.bak /home/alice", &names),
+            "ls /home/<user>.bak ~"
+        );
+        // End of text folds. A trailing sentence period does not — it might
+        // begin a longer name like alice.bak — but the username pass still
+        // redacts the name there.
+        assert_eq!(redact_names("home: /home/alice", &names), "home: ~");
+        assert_eq!(
+            redact_names("home is /home/alice.", &names),
+            "home is /home/<user>."
+        );
+    }
+
     /// A peer bundle whose Environment names the other machine, for the
     /// peer-redaction tests below.
     fn peer_fixture(label: &str, hostname: Option<&str>, username: Option<&str>) -> control::PeerDiagnostics {
@@ -2055,6 +2157,37 @@ mod tests {
         let reason = empty_peers_reason(Role::Server, &d);
         assert!(reason.contains("predates peer diagnostics"), "{}", reason);
         assert!(reason.contains("mx daemon restart"), "{}", reason);
+        // No daemon answered AT ALL: the offline fallback is stamped with the
+        // current protocol version, so without the caveat check the branches
+        // above confidently named a cause for a daemon that was never asked.
+        d.environment.caveat = Some("no daemon answered".to_string());
+        let reason = empty_peers_reason(Role::Server, &d);
+        assert!(reason.contains("no daemon answered"), "{}", reason);
+        assert!(!reason.contains("no connected clients"), "{}", reason);
+    }
+
+    /// Rust's {:?} is not shell quoting: inside its double quotes, `$(...)`
+    /// and backticks still expand, and a --title would become a command.
+    #[test]
+    fn the_issue_command_shell_quotes_its_title() {
+        assert_eq!(shell_quote("plain title"), "'plain title'");
+        // An embedded quote gets the standard '\'' escape; everything else —
+        // substitution, backticks, glob — sits inert inside single quotes.
+        assert_eq!(
+            shell_quote("it's broken $(rm -rf ~) `now` *"),
+            "'it'\\''s broken $(rm -rf ~) `now` *'"
+        );
+        // And it reaches the printed command, whatever gh's availability.
+        let dir = tempfile::tempdir().unwrap();
+        let out = prepare_issue(
+            "body",
+            Some("it's $(touch /tmp/pwned)"),
+            &diagnostics_fixture(),
+            &dir.path().join("report.md"),
+        );
+        if which("gh").is_some() {
+            assert!(out.contains("'it'\\''s $(touch /tmp/pwned)'"), "{}", out);
+        }
     }
 
     #[test]
@@ -2072,7 +2205,7 @@ mod tests {
         assert!(out.contains("Report written to"), "{}", out);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "# report body");
         // The title is quoted into the command, not interpolated raw.
-        assert!(out.contains("\"clipboard never crosses\""), "{}", out);
+        assert!(out.contains("--title 'clipboard never crosses'"), "{}", out);
         assert!(out.contains("File it with:"), "{}", out);
         // Filing is publishing: the reporter is told what is in it and sends
         // it themselves. Nothing here posts anything.
@@ -2128,6 +2261,22 @@ mod tests {
         assert_eq!(mode, 0o600, "{:o}", mode);
     }
 
+    /// The artifact names are predictable and their directory is
+    /// world-writable: a symlink pre-planted on the path must be REFUSED,
+    /// not opened — truncation happens at open() time, so following the
+    /// link would destroy whatever it points at.
+    #[test]
+    fn a_symlink_on_the_artifact_path_is_refused_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.md");
+        std::fs::write(&target, "precious").unwrap();
+        let link = dir.path().join("monux-report-1234.md");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(create_private_file(&link).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "precious");
+    }
+
     #[test]
     fn an_unwritable_report_path_falls_back_instead_of_failing() {
         // A read-only or missing directory must not cost the user the report:
@@ -2161,6 +2310,47 @@ mod tests {
     fn probes_time_out_instead_of_hanging() {
         let err = probe_with_timeout("sleep", &["30"], Duration::from_millis(150)).unwrap_err();
         assert!(err.to_string().contains("did not answer"), "{:#}", err);
+    }
+
+    /// A probe that closes its stdout but never exits finished the READ —
+    /// the child behind it must still be killed and reaped, or the daemon
+    /// collects a zombie per probe.
+    #[test]
+    fn a_probe_that_closes_stdout_but_keeps_running_is_reaped() {
+        let start = std::time::Instant::now();
+        let out = probe_with_timeout(
+            "sh",
+            &["-c", "echo hi; exec 1>&-; sleep 30"],
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        assert_eq!(out.trim(), "hi");
+        // The answer arrives once the wait deadline expires and the child is
+        // killed — nowhere near the probe's own 30s.
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the lingering child was not killed: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A clipboard tool that closes stdin at once (so the write fails) but
+    /// never exits must not be met with a bare wait(): that used to block
+    /// the tray's service thread for good.
+    #[test]
+    fn a_wedged_clipboard_tool_is_killed_on_the_write_error_path() {
+        let start = std::time::Instant::now();
+        // Bigger than the 64 KiB pipe buffer, so the write is still in
+        // flight when the child closes stdin — the EPIPE path, not a race
+        // against the child getting there first.
+        let payload = "x".repeat(128 * 1024);
+        let err = pipe_into("sh", &["-c", "exec 0<&-; sleep 30"], &payload).unwrap_err();
+        assert!(err.to_string().contains("failed to write"), "{:#}", err);
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "waited on a wedged tool: {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

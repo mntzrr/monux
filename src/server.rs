@@ -38,6 +38,59 @@ const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// How many client handshakes may be in flight at once (see the accept loop).
 const MAX_CONCURRENT_HANDSHAKES: usize = 32;
 
+/// How many ESTABLISHED connections one approved client fingerprint may hold
+/// at once (see PeerConnections). Hardening, not authentication: a legitimate
+/// client holds exactly one connection (a reconnect replaces it), so a small
+/// cap is far above any real need.
+const MAX_CONNECTIONS_PER_PEER: usize = 4;
+
+/// Counts established connections per client fingerprint. The handshake phase
+/// is already bounded (MAX_CONCURRENT_HANDSHAKES, plus quinn's max_incoming
+/// on what queues before accept), but without this an approved peer could
+/// open unlimited parallel established connections — each spawning two tasks,
+/// a rotation roster entry, and a bulk-writer task.
+#[derive(Default)]
+struct PeerConnections {
+    counts: HashMap<String, usize>,
+}
+
+impl PeerConnections {
+    /// Records one more established connection for `fingerprint`; None when
+    /// the peer is already at MAX_CONNECTIONS_PER_PEER (the caller closes the
+    /// connection instead of serving it).
+    fn try_acquire(counts: &Arc<Mutex<Self>>, fingerprint: &str) -> Option<PeerConnectionSlot> {
+        let mut inner = counts.lock().expect("peer connections lock poisoned");
+        let count = inner.counts.entry(fingerprint.to_string()).or_insert(0);
+        if *count >= MAX_CONNECTIONS_PER_PEER {
+            return None;
+        }
+        *count += 1;
+        Some(PeerConnectionSlot {
+            counts: Arc::clone(counts),
+            fingerprint: fingerprint.to_string(),
+        })
+    }
+}
+
+/// One counted connection: dropping it releases the count, so every exit
+/// path of the connection task frees the peer's slot.
+struct PeerConnectionSlot {
+    counts: Arc<Mutex<PeerConnections>>,
+    fingerprint: String,
+}
+
+impl Drop for PeerConnectionSlot {
+    fn drop(&mut self) {
+        let mut inner = self.counts.lock().expect("peer connections lock poisoned");
+        if let Some(count) = inner.counts.get_mut(&self.fingerprint) {
+            *count -= 1;
+            if *count == 0 {
+                inner.counts.remove(&self.fingerprint);
+            }
+        }
+    }
+}
+
 /// Tracks per-client protocol versions so a version-mismatched client reads
 /// like the self-healing flow it is (it will auto-update and return), not
 /// like a broken connection erroring every few seconds — and so the moment
@@ -344,7 +397,7 @@ pub async fn run_server_connections_loop(
     mode: transport::NetworkMode,
     endpoint_slot: SharedEndpoint,
 ) -> Result<()> {
-    let server_endpoint = bind_server_with_retry(listen_addr, cert_verifier, mode).await?;
+    let server_endpoint = bind_server_with_retry(listen_addr, cert_verifier.clone(), mode).await?;
     // Publish the endpoint for the shutdown path (see SharedEndpoint).
     *endpoint_slot
         .lock()
@@ -352,6 +405,9 @@ pub async fn run_server_connections_loop(
     // Protocol-version tracker: turns refusal spam into the self-healing
     // story (outdated client auto-updating) and notes when it catches up.
     let peer_versions = Arc::new(Mutex::new(PeerVersions::default()));
+    // Per-fingerprint count of established connections (see
+    // MAX_CONNECTIONS_PER_PEER): bounds what an approved peer can pile up.
+    let peer_connections = Arc::new(Mutex::new(PeerConnections::default()));
     // How long a single connection handshake may take before it is dropped.
     // Local mode is generous (an approval-pending peer retries anyway);
     // Www mode never prompts, so it can be much stricter. The interactive
@@ -395,6 +451,9 @@ pub async fn run_server_connections_loop(
         let conn_token = next_conn_token;
         next_conn_token += 1;
         let remote_addr = conn.remote_address();
+        // Let the approval prompt name who is connecting (approval.rs); the
+        // address is unauthenticated transport info, like the client side's.
+        cert_verifier.record_incoming_attempt(remote_addr);
         if mode == transport::NetworkMode::Www && !conn.remote_address_validated() {
             // On the public internet, require the client to validate its source
             // address via a QUIC retry packet before we spend resources on a
@@ -414,6 +473,7 @@ pub async fn run_server_connections_loop(
         };
         let rotation_tx_cpy = rotation_tx.clone();
         let peer_versions_cpy = peer_versions.clone();
+        let peer_connections_cpy = peer_connections.clone();
         // Complete the handshake in a spawned task so that a slow or stuck peer
         // cannot block the accept loop for other clients. The connection task
         // is only spawned once the client's fingerprint is known: AddClient
@@ -464,10 +524,29 @@ pub async fn run_server_connections_loop(
                 }
             };
             debug!("Got fingerprint: {}", fingerprint);
+            // Bound established connections per client fingerprint (see
+            // MAX_CONNECTIONS_PER_PEER): the handshake semaphore bounds only
+            // connections BEING established, so without this an approved peer
+            // could accumulate unlimited served connections. On refusal the
+            // connection is dropped here, closing it so the client retries
+            // rather than running unserved.
+            let conn_slot = match PeerConnections::try_acquire(&peer_connections_cpy, &fingerprint) {
+                Some(slot) => slot,
+                None => {
+                    warn!(
+                        "Client {} ({}) already has {} established connections, closing this extra one",
+                        remote_addr, fingerprint, MAX_CONNECTIONS_PER_PEER
+                    );
+                    return;
+                }
+            };
             // The handshake is done; free the slot before the connection task,
             // which lives as long as the client stays connected.
             drop(handshake_permit);
             task::spawn(async move {
+                // Kept until this task ends, so the peer's connection count is
+                // released on every exit path.
+                let _conn_slot = conn_slot;
                 let result = handle_connection(conn, fingerprint, rotation_tx_cpy.clone(), max_clipboard_size_bytes, conn_token, peer_versions_cpy).await;
                 // Remove the client from the rotation on EVERY exit path,
                 // graceful (QUIC application close) included — an Ok return
@@ -997,5 +1076,24 @@ mod tests {
         let port_b: SocketAddr = "10.0.0.1:50001".parse().unwrap();
         assert!(pv.check(port_b, old).is_err());
         assert_eq!(pv.last_refusal_log.len(), 1); // keyed by IP, not addr:port
+    }
+
+    #[test]
+    fn peer_connections_cap_at_the_limit_and_release_on_drop() {
+        let counts = Arc::new(Mutex::new(PeerConnections::default()));
+        let slots: Vec<PeerConnectionSlot> = (0..MAX_CONNECTIONS_PER_PEER)
+            .map(|_| {
+                PeerConnections::try_acquire(&counts, "fp").expect("below the cap must acquire")
+            })
+            .collect();
+        // At the cap: further connections from this peer are refused...
+        assert!(PeerConnections::try_acquire(&counts, "fp").is_none());
+        // ...without affecting any other peer.
+        assert!(PeerConnections::try_acquire(&counts, "other").is_some());
+        // Dropping the slots releases the count (every connection-task exit
+        // path), and empty entries don't linger in the map.
+        drop(slots);
+        assert!(PeerConnections::try_acquire(&counts, "fp").is_some());
+        assert!(counts.lock().unwrap().counts.is_empty());
     }
 }

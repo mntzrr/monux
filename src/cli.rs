@@ -85,7 +85,7 @@ Examples:
   monux server
   monux server --edge-map bottom=auto    # switch input at the bottom screen edge
   monux server --www                     # conservative tuning for the public internet
-  monux server --fingerprints aa11bbcc   # pre-approve a client (no approval prompt)")]
+  monux server --fingerprints aa11bbccaa11bbccaa11bbccaa11bbccaa11bbccaa11bbccaa11bbccaa11bbcc  # pre-approve a client (no approval prompt)")]
     Server(ServerArgs),
 
     /// Runs a Monux client
@@ -252,8 +252,8 @@ pub struct DaemonArgs {
 
 #[derive(Args)]
 pub struct ConfigArgs {
-    /// show / keys / set / unset / edit / validate; bare 'monux config' shows
-    /// the effective values
+    /// show / keys / set / unset / edit / validate / history / revert; bare
+    /// 'monux config' shows the effective values
     #[command(subcommand)]
     pub command: Option<ConfigCommands>,
 }
