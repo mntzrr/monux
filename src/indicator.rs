@@ -479,9 +479,9 @@ fn menu_rows(status: &DaemonStatus) -> Vec<MenuRow> {
             // flips the monitor's flag and writes client.link-notify).
             rows.push(MenuRow::Action {
                 label: if c.link_notify {
-                    "Link notifications: on — turn off"
+                    "Link notifications: on"
                 } else {
-                    "Link notifications: off — turn on"
+                    "Link notifications: off"
                 }
                 .to_string(),
                 action: MenuAction::SetLinkNotify(!c.link_notify),
@@ -1271,7 +1271,7 @@ mod tests {
         // row offers to turn notifications ON.
         let rows = menu_rows(&DaemonStatus::Up(client_state(true, true)));
         assert!(rows.contains(&action_row(
-            "Link notifications: off — turn on",
+            "Link notifications: off",
             MenuAction::SetLinkNotify(true),
             true
         )));
@@ -1282,7 +1282,7 @@ mod tests {
         state.link_notify = true;
         let rows = menu_rows(&DaemonStatus::Up(State::Client(state)));
         assert!(rows.contains(&action_row(
-            "Link notifications: on — turn off",
+            "Link notifications: on",
             MenuAction::SetLinkNotify(false),
             true
         )));
