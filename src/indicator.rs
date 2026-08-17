@@ -293,6 +293,9 @@ enum MenuAction {
     SwitchTo(String),
     Pause,
     Resume,
+    /// Sets the client's degraded-link notifications on/off (the bool is the
+    /// TARGET state, the opposite of what the status poll reported).
+    SetLinkNotify(bool),
     UpdateNow,
     CopyDiagnostics,
     /// Starts the server/client daemon (not-running menu only). Local: no
@@ -317,6 +320,7 @@ impl MenuAction {
             MenuAction::SwitchTo(_) => "Switch",
             MenuAction::Pause => "Pause",
             MenuAction::Resume => "Resume",
+            MenuAction::SetLinkNotify(_) => "Link notifications",
             MenuAction::UpdateNow => "Update check",
             MenuAction::CopyDiagnostics => "Copy diagnostics",
             MenuAction::StartServer => "Start server",
@@ -471,6 +475,18 @@ fn menu_rows(status: &DaemonStatus) -> Vec<MenuRow> {
                 if c.active { "here" } else { "server" }
             )));
             rows.push(MenuRow::Separator);
+            // Live + persisted toggle (the daemon's "link-notify" command
+            // flips the monitor's flag and writes client.link-notify).
+            rows.push(MenuRow::Action {
+                label: if c.link_notify {
+                    "Link notifications: on — turn off"
+                } else {
+                    "Link notifications: off — turn on"
+                }
+                .to_string(),
+                action: MenuAction::SetLinkNotify(!c.link_notify),
+                enabled: true,
+            });
             // The client state has no update_available field, so this is
             // always the plain manual check.
             rows.push(MenuRow::Action {
@@ -748,6 +764,10 @@ fn action_request(action: &MenuAction) -> String {
         }
         MenuAction::Pause => r#"{"cmd":"pause"}"#.to_string(),
         MenuAction::Resume => r#"{"cmd":"resume"}"#.to_string(),
+        MenuAction::SetLinkNotify(on) => {
+            serde_json::json!({"cmd": "link-notify", "action": if *on { "on" } else { "off" }})
+                .to_string()
+        }
         MenuAction::UpdateNow => r#"{"cmd":"update_now"}"#.to_string(),
         MenuAction::HideTray => r#"{"cmd":"indicator","action":"hide"}"#.to_string(),
         MenuAction::Restart => r#"{"cmd":"restart"}"#.to_string(),
@@ -1048,6 +1068,7 @@ mod tests {
             connected_since_secs: if connected { Some(42) } else { None },
             rtt_ms: if connected { Some(3) } else { None },
             lost_packets: if connected { Some(0) } else { None },
+            link_notify: false,
         })
     }
 
@@ -1228,7 +1249,8 @@ mod tests {
             if let MenuRow::Action { action, enabled, .. } = row {
                 assert!(matches!(
                     action,
-                    MenuAction::UpdateNow
+                    MenuAction::SetLinkNotify(_)
+                        | MenuAction::UpdateNow
                         | MenuAction::CopyDiagnostics
                         | MenuAction::HideTray
                         | MenuAction::Restart
@@ -1241,6 +1263,38 @@ mod tests {
         let rows = menu_rows(&DaemonStatus::Up(client_state(false, false)));
         assert!(rows.contains(&MenuRow::Label("Connection: not connected".to_string())));
         assert!(rows.contains(&MenuRow::Label("Input: server".to_string())));
+    }
+
+    #[test]
+    fn client_menu_toggle_tracks_the_link_notify_state() {
+        // Off (the default, and what an older daemon's state parses as): the
+        // row offers to turn notifications ON.
+        let rows = menu_rows(&DaemonStatus::Up(client_state(true, true)));
+        assert!(rows.contains(&action_row(
+            "Link notifications: off — turn on",
+            MenuAction::SetLinkNotify(true),
+            true
+        )));
+        // On: the row offers to turn them back off.
+        let State::Client(mut state) = client_state(true, true) else {
+            panic!("client_state builds a client state")
+        };
+        state.link_notify = true;
+        let rows = menu_rows(&DaemonStatus::Up(State::Client(state)));
+        assert!(rows.contains(&action_row(
+            "Link notifications: on — turn off",
+            MenuAction::SetLinkNotify(false),
+            true
+        )));
+        // The wire request names the target state.
+        assert_eq!(
+            action_request(&MenuAction::SetLinkNotify(true)),
+            r#"{"action":"on","cmd":"link-notify"}"#
+        );
+        assert_eq!(
+            action_request(&MenuAction::SetLinkNotify(false)),
+            r#"{"action":"off","cmd":"link-notify"}"#
+        );
     }
 
     #[test]

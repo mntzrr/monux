@@ -1387,7 +1387,10 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
     let mut reconnect_backoff = Duration::ZERO;
     // Live state for the control socket: the reconnect loop drives
     // (dis)connected, the Switch handler in client.rs drives `active`.
-    let control_state = Arc::new(monux::control::ClientStateMirror::new(connect_addr));
+    let control_state = Arc::new(monux::control::ClientStateMirror::new(
+        connect_addr,
+        link_notify,
+    ));
     // Local control IPC (status/update/restart/exit only — rotation and pause
     // are server concepts). Optional, as on the server. The tray-indicator
     // supervisor is created here so the socket can hide/show it, but only
@@ -1400,6 +1403,7 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
                 state: control_state.clone(),
                 auto_update,
                 indicator: indicator.handle(),
+                config_dir: config_dir.clone(),
             });
             spawn_control_listener(listener, handler);
         }
@@ -1424,7 +1428,7 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
         scroll_scale,
         control_state: control_state.clone(),
         throttle_mode,
-        link_notify,
+        link_notify: control_state.link_notify(),
         edge_map,
         edge_dwell,
     };

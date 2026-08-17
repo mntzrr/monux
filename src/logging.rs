@@ -130,11 +130,20 @@ impl<S: tracing::Subscriber> Layer<S> for RingBufferLayer {
 }
 
 pub fn init_logging() {
-    let filter_layer = EnvFilter::try_from_env("LOG_LEVEL")
+    // An empty (or whitespace-only) LOG_LEVEL — e.g. an exported-but-unset
+    // variable in a shell profile or systemd unit — reads as unset, not as an
+    // invalid filter.
+    let level = std::env::var("LOG_LEVEL").unwrap_or_default();
+    let level = if level.trim().is_empty() {
+        "info"
+    } else {
+        level.as_str()
+    };
+    let filter_layer = EnvFilter::try_new(level)
         .unwrap_or_else(|_| {
             eprintln!(
                 "Ignoring invalid LOG_LEVEL value {:?}; falling back to 'info'",
-                std::env::var("LOG_LEVEL").unwrap_or_default()
+                level
             );
             EnvFilter::try_new("info").expect("Failed to initialize filter layer")
         })

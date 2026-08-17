@@ -151,9 +151,10 @@ pub struct ClientConfig {
     pub scroll_scale: f64,
     pub control_state: Arc<crate::control::ClientStateMirror>,
     pub throttle_mode: ThrottleMode,
-    /// Opt-in desktop notifications on link degradation/recovery (the
-    /// monitor_link task always logs; notifications need --link-notify).
-    pub link_notify: bool,
+    /// Degraded-link desktop notifications, opt-in (--link-notify). Shared
+    /// with the control socket's state mirror, so the tray's "Link
+    /// notifications" toggle flips it live, without a reconnect.
+    pub link_notify: Arc<AtomicBool>,
     /// An explicit --edge-map. None leaves the return edge to the server's
     /// EdgeInfo inference (see EdgeInference).
     pub edge_map: Option<crate::edge::EdgeMap>,
@@ -204,7 +205,7 @@ pub async fn run<O: output::OutputHandler>(
             client.conn().clone(),
             client.throttle_cell.clone(),
             cfg.throttle_mode,
-            cfg.link_notify,
+            cfg.link_notify.clone(),
         ));
     }
     // Screen-edge switching back to the server: either an explicit --edge-map
@@ -1650,13 +1651,15 @@ impl DegradationEpisode {
 /// Samples the connection's QUIC path stats on a timer and warns — at most
 /// once per LINK_NOTIFY_COOLDOWN — when the link degrades past LAN
 /// expectations, plus once when it recovers. The message points at the
-/// WiFi/link, not monux. Desktop notifications are opt-in (link_notify); the
-/// log lines always happen. Exits when the connection closes.
+/// WiFi/link, not monux. Desktop notifications are opt-in: link_notify is
+/// read at notify time, so the control socket's "link-notify" toggle applies
+/// to this live connection. The log lines always happen. Exits when the
+/// connection closes.
 async fn monitor_link(
     conn: quinn::Connection,
     throttle: throttle::SharedThrottle,
     throttle_mode: ThrottleMode,
-    link_notify: bool,
+    link_notify: Arc<AtomicBool>,
 ) {
     let mut monitor = LinkMonitor::new();
     let mut quality = LinkQuality::new();
@@ -1745,7 +1748,7 @@ async fn monitor_link(
                     path.black_holes_detected,
                     path.cwnd
                 );
-                if link_notify {
+                if link_notify.load(Ordering::Relaxed) {
                     notify::notify(
                         "monux-link",
                         notify::Urgency::Normal,
@@ -1767,7 +1770,7 @@ async fn monitor_link(
                     Some(summary) => info!("Link recovered: rtt={:?} ({})", path.rtt, summary),
                     None => info!("Link recovered: rtt={:?}", path.rtt),
                 }
-                if link_notify {
+                if link_notify.load(Ordering::Relaxed) {
                     notify::notify(
                         "monux-link",
                         notify::Urgency::Low,

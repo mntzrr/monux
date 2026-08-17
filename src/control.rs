@@ -58,6 +58,11 @@
 //!   with --no-indicator — an explicit opt-out the socket may not override.
 //!   Manually-started indicators are never managed by this. The tray menu's
 //!   "Hide tray icon" and `monux gui tray hide|show` drive this command.
+//! - `{"cmd":"link-notify","action":"on"|"off"}` — turn the client's
+//!   degraded-link desktop notifications on or off (client socket only). The
+//!   change is live immediately and persisted to the config file
+//!   (client.link-notify), so it survives restarts. The tray menu's "Link
+//!   notifications" toggle drives this command.
 //! - `{"cmd":"restart"}` — graceful shutdown, then re-exec into the installed
 //!   binary (the auto-updater's restart path).
 //! - `{"cmd":"exit"}` — graceful shutdown.
@@ -68,9 +73,9 @@
 //! command, wrong role, missing target, event queue full, ...). A command's
 //! `ok` means it was accepted by the daemon's event loop — the effect (e.g.
 //! a rotation switch) lands asynchronously; poll status to observe it. The
-//! server socket serves the full command set; the client socket serves only
-//! status/diagnostics/update_now/indicator/restart/exit (rotation and pause
-//! are server concepts).
+//! server socket serves the full command set minus link-notify; the client
+//! socket serves only status/diagnostics/update_now/indicator/link-notify/
+//! restart/exit (rotation and pause are server concepts).
 //!
 //! # Diagnostics schema (the `diagnostics` object of a diagnostics response)
 //!
@@ -107,9 +112,12 @@
 //!   (the ServerEvent::Switch state)
 //! - `connected_since_secs`, `rtt_ms`, `lost_packets`: connection age, QUIC
 //!   path RTT in ms, and cumulative lost packets; all null while disconnected
+//! - `link_notify`: bool — degraded-link desktop notifications on/off
+//!   (absent from daemons older than 13.3.0; parse as off)
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -390,6 +398,11 @@ pub struct ClientState {
     pub connected_since_secs: Option<u64>,
     pub rtt_ms: Option<u64>,
     pub lost_packets: Option<u64>,
+    /// Whether degraded-link desktop notifications are on (tray-toggleable,
+    /// persisted as client.link-notify). Defaulted on the wire: a daemon from
+    /// before this field existed parses as off.
+    #[serde(default)]
+    pub link_notify: bool,
 }
 
 /// Either daemon's state, parsed by the status CLI (`role` discriminates).
@@ -459,6 +472,7 @@ impl std::fmt::Display for State {
                     (false, _) => writeln!(f, "  connected:      no")?,
                 }
                 writeln!(f, "  active:         {}", yes_no(s.active))?;
+                writeln!(f, "  link notify:    {}", yes_no(s.link_notify))?;
                 Ok(())
             }
         }
@@ -480,6 +494,10 @@ fn yes_no(v: bool) -> &'static str {
 /// time, so a status request always sees the current RTT.
 pub struct ClientStateMirror {
     inner: Mutex<ClientStateInner>,
+    /// The degraded-link notification toggle, shared live with the client
+    /// connection's link monitor (monitor_link reads it at notify time), so a
+    /// control-socket "link-notify" command takes effect without a reconnect.
+    link_notify: Arc<AtomicBool>,
 }
 
 struct ClientStateInner {
@@ -492,7 +510,7 @@ struct ClientStateInner {
 }
 
 impl ClientStateMirror {
-    pub fn new(server: SocketAddr) -> Self {
+    pub fn new(server: SocketAddr, link_notify: bool) -> Self {
         Self {
             inner: Mutex::new(ClientStateInner {
                 server,
@@ -501,7 +519,20 @@ impl ClientStateMirror {
                 connected_at: None,
                 conn: None,
             }),
+            link_notify: Arc::new(AtomicBool::new(link_notify)),
         }
+    }
+
+    /// The shared link-notification flag, for the client connection's link
+    /// monitor (reads it at notify time; the socket writes it here).
+    pub fn link_notify(&self) -> Arc<AtomicBool> {
+        self.link_notify.clone()
+    }
+
+    /// Control-socket "link-notify" command: flips the live flag; persistence
+    /// is the handler's job (it owns the config path).
+    pub fn set_link_notify(&self, on: bool) {
+        self.link_notify.store(on, Ordering::Relaxed);
     }
 
     /// The reconnect loop re-discovered the server elsewhere.
@@ -575,6 +606,7 @@ impl ClientStateMirror {
             connected_since_secs,
             rtt_ms,
             lost_packets,
+            link_notify: self.link_notify.load(Ordering::Relaxed),
         }
     }
 }
@@ -956,6 +988,9 @@ pub struct ClientHandler {
     pub auto_update: bool,
     /// Hide/show control for the auto-spawned tray indicator.
     pub indicator: crate::indicator_spawn::SupervisorHandle,
+    /// Where client.link-notify persists when the socket toggles it
+    /// (config::path(config_dir) is the file).
+    pub config_dir: PathBuf,
 }
 
 pub enum Handler {
@@ -1058,6 +1093,46 @@ impl Handler {
                     ),
                 }
             }
+            "link-notify" => match self {
+                Handler::Server(_) => (
+                    Response::err("'link-notify' is a client-side command (this is the server socket)"),
+                    None,
+                ),
+                Handler::Client(h) => match req.action.as_deref() {
+                    Some("on") | Some("off") => {
+                        let on = req.action.as_deref() == Some("on");
+                        // Live first: the flag is shared with the link
+                        // monitor, so this connection picks it up at once.
+                        h.state.set_link_notify(on);
+                        info!(
+                            "Control socket: link notifications turned {}",
+                            if on { "on" } else { "off" }
+                        );
+                        // Persist so the choice survives a restart. A persist
+                        // failure leaves the live toggle applied and says so.
+                        let path = crate::config::path(&h.config_dir);
+                        match crate::config::set_value(
+                            &path,
+                            "client.link-notify",
+                            &[on.to_string()],
+                        ) {
+                            Ok(_) => (Response::ok_empty(), None),
+                            Err(e) => (
+                                Response::err(format!(
+                                    "applied for this session, but failed to persist to {}: {:#}",
+                                    path.display(),
+                                    e
+                                )),
+                                None,
+                            ),
+                        }
+                    }
+                    _ => (
+                        Response::err("link-notify needs an action: on|off"),
+                        None,
+                    ),
+                },
+            },
             "switch" | "pause" | "resume" => match self {
                 Handler::Client(_) => (
                     Response::err(format!(
@@ -1717,15 +1792,23 @@ mod tests {
         )
     }
 
-    fn client_handler(auto_update: bool) -> (Handler, Arc<ClientStateMirror>) {
-        let mirror = Arc::new(ClientStateMirror::new("127.0.0.1:9999".parse().unwrap()));
+    /// A client handler with a fresh temp config dir (returned so it outlives
+    /// the handler): the link-notify command persists to it for real.
+    fn client_handler(auto_update: bool) -> (Handler, Arc<ClientStateMirror>, tempfile::TempDir) {
+        let mirror = Arc::new(ClientStateMirror::new(
+            "127.0.0.1:9999".parse().unwrap(),
+            false,
+        ));
+        let dir = tempfile::tempdir().unwrap();
         (
             Handler::Client(ClientHandler {
                 state: mirror.clone(),
                 auto_update,
                 indicator: opted_out_indicator(),
+                config_dir: dir.path().to_path_buf(),
             }),
             mirror,
+            dir,
         )
     }
 
@@ -1910,7 +1993,7 @@ mod tests {
         .unwrap();
         assert_eq!(v, serde_json::json!({"ok": false, "error": "boom"}));
         // Status carries the state under "state".
-        let (handler, _mirror) = client_handler(true);
+        let (handler, _mirror, _dir) = client_handler(true);
         let mirror_state = match &handler {
             Handler::Client(h) => h.state.snapshot(),
             _ => unreachable!(),
@@ -1998,7 +2081,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_socket_serves_only_its_command_set() {
-        let (handler, _mirror) = client_handler(true);
+        let (handler, _mirror, _dir) = client_handler(true);
 
         // status works and reports a disconnected client.
         let (resp, _) = handler.dispatch(&req("status", None)).await;
@@ -2011,6 +2094,7 @@ mod tests {
         assert!(state["connected_since_secs"].is_null());
         assert!(state["rtt_ms"].is_null());
         assert!(state["lost_packets"].is_null());
+        assert_eq!(state["link_notify"], false);
 
         // Rotation and pause are server concepts: clear role error.
         for cmd in ["switch", "pause", "resume"] {
@@ -2024,6 +2108,40 @@ mod tests {
         assert!(resp.ok);
         let (resp, post) = handler.dispatch(&req("exit", None)).await;
         assert!(resp.ok && post == Some(PostAction::Exit));
+    }
+
+    #[tokio::test]
+    async fn link_notify_command_flips_live_and_persists() {
+        let (handler, mirror, dir) = client_handler(true);
+        assert!(!mirror.snapshot().link_notify);
+
+        // on: the live flag flips and the config file gains the override.
+        let (resp, _) = handler.dispatch(&req_action("link-notify", Some("on"))).await;
+        assert!(resp.ok, "unexpected error: {:?}", resp.error);
+        assert!(mirror.snapshot().link_notify);
+        let text = std::fs::read_to_string(crate::config::path(dir.path())).unwrap();
+        let cfg = crate::config::File::parse(&text).unwrap();
+        assert_eq!(cfg.get_bool("client.link-notify"), Some(true));
+
+        // off again: live and persisted.
+        let (resp, _) = handler.dispatch(&req_action("link-notify", Some("off"))).await;
+        assert!(resp.ok, "unexpected error: {:?}", resp.error);
+        assert!(!mirror.snapshot().link_notify);
+        let text = std::fs::read_to_string(crate::config::path(dir.path())).unwrap();
+        let cfg = crate::config::File::parse(&text).unwrap();
+        assert_eq!(cfg.get_bool("client.link-notify"), Some(false));
+
+        // A missing or unknown action is a validation error.
+        let (resp, _) = handler.dispatch(&req_action("link-notify", None)).await;
+        assert!(!resp.ok);
+        assert!(resp.error.unwrap().contains("on|off"));
+
+        // The server socket refuses it as a client-side command.
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let handler = server_handler(event_tx, true);
+        let (resp, _) = handler.dispatch(&req_action("link-notify", Some("on"))).await;
+        assert!(!resp.ok);
+        assert!(resp.error.unwrap().contains("client-side"));
     }
 
     #[tokio::test]
@@ -2048,7 +2166,7 @@ mod tests {
         let (resp, _) = handler.dispatch(&req_action("indicator", Some("blink"))).await;
         assert!(!resp.ok);
 
-        let (handler, _mirror) = client_handler(true);
+        let (handler, _mirror, _dir) = client_handler(true);
         let (resp, post) = handler.dispatch(&req_action("indicator", Some("hide"))).await;
         assert!(resp.ok && post == Some(PostAction::IndicatorHide));
         let (resp, _) = handler.dispatch(&req_action("indicator", Some("show"))).await;
@@ -2061,7 +2179,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("client.sock");
         let listener = Listener::bind_at(&path, "client").unwrap();
-        let (handler, _mirror) = client_handler(true);
+        let (handler, _mirror, _dir) = client_handler(true);
         let task = tokio::spawn(listener.run(handler));
 
         // hide: plain ack (the deferred effect runs after the response and
@@ -2086,14 +2204,21 @@ mod tests {
 
     #[test]
     fn client_mirror_tracks_lifecycle() {
-        let mirror = ClientStateMirror::new("127.0.0.1:9999".parse().unwrap());
+        let mirror = ClientStateMirror::new("127.0.0.1:9999".parse().unwrap(), false);
         let state = mirror.snapshot();
-        assert!(!state.connected && !state.active);
+        assert!(!state.connected && !state.active && !state.link_notify);
 
         mirror.set_server("127.0.0.1:8888".parse().unwrap());
         assert_eq!(mirror.snapshot().server, "127.0.0.1:8888");
         mirror.set_active(true);
         assert!(mirror.snapshot().active);
+        // The link-notify toggle reports through the snapshot...
+        mirror.set_link_notify(true);
+        assert!(mirror.snapshot().link_notify);
+        // ...and shares its flag with a holder (monitor_link's view).
+        let shared = mirror.link_notify();
+        mirror.set_link_notify(false);
+        assert!(!shared.load(Ordering::Relaxed));
         // A drop clears active along with the connection.
         mirror.set_disconnected();
         let state = mirror.snapshot();
@@ -2113,7 +2238,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("client.sock");
         let listener = Listener::bind_at(&path, "client").unwrap();
-        let (handler, mirror) = client_handler(true);
+        let (handler, mirror, _dir) = client_handler(true);
         let task = tokio::spawn(listener.run(handler));
 
         // A status request gets the live client state as JSON.
@@ -2206,7 +2331,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("client.sock");
         let listener = Listener::bind_at(&path, "client").unwrap();
-        let (handler, _mirror) = client_handler(true);
+        let (handler, _mirror, _dir) = client_handler(true);
         let task = tokio::spawn(listener.run(handler));
 
         // Two requests written in one go (pipelined) on a single connection
@@ -2325,11 +2450,13 @@ mod tests {
         assert!(text.contains("monux client v1.4.0 (protocol 8)"));
         assert!(text.contains("server:         10.0.0.1:1213"));
         assert!(text.contains("connected:      yes (for 42s, rtt 1ms, 0 packets lost)"));
+        // link_notify is absent from pre-13.3.0 daemons and parses as off.
+        assert!(text.contains("link notify:    no"));
     }
 
     #[tokio::test]
     async fn diagnostics_from_the_client_socket() {
-        let (handler, mirror) = client_handler(true);
+        let (handler, mirror, _dir) = client_handler(true);
         mirror.set_server("10.0.0.1:1213".parse().unwrap());
         let (resp, post) = handler.dispatch(&req("diagnostics", None)).await;
         assert!(resp.ok && post.is_none());
