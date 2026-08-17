@@ -67,7 +67,7 @@ When the machines sit next to each other, the link should feel like it. Both end
 
 The other half of proximity is the *path*: everything normally goes via the router even when the machines are arm's-length apart. monux can steer the connection onto a **direct, routerless link** instead with a plain Ethernet cable: plug it between the machines (both ends auto-assign link-local addresses, no DHCP or config needed) and mDNS discovery steers the connection over it automatically. Connecting by hand with `monux client <ip>` always overrides the preference.
 
-When the link is degraded, monux says so in several places: a desktop notification (at most once per 5 minutes, plus once on recovery), the client's `Link stats:` / `Link degraded:` log lines (every 15s sample), and the server's 10-second input-status heartbeat (`Link to <client> is degraded: rtt=...`, only while above the threshold). If you see sporadic RTT spikes on WiFi, the checklist:
+When the link is degraded, monux says so in several places: the client's `Link stats:` / `Link degraded:` log lines (every 15s sample), the server's 10-second input-status heartbeat (`Link to <client> is degraded: rtt=...`, only while above the threshold), and — opt-in via `--link-notify` — a desktop notification (at most once per 5 minutes, plus once on recovery). If you see sporadic RTT spikes on WiFi, the checklist:
 
 1. **Power saving off on BOTH machines** — check with `iw dev <iface> get power_save` (`monux setup` disables it, but only on the machine where you ran it).
 2. **2.4 GHz congestion** — wireless peripherals, Bluetooth, USB3 ports, and the neighbors' networks all share the band; sporadic spikes that correlate with nothing on either machine are usually this.

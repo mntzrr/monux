@@ -912,6 +912,16 @@ pub struct ClientArgs {
     #[arg(long, value_name = "kb", help_heading = H_TUNING)]
     pub max_clipboard_size_kb: Option<u64>,
 
+    /// Desktop notification when the link degrades or recovers
+    ///
+    /// Off by default: a degraded link (RTT over 50ms or packet loss over 2%)
+    /// is only logged — the 'Link degraded:' line and the per-sample 'Link
+    /// stats:' lines. Set to also get 'monux: link degraded' / 'monux: link
+    /// recovered' desktop notifications (at most once per 5 minutes). Only
+    /// meaningful in LAN mode: the link monitor does not run under --www.
+    #[arg(long, num_args = 0, default_missing_value = "true", help_heading = H_TUNING)]
+    pub link_notify: Option<bool>,
+
     /// Turn off the automatic background update
     ///
     /// The background update is on by default: a daily check at low CPU
@@ -967,6 +977,10 @@ impl ClientArgs {
             .bulk_throttle_mbps
             .take()
             .or_else(|| cfg.get_f64("client.bulk-throttle-mbps"));
+        self.link_notify = self
+            .link_notify
+            .take()
+            .or_else(|| cfg.get_bool("client.link-notify"));
         self.edge_map = self.edge_map.take().or_else(|| cfg.get_str_vec("client.edge-map"));
         self.edge_dwell_ms = self
             .edge_dwell_ms

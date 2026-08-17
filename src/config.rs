@@ -470,6 +470,17 @@ pub static REGISTRY: &[KeySpec] = &[
         validate: v_bool,
         since: BASELINE_SINCE,
     },
+    KeySpec {
+        key: "client.link-notify",
+        section: Section::Client,
+        flag: "link-notify",
+        expects: "true|false",
+        default_display: "false (log lines only)",
+        help: "desktop notification when the link degrades or recovers",
+        kind: Kind::Bool,
+        validate: v_bool,
+        since: "13.2.0",
+    },
 ];
 
 /// Renamed keys honored for a deprecation window: (old name, new name).

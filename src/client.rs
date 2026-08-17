@@ -151,6 +151,9 @@ pub struct ClientConfig {
     pub scroll_scale: f64,
     pub control_state: Arc<crate::control::ClientStateMirror>,
     pub throttle_mode: ThrottleMode,
+    /// Opt-in desktop notifications on link degradation/recovery (the
+    /// monitor_link task always logs; notifications need --link-notify).
+    pub link_notify: bool,
     /// An explicit --edge-map. None leaves the return edge to the server's
     /// EdgeInfo inference (see EdgeInference).
     pub edge_map: Option<crate::edge::EdgeMap>,
@@ -201,6 +204,7 @@ pub async fn run<O: output::OutputHandler>(
             client.conn().clone(),
             client.throttle_cell.clone(),
             cfg.throttle_mode,
+            cfg.link_notify,
         ));
     }
     // Screen-edge switching back to the server: either an explicit --edge-map
@@ -1646,11 +1650,13 @@ impl DegradationEpisode {
 /// Samples the connection's QUIC path stats on a timer and warns — at most
 /// once per LINK_NOTIFY_COOLDOWN — when the link degrades past LAN
 /// expectations, plus once when it recovers. The message points at the
-/// WiFi/link, not monux. Exits when the connection closes.
+/// WiFi/link, not monux. Desktop notifications are opt-in (link_notify); the
+/// log lines always happen. Exits when the connection closes.
 async fn monitor_link(
     conn: quinn::Connection,
     throttle: throttle::SharedThrottle,
     throttle_mode: ThrottleMode,
+    link_notify: bool,
 ) {
     let mut monitor = LinkMonitor::new();
     let mut quality = LinkQuality::new();
@@ -1739,17 +1745,19 @@ async fn monitor_link(
                     path.black_holes_detected,
                     path.cwnd
                 );
-                notify::notify(
-                    "monux-link",
-                    notify::Urgency::Normal,
-                    10000,
-                    "monux: link degraded",
-                    &format!(
-                        "Connection to the server is degraded: RTT {:.0}ms, {:.1}% packet loss. This is a WiFi/link problem, not monux — check signal strength or cabling.",
-                        path.rtt.as_secs_f64() * 1000.0,
-                        loss_rate * 100.0
-                    ),
-                );
+                if link_notify {
+                    notify::notify(
+                        "monux-link",
+                        notify::Urgency::Normal,
+                        10000,
+                        "monux: link degraded",
+                        &format!(
+                            "Connection to the server is degraded: RTT {:.0}ms, {:.1}% packet loss. This is a WiFi/link problem, not monux — check signal strength or cabling.",
+                            path.rtt.as_secs_f64() * 1000.0,
+                            loss_rate * 100.0
+                        ),
+                    );
+                }
             }
             LinkVerdict::Recovered => {
                 match episode
@@ -1759,16 +1767,18 @@ async fn monitor_link(
                     Some(summary) => info!("Link recovered: rtt={:?} ({})", path.rtt, summary),
                     None => info!("Link recovered: rtt={:?}", path.rtt),
                 }
-                notify::notify(
-                    "monux-link",
-                    notify::Urgency::Low,
-                    4000,
-                    "monux: link recovered",
-                    &format!(
-                        "Connection to the server is healthy again (RTT {:.0}ms).",
-                        path.rtt.as_secs_f64() * 1000.0
-                    ),
-                );
+                if link_notify {
+                    notify::notify(
+                        "monux-link",
+                        notify::Urgency::Low,
+                        4000,
+                        "monux: link recovered",
+                        &format!(
+                            "Connection to the server is healthy again (RTT {:.0}ms).",
+                            path.rtt.as_secs_f64() * 1000.0
+                        ),
+                    );
+                }
             }
         }
         // While degraded, keep the episode's peak RTT up to date for the

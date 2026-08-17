@@ -584,6 +584,7 @@ fn main() -> Result<()> {
             let auto_indicator = !args.no_indicator.unwrap_or(false);
             let update_mode = update_mode(args.auto_install.unwrap_or(false));
             let www = args.www.unwrap_or(false);
+            let link_notify = args.link_notify.unwrap_or(false);
             let mouse_scale = args.mouse_scale.unwrap_or(monux::config::DEFAULT_INPUT_SCALE);
             let scroll_scale = args
                 .scroll_scale
@@ -689,6 +690,7 @@ fn main() -> Result<()> {
                     mouse_scale,
                     scroll_scale,
                     throttle_mode,
+                    link_notify,
                     edge_map,
                     edge_dwell: Duration::from_millis(
                         args.edge_dwell_ms
@@ -1320,6 +1322,7 @@ struct ClientDaemonArgs {
     mouse_scale: f64,
     scroll_scale: f64,
     throttle_mode: monux::rotation::ThrottleMode,
+    link_notify: bool,
     edge_map: Option<monux::edge::EdgeMap>,
     edge_dwell: Duration,
     auto_update: bool,
@@ -1336,6 +1339,7 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
         mouse_scale,
         scroll_scale,
         throttle_mode,
+        link_notify,
         edge_map,
         edge_dwell,
         auto_update,
@@ -1420,6 +1424,7 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
         scroll_scale,
         control_state: control_state.clone(),
         throttle_mode,
+        link_notify,
         edge_map,
         edge_dwell,
     };
@@ -2086,9 +2091,10 @@ mod tests {
 
     #[test]
     fn client_args_resolve_flag_beats_config_beats_default() {
-        let cfg =
-            monux::config::File::parse("[client]\nmouse-scale = 0.5\nedge-dwell-ms = 400\n")
-                .unwrap();
+        let cfg = monux::config::File::parse(
+            "[client]\nmouse-scale = 0.5\nedge-dwell-ms = 400\nlink-notify = true\n",
+        )
+        .unwrap();
 
         // Explicit flag wins; config fills the rest.
         let cli = Cli::try_parse_from(["monux", "client", "--mouse-scale", "2"]).unwrap();
@@ -2098,6 +2104,7 @@ mod tests {
         args.resolve(&cfg);
         assert_eq!(args.mouse_scale, Some(2.0));
         assert_eq!(args.edge_dwell_ms, Some(400));
+        assert_eq!(args.link_notify, Some(true));
 
         // Without a config file the use sites fall back to the built-ins.
         let cli = Cli::try_parse_from(["monux", "client"]).unwrap();
@@ -2111,6 +2118,8 @@ mod tests {
             1.0
         );
         assert!(args.edge_dwell_ms.is_none());
+        // Link notifications are opt-in: unset means off.
+        assert!(!args.link_notify.unwrap_or(false));
         assert!(args.host.is_none(), "the positional host is not configurable");
     }
 }
