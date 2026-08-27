@@ -72,6 +72,10 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // single_range_in_vec_init fires on entry (b) below: keys_from takes a
+    // slice of *ranges*, so a one-element range array is intentional and the
+    // lint's suggestion (collect into a Vec<u16>) would not type-check.
+    #[allow(clippy::single_range_in_vec_init)]
     let candidates: Vec<(&str, AttributeSet<KeyCode>)> = vec![
         ("a: all BTN_* except BTN_TOOL_* (current)", current),
         ("b: mouse buttons only (0x110..=0x117)", keys_from(&[0x110..=0x117])),
