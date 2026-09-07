@@ -57,6 +57,10 @@ If input (e.g. the Enter key) stops registering on the server machine while `mon
 - Freeze windows that self-heal after seconds-to-a-minute point at a blocking wait that timed out — check whether they line up with clipboard warnings above.
 - On connection loss, both sides log `Connection stats on drop: rtt=... lost_packets=N/M congestion_events=... black_holes=...`. High loss/congestion/black-holes means a lossy link (WiFi interference, weak signal); near-zero loss with a normal RTT means the *peer* went silent (CPU stall on that machine, or WiFi buffering/power saving there despite setup — recheck `iw dev` on the client).
 
+## A device never switches (e.g. the mouse stays local)
+
+If one device (typically a mouse) stays on the server when everything else switches, its node was lost at a hotplug: the log shows `Failed to init device /dev/input/eventN: Permission denied` — the node appeared while udev had not yet applied its permissions, outlasting the open retry. Since v13.3.3 a periodic rescan picks such strays back up within ~30 seconds; on older versions, replug the device (or restart the daemon) to recover it. Recycled `eventN` numbers make this likelier than it looks: a node number freed by a disconnected Bluetooth device can be claimed seconds later by a replugged receiver, right in the permission window.
+
 ## RTT spikes and degraded links (WiFi)
 
 Latency-sensitive input shares the link with bulk clipboard traffic, and QUIC's stream priorities only order data *inside* the connection — the kernel/WiFi driver queue below is FIFO, so an unthrottled multi-MB clipboard transfer fills it and input packets behind it wait for the whole backlog to drain (bufferbloat, seen as RTT spikes for the duration of the transfer). monux therefore paces bulk transfers — adaptively by default: **40 Mbps**, raised to **160 Mbps** while the link is measured close and clean (see below), on both server and client. Pin a rate with `--bulk-throttle-mbps` (0 disables); large clipboard transfers take slightly longer at low rates (5 MB ≈ 1 s at 40 Mbps).

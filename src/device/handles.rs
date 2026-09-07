@@ -109,6 +109,24 @@ impl<H: DeviceHandler> DeviceHandles<H> {
         self.toggled_devices.remove(path)
     }
 
+    /// Whether this path already has a reader task that is still running.
+    /// A path with no entry at all needs a reader; a path whose reader task
+    /// has finished also needs one — a finished task means the device went
+    /// away and its removal was missed, so the path's eventN number may
+    /// already have been recycled for different hardware (the periodic rescan
+    /// re-adds such paths; add() aborts the finished handle as it displaces
+    /// it). Only a live reader must be left alone.
+    pub(crate) fn has_live_reader(&self, path: &Path) -> bool {
+        let handle = self
+            .always_grabbed_devices
+            .get(path)
+            .or_else(|| self.toggled_devices.get(path));
+        match handle {
+            Some(handle) => !handle.handle.is_finished(),
+            None => false,
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.always_grabbed_devices.is_empty() && self.toggled_devices.is_empty()
     }
@@ -132,4 +150,60 @@ fn start_device_stream(device: Device, path: &Path) -> Result<EventStream> {
             path.to_string_lossy()
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::pending;
+    use std::time::Duration;
+    use tokio::time;
+
+    struct StubHandler;
+
+    impl DeviceHandler for StubHandler {
+        fn handle_device_stream(
+            &mut self,
+            _events: EventStream,
+            _state_rx: watch::Receiver<device::GrabState>,
+            _device_info: util::DeviceInfo,
+            _class: device::DeviceClass,
+        ) -> Result<DeviceHandle> {
+            Ok(DeviceHandle {
+                handle: task::spawn(pending()),
+            })
+        }
+    }
+
+    fn test_handles() -> DeviceHandles<StubHandler> {
+        let (grab_tx, _grab_rx) = watch::channel(device::GrabState {
+            client_active: false,
+            paused: false,
+        });
+        DeviceHandles::new(StubHandler, grab_tx, HashSet::new())
+    }
+
+    /// The rescan's add/skip decision (see has_live_reader): a path with no
+    /// entry, or one whose reader task has already finished, needs a reader;
+    /// a live reader must not be touched.
+    #[tokio::test]
+    async fn has_live_reader_distinguishes_live_finished_and_absent() {
+        let mut handles = test_handles();
+        let live = PathBuf::from("/dev/input/event1");
+        let finished = PathBuf::from("/dev/input/event2");
+        let absent = PathBuf::from("/dev/input/event3");
+
+        handles
+            .always_grabbed_devices
+            .insert(live.clone(), DeviceHandle { handle: task::spawn(pending()) });
+        let done = DeviceHandle { handle: task::spawn(async {}) };
+        // Let the finished task actually run to completion before asserting.
+        time::sleep(Duration::from_millis(50)).await;
+        assert!(done.handle.is_finished());
+        handles.toggled_devices.insert(finished.clone(), done);
+
+        assert!(handles.has_live_reader(&live));
+        assert!(!handles.has_live_reader(&finished));
+        assert!(!handles.has_live_reader(&absent));
+    }
 }

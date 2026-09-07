@@ -6,9 +6,15 @@ use evdev::{Device, EventType, KeyCode};
 use notify::Watcher;
 use regex::Regex;
 use tokio::sync::mpsc;
+use tokio::time;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::device::{handles, output, util};
+
+/// How often to reconcile the watched devices against the kernel (see
+/// rescan_devices). Short enough that a lost hotplug heals before it is
+/// missed; long enough that the enumeration is free.
+const RESCAN_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 enum DeviceEventKind {
@@ -67,13 +73,26 @@ pub async fn watch_loop<H: handles::DeviceHandler>(
         bail!("Didn't find any compatible input devices to listen to.");
     }
 
-    // Start handler to consume new/removed device events
+    // Start handler to consume new/removed device events, with a periodic
+    // rescan as the safety net for anything the inotify path lost (see
+    // rescan_devices).
+    let mut rescan = time::interval(RESCAN_INTERVAL);
+    // Delay, not Burst: after a suspend the missed ticks are owed once, not
+    // one per elapsed period (same invariant as grab_retry_interval).
+    rescan.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    rescan.tick().await; // the construction tick fires immediately; consume it
     loop {
-        if let Some(event) = device_event_rx.recv().await {
-            handle_device_event(&mut device_handles, &device_filters, &virtual_nodes, event).await;
-        } else {
-            // Channel lost, exit
-            return Ok(());
+        tokio::select! {
+            maybe_event = device_event_rx.recv() => {
+                let Some(event) = maybe_event else {
+                    // Channel lost, exit
+                    return Ok(());
+                };
+                handle_device_event(&mut device_handles, &device_filters, &virtual_nodes, event).await;
+            }
+            _ = rescan.tick() => {
+                rescan_devices(&mut device_handles, &device_filters);
+            }
         }
     }
 }
@@ -137,12 +156,65 @@ async fn handle_device_event<H: handles::DeviceHandler>(
     }
 }
 
+/// Reconciles the watched devices against the kernel: adds every compatible
+/// device that enumerates but has no live reader (see
+/// DeviceHandles::has_live_reader for what counts as missing).
+///
+/// This is the safety net for open_device_with_retry's bounded permission
+/// retry: the inotify watch only reports create/remove, so a node that stayed
+/// inside the udev permission window past the retry budget was previously
+/// lost until its next replug — its input silently stayed with the local
+/// machine (seen in the wild as "switching moves the keyboard, the mouse
+/// stays on the server", where the mouse's eventN had been recycled from a
+/// just-disconnected Bluetooth node and its permission took >1s to settle).
+///
+/// Forward-only by design: it never removes entries. A removed device's
+/// reader exits on its own (ENODEV), and aborting a live reader because its
+/// path happened not to enumerate on one pass would be destructive on a
+/// transient open failure.
+fn rescan_devices<H: handles::DeviceHandler>(
+    device_handles: &mut handles::DeviceHandles<H>,
+    device_filters: &[Regex],
+) {
+    let mut added = 0;
+    for (path, device) in evdev::enumerate() {
+        // enumerate() already filters for 'event*' filenames
+        if device_handles.has_live_reader(&path) {
+            continue;
+        }
+        let device_info = util::DeviceInfo::new(&device, false);
+        if !compatible_device(&device, &path, &device_info) {
+            continue;
+        }
+        if !matches_filters(device_filters, &device, &path, &device_info) {
+            continue;
+        }
+        added += 1;
+        if let Err(e) = device_handles.add(&path, device) {
+            warn!(
+                "Failed to add device {} on rescan: {}",
+                path.to_string_lossy(),
+                e
+            );
+        }
+    }
+    if added > 0 {
+        info!(
+            "Device rescan picked up {} device(s) the hotplug watch had missed",
+            added
+        );
+    } else {
+        debug!("Device rescan found nothing new");
+    }
+}
+
 /// Opens a newly-appeared device node, tolerating the window between the
 /// kernel creating the node (root:root 0600) and udev applying group/mode
 /// permissions (root:input 0660). Without this, devices appearing while we
 /// run — hot-plugged keyboards, but also the virtual devices of any monux
 /// instance (including our own) — are skipped with a spurious Permission
-/// denied and, in the hot-plug case, never picked up at all.
+/// denied and, when the window outlasts the retry budget here, stay lost
+/// until the periodic rescan picks them up (see rescan_devices).
 async fn open_device_with_retry(path: &Path) -> std::io::Result<Device> {
     const MAX_ATTEMPTS: u32 = 20;
     const RETRY_DELAY: Duration = Duration::from_millis(50);
