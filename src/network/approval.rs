@@ -513,7 +513,10 @@ impl<'a> MonuxCertVerification<'a> {
                 // on us — record the knock so `monux status` can show it and
                 // `monux approve` can act on it. The address context: the
                 // server side knows who contacted it; the client side knows
-                // who it was trying to reach.
+                // who it was trying to reach. The name: the mDNS/handshake
+                // hint when one was learned (client side), else the peer
+                // certificate's hostname CN — that is what lets a server
+                // tell several knocking clients apart beyond their IPs.
                 let (address, name) = if we_are_server {
                     (
                         self.incoming_attempt
@@ -521,15 +524,20 @@ impl<'a> MonuxCertVerification<'a> {
                             .ok()
                             .and_then(|slot| *slot)
                             .map(|a| a.to_string()),
-                        None,
+                        certs::common_name(their_cert),
                     )
                 } else {
                     self.server_attempt
                         .lock()
                         .ok()
                         .and_then(|slot| slot.clone())
-                        .map(|attempt| (Some(attempt.addr.to_string()), attempt.name))
-                        .unwrap_or((None, None))
+                        .map(|attempt| {
+                            (
+                                Some(attempt.addr.to_string()),
+                                attempt.name.or_else(|| certs::common_name(their_cert)),
+                            )
+                        })
+                        .unwrap_or_else(|| (None, certs::common_name(their_cert)))
                 };
                 record_pending(
                     &mut approval_state,
@@ -1382,6 +1390,13 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].fingerprint, certs::fingerprint(&their_cert));
         assert_eq!(pending[0].attempts, 1);
+        // The peer cert's hostname CN captions the request — with several
+        // clients knocking, that is what tells them apart beyond the IPs.
+        assert_eq!(
+            pending[0].name.as_deref(),
+            certs::common_name(&their_cert).as_deref()
+        );
+        assert!(pending[0].name.is_some(), "generated certs carry a CN");
         // Re-knocks accumulate instead of duplicating entries.
         verifier
             .verify_cert(&their_cert, "Client", true)
