@@ -17,6 +17,28 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 1
 fi
 
+# The dependency tree has an MSRV, and the resolver's failure ("rustc X is
+# not supported by the following packages: ...") gives no hint that the fix
+# is a toolchain upgrade. Check up front; keep the floor in sync with the
+# crates pinned in Cargo.lock.
+min_rustc_major=1
+min_rustc_minor=88
+if rustc_ver=$(rustc --version 2>/dev/null); then
+    rustc_ver=${rustc_ver#rustc }          # "1.86.0 (Homebrew)"
+    rustc_ver=${rustc_ver%% *}             # "1.86.0"
+    rustc_major=${rustc_ver%%.*}           # "1"
+    rustc_minor=${rustc_ver#*.}            # "86.0"
+    rustc_minor=${rustc_minor%%.*}         # "86"
+    if [ "$rustc_major" -lt "$min_rustc_major" ] || \
+       { [ "$rustc_major" -eq "$min_rustc_major" ] && [ "$rustc_minor" -lt "$min_rustc_minor" ]; }; then
+        cat >&2 <<EOF
+error: rustc $rustc_ver is too old; building monux needs >= $min_rustc_major.$min_rustc_minor.
+    Upgrade with rustup (https://rustup.rs/), or with Homebrew: brew upgrade rust
+EOF
+        exit 1
+    fi
+fi
+
 if [ "$os" = "Darwin" ]; then
     # The Xcode command line tools provide the C toolchain that ring/zstd
     # (TLS, compression) build with.
@@ -129,14 +151,34 @@ extendedKeyUsage=codeSigning
 EOF
         # The config-file route (not -addext): macOS ships LibreSSL, whose
         # openssl does not support -addext.
+        # PKCS#12: OpenSSL 3.x defaults (AES + PBKDF2 MAC) are rejected by
+        # 'security import' with "MAC verification failed" — and Homebrew's
+        # OpenSSL is first in PATH on many dev machines. -legacy switches to
+        # the old algorithms; LibreSSL predates the flag and already exports
+        # legacy-compatible formats, so only flag OpenSSL 3+.
+        pkcs12_legacy=""
+        case "$(openssl version 2>/dev/null)" in
+            "OpenSSL 3"*) pkcs12_legacy="-legacy" ;;
+        esac
         if openssl req -x509 -newkey rsa:2048 -keyout "$tmp/key.pem" -out "$tmp/cert.pem" \
                 -days 3650 -nodes -config "$tmp/monux.cnf" >/dev/null 2>&1 \
-            && openssl pkcs12 -export -out "$tmp/monux.p12" -inkey "$tmp/key.pem" \
+            && openssl pkcs12 -export $pkcs12_legacy -out "$tmp/monux.p12" -inkey "$tmp/key.pem" \
                 -in "$tmp/cert.pem" -passout pass:monux-install >/dev/null 2>&1 \
             && security import "$tmp/monux.p12" \
                 -k "$HOME/Library/Keychains/login.keychain-db" \
                 -P monux-install -T /usr/bin/codesign >/dev/null 2>&1; then
             echo "Identity created in the login keychain."
+            # Trust the self-signed cert, or the identity fails
+            # 'security find-identity -v' validation (the rerun check above)
+            # and gets re-created on every rerun. macOS asks for
+            # authorization with a dialog; declining only costs the rerun
+            # check — the identity still signs.
+            if ! security add-trusted-cert -r trustRoot \
+                    -k "$HOME/Library/Keychains/login.keychain-db" \
+                    "$tmp/cert.pem" >/dev/null 2>&1; then
+                echo "note: could not mark the certificate trusted; the identity still signs," >&2
+                echo "      but 'security find-identity -v' won't list it." >&2
+            fi
         else
             echo "warning: could not create the signing identity; using ad-hoc signing instead." >&2
             echo "         Every rebuild will need the Accessibility grant re-done (remove and" >&2
