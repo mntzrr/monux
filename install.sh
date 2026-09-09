@@ -211,11 +211,13 @@ EOF
         # Until granted, a client run exits immediately with the grant
         # instructions (the TCC check runs before any networking). Once
         # granted it reaches the connection loop — still alive after the
-        # wait means the grant is in effect. The unreachable 127.0.0.1:1
-        # target keeps that loop from ever connecting to anything real.
+        # wait means the grant is in effect. The unreachable 127.0.0.1
+        # --port 1 target keeps that loop from ever connecting to anything
+        # real (a bare host positional plus --port: the client takes no
+        # host:port argument, which would fail to resolve).
         local out
         out=$(mktemp)
-        "$monux_bin" client 127.0.0.1:1 >"$out" 2>&1 &
+        "$monux_bin" client 127.0.0.1 --port 1 >"$out" 2>&1 &
         local pid=$!
         sleep 3
         if kill -0 "$pid" 2>/dev/null; then
