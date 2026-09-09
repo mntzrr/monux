@@ -146,6 +146,16 @@ Examples:
   monux status --server     # restrict to one role (or --client)")]
     Status(StatusArgs),
 
+    /// Approves a peer waiting for certificate approval
+    ///
+    /// Peers that connect with an unknown certificate are listed by
+    /// 'monux status' under "awaiting approval"; this approves one by
+    /// fingerprint prefix (any unique prefix; with exactly one request
+    /// pending, no prefix is needed at all). With no daemon running,
+    /// --server/--client persist the fingerprint into the config so the
+    /// daemon approves the peer when it next starts.
+    Approve(ApproveArgs),
+
     /// Collects a bug-report bundle: daemon state, logs, journal, environment
     ///
     /// Everything a monux bug report needs, in one paste: the daemon's state
@@ -445,6 +455,32 @@ pub struct StatusArgs {
     /// Print the daemon's raw JSON response instead of a human-readable summary
     #[arg(long, help_heading = H_OUTPUT)]
     pub json: bool,
+}
+
+/// `monux approve` (see Commands::Approve).
+#[derive(Args)]
+pub struct ApproveArgs {
+    /// The fingerprint prefix of the request to approve (from 'monux status')
+    ///
+    /// Any prefix that matches exactly one pending request. With exactly one
+    /// request pending this can be omitted.
+    #[arg(value_name = "prefix")]
+    pub target: Option<String>,
+
+    /// Persist into the server's config instead of a running daemon
+    ///
+    /// With no daemon running: writes server.fingerprint, so 'monux server'
+    /// approves this peer from its next start.
+    #[arg(long, conflicts_with = "client", help_heading = H_TARGET)]
+    pub server: bool,
+
+    /// Persist into the client's config instead of a running daemon
+    #[arg(long, help_heading = H_TARGET)]
+    pub client: bool,
+
+    /// Use this explicit control socket path
+    #[arg(long, value_name = "path", help_heading = H_TARGET)]
+    pub socket: Option<PathBuf>,
 }
 
 #[derive(Args)]

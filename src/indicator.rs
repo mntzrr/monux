@@ -1035,6 +1035,7 @@ mod tests {
 
     fn server_state(paused: bool, target: &str, clients: Vec<(&str, Option<u64>)>) -> State {
         State::Server(ServerState {
+            pending_approvals: Vec::new(),
             version: "1.5.0".to_string(),
             protocol_version: 8,
             listen: "10.0.0.1:1213".to_string(),
@@ -1060,6 +1061,7 @@ mod tests {
 
     fn client_state(connected: bool, active: bool) -> State {
         State::Client(ClientState {
+            pending_approvals: Vec::new(),
             version: "1.5.0".to_string(),
             protocol_version: 8,
             server: "10.0.0.1:1213".to_string(),

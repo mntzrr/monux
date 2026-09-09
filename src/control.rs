@@ -63,6 +63,12 @@
 //!   change is live immediately and persisted to the config file
 //!   (client.link-notify), so it survives restarts. The tray menu's "Link
 //!   notifications" toggle drives this command.
+//! - `{"cmd":"approve","target":"<fingerprint-prefix>"}` — approve a peer
+//!   waiting for certificate approval (see the pending_approvals status
+//!   field). Any prefix matching exactly one pending request; with exactly
+//!   one request pending the target may be omitted. The daemon persists the
+//!   peer's certificate, so the approval survives restarts, and the peer
+//!   connects on its next retry. `monux approve` drives this command.
 //! - `{"cmd":"restart"}` — graceful shutdown, then re-exec into the installed
 //!   binary (the auto-updater's restart path).
 //! - `{"cmd":"exit"}` — graceful shutdown.
@@ -75,7 +81,7 @@
 //! a rotation switch) lands asynchronously; poll status to observe it. The
 //! server socket serves the full command set minus link-notify; the client
 //! socket serves only status/diagnostics/update_now/indicator/link-notify/
-//! restart/exit (rotation and pause are server concepts).
+//! approve/restart/exit (rotation and pause are server concepts).
 //!
 //! # Diagnostics schema (the `diagnostics` object of a diagnostics response)
 //!
@@ -382,6 +388,11 @@ pub struct ServerState {
     pub clipboard: ServerClipboardState,
     /// Sha of a newer commit seen by the auto-updater, if any.
     pub update_available: Option<String>,
+    /// Peers waiting for certificate approval, enriched by the handler at
+    /// answer time (the rotation mirror doesn't see the verifier). Defaulted
+    /// on the wire for older daemons.
+    #[serde(default)]
+    pub pending_approvals: Vec<crate::network::approval::PendingPeer>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -421,6 +432,11 @@ pub struct ClientState {
     /// before this field existed parses as off.
     #[serde(default)]
     pub link_notify: bool,
+    /// Peers waiting for certificate approval, enriched by the handler at
+    /// answer time (the mirror doesn't see the verifier). Defaulted on the
+    /// wire for older daemons.
+    #[serde(default)]
+    pub pending_approvals: Vec<crate::network::approval::PendingPeer>,
 }
 
 /// Either daemon's state, parsed by the status CLI (`role` discriminates).
@@ -471,6 +487,7 @@ impl std::fmt::Display for State {
                         c.edge.as_deref().unwrap_or("-")
                     )?;
                 }
+                write_pending(f, &s.pending_approvals, "client")?;
                 Ok(())
             }
             State::Client(s) => {
@@ -491,10 +508,47 @@ impl std::fmt::Display for State {
                 }
                 writeln!(f, "  active:         {}", yes_no(s.active))?;
                 writeln!(f, "  link notify:    {}", yes_no(s.link_notify))?;
+                write_pending(f, &s.pending_approvals, "server")?;
                 Ok(())
             }
         }
     }
+}
+
+/// Renders the pending-approval section shared by both roles' status output.
+/// `other_role` names what a pending peer is (a client to a server, a server
+/// to a client) for the hint line.
+fn write_pending(
+    f: &mut std::fmt::Formatter,
+    pending: &[crate::network::approval::PendingPeer],
+    other_role: &str,
+) -> std::fmt::Result {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    writeln!(f, "awaiting approval ({}):", pending.len())?;
+    for p in pending {
+        // The 16-char prefix is exactly what 'monux approve' takes.
+        let prefix: String = p.fingerprint.chars().take(16).collect();
+        writeln!(
+            f,
+            "  {} from {}{} — {} attempt(s), {}s ago",
+            prefix,
+            p.address.as_deref().unwrap_or("?"),
+            p.name
+                .as_deref()
+                .map(|n| format!(" ({})", n))
+                .unwrap_or_default(),
+            p.attempts,
+            p.last_seen_secs_ago
+        )?;
+    }
+    writeln!(
+        f,
+        "  approve with: monux approve <prefix>   (approves the {} above)",
+        other_role
+    )?;
+    Ok(())
 }
 
 fn yes_no(v: bool) -> &'static str {
@@ -625,6 +679,7 @@ impl ClientStateMirror {
             rtt_ms,
             lost_packets,
             link_notify: self.link_notify.load(Ordering::Relaxed),
+            pending_approvals: Vec::new(),
         }
     }
 }
@@ -983,6 +1038,14 @@ enum PostAction {
     IndicatorHide,
 }
 
+/// The approval surface the handlers need from the certificate verifier:
+/// the pending-request listing for status, and the approve action. A trait so
+/// the dispatch tests can stand in for a real verifier.
+pub trait Approvals: Send + Sync {
+    fn pending(&self) -> Vec<crate::network::approval::PendingPeer>;
+    fn approve(&self, prefix: &str) -> anyhow::Result<String>;
+}
+
 /// Command/context bundle for the server socket.
 pub struct ServerHandler {
     /// Structured live state, refreshed by the rotation loop.
@@ -1000,6 +1063,8 @@ pub struct ServerHandler {
     /// Hide/show control for the auto-spawned tray indicator.
     #[cfg(target_os = "linux")]
     pub indicator: crate::indicator_spawn::SupervisorHandle,
+    /// Certificate-approval requests: pending listing + approve action.
+    pub approvals: std::sync::Arc<dyn Approvals>,
 }
 
 /// Command/context bundle for the client socket.
@@ -1009,6 +1074,8 @@ pub struct ClientHandler {
     /// Hide/show control for the auto-spawned tray indicator.
     #[cfg(target_os = "linux")]
     pub indicator: crate::indicator_spawn::SupervisorHandle,
+    /// Certificate-approval requests: pending listing + approve action.
+    pub approvals: std::sync::Arc<dyn Approvals>,
     /// Where client.link-notify persists when the socket toggles it
     /// (config::path(config_dir) is the file).
     pub config_dir: PathBuf,
@@ -1020,20 +1087,77 @@ pub enum Handler {
 }
 
 impl Handler {
+    /// The approval surface of whichever daemon answered.
+    fn approvals(&self) -> &dyn Approvals {
+        match self {
+            Handler::Server(h) => h.approvals.as_ref(),
+            Handler::Client(h) => h.approvals.as_ref(),
+        }
+    }
+
     /// Validates and dispatches one request. Shared commands behave the same
     /// on both roles; rotation/pause are server-only (see module docs).
     async fn dispatch(&self, req: &Request) -> (Response, Option<PostAction>) {
         match req.cmd.as_str() {
             "status" => match self {
                 Handler::Server(h) => match h.state.server_state() {
-                    Some(state) => (Response::ok_state(State::Server(state)), None),
+                    Some(mut state) => {
+                        // The rotation mirror can't see the verifier; enrich
+                        // at answer time instead.
+                        state.pending_approvals = h.approvals.pending();
+                        (Response::ok_state(State::Server(state)), None)
+                    }
                     None => (
                         Response::err("state not available yet (rotation loop has not run)"),
                         None,
                     ),
                 },
-                Handler::Client(h) => (Response::ok_state(State::Client(h.state.snapshot())), None),
+                Handler::Client(h) => {
+                    let mut state = h.state.snapshot();
+                    state.pending_approvals = h.approvals.pending();
+                    (Response::ok_state(State::Client(state)), None)
+                }
             },
+            "approve" => {
+                // Approve a pending certificate request by fingerprint
+                // prefix. No target and exactly one pending request: approve
+                // that one (the common headless flow — nothing to copy).
+                // Ambiguity and misses are errors listing what IS pending,
+                // never a silent pick.
+                let pending = self.approvals().pending();
+                let prefix: Option<String> = match req.target.as_deref().map(str::trim) {
+                    Some(t) if !t.is_empty() => Some(t.to_string()),
+                    None | Some("") if pending.len() == 1 => Some(pending[0].fingerprint.clone()),
+                    _ => None,
+                };
+                match prefix {
+                    Some(prefix) => match self.approvals().approve(&prefix) {
+                        Ok(_fp) => (Response::ok_empty(), None),
+                        Err(e) => (Response::err(format!("{:#}", e)), None),
+                    },
+                    None => {
+                        let listed = if pending.is_empty() {
+                            "nothing is pending".to_string()
+                        } else {
+                            format!(
+                                "pending: {}",
+                                pending
+                                    .iter()
+                                    .map(|p| p.fingerprint[..8].to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        };
+                        (
+                            Response::err(format!(
+                                "approve needs a fingerprint prefix ({})",
+                                listed
+                            )),
+                            None,
+                        )
+                    }
+                }
+            }
             "diagnostics" => {
                 let lines = requested_lines(req.lines);
                 match self {
@@ -1611,8 +1735,68 @@ pub fn fetch_diagnostics(
 /// socket (server socket first, then the client's) and returns the text to
 /// print. The daemon's error string propagates — e.g. switch/pause from a
 /// client socket, an unknown switch target, or --no-auto-update on update.
-pub fn daemon_cli(request: &str, ok_message: &str, socket: Option<&Path>) -> Result<String> {
-    let candidates: Vec<PathBuf> = match socket {
+/// `monux approve` (see Commands::Approve): approve a pending certificate
+/// request on a running daemon; with --server/--client (and no daemon
+/// needed), persist the fingerprint into that role's config instead, so the
+/// daemon approves the peer from its next start — pre-provisioning without
+/// running anything.
+pub fn approve_cli(
+    target: Option<&str>,
+    server: bool,
+    client: bool,
+    socket: Option<&Path>,
+    config_dir: &Path,
+) -> Result<String> {
+    if !server && !client {
+        // Daemon route: approve a recorded knock. The daemon resolves the
+        // prefix against its pending list (and accepts a bare command when
+        // exactly one request is waiting).
+        let request = serde_json::json!({
+            "cmd": "approve",
+            "target": target,
+        })
+        .to_string();
+        let candidates: Vec<PathBuf> = match socket {
+            Some(path) => vec![path.to_path_buf()],
+            None => vec![socket_path(Role::Server), socket_path(Role::Client)],
+        };
+        let (_path, raw) = query_first(&candidates, &request, SOCKET_TIMEOUT)?;
+        let response: RawResponse = serde_json::from_str(&raw)
+            .with_context(|| format!("Malformed response: {}", raw))?;
+        if !response.ok {
+            bail!(
+                "The daemon reported an error: {}",
+                response.error.unwrap_or_default()
+            );
+        }
+        return Ok("Approved; the peer connects on its next retry".to_string());
+    }
+
+    // Offline route: persist into the config for the chosen role.
+    let Some(target) = target.map(str::trim).filter(|t| !t.is_empty()) else {
+        bail!("persisting an approval needs the peer's fingerprint (read it off the peer's startup banner, or from 'monux status' while a daemon runs)");
+    };
+    let normalized = crate::network::approval::normalize_fingerprint(target);
+    // Same rule the daemon and the config validator enforce: a full digest
+    // or a >=16-char prefix.
+    crate::network::approval::validate_fingerprint(&normalized)?;
+    let (key, role) = if server {
+        ("server.fingerprint", "server")
+    } else {
+        ("client.fingerprint", "client")
+    };
+    crate::config::set_value(
+        &crate::config::path(config_dir),
+        key,
+        std::slice::from_ref(&normalized),
+    )?;
+    Ok(format!(
+        "Saved {} to {}; the {} approves this peer from its next start",
+        normalized, key, role
+    ))
+}
+
+pub fn daemon_cli(request: &str, ok_message: &str, socket: Option<&Path>) -> Result<String> {    let candidates: Vec<PathBuf> = match socket {
         Some(path) => vec![path.to_path_buf()],
         None => vec![socket_path(Role::Server), socket_path(Role::Client)],
     };
@@ -1796,6 +1980,151 @@ mod tests {
         }
     }
 
+    /// A no-op approvals stand-in: no pending requests, nothing approvable.
+    fn test_approvals() -> std::sync::Arc<dyn Approvals> {
+        std::sync::Arc::new(NoApprovals)
+    }
+
+    struct NoApprovals;
+
+    impl Approvals for NoApprovals {
+        fn pending(&self) -> Vec<crate::network::approval::PendingPeer> {
+            Vec::new()
+        }
+        fn approve(&self, prefix: &str) -> anyhow::Result<String> {
+            bail!("no pending approval request matches '{}'", prefix)
+        }
+    }
+
+    /// A programmable approvals stand-in: fixed pending list, approve
+    /// resolves against it exactly like the real verifier's prefix rule.
+    struct FakeApprovals {
+        pending: Vec<crate::network::approval::PendingPeer>,
+    }
+
+    impl Approvals for FakeApprovals {
+        fn pending(&self) -> Vec<crate::network::approval::PendingPeer> {
+            self.pending.clone()
+        }
+        fn approve(&self, prefix: &str) -> anyhow::Result<String> {
+            let matches: Vec<&crate::network::approval::PendingPeer> = self
+                .pending
+                .iter()
+                .filter(|p| p.fingerprint.starts_with(prefix))
+                .collect();
+            match matches.as_slice() {
+                [] => bail!("no pending approval request matches '{}'", prefix),
+                [only] => Ok(only.fingerprint.clone()),
+                many => bail!(
+                    "'{}' is ambiguous: {} pending requests match",
+                    prefix,
+                    many.len()
+                ),
+            }
+        }
+    }
+
+    fn pending_peer(fingerprint: &str, address: &str) -> crate::network::approval::PendingPeer {
+        crate::network::approval::PendingPeer {
+            fingerprint: fingerprint.to_string(),
+            address: Some(address.to_string()),
+            name: Some("laptop".to_string()),
+            attempts: 7,
+            last_seen_secs_ago: 2,
+        }
+    }
+
+    /// A client handler whose approvals stand-in is the given fake (the
+    /// plain client_handler uses the empty NoApprovals).
+    fn client_handler_with_approvals(
+        approvals: std::sync::Arc<dyn Approvals>,
+    ) -> (Handler, Arc<ClientStateMirror>, tempfile::TempDir) {
+        let mirror = Arc::new(ClientStateMirror::new(
+            "127.0.0.1:9999".parse().unwrap(),
+            false,
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        (
+            Handler::Client(ClientHandler {
+                state: mirror.clone(),
+                auto_update: false,
+                #[cfg(target_os = "linux")]
+                indicator: opted_out_indicator(),
+                approvals,
+                config_dir: dir.path().to_path_buf(),
+            }),
+            mirror,
+            dir,
+        )
+    }
+
+    #[tokio::test]
+    async fn approve_command_resolves_prefixes_and_reports_errors() {
+        let fake = std::sync::Arc::new(FakeApprovals {
+            pending: vec![
+                pending_peer(&"aa11".repeat(16), "192.0.2.10:52310"),
+                pending_peer(&"bb22".repeat(16), "192.0.2.11:52311"),
+            ],
+        });
+        let (handler, _mirror, _dir) = client_handler_with_approvals(fake);
+
+        // A unique prefix approves.
+        let (resp, post) = handler
+            .dispatch(&req("approve", Some(&"aa11".repeat(8))))
+            .await;
+        assert!(resp.ok, "{:?}", resp.error);
+        assert!(post.is_none());
+
+        // No target with two pending: error listing them, never a pick.
+        let (resp, _) = handler.dispatch(&req("approve", None)).await;
+        assert!(!resp.ok);
+        let err = resp.error.unwrap();
+        assert!(err.contains("pending: aa11aa11, bb22bb22"), "{}", err);
+
+        // Ambiguity and misses surface the underlying error.
+        let (resp, _) = handler.dispatch(&req("approve", Some("cc33"))).await;
+        assert!(!resp.ok);
+        assert!(resp.error.unwrap().contains("no pending"), "miss");
+        let (resp, _) = handler
+            .dispatch(&req("approve", Some("")))
+            .await;
+        assert!(!resp.ok, "an empty target must not pick");
+    }
+
+    #[tokio::test]
+    async fn approve_command_without_target_approves_the_sole_request() {
+        let fp = "cc33".repeat(16);
+        let fake = std::sync::Arc::new(FakeApprovals {
+            pending: vec![pending_peer(&fp, "192.0.2.12:52312")],
+        });
+        let (handler, _mirror, _dir) = client_handler_with_approvals(fake);
+        let (resp, _) = handler.dispatch(&req("approve", None)).await;
+        assert!(resp.ok, "{:?}", resp.error);
+    }
+
+    #[tokio::test]
+    async fn status_lists_pending_approvals() {
+        let fake = std::sync::Arc::new(FakeApprovals {
+            pending: vec![pending_peer(&"aa11".repeat(16), "192.0.2.10:52310")],
+        });
+        let (handler, _mirror, _dir) = client_handler_with_approvals(fake);
+        let (resp, _) = handler.dispatch(&req("status", None)).await;
+        assert!(resp.ok);
+        let state = resp.state.expect("status carries state");
+        // The client state carries the enriched pending list...
+        let parsed: State = serde_json::from_value(state).unwrap();
+        let State::Client(c) = parsed else {
+            panic!("expected client state");
+        };
+        assert_eq!(c.pending_approvals.len(), 1);
+        assert_eq!(c.pending_approvals[0].fingerprint, "aa11".repeat(16));
+        // ...and the human rendering advertises the approve command.
+        let text = State::Client(c).to_string();
+        assert!(text.contains("awaiting approval (1)"), "{}", text);
+        assert!(text.contains("monux approve <prefix>"), "{}", text);
+        assert!(text.contains("aa11aa11aa11aa11"), "{}", text);
+    }
+
     /// A supervisor handle whose daemon opted out of the indicator: no
     /// child, no task, and show() refuses — all without touching the
     /// environment or spawning processes.
@@ -1829,6 +2158,7 @@ mod tests {
                 auto_update,
                 #[cfg(target_os = "linux")]
                 indicator: opted_out_indicator(),
+                approvals: test_approvals(),
             }),
             rotation_rx,
         )
@@ -1848,6 +2178,7 @@ mod tests {
                 auto_update,
                 #[cfg(target_os = "linux")]
                 indicator: opted_out_indicator(),
+                approvals: test_approvals(),
                 config_dir: dir.path().to_path_buf(),
             }),
             mirror,

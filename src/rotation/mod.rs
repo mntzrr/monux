@@ -2485,6 +2485,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// know it; the mirror fills it in on read (DiagnosticsMirror::server_state).
     fn server_state(&self) -> crate::control::ServerState {
         crate::control::ServerState {
+            pending_approvals: Vec::new(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: crate::msgs::shared::PROTOCOL_VERSION,
             listen: String::new(),

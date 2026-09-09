@@ -148,6 +148,19 @@ fn main() -> Result<()> {
     // get the die-quietly-on-SIGPIPE disposition; the daemon paths below
     // deliberately don't (see cli_sigpipe_kill).
     match &cli.command {
+        Commands::Approve(args) => {
+            cli_sigpipe_kill();
+            let config_dir = init_config_dir()?;
+            let out = monux::control::approve_cli(
+                args.target.as_deref(),
+                args.server,
+                args.client,
+                args.socket.as_deref(),
+                &config_dir,
+            )?;
+            println!("{}", out);
+            return Ok(());
+        }
         Commands::Daemon(args) => match &args.command {
             DaemonCommands::Switch(args) => {
                 cli_sigpipe_kill();
@@ -440,13 +453,14 @@ fn main() -> Result<()> {
         Commands::Setup(_)
         | Commands::Update(_)
         | Commands::Status(_)
+        | Commands::Approve(_)
         | Commands::Servers
         | Commands::Config(_)
         | Commands::Gui(_)
         | Commands::System(_)
         | Commands::Diagnostics(_)
         | Commands::Daemon(_) => {
-            unreachable!("setup/update/status/servers/config/gui/system/daemon/diagnostics commands are handled before runtime initialization")
+            unreachable!("setup/update/status/approve/servers/config/gui/system/daemon/diagnostics commands are handled before runtime initialization")
         }
         Commands::Server(mut args) => {
             #[cfg(not(target_os = "linux"))]
@@ -1044,6 +1058,7 @@ async fn server(args: ServerDaemonArgs<'_>) -> Result<()> {
                 rotation_tx: rotation_tx.clone(),
                 auto_update,
                 indicator: indicator.handle(),
+                approvals: verifier.clone(),
             });
             spawn_control_listener(listener, handler);
         }
@@ -1452,6 +1467,7 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
                 auto_update,
                 #[cfg(target_os = "linux")]
                 indicator: indicator.handle(),
+                approvals: verifier.clone(),
                 config_dir: config_dir.clone(),
             });
             spawn_control_listener(listener, handler);
@@ -1810,6 +1826,27 @@ mod tests {
         assert_eq!(args.autostart, Some(monux::setup::Autostart::Server));
         assert!(args.desktop_shortcut);
         assert!(!setup_needs_root(&args.autostart, args.desktop_shortcut));
+    }
+
+    #[test]
+    fn approve_command_parses_prefix_and_role_flags() {
+        // Bare: approve the sole pending request on whichever daemon answers.
+        let cli = Cli::try_parse_from(["monux", "approve"]).unwrap();
+        let Commands::Approve(args) = cli.command else {
+            panic!("expected the approve command")
+        };
+        assert!(args.target.is_none() && !args.server && !args.client);
+
+        // Prefix + offline persistence into a role's config.
+        let cli = Cli::try_parse_from(["monux", "approve", "aa11bbccaa11bbcc", "--server"]).unwrap();
+        let Commands::Approve(args) = cli.command else {
+            panic!("expected the approve command")
+        };
+        assert_eq!(args.target.as_deref(), Some("aa11bbccaa11bbcc"));
+        assert!(args.server && !args.client);
+
+        // The roles conflict, like everywhere else.
+        assert!(Cli::try_parse_from(["monux", "approve", "--server", "--client"]).is_err());
     }
 
     #[test]
