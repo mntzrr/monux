@@ -51,6 +51,8 @@
 //! Linux-specific.
 
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
