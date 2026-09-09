@@ -41,7 +41,7 @@ fn frame_needs_own_syn(events: &[event::InputEvent]) -> bool {
             .as_ref()
             .map(|e| e.type_)
             .or_else(|| event.inputf64.as_ref().map(|e| e.type_));
-        type_ == Some(evdev::EventType::ABSOLUTE.0)
+        type_ == Some(crate::msgs::consts::EV_ABS)
     })
 }
 
@@ -79,13 +79,15 @@ impl DeltaScaler {
     /// The scale applying to a relative-axis code, if any: pointer motion axes
     /// scale by mouse_scale, wheel and hi-res wheel axes by scroll_scale.
     fn scale_for(&self, code: u16) -> Option<f64> {
-        use evdev::RelativeAxisCode as R;
-        if code == R::REL_X.0 || code == R::REL_Y.0 {
+        use crate::msgs::consts::{
+            REL_HWHEEL, REL_HWHEEL_HI_RES, REL_WHEEL, REL_WHEEL_HI_RES, REL_X, REL_Y,
+        };
+        if code == REL_X || code == REL_Y {
             Some(self.mouse_scale)
-        } else if code == R::REL_WHEEL.0
-            || code == R::REL_HWHEEL.0
-            || code == R::REL_WHEEL_HI_RES.0
-            || code == R::REL_HWHEEL_HI_RES.0
+        } else if code == REL_WHEEL
+            || code == REL_HWHEEL
+            || code == REL_WHEEL_HI_RES
+            || code == REL_HWHEEL_HI_RES
         {
             Some(self.scroll_scale)
         } else {
@@ -106,7 +108,7 @@ impl DeltaScaler {
             let Some(i) = &mut e.inputi32 else {
                 return true;
             };
-            if i.type_ != evdev::EventType::RELATIVE.0 {
+            if i.type_ != crate::msgs::consts::EV_REL {
                 return true;
             }
             let Some(scale) = self.scale_for(i.code) else {
@@ -1211,10 +1213,10 @@ impl Connection {
         trace!("Applying motion datagram seq={}: dx={} dy={}", msg.seq, dx, dy);
         let mut events = Vec::with_capacity(2);
         if dx != 0 {
-            events.push(event::motion_event(evdev::RelativeAxisCode::REL_X.0, dx));
+            events.push(event::motion_event(crate::msgs::consts::REL_X, dx));
         }
         if dy != 0 {
-            events.push(event::motion_event(evdev::RelativeAxisCode::REL_Y.0, dy));
+            events.push(event::motion_event(crate::msgs::consts::REL_Y, dy));
         }
         // Pointer scaling applies to datagram motion too (see DeltaScaler).
         self.scaler.apply(&mut events);
@@ -1812,12 +1814,12 @@ mod tests {
         );
     }
 
-    const REL: u16 = evdev::EventType::RELATIVE.0;
-    const KEY: u16 = evdev::EventType::KEY.0;
-    const REL_X: u16 = evdev::RelativeAxisCode::REL_X.0;
-    const REL_Y: u16 = evdev::RelativeAxisCode::REL_Y.0;
-    const REL_WHEEL: u16 = evdev::RelativeAxisCode::REL_WHEEL.0;
-    const REL_HWHEEL_HI_RES: u16 = evdev::RelativeAxisCode::REL_HWHEEL_HI_RES.0;
+    const REL: u16 = crate::msgs::consts::EV_REL;
+    const KEY: u16 = crate::msgs::consts::EV_KEY;
+    const REL_X: u16 = crate::msgs::consts::REL_X;
+    const REL_Y: u16 = crate::msgs::consts::REL_Y;
+    const REL_WHEEL: u16 = crate::msgs::consts::REL_WHEEL;
+    const REL_HWHEEL_HI_RES: u16 = crate::msgs::consts::REL_HWHEEL_HI_RES;
 
     fn rel(code: u16, value: i32) -> event::InputEvent {
         event::InputEvent {
@@ -1833,7 +1835,7 @@ mod tests {
     fn abs(code: u16, value: i32) -> event::InputEvent {
         event::InputEvent {
             inputi32: Some(event::InputI32 {
-                type_: evdev::EventType::ABSOLUTE.0,
+                type_: crate::msgs::consts::EV_ABS,
                 code,
                 value,
             }),
@@ -1845,7 +1847,7 @@ mod tests {
         event::InputEvent {
             inputi32: None,
             inputf64: Some(event::InputF64 {
-                type_: evdev::EventType::ABSOLUTE.0,
+                type_: crate::msgs::consts::EV_ABS,
                 code,
                 value,
             }),
@@ -1857,13 +1859,13 @@ mod tests {
     /// one frame, which the compositor reads as no touch at all.
     #[test]
     fn absolute_frames_are_not_coalesced() {
-        let mt_position_x = evdev::AbsoluteAxisCode::ABS_MT_POSITION_X.0;
+        let mt_position_x = crate::msgs::consts::ABS_MT_POSITION_X;
         assert!(frame_needs_own_syn(&[abs(mt_position_x, 4338)]));
         // Scaled continuous axes travel as inputf64 and must count too.
         assert!(frame_needs_own_syn(&[abs_scaled(mt_position_x, 0.5)]));
         // A real touchpad frame: buttons alongside the absolute axes.
         assert!(frame_needs_own_syn(&[
-            abs(evdev::AbsoluteAxisCode::ABS_MT_TRACKING_ID.0, -1),
+            abs(crate::msgs::consts::ABS_MT_TRACKING_ID, -1),
             rel(REL_X, 0),
         ]));
         // Relative and key frames keep the batching that matters at 8kHz.
@@ -1991,13 +1993,13 @@ mod tests {
         let abs = event::InputEvent {
             inputi32: None,
             inputf64: Some(event::InputF64 {
-                type_: evdev::EventType::ABSOLUTE.0,
-                code: evdev::AbsoluteAxisCode::ABS_X.0,
+                type_: crate::msgs::consts::EV_ABS,
+                code: crate::msgs::consts::ABS_X,
                 value: 0.5,
             }),
         };
         // REL_Z is a relative axis but neither pointer motion nor wheel.
-        let rel_z = rel(evdev::RelativeAxisCode::REL_Z.0, 4);
+        let rel_z = rel(crate::msgs::consts::REL_Z, 4);
         let mut batch = vec![key, abs, rel_z];
         s.apply(&mut batch);
         assert_eq!(batch.len(), 3);

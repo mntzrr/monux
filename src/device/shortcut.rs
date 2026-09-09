@@ -1,19 +1,20 @@
 use std::collections::HashSet;
-use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Result};
-use evdev::{EventType, KeyCode};
 
 use crate::device::Event;
+#[cfg(target_os = "linux")]
+use crate::msgs::consts::EV_KEY;
+use crate::msgs::keycodes::from_name;
 
 pub struct KeyCombos {
     pub combos: Vec<KeyCombo>,
-    pub all_keys: HashSet<KeyCode>,
+    pub all_keys: HashSet<u16>,
 }
 
 /// A combination of keys paired with an action to be emitted when the combination is entered by the user
 pub struct KeyCombo {
-    pub keys: Vec<KeyCode>,
+    pub keys: Vec<u16>,
     pub action: Event,
 }
 
@@ -78,14 +79,18 @@ fn parse_action(keys: &str, action: Event) -> Result<KeyCombo> {
     for keyname_orig in keys_iter {
         // First try 'KEY_<X>'
         let keyname = keyname_orig.trim().to_uppercase();
-        if let Ok(key) = KeyCode::from_str(format!("KEY_{}", keyname).as_str()) {
+        if let Some(key) = from_name(format!("KEY_{}", keyname).as_str()) {
             keys.push(key);
         } else {
             // Didn't find 'KEY_<X>', try just '<X>' for things like 'BTN_0'
-            keys.push(
-                KeyCode::from_str(keyname.to_string().as_str())
-                    .map_err(|e| anyhow!("Unsupported key '{}': Tried KEY_{} and {}, see list of available keys at https://docs.rs/evdev/latest/evdev/struct.KeyCode.html (error: {:?})", keyname_orig, keyname, keyname, e))?,
-            );
+            keys.push(from_name(keyname.as_str()).ok_or_else(|| {
+                anyhow!(
+                    "Unsupported key '{}': Tried KEY_{} and {}, see the evdev KeyCode key list at https://docs.rs/evdev/latest/evdev/struct.KeyCode.html",
+                    keyname_orig,
+                    keyname,
+                    keyname
+                )
+            })?);
         }
     }
     // Sort the keys to detect duplicates across e.g. "shift+alt+n" and "alt+shift+n".
@@ -98,6 +103,8 @@ fn parse_action(keys: &str, action: Event) -> Result<KeyCombo> {
 }
 
 /// Result of checking an input event for matching key combination shortcuts
+/// (consumed by the Linux capture path; the config validators only parse).
+#[cfg(target_os = "linux")]
 pub(crate) enum ComboAction {
     /// The caller should not send the input event.
     ConsumeEvent,
@@ -126,6 +133,7 @@ pub(crate) enum ComboAction {
 /// combo keys are still held fires again — e.g. holding Shift+Alt and tapping R cycles
 /// through clients. Autorepeat (value 2) never fires.
 #[derive(Clone)]
+#[cfg(target_os = "linux")]
 pub(crate) struct ComboState {
     /// The action to take
     action: Event,
@@ -137,12 +145,13 @@ pub(crate) struct ComboState {
     fired: bool,
 }
 
+#[cfg(target_os = "linux")]
 impl ComboState {
-    pub(crate) fn new(combo_keys: Vec<KeyCode>, action: Event) -> ComboState {
+    pub(crate) fn new(combo_keys: Vec<u16>, action: Event) -> ComboState {
         let len = combo_keys.len();
         ComboState {
             action,
-            combo_key_codes: combo_keys.into_iter().map(|k| k.code()).collect(),
+            combo_key_codes: combo_keys,
             pressed_keys: bit_vec::BitVec::from_elem(len, false),
             fired: false,
         }
@@ -150,24 +159,25 @@ impl ComboState {
 
     /// Checks if the provided event completes a combo according to internal state.
     /// If so, then the action to be taken is returned.
-    pub(crate) fn check_combo(&mut self, event: &evdev::InputEvent) -> ComboAction {
-        if event.event_type() != EventType::KEY {
+    pub(crate) fn check_combo(&mut self, event: (u16, u16, i32)) -> ComboAction {
+        let (type_, code, value) = event;
+        if type_ != EV_KEY {
             // Not a keypress, pass through
             return ComboAction::PassEvent;
         }
         // Check if this key is one of our assigned combo keys.
         // This search should be cheap as it's limited to the size of the key combo (2-4 keys?)
-        if let Some(idx) = self.key_idx(event.code()) {
+        if let Some(idx) = self.key_idx(code) {
             // The key event is related to our combo. Update our state to reflect the keypress or release.
             // Matching is value-aware: a release (value 0) never completes the combo,
             // and autorepeat (value 2) never fires it.
             let was_pressed = self.pressed_keys.get(idx).expect("idx is in bounds");
-            self.pressed_keys.set(idx, event.value() >= 1);
+            self.pressed_keys.set(idx, value >= 1);
             if self.fired {
                 // The combo fired already; consume every combo key event until all the
                 // combo keys have been released, so the new target (which never saw these
                 // keys pressed) doesn't get stray repeats or releases.
-                if event.value() == 1 && !was_pressed && self.pressed_keys.all() {
+                if value == 1 && !was_pressed && self.pressed_keys.all() {
                     // A fresh press completing the combo again while the other combo keys
                     // are still held: fire again. Holding Shift+Alt and tapping R cycles
                     // through clients. Autorepeat (value 2) never re-fires.
@@ -182,7 +192,7 @@ impl ComboState {
                 // Waiting for the full combo to be pressed. Events pass through untouched
                 // until then: we can't speculatively consume presses, since the user might
                 // be using the keys for something else (e.g. the N in ALT+N).
-                if event.value() == 1 && self.pressed_keys.all() {
+                if value == 1 && self.pressed_keys.all() {
                     // The final missing combo key was just pressed: the combo is complete.
                     // Fire right away and consume this press. The earlier combo key presses
                     // were already forwarded to the current target, which is fine: the
@@ -218,33 +228,35 @@ impl ComboState {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use crate::msgs::consts::EV_REL;
 
-    const SHIFT: KeyCode = KeyCode::KEY_LEFTSHIFT;
-    const ALT: KeyCode = KeyCode::KEY_LEFTALT;
-    const R: KeyCode = KeyCode::KEY_R;
-    const G: KeyCode = KeyCode::KEY_G;
-    const X: KeyCode = KeyCode::KEY_X;
+    // KEY_LEFTSHIFT, KEY_LEFTALT, KEY_R, KEY_G, KEY_X (see msgs::keycodes).
+    const SHIFT: u16 = 42;
+    const ALT: u16 = 56;
+    const R: u16 = 19;
+    const G: u16 = 34;
+    const X: u16 = 45;
 
     fn rotate_combo() -> ComboState {
         ComboState::new(vec![SHIFT, ALT, R], Event::SwitchNext)
     }
 
-    fn key(code: KeyCode, value: i32) -> evdev::InputEvent {
-        evdev::InputEvent::new(EventType::KEY.0, code.code(), value)
+    fn key(code: u16, value: i32) -> (u16, u16, i32) {
+        (EV_KEY, code, value)
     }
 
-    fn press(code: KeyCode) -> evdev::InputEvent {
+    fn press(code: u16) -> (u16, u16, i32) {
         key(code, 1)
     }
 
-    fn repeat(code: KeyCode) -> evdev::InputEvent {
+    fn repeat(code: u16) -> (u16, u16, i32) {
         key(code, 2)
     }
 
-    fn release(code: KeyCode) -> evdev::InputEvent {
+    fn release(code: u16) -> (u16, u16, i32) {
         key(code, 0)
     }
 
@@ -288,7 +300,7 @@ mod tests {
     /// combo to its initial state.
     fn drain_all(cs: &mut ComboState) {
         for code in [SHIFT, ALT, R] {
-            assert_consume(cs.check_combo(&release(code)));
+            assert_consume(cs.check_combo(release(code)));
         }
     }
 
@@ -297,90 +309,90 @@ mod tests {
         let mut cs = rotate_combo();
         // Combo keys may be pressed in any order; each passes through until the
         // combo is complete (they might be meant for the current target).
-        assert_pass(cs.check_combo(&press(ALT)));
-        assert_pass(cs.check_combo(&press(SHIFT)));
-        assert_fired(cs.check_combo(&press(R)), &Event::SwitchNext);
+        assert_pass(cs.check_combo(press(ALT)));
+        assert_pass(cs.check_combo(press(SHIFT)));
+        assert_fired(cs.check_combo(press(R)), &Event::SwitchNext);
     }
 
     #[test]
     fn consumes_chord_events_until_all_released() {
         let mut cs = rotate_combo();
-        assert_pass(cs.check_combo(&press(SHIFT)));
-        assert_pass(cs.check_combo(&press(ALT)));
-        assert_fired(cs.check_combo(&press(R)), &Event::SwitchNext);
+        assert_pass(cs.check_combo(press(SHIFT)));
+        assert_pass(cs.check_combo(press(ALT)));
+        assert_fired(cs.check_combo(press(R)), &Event::SwitchNext);
         // Until every combo key is released, all combo key events (releases,
         // autorepeats) are consumed so no stray events reach the new target,
         // which never saw these keys pressed.
-        assert_consume(cs.check_combo(&repeat(R)));
-        assert_consume(cs.check_combo(&release(R)));
-        assert_consume(cs.check_combo(&repeat(SHIFT)));
+        assert_consume(cs.check_combo(repeat(R)));
+        assert_consume(cs.check_combo(release(R)));
+        assert_consume(cs.check_combo(repeat(SHIFT)));
         // Non-combo keys pass through untouched meanwhile.
-        assert_pass(cs.check_combo(&press(X)));
-        assert_pass(cs.check_combo(&release(X)));
-        assert_consume(cs.check_combo(&release(SHIFT)));
+        assert_pass(cs.check_combo(press(X)));
+        assert_pass(cs.check_combo(release(X)));
+        assert_consume(cs.check_combo(release(SHIFT)));
         // Not all released yet (ALT still held): still consuming.
-        assert_consume(cs.check_combo(&press(ALT)));
-        assert_consume(cs.check_combo(&release(ALT)));
+        assert_consume(cs.check_combo(press(ALT)));
+        assert_consume(cs.check_combo(release(ALT)));
         // All released now: the state machine is clean, a fresh combo fires.
-        assert_pass(cs.check_combo(&press(SHIFT)));
-        assert_pass(cs.check_combo(&press(ALT)));
-        assert_fired(cs.check_combo(&press(R)), &Event::SwitchNext);
+        assert_pass(cs.check_combo(press(SHIFT)));
+        assert_pass(cs.check_combo(press(ALT)));
+        assert_fired(cs.check_combo(press(R)), &Event::SwitchNext);
     }
 
     #[test]
     fn repress_of_final_key_refires_while_others_held() {
         let mut cs = rotate_combo();
-        assert_pass(cs.check_combo(&press(SHIFT)));
-        assert_pass(cs.check_combo(&press(ALT)));
-        assert_fired(cs.check_combo(&press(R)), &Event::SwitchNext);
+        assert_pass(cs.check_combo(press(SHIFT)));
+        assert_pass(cs.check_combo(press(ALT)));
+        assert_fired(cs.check_combo(press(R)), &Event::SwitchNext);
         // Holding Shift+Alt and tapping R cycles through clients.
-        assert_consume(cs.check_combo(&release(R)));
-        assert_fired(cs.check_combo(&press(R)), &Event::SwitchNext);
-        assert_consume(cs.check_combo(&release(R)));
-        assert_fired(cs.check_combo(&press(R)), &Event::SwitchNext);
+        assert_consume(cs.check_combo(release(R)));
+        assert_fired(cs.check_combo(press(R)), &Event::SwitchNext);
+        assert_consume(cs.check_combo(release(R)));
+        assert_fired(cs.check_combo(press(R)), &Event::SwitchNext);
         drain_all(&mut cs);
     }
 
     #[test]
     fn autorepeat_never_fires() {
         let mut cs = rotate_combo();
-        assert_pass(cs.check_combo(&press(SHIFT)));
-        assert_pass(cs.check_combo(&press(ALT)));
+        assert_pass(cs.check_combo(press(SHIFT)));
+        assert_pass(cs.check_combo(press(ALT)));
         // An autorepeat of the last combo key doesn't complete the combo.
-        assert_pass(cs.check_combo(&repeat(R)));
-        assert_fired(cs.check_combo(&press(R)), &Event::SwitchNext);
+        assert_pass(cs.check_combo(repeat(R)));
+        assert_fired(cs.check_combo(press(R)), &Event::SwitchNext);
         // Autorepeats of the held combo keys after firing don't re-fire either
         // (no machine-gunning while the chord is held).
-        assert_consume(cs.check_combo(&repeat(R)));
-        assert_consume(cs.check_combo(&repeat(SHIFT)));
-        assert_consume(cs.check_combo(&repeat(ALT)));
+        assert_consume(cs.check_combo(repeat(R)));
+        assert_consume(cs.check_combo(repeat(SHIFT)));
+        assert_consume(cs.check_combo(repeat(ALT)));
         drain_all(&mut cs);
     }
 
     #[test]
     fn abandoned_partial_chord_does_not_fire() {
         let mut cs = rotate_combo();
-        assert_pass(cs.check_combo(&press(SHIFT)));
-        assert_pass(cs.check_combo(&press(ALT)));
+        assert_pass(cs.check_combo(press(SHIFT)));
+        assert_pass(cs.check_combo(press(ALT)));
         // The user gives up on the chord: no fire, and the releases pass
         // through (their presses were forwarded earlier).
-        assert_pass(cs.check_combo(&release(SHIFT)));
-        assert_pass(cs.check_combo(&release(ALT)));
+        assert_pass(cs.check_combo(release(SHIFT)));
+        assert_pass(cs.check_combo(release(ALT)));
         // The state machine is clean: a fresh attempt fires normally.
-        assert_pass(cs.check_combo(&press(SHIFT)));
-        assert_pass(cs.check_combo(&press(ALT)));
-        assert_fired(cs.check_combo(&press(R)), &Event::SwitchNext);
+        assert_pass(cs.check_combo(press(SHIFT)));
+        assert_pass(cs.check_combo(press(ALT)));
+        assert_fired(cs.check_combo(press(R)), &Event::SwitchNext);
         drain_all(&mut cs);
     }
 
     #[test]
     fn release_never_completes_chord() {
         let mut cs = rotate_combo();
-        assert_pass(cs.check_combo(&press(SHIFT)));
-        assert_pass(cs.check_combo(&press(ALT)));
+        assert_pass(cs.check_combo(press(SHIFT)));
+        assert_pass(cs.check_combo(press(ALT)));
         // A release event for the missing combo key must not count as a match.
-        assert_pass(cs.check_combo(&release(R)));
-        assert_fired(cs.check_combo(&press(R)), &Event::SwitchNext);
+        assert_pass(cs.check_combo(release(R)));
+        assert_fired(cs.check_combo(press(R)), &Event::SwitchNext);
         drain_all(&mut cs);
     }
 
@@ -388,15 +400,15 @@ mod tests {
     fn non_chord_events_pass_through() {
         let mut cs = rotate_combo();
         // Non-key events and non-combo keys are ignored, before and after firing.
-        assert_pass(cs.check_combo(&evdev::InputEvent::new(EventType::RELATIVE.0, 0, 5)));
-        assert_pass(cs.check_combo(&press(X)));
-        assert_pass(cs.check_combo(&press(SHIFT)));
-        assert_pass(cs.check_combo(&press(ALT)));
-        assert_fired(cs.check_combo(&press(R)), &Event::SwitchNext);
-        assert_pass(cs.check_combo(&press(X)));
-        assert_pass(cs.check_combo(&repeat(X)));
-        assert_pass(cs.check_combo(&release(X)));
-        assert_pass(cs.check_combo(&evdev::InputEvent::new(EventType::RELATIVE.0, 0, -3)));
+        assert_pass(cs.check_combo((EV_REL, 0, 5)));
+        assert_pass(cs.check_combo(press(X)));
+        assert_pass(cs.check_combo(press(SHIFT)));
+        assert_pass(cs.check_combo(press(ALT)));
+        assert_fired(cs.check_combo(press(R)), &Event::SwitchNext);
+        assert_pass(cs.check_combo(press(X)));
+        assert_pass(cs.check_combo(repeat(X)));
+        assert_pass(cs.check_combo(release(X)));
+        assert_pass(cs.check_combo((EV_REL, 0, -3)));
         drain_all(&mut cs);
     }
 
@@ -406,29 +418,29 @@ mod tests {
         let mut goto = ComboState::new(vec![SHIFT, ALT, G], Event::SwitchTo("abcd".to_string()));
         // Shared modifier presses pass through and prime both state machines.
         for cs in [&mut rotate, &mut goto] {
-            assert_pass(cs.check_combo(&press(SHIFT)));
-            assert_pass(cs.check_combo(&press(ALT)));
+            assert_pass(cs.check_combo(press(SHIFT)));
+            assert_pass(cs.check_combo(press(ALT)));
         }
         // Completing the rotate chord fires only the rotate action.
-        assert_fired(rotate.check_combo(&press(R)), &Event::SwitchNext);
-        assert_pass(goto.check_combo(&press(R)));
+        assert_fired(rotate.check_combo(press(R)), &Event::SwitchNext);
+        assert_pass(goto.check_combo(press(R)));
         // Tapping the goto chord's last key while the modifiers are still held
         // fires the goto action; the primed rotate combo ignores the other key.
-        assert_consume(rotate.check_combo(&release(R)));
-        assert_pass(goto.check_combo(&release(R)));
-        assert_pass(rotate.check_combo(&press(G)));
+        assert_consume(rotate.check_combo(release(R)));
+        assert_pass(goto.check_combo(release(R)));
+        assert_pass(rotate.check_combo(press(G)));
         assert_fired(
-            goto.check_combo(&press(G)),
+            goto.check_combo(press(G)),
             &Event::SwitchTo("abcd".to_string()),
         );
         // Releasing everything leaves both state machines clean.
         for code in [SHIFT, ALT] {
-            assert_consume(rotate.check_combo(&release(code)));
+            assert_consume(rotate.check_combo(release(code)));
         }
         for code in [SHIFT, ALT, G] {
-            assert_consume(goto.check_combo(&release(code)));
+            assert_consume(goto.check_combo(release(code)));
         }
-        assert_pass(rotate.check_combo(&press(SHIFT)));
-        assert_pass(goto.check_combo(&press(SHIFT)));
+        assert_pass(rotate.check_combo(press(SHIFT)));
+        assert_pass(goto.check_combo(press(SHIFT)));
     }
 }

@@ -286,7 +286,7 @@ enum MotionSend {
 /// routing decision taken, so a dying keypress can be followed through the
 /// pipeline in the wild.
 fn keytrace_route(events: &[event::InputEvent], decision: &str) {
-    const EV_KEY: u16 = evdev::EventType::KEY.0;
+    const EV_KEY: u16 = crate::msgs::consts::EV_KEY;
     for e in events {
         if let Some(i) = &e.inputi32 {
             if i.type_ == EV_KEY && device::key_traced(i.code) {
@@ -2485,6 +2485,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// know it; the mirror fills it in on read (DiagnosticsMirror::server_state).
     fn server_state(&self) -> crate::control::ServerState {
         crate::control::ServerState {
+            pending_approvals: Vec::new(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: crate::msgs::shared::PROTOCOL_VERSION,
             listen: String::new(),
@@ -2700,10 +2701,10 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         // Stream fallback (peer can't do datagrams): ordered and lossless.
         let mut events = Vec::with_capacity(2);
         if dx != 0 {
-            events.push(event::motion_event(evdev::RelativeAxisCode::REL_X.0, dx));
+            events.push(event::motion_event(crate::msgs::consts::REL_X, dx));
         }
         if dy != 0 {
-            events.push(event::motion_event(evdev::RelativeAxisCode::REL_Y.0, dy));
+            events.push(event::motion_event(crate::msgs::consts::REL_Y, dy));
         }
         if let Err(e) = self
             .send_event_to_remote_client(event::ServerEvent::Input(events))
@@ -2875,7 +2876,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 let mut dy = 0i32;
                 for e in &events {
                     if let Some(i) = &e.inputi32 {
-                        if i.code == evdev::RelativeAxisCode::REL_X.0 {
+                        if i.code == crate::msgs::consts::REL_X {
                             dx = dx.saturating_add(i.value);
                         } else {
                             dy = dy.saturating_add(i.value);
@@ -3585,9 +3586,9 @@ mod tests {
 
     #[test]
     fn pure_pointer_motion_detection() {
-        let ev_rel = evdev::EventType::RELATIVE.0;
-        let rel_x = evdev::RelativeAxisCode::REL_X.0;
-        let rel_y = evdev::RelativeAxisCode::REL_Y.0;
+        let ev_rel = crate::msgs::consts::EV_REL;
+        let rel_x = crate::msgs::consts::REL_X;
+        let rel_y = crate::msgs::consts::REL_Y;
 
         // Pure X/Y motion in one or several events: datagram-worthy.
         assert!(is_pure_pointer_motion(&[i32_event(ev_rel, rel_x, 3)]));
@@ -3600,17 +3601,17 @@ mod tests {
         assert!(!is_pure_pointer_motion(&[]));
 
         // Wheel, buttons, keys, and absolute axes must stay on the ordered stream.
-        let rel_wheel = evdev::RelativeAxisCode::REL_WHEEL.0;
+        let rel_wheel = crate::msgs::consts::REL_WHEEL;
         assert!(!is_pure_pointer_motion(&[i32_event(ev_rel, rel_wheel, 1)]));
         assert!(!is_pure_pointer_motion(&[
             i32_event(ev_rel, rel_x, 3),
-            i32_event(evdev::EventType::KEY.0, 0x110, 1) // BTN_LEFT press
+            i32_event(crate::msgs::consts::EV_KEY, 0x110, 1) // BTN_LEFT press
         ]));
         assert!(!is_pure_pointer_motion(&[event::InputEvent {
             inputi32: None,
             inputf64: Some(event::InputF64 {
-                type_: evdev::EventType::ABSOLUTE.0,
-                code: evdev::AbsoluteAxisCode::ABS_X.0,
+                type_: crate::msgs::consts::EV_ABS,
+                code: crate::msgs::consts::ABS_X,
                 value: 0.5,
             }),
         }]));
@@ -3716,8 +3717,8 @@ mod tests {
 
         let batch = device::InputBatch {
             events: vec![
-                i32_event(evdev::EventType::KEY.0, 28, 1),
-                i32_event(evdev::EventType::KEY.0, 28, 0),
+                i32_event(crate::msgs::consts::EV_KEY, 28, 1),
+                i32_event(crate::msgs::consts::EV_KEY, 28, 0),
             ],
             is_grabbed: true,
             class: event::DeviceClass::Mouse,
@@ -3731,7 +3732,7 @@ mod tests {
         // Events from ungrabbed (passthrough) devices don't count toward the
         // swallow detector's grabbed tally (mouse movement is not a swallow).
         let batch = device::InputBatch {
-            events: vec![i32_event(evdev::EventType::RELATIVE.0, 0, 5)],
+            events: vec![i32_event(crate::msgs::consts::EV_REL, 0, 5)],
             is_grabbed: false,
             class: event::DeviceClass::Mouse,
         };
@@ -3774,9 +3775,9 @@ mod tests {
         // dropped while a client is active — see
         // client_active_drops_ungrabbed_batches.)
         rotation.current_client = Some("127.0.0.1:1234".parse().unwrap());
-        let rel = evdev::EventType::RELATIVE.0;
-        let rel_x = evdev::RelativeAxisCode::REL_X.0;
-        let rel_y = evdev::RelativeAxisCode::REL_Y.0;
+        let rel = crate::msgs::consts::EV_REL;
+        let rel_x = crate::msgs::consts::REL_X;
+        let rel_y = crate::msgs::consts::REL_Y;
         for (dx, dy) in [(3, -2), (1, 0), (-2, 5)] {
             rotation
                 .send_input_events(device::InputBatch {
@@ -3831,7 +3832,7 @@ mod tests {
         // forwarded, or every event lands twice.
         rotation
             .send_input_events(device::InputBatch {
-                events: vec![i32_event(evdev::EventType::RELATIVE.0, 0, 5)],
+                events: vec![i32_event(crate::msgs::consts::EV_REL, 0, 5)],
                 is_grabbed: false,
                 class: event::DeviceClass::Mouse,
             })
@@ -3849,7 +3850,7 @@ mod tests {
         // fabricated endpoint the send fails and falls back to local).
         rotation
             .send_input_events(device::InputBatch {
-                events: vec![i32_event(evdev::EventType::RELATIVE.0, 0, 5)],
+                events: vec![i32_event(crate::msgs::consts::EV_REL, 0, 5)],
                 is_grabbed: true,
                 class: event::DeviceClass::Mouse,
             })
@@ -5102,6 +5103,7 @@ mod tests {
         (dir, rotation, grab_rx)
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn class_grabbed_matrix() {
         use crate::device::input::class_grabbed;
@@ -5235,6 +5237,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn pause_toggle_drives_ungrab_and_regrab_on_both_device_classes() {
         use crate::device::input::class_grabbed;
@@ -5275,6 +5278,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn pause_with_client_regrabs_mice_on_resume_and_stays_ungrabbed_on_drop() {
         use crate::device::input::class_grabbed;
@@ -5318,8 +5322,8 @@ mod tests {
         rotation
             .send_input_events(device::InputBatch {
                 events: vec![
-                    i32_event(evdev::EventType::KEY.0, 28, 1),
-                    i32_event(evdev::EventType::KEY.0, 28, 0),
+                    i32_event(crate::msgs::consts::EV_KEY, 28, 1),
+                    i32_event(crate::msgs::consts::EV_KEY, 28, 0),
                 ],
                 is_grabbed: false,
                 class: event::DeviceClass::Mouse,

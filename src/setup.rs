@@ -20,9 +20,11 @@
 //!   TOS byte per packet, so only netfilter can set it)
 //!
 //! The flag-scoped actions:
-//! - with `--autostart`, a per-user systemd service starting monux with the
+//! - with `--autostart`, a per-user login service starting monux with the
 //!   graphical session (the only action that does NOT need root; it manages
-//!   the invoking user's own systemd units)
+//!   the invoking user's own systemd units). On macOS the same flag manages a
+//!   per-user LaunchAgent instead — see setup_macos.rs, which shares the
+//!   user-context resolution and the atomic-write/symlink-guard helpers below.
 //! - with `--desktop-shortcut`, a per-user app-menu entry launching
 //!   `monux gui tray show` (also user-level: it manages the invoking user's
 //!   own data home)
@@ -32,13 +34,18 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
+#[cfg(target_os = "linux")]
 pub(crate) const NM_POWERSAVE_CONF_PATH: &str =
     "/etc/NetworkManager/conf.d/99-monux-disable-wifi-powersave.conf";
+#[cfg(target_os = "linux")]
 pub(crate) const UDEV_RULE_PATH: &str = "/etc/udev/rules.d/99-monux-uinput.rules";
+#[cfg(target_os = "linux")]
 pub(crate) const MODULES_LOAD_PATH: &str = "/etc/modules-load.d/monux-uinput.conf";
+#[cfg(target_os = "linux")]
 pub(crate) const SYSCTL_BUF_CONF_PATH: &str = "/etc/sysctl.d/90-monux-udp-buffers.conf";
 
 /// Where per-user systemd units live, relative to the target user's home.
+#[cfg(target_os = "linux")]
 pub(crate) const SYSTEMD_USER_UNIT_DIR: &str = ".config/systemd/user";
 
 /// `--autostart` for `monux setup`: manage a per-user systemd service
@@ -50,34 +57,41 @@ pub enum Autostart {
     Server,
     /// Write and enable+start monux-client.service (mDNS auto-discovery).
     Client,
-    /// Disable and remove both services.
+    /// Install, enable and start the tray indicator's login service (a
+    /// macOS LaunchAgent; on Linux the daemon auto-spawns the tray, so
+    /// this choice only applies to macOS).
+    Tray,
+    /// Disable and remove the login services.
     Off,
-    /// Print a read-only status report for both services (installed? enabled?
+    /// Print a read-only status report for the services (installed? enabled?
     /// running — autostarted or manually?) and change nothing.
     Status,
 }
 
-/// The roles a service unit can run (`off` maps to no role).
+/// The roles a login service can run (`off` maps to no role).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Role {
+pub(crate) enum Role {
     Server,
     Client,
 }
 
 impl Role {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Role::Server => "server",
             Role::Client => "client",
         }
     }
 
+    /// The systemd user unit file name for a daemon role ("server"/"client").
+    #[cfg(target_os = "linux")]
     fn unit_name(self) -> String {
         unit_name_for(self.as_str())
     }
 }
 
 /// The systemd user unit file name for a daemon role ("server"/"client").
+#[cfg(target_os = "linux")]
 pub(crate) fn unit_name_for(role: &str) -> String {
     format!("monux-{}.service", role)
 }
@@ -85,6 +99,7 @@ pub(crate) fn unit_name_for(role: &str) -> String {
 /// Content of the per-user systemd unit for a role. `%h` expands to the
 /// user's home at unit load time. `monux client` without an address argument
 /// uses mDNS auto-discovery, so no server IP is baked into the unit.
+#[cfg(target_os = "linux")]
 fn unit_content(role: Role) -> String {
     let role = role.as_str();
     format!(
@@ -92,13 +107,15 @@ fn unit_content(role: Role) -> String {
     )
 }
 
-/// A command to spawn, in test-inspectable form. pub(crate) so uninstall.rs
-/// can drive the same runuser-wrapped systemctl invocations.
+/// A command to spawn, in test-inspectable form. Platform-agnostic (systemd
+/// on Linux, launchctl on macOS); pub(crate) so uninstall.rs can drive the
+/// same runuser-wrapped systemctl invocations and setup_macos.rs its
+/// launchctl ones.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CmdSpec {
-    program: String,
-    args: Vec<String>,
-    env: Vec<(String, String)>,
+    pub(crate) program: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) env: Vec<(String, String)>,
 }
 
 impl CmdSpec {
@@ -124,7 +141,7 @@ impl CmdSpec {
     /// read-only status probes, whose answer may come with a non-zero exit
     /// (`systemctl is-enabled` answers "disabled" with exit 1). Only a spawn
     /// failure (the program is absent) is an error.
-    fn probe(&self) -> Result<String> {
+    pub(crate) fn probe(&self) -> Result<String> {
         let output = Command::new(&self.program)
             .args(&self.args)
             .envs(self.env.iter().cloned())
@@ -151,6 +168,7 @@ impl CmdSpec {
 
 /// A user to run `systemctl --user` as, when setup runs as root via sudo.
 /// pub(crate) so uninstall.rs can target the same user's manager.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UserCtx {
     pub(crate) name: String,
@@ -160,11 +178,13 @@ pub(crate) struct UserCtx {
 /// Builds `systemctl --user` invocations for the autostart target user: plain
 /// when running as that user, or wrapped in `runuser` with the session
 /// environment pointed at the user's runtime dir when running as root.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Systemctl {
     pub(crate) user: Option<UserCtx>,
 }
 
+#[cfg(target_os = "linux")]
 impl Systemctl {
     pub(crate) fn spec(&self, args: &[&str]) -> CmdSpec {
         let mut full: Vec<String> = std::iter::once("--user".to_string())
@@ -204,6 +224,7 @@ impl Systemctl {
 /// Who the autostart service belongs to. Setup normally runs as root via
 /// `sudo -E`: the unit must land in the INVOKING user's home and be managed
 /// through their user manager, not root's.
+#[cfg(target_os = "linux")]
 struct AutostartTarget {
     unit_dir: PathBuf,
     systemctl: Systemctl,
@@ -270,7 +291,7 @@ pub(crate) fn passwd_entry(name: &str) -> Result<(PathBuf, u32, u32)> {
 /// Where a per-user install goes: the invoking user's home dir, plus the
 /// uid/gid the files should be chowned to when setup runs as root via sudo
 /// (None when unprivileged — the files are ours anyway).
-type InvokingUser = (PathBuf, Option<(u32, u32)>);
+pub(crate) type InvokingUser = (PathBuf, Option<(u32, u32)>);
 
 /// Resolves the invoking user's home dir, plus the uid/gid user-visible
 /// files should be chowned to when setup runs as root via sudo (None when
@@ -278,7 +299,7 @@ type InvokingUser = (PathBuf, Option<(u32, u32)>);
 /// sensible target: running as root directly (root's home is not the one a
 /// desktop session uses, and these installs are per-user). Shared by the
 /// autostart and the desktop-shortcut targets.
-fn resolve_invoking_user() -> Result<Option<InvokingUser>> {
+pub(crate) fn resolve_invoking_user() -> Result<Option<InvokingUser>> {
     let sudo_user = std::env::var("SUDO_USER").unwrap_or_default();
     if unsafe { libc::geteuid() } == 0 {
         if sudo_user.is_empty() || sudo_user == "root" {
@@ -295,6 +316,7 @@ fn resolve_invoking_user() -> Result<Option<InvokingUser>> {
 }
 
 /// Resolves the autostart target user (see resolve_invoking_user).
+#[cfg(target_os = "linux")]
 fn resolve_autostart_target() -> Result<Option<AutostartTarget>> {
     let sudo_user = std::env::var("SUDO_USER").unwrap_or_default();
     let Some((home, owner)) = resolve_invoking_user()? else {
@@ -320,7 +342,7 @@ fn resolve_autostart_target() -> Result<Option<AutostartTarget>> {
 /// `~/.config/systemd/user -> /etc` would chown /etc to an unprivileged uid.
 /// `lchown` changes the link itself, which is harmless. Same threat the
 /// O_NOFOLLOW in atomic_write_no_follow defends against, on the ownership side.
-fn chown_best_effort(path: &Path, uid: u32, gid: u32) {
+pub(crate) fn chown_best_effort(path: &Path, uid: u32, gid: u32) {
     use std::os::unix::ffi::OsStrExt;
     let cpath = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
         Ok(c) => c,
@@ -339,7 +361,7 @@ fn chown_best_effort(path: &Path, uid: u32, gid: u32) {
 /// Bailing is the right answer rather than an openat(O_NOFOLLOW) walk: nothing
 /// legitimately puts a symlink on this path, and setup runs as root into a
 /// tree the unprivileged user controls.
-fn ensure_no_symlink_components(path: &Path) -> Result<()> {
+pub(crate) fn ensure_no_symlink_components(path: &Path) -> Result<()> {
     let mut walked = PathBuf::new();
     for component in path.components() {
         walked.push(component);
@@ -362,7 +384,7 @@ fn ensure_no_symlink_components(path: &Path) -> Result<()> {
 /// guard in write_unit_file applied to one level and this applies to all of
 /// them. Creating a level at a time also means `create_dir` — which fails with
 /// EEXIST on a symlink rather than following it — sees each component.
-fn create_dir_all_tracked(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+pub(crate) fn create_dir_all_tracked(path: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut missing = Vec::new();
     let mut cursor = Some(path);
     while let Some(dir) = cursor {
@@ -385,6 +407,7 @@ fn create_dir_all_tracked(path: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(created)
 }
 
+#[cfg(target_os = "linux")]
 fn write_unit_file(path: &Path, role: Role, owner: Option<(u32, u32)>) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_no_symlink_components(parent)?;
@@ -420,7 +443,7 @@ fn write_unit_file(path: &Path, role: Role, owner: Option<(u32, u32)>) -> Result
 /// replaces a symlink at `path` instead of following it — this write can run
 /// as root (setup re-executes with sudo) into the invoking user's home, where
 /// a pre-placed unit-path symlink would otherwise be clobbered through.
-fn atomic_write_no_follow(path: &Path, content: &str) -> std::io::Result<()> {
+pub(crate) fn atomic_write_no_follow(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let name = path
@@ -459,6 +482,7 @@ fn atomic_write_no_follow(path: &Path, content: &str) -> std::io::Result<()> {
 /// Applies the `--autostart` choice: writes/removes the unit files under the
 /// target's unit dir and runs the systemctl steps via `run` (the seam that
 /// keeps tests off the real systemd). No flag: no autostart changes at all.
+#[cfg(target_os = "linux")]
 fn apply_autostart(
     choice: Option<Autostart>,
     target: &AutostartTarget,
@@ -472,6 +496,12 @@ fn apply_autostart(
     match choice {
         Autostart::Server => enable_role(Role::Server, target, failures, run),
         Autostart::Client => enable_role(Role::Client, target, failures, run),
+        Autostart::Tray => {
+            *failures += 1;
+            println!(
+                "[fail] autostart: the tray indicator is auto-spawned by the daemon on Linux; 'tray' autostart only applies to macOS"
+            );
+        }
         Autostart::Off => disable_all_roles(target, failures, run),
         // setup_autostart intercepts Status before apply (it needs an
         // output-capturing probe seam, not the mutation runner).
@@ -479,11 +509,11 @@ fn apply_autostart(
     }
 }
 
-/// A warning when the binary the autostart unit's ExecStart points at
-/// (%h/.local/bin/monux) doesn't exist — a cargo-only install keeps monux in
-/// ~/.cargo/bin, and an enabled unit pointing at a missing binary
-/// restart-loops at every login. None when the binary is there.
-fn autostart_binary_warning(home: &Path) -> Option<String> {
+/// A warning when the binary the login service points at (%h/.local/bin/monux)
+/// doesn't exist — a cargo-only install keeps monux in ~/.cargo/bin, and an
+/// enabled unit pointing at a missing binary restart-loops at every login.
+/// None when the binary is there. Shared with the macOS LaunchAgent install.
+pub(crate) fn autostart_binary_warning(home: &Path) -> Option<String> {
     let binary = home.join(".local/bin/monux");
     if binary.exists() {
         return None;
@@ -494,6 +524,7 @@ fn autostart_binary_warning(home: &Path) -> Option<String> {
     ))
 }
 
+#[cfg(target_os = "linux")]
 fn enable_role(
     role: Role,
     target: &AutostartTarget,
@@ -538,6 +569,7 @@ fn enable_role(
     );
 }
 
+#[cfg(target_os = "linux")]
 fn disable_all_roles(
     target: &AutostartTarget,
     failures: &mut u32,
@@ -574,21 +606,23 @@ fn disable_all_roles(
 }
 
 /// Everything `setup --autostart status` learns about one role. The Option
-/// fields are None when the probe couldn't answer (systemctl absent or
-/// returning something unexpected); holder_pid is the single-instance lock
-/// probe (Some = a live monux of this role).
+/// fields are None when the probe couldn't answer (systemctl/launchctl absent
+/// or returning something unexpected); holder_pid is the single-instance lock
+/// probe (Some = a live monux of this role). Platform-agnostic: rendered by
+/// render_role_status on both Linux and macOS.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct RoleStatus {
-    installed: bool,
-    enabled: Option<bool>,
-    active: Option<bool>,
-    main_pid: Option<i32>,
-    active_since: Option<String>,
-    holder_pid: Option<i32>,
+pub(crate) struct RoleStatus {
+    pub(crate) installed: bool,
+    pub(crate) enabled: Option<bool>,
+    pub(crate) active: Option<bool>,
+    pub(crate) main_pid: Option<i32>,
+    pub(crate) active_since: Option<String>,
+    pub(crate) holder_pid: Option<i32>,
 }
 
 /// Parses `systemctl --user is-enabled` stdout: Some(bool) on a definitive
 /// answer, None on anything unexpected (the report then shows "enabled?").
+#[cfg(target_os = "linux")]
 fn parse_is_enabled(out: &str) -> Option<bool> {
     match out.trim() {
         "enabled" => Some(true),
@@ -598,6 +632,7 @@ fn parse_is_enabled(out: &str) -> Option<bool> {
 }
 
 /// Parses `systemctl --user is-active` stdout (see parse_is_enabled).
+#[cfg(target_os = "linux")]
 fn parse_is_active(out: &str) -> Option<bool> {
     match out.trim() {
         "active" => Some(true),
@@ -611,6 +646,7 @@ fn parse_is_active(out: &str) -> Option<bool> {
 /// timestamp count as absent. The timestamp is reformatted from systemd's
 /// "Sat 2026-07-25 15:28:34 CEST" into "2026-07-25T15:28:34"; an unexpected
 /// shape passes through unchanged.
+#[cfg(target_os = "linux")]
 fn parse_show(out: &str) -> (Option<i32>, Option<String>) {
     let mut pid = None;
     let mut since = None;
@@ -637,6 +673,7 @@ fn parse_show(out: &str) -> (Option<i32>, Option<String>) {
 /// only error) and the single-instance lock (passed in, so the probe stays
 /// testable). A systemctl that can't even spawn degrades to a note (once per
 /// report) plus the file/lock state.
+#[cfg(target_os = "linux")]
 fn probe_role_status(
     role: Role,
     target: &AutostartTarget,
@@ -688,8 +725,11 @@ fn probe_role_status(
 
 /// One line of the report, e.g. "server: installed, enabled, active (pid
 /// 417077 since 2026-07-25T15:28:34) — running (autostarted)".
-fn render_role_status(role: Role, status: &RoleStatus) -> String {
-    let mut line = format!("{}: ", role.as_str());
+/// Platform-agnostic: the enabled/active concepts map to systemd units on
+/// Linux and bootstrapped/running LaunchAgents on macOS. `agent` is the
+/// display name ("server", "client", or the macOS tray).
+pub(crate) fn render_role_status(agent: &str, status: &RoleStatus) -> String {
+    let mut line = format!("{}: ", agent);
     if !status.installed {
         line.push_str("not installed");
         // No unit: any live daemon of this role was started by hand.
@@ -742,6 +782,7 @@ fn render_role_status(role: Role, status: &RoleStatus) -> String {
 /// humans: ~/.config/systemd/user/monux-server.service reads better than the
 /// absolute path). unit_dir is $HOME/.config/systemd/user by construction,
 /// so its 4th ancestor (0-based 3) is the home.
+#[cfg(target_os = "linux")]
 fn display_unit_path(unit_dir: &Path, path: &Path) -> String {
     match unit_dir
         .ancestors()
@@ -758,6 +799,7 @@ fn display_unit_path(unit_dir: &Path, path: &Path) -> String {
 /// the only outside contact is the filesystem, read-only systemctl queries
 /// (through `query`, the seam that keeps tests off the real systemd) and the
 /// single-instance lock probe (`holder`).
+#[cfg(target_os = "linux")]
 fn autostart_status_report(
     target: &AutostartTarget,
     query: &dyn Fn(&CmdSpec) -> Result<String>,
@@ -767,7 +809,7 @@ fn autostart_status_report(
     let mut lines = Vec::new();
     for role in [Role::Server, Role::Client] {
         let status = probe_role_status(role, target, query, holder(role), &mut notes);
-        lines.push(render_role_status(role, &status));
+        lines.push(render_role_status(role.as_str(), &status));
     }
     for role in [Role::Server, Role::Client] {
         let unit_path = target.unit_dir.join(role.unit_name());
@@ -789,6 +831,7 @@ fn autostart_status_report(
 /// path it shares; None when there is no autostart target to report on (a
 /// bare root shell), so the bundle can say "could not probe" rather than
 /// inventing a state.
+#[cfg(target_os = "linux")]
 pub fn autostart_status_text() -> Option<String> {
     let target = resolve_autostart_target().ok().flatten()?;
     Some(autostart_status_report(
@@ -798,6 +841,7 @@ pub fn autostart_status_text() -> Option<String> {
     ))
 }
 
+#[cfg(target_os = "linux")]
 fn setup_autostart(choice: Option<Autostart>, failures: &mut u32) {
     if choice.is_none() {
         // No flag: leave autostart untouched.
@@ -833,6 +877,7 @@ fn setup_autostart(choice: Option<Autostart>, failures: &mut u32) {
 }
 
 /// The desktop entry file name, under the per-user applications dir.
+#[cfg(target_os = "linux")]
 pub(crate) const DESKTOP_SHORTCUT_NAME: &str = "monux-tray.desktop";
 
 /// The applications dir for per-user desktop entries: $XDG_DATA_HOME/
@@ -840,6 +885,7 @@ pub(crate) const DESKTOP_SHORTCUT_NAME: &str = "monux-tray.desktop";
 /// XDG base-directory-spec default; a relative value is invalid and ignored,
 /// an empty one counts as unset). `xdg_data_home` is the raw env value, a
 /// parameter so the resolution is testable.
+#[cfg(target_os = "linux")]
 pub(crate) fn applications_dir_from(
     home: &Path,
     xdg_data_home: Option<&std::ffi::OsStr>,
@@ -854,6 +900,7 @@ pub(crate) fn applications_dir_from(
 /// daemon it un-hides the auto-spawned indicator, without one it starts a
 /// standalone tray (see indicator.rs). Icon is a stock freedesktop name —
 /// the repo ships no assets.
+#[cfg(target_os = "linux")]
 fn desktop_shortcut_content() -> &'static str {
     "[Desktop Entry]\nType=Application\nName=monux tray\nComment=Show the monux tray indicator (starts it when no daemon is running)\nExec=monux gui tray show\nTerminal=false\nCategories=Utility;\nIcon=input-keyboard\n"
 }
@@ -862,6 +909,7 @@ fn desktop_shortcut_content() -> &'static str {
 /// idempotent, and symlink-safe should the path be pre-seeded) and chowns
 /// what it creates when setup runs as root via sudo, so the file stays
 /// user-manageable.
+#[cfg(target_os = "linux")]
 fn write_desktop_shortcut(path: &Path, owner: Option<(u32, u32)>) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_no_symlink_components(parent)?;
@@ -888,6 +936,7 @@ fn write_desktop_shortcut(path: &Path, owner: Option<(u32, u32)>) -> Result<()> 
 /// never runs install.sh) get the shortcut too. Returns true when it wrote
 /// the file. Never fails hard over it — the caller logs and moves on; an
 /// existing file (stock or user-edited) is left alone.
+#[cfg(target_os = "linux")]
 pub fn ensure_desktop_shortcut(home: &Path, xdg_data_home: Option<&std::ffi::OsStr>) -> Result<bool> {
     let path = applications_dir_from(home, xdg_data_home).join(DESKTOP_SHORTCUT_NAME);
     if path.exists() {
@@ -900,6 +949,7 @@ pub fn ensure_desktop_shortcut(home: &Path, xdg_data_home: Option<&std::ffi::OsS
 /// `--desktop-shortcut`: installs a .desktop entry so the tray can be
 /// launched from the desktop's app menu. User-level, like --autostart: it
 /// never elevates; the file lands in the invoking user's data home.
+#[cfg(target_os = "linux")]
 fn setup_desktop_shortcut(failures: &mut u32) {
     let (home, owner) = match resolve_invoking_user() {
         Ok(Some(v)) => v,
@@ -927,20 +977,24 @@ fn setup_desktop_shortcut(failures: &mut u32) {
 /// Target for net.core.{r,w}mem_max: comfortably above the 2 MiB that monux
 /// requests for its QUIC UDP socket buffers (the kernel clamps SO_SNDBUF/
 /// SO_RCVBUF to these sysctls).
+#[cfg(target_os = "linux")]
 const SOCK_MEM_MAX: u64 = 2_621_440;
 
 /// The nftables table monux's DSCP marks live in. A dedicated table makes the
 /// feature atomic to install and to remove — `nft delete table` undoes
 /// everything without touching anyone else's rules.
+#[cfg(target_os = "linux")]
 pub(crate) const NFT_QOS_TABLE: &str = "monux-qos";
 
 /// The UDP port the QoS marks match: the default monux listen port. A server
 /// on a custom --port needs matching custom rules.
+#[cfg(target_os = "linux")]
 const QOS_MARK_PORT: u16 = 1213;
 
 /// The nftables commands installing monux's DSCP marks, in order (one `nft`
 /// invocation per entry). nft takes a whole command as a single argument, so
 /// no shell quoting is involved.
+#[cfg(target_os = "linux")]
 pub(crate) fn nft_qos_install_cmds() -> Vec<String> {
     vec![
         format!("add table inet {}", NFT_QOS_TABLE),
@@ -960,6 +1014,7 @@ pub(crate) fn nft_qos_install_cmds() -> Vec<String> {
 }
 
 /// Whether `nft list table inet <table>` output already carries both marks.
+#[cfg(target_os = "linux")]
 fn nft_ruleset_has_marks(ruleset: &str) -> bool {
     ruleset.contains("udp sport 1213")
         && ruleset.contains("udp dport 1213")
@@ -968,6 +1023,7 @@ fn nft_ruleset_has_marks(ruleset: &str) -> bool {
 
 /// The two iptables rules (everything after `iptables -t mangle <verb>
 /// OUTPUT`) matching monux's DSCP marks.
+#[cfg(target_os = "linux")]
 pub(crate) fn iptables_qos_rule_specs() -> [Vec<String>; 2] {
     ["--sport", "--dport"].map(|side| {
         [
@@ -984,14 +1040,17 @@ pub(crate) fn iptables_qos_rule_specs() -> [Vec<String>; 2] {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn powersave_conf_content() -> &'static str {
     "[connection]\nwifi.powersave = 2\n"
 }
 
+#[cfg(target_os = "linux")]
 fn udev_rule_content() -> &'static str {
     "SUBSYSTEM==\"misc\", KERNEL==\"uinput\", GROUP=\"input\", MODE=\"0660\"\n"
 }
 
+#[cfg(target_os = "linux")]
 fn sysctl_buf_conf_content() -> String {
     format!(
         "net.core.rmem_max = {}\nnet.core.wmem_max = {}\n",
@@ -999,6 +1058,7 @@ fn sysctl_buf_conf_content() -> String {
     )
 }
 
+#[cfg(target_os = "linux")]
 pub fn run(autostart: Option<Autostart>, desktop_shortcut: bool) -> Result<()> {
     // Flag scoping: no flags means the full base set below; ANY flag scopes
     // the run to that flag's actions only.
@@ -1051,6 +1111,7 @@ pub fn run(autostart: Option<Autostart>, desktop_shortcut: bool) -> Result<()> {
 /// The argv with secrets scrubbed for error messages (which land in the
 /// system journal via the callers' warnings): the element following
 /// `wifi-sec.psk` is a cleartext WiFi password.
+#[cfg(target_os = "linux")]
 fn redacted_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
     let mut redact_next = false;
     args.iter()
@@ -1067,6 +1128,7 @@ fn redacted_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
 }
 
 /// Runs a command, returning its stdout on success.
+#[cfg(target_os = "linux")]
 pub(crate) fn run_cmd(program: &str, args: &[&str]) -> Result<String> {
     let output = Command::new(program)
         .args(args)
@@ -1084,12 +1146,14 @@ pub(crate) fn run_cmd(program: &str, args: &[&str]) -> Result<String> {
 }
 
 /// Checks `id -nG` output for group membership.
+#[cfg(target_os = "linux")]
 pub(crate) fn groups_contain(id_ng_output: &str, group: &str) -> bool {
     id_ng_output
         .split_whitespace()
         .any(|g| g == group)
 }
 
+#[cfg(target_os = "linux")]
 fn setup_input_group(failures: &mut u32) {
     // The user to grant device access: the one who invoked sudo.
     let user = std::env::var("SUDO_USER").unwrap_or_default();
@@ -1123,6 +1187,7 @@ fn setup_input_group(failures: &mut u32) {
 /// a pure bit check while 'input' members still can't open the device. An
 /// unknown `input` gid counts as NOT accessible — the rule gets written, and
 /// udev logs if the group is truly absent.
+#[cfg(target_os = "linux")]
 fn group_accessible(mode: u32, gid: u32, input_gid: Option<u32>) -> bool {
     mode & 0o060 == 0o060 && Some(gid) == input_gid
 }
@@ -1130,10 +1195,12 @@ fn group_accessible(mode: u32, gid: u32, input_gid: Option<u32>) -> bool {
 /// The gid of the `input` group (via `id`, the same tool setup_input_group
 /// queries membership with), so group_accessible can tell the right group
 /// from just any group with rw bits.
+#[cfg(target_os = "linux")]
 fn input_group_gid() -> Option<u32> {
     run_cmd("id", &["-g", "input"]).ok()?.trim().parse().ok()
 }
 
+#[cfg(target_os = "linux")]
 fn setup_uinput_access(failures: &mut u32) {
     let uinput = Path::new("/dev/uinput");
     if !uinput.exists() {
@@ -1201,6 +1268,7 @@ fn setup_uinput_access(failures: &mut u32) {
 }
 
 /// Parses `iw dev` output into a list of interface names.
+#[cfg(target_os = "linux")]
 fn parse_iw_interfaces(iw_dev_output: &str) -> Vec<String> {
     iw_dev_output
         .lines()
@@ -1211,6 +1279,7 @@ fn parse_iw_interfaces(iw_dev_output: &str) -> Vec<String> {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
 fn setup_wifi_powersave(failures: &mut u32) {
     // Persistent setting, via NetworkManager when it's in use.
     if Path::new("/etc/NetworkManager").exists() {
@@ -1266,6 +1335,7 @@ fn setup_wifi_powersave(failures: &mut u32) {
 /// ECN codepoint, so only netfilter can set a wire-level mark. nftables is
 /// preferred (a dedicated table is atomic to install and remove); iptables is
 /// the fallback. Idempotent; the rules don't persist across reboots.
+#[cfg(target_os = "linux")]
 fn setup_qos_marking(failures: &mut u32) {
     if run_cmd("nft", &["--version"]).is_ok() {
         // A complete existing install is left alone; a partial one (older
@@ -1335,10 +1405,12 @@ fn setup_qos_marking(failures: &mut u32) {
 }
 
 /// Reads a numeric /proc sysctl value, e.g. /proc/sys/net/core/rmem_max.
+#[cfg(target_os = "linux")]
 fn read_proc_sysctl(path: &str) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+#[cfg(target_os = "linux")]
 fn setup_socket_buffers(failures: &mut u32) {
     const RMEM_PROC: &str = "/proc/sys/net/core/rmem_max";
     const WMEM_PROC: &str = "/proc/sys/net/core/wmem_max";
@@ -1367,7 +1439,10 @@ fn setup_socket_buffers(failures: &mut u32) {
     }
 }
 
-#[cfg(test)]
+/// Linux-only: the systemd unit, udev, NetworkManager and QoS machinery and
+/// their tests. The shared helpers (CmdSpec, atomic writes, role-status
+/// rendering) are tested in `tests` below, which also builds on macOS.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
@@ -1468,17 +1543,6 @@ mod tests {
         assert!(!group_accessible(0o600, 42, Some(42)));
         // The 'input' gid unknown: not proven accessible, write the rule.
         assert!(!group_accessible(0o660, 42, None));
-    }
-
-    #[test]
-    fn autostart_binary_warning_only_when_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        // No ~/.local/bin/monux: the unit would restart-loop, so warn.
-        let warning = autostart_binary_warning(tmp.path()).unwrap();
-        assert!(warning.contains(".local/bin/monux"), "{}", warning);
-        std::fs::create_dir_all(tmp.path().join(".local/bin")).unwrap();
-        std::fs::write(tmp.path().join(".local/bin/monux"), b"binary").unwrap();
-        assert!(autostart_binary_warning(tmp.path()).is_none());
     }
 
     /// A target rooted at a tempdir, managing the current user directly.
@@ -1724,20 +1788,6 @@ mod tests {
     /// Only directories setup actually created are chowned; a pre-existing one
     /// is not ours to hand to anyone.
     #[test]
-    fn create_dir_all_tracked_reports_only_what_it_created() {
-        let tmp = tempfile::tempdir().unwrap();
-        let existing = tmp.path().join("a");
-        std::fs::create_dir(&existing).unwrap();
-
-        let created = create_dir_all_tracked(&existing.join("b/c")).unwrap();
-        assert_eq!(created, vec![existing.join("b"), existing.join("b/c")]);
-        // A second run creates nothing, so it chowns nothing.
-        assert!(create_dir_all_tracked(&existing.join("b/c"))
-            .unwrap()
-            .is_empty());
-    }
-
-    #[test]
     fn status_parsing() {
         assert_eq!(parse_is_enabled("enabled\n"), Some(true));
         assert_eq!(parse_is_enabled("disabled\n"), Some(false));
@@ -1759,81 +1809,6 @@ mod tests {
         // An unexpected timestamp shape passes through unchanged.
         let (_, since) = parse_show("MainPID=1\nActiveEnterTimestamp=weird\n");
         assert_eq!(since.as_deref(), Some("weird"));
-    }
-
-    #[test]
-    fn status_rendering_matrix() {
-        // Nothing installed, nothing running.
-        assert_eq!(
-            render_role_status(Role::Client, &RoleStatus::default()),
-            "client: not installed"
-        );
-        // Not installed, but a manually started daemon holds the lock.
-        let status = RoleStatus {
-            holder_pid: Some(4242),
-            ..Default::default()
-        };
-        assert_eq!(
-            render_role_status(Role::Server, &status),
-            "server: not installed — running (manual, pid 4242)"
-        );
-        // Installed and enabled, unit down, nothing running.
-        let status = RoleStatus {
-            installed: true,
-            enabled: Some(true),
-            active: Some(false),
-            ..Default::default()
-        };
-        assert_eq!(
-            render_role_status(Role::Server, &status),
-            "server: installed, enabled, inactive — not running"
-        );
-        // Installed, unit down, but a manual daemon holds the lock.
-        let status = RoleStatus {
-            installed: true,
-            enabled: Some(false),
-            active: Some(false),
-            holder_pid: Some(4242),
-            ..Default::default()
-        };
-        assert_eq!(
-            render_role_status(Role::Server, &status),
-            "server: installed, disabled, inactive — running (manual, pid 4242)"
-        );
-        // systemctl unavailable: unknowns render as ?, the lock probe still
-        // speaks — without an autostarted/manual claim it can't back up.
-        let status = RoleStatus {
-            installed: true,
-            holder_pid: Some(4242),
-            ..Default::default()
-        };
-        assert_eq!(
-            render_role_status(Role::Server, &status),
-            "server: installed, enabled?, active? — running (pid 4242)"
-        );
-        // Active per systemd: autostarted regardless of the lock probe.
-        let status = RoleStatus {
-            installed: true,
-            enabled: Some(true),
-            active: Some(true),
-            main_pid: Some(417077),
-            active_since: Some("2026-07-25T15:28:34".to_string()),
-            holder_pid: None,
-        };
-        assert_eq!(
-            render_role_status(Role::Server, &status),
-            "server: installed, enabled, active (pid 417077 since 2026-07-25T15:28:34) — running (autostarted)"
-        );
-        // Active without the show details: no pid/since parenthetical.
-        let status = RoleStatus {
-            installed: true,
-            active: Some(true),
-            ..Default::default()
-        };
-        assert_eq!(
-            render_role_status(Role::Server, &status),
-            "server: installed, enabled?, active — running (autostarted)"
-        );
     }
 
     #[test]
@@ -2034,5 +2009,145 @@ mod tests {
         // temp files behind.
         write_desktop_shortcut(&path, None).unwrap();
         assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
+}
+
+/// Shared with the macOS build: the helpers setup_macos.rs reuses, tested
+/// here so `cargo test` on a Mac exercises them too.
+#[cfg(test)]
+mod shared_tests {
+    use super::*;
+
+    #[test]
+    fn cmdspec_manual_line_joins_program_and_args() {
+        let spec = CmdSpec {
+            program: "launchctl".to_string(),
+            args: vec!["bootstrap".to_string(), "gui/501".to_string()],
+            env: vec![],
+        };
+        assert_eq!(spec.manual_line(), "launchctl bootstrap gui/501");
+        // The runuser unwrapping (a Linux shape) leaves other programs alone.
+        let spec = CmdSpec {
+            program: "systemctl".to_string(),
+            args: vec!["--user".to_string(), "daemon-reload".to_string()],
+            env: vec![],
+        };
+        assert_eq!(spec.manual_line(), "systemctl --user daemon-reload");
+    }
+
+    #[test]
+    fn atomic_write_replaces_a_symlink_without_following_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("agent.plist");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::write(&elsewhere, "precious").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        atomic_write_no_follow(&path, "content").unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(!meta.file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "content");
+        // The symlink's old target is untouched, and no temp file lingers.
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "precious");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn autostart_binary_warning_only_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No ~/.local/bin/monux: the unit would restart-loop, so warn.
+        let warning = autostart_binary_warning(tmp.path()).unwrap();
+        assert!(warning.contains(".local/bin/monux"), "{}", warning);
+        std::fs::create_dir_all(tmp.path().join(".local/bin")).unwrap();
+        std::fs::write(tmp.path().join(".local/bin/monux"), b"binary").unwrap();
+        assert!(autostart_binary_warning(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn create_dir_all_tracked_reports_only_what_it_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let existing = tmp.path().join("a");
+        std::fs::create_dir(&existing).unwrap();
+
+        let created = create_dir_all_tracked(&existing.join("b/c")).unwrap();
+        assert_eq!(created, vec![existing.join("b"), existing.join("b/c")]);
+        // A second run creates nothing, so it chowns nothing.
+        assert!(create_dir_all_tracked(&existing.join("b/c"))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn status_rendering_matrix() {
+        // Nothing installed, nothing running.
+        assert_eq!(
+            render_role_status("client", &RoleStatus::default()),
+            "client: not installed"
+        );
+        // Not installed, but a manually started daemon holds the lock.
+        let status = RoleStatus {
+            holder_pid: Some(4242),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_role_status("server", &status),
+            "server: not installed — running (manual, pid 4242)"
+        );
+        // Installed and enabled, unit down, nothing running.
+        let status = RoleStatus {
+            installed: true,
+            enabled: Some(true),
+            active: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_role_status("server", &status),
+            "server: installed, enabled, inactive — not running"
+        );
+        // Installed, unit down, but a manual daemon holds the lock.
+        let status = RoleStatus {
+            installed: true,
+            enabled: Some(false),
+            active: Some(false),
+            holder_pid: Some(4242),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_role_status("server", &status),
+            "server: installed, disabled, inactive — running (manual, pid 4242)"
+        );
+        // systemctl unavailable: unknowns render as ?, the lock probe still
+        // speaks — without an autostarted/manual claim it can't back up.
+        let status = RoleStatus {
+            installed: true,
+            holder_pid: Some(4242),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_role_status("server", &status),
+            "server: installed, enabled?, active? — running (pid 4242)"
+        );
+        // Active per systemd: autostarted regardless of the lock probe.
+        let status = RoleStatus {
+            installed: true,
+            enabled: Some(true),
+            active: Some(true),
+            main_pid: Some(417077),
+            active_since: Some("2026-07-25T15:28:34".to_string()),
+            holder_pid: None,
+        };
+        assert_eq!(
+            render_role_status("server", &status),
+            "server: installed, enabled, active (pid 417077 since 2026-07-25T15:28:34) — running (autostarted)"
+        );
+        // Active without the show details: no pid/since parenthetical.
+        let status = RoleStatus {
+            installed: true,
+            active: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_role_status("server", &status),
+            "server: installed, enabled?, active — running (autostarted)"
+        );
     }
 }

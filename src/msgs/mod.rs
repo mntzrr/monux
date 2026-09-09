@@ -1,5 +1,7 @@
 pub mod bulk;
+pub mod consts;
 pub mod event;
+pub mod keycodes;
 pub mod shared;
 
 #[cfg(test)]

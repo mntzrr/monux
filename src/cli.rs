@@ -102,16 +102,18 @@ Examples:
 
     /// Optimizes this machine for local KVM, persisting machine-local settings
     ///
-    /// No flags: applies everything ('input' group membership, /dev/uinput
-    /// permissions, WiFi power saving off, raised UDP socket buffers, DSCP
-    /// QoS marking) and re-executes with sudo automatically. ANY flag scopes
-    /// the run to that flag's actions only; '--autostart' manages a per-user
-    /// systemd unit and '--desktop-shortcut' a per-user app-menu entry, both
-    /// WITHOUT elevating.
+    /// Linux, no flags: applies everything ('input' group membership,
+    /// /dev/uinput permissions, WiFi power saving off, raised UDP socket
+    /// buffers, DSCP QoS marking) and re-executes with sudo automatically.
+    /// ANY flag scopes the run to that flag's actions only; '--autostart'
+    /// manages the per-user login service (a systemd unit on Linux, a
+    /// LaunchAgent on macOS) and '--desktop-shortcut' a per-user app-menu
+    /// entry, both WITHOUT elevating.
     #[command(after_long_help = "\
 Examples:
   monux setup                        # apply everything (elevates via sudo)
   monux setup --autostart server     # only install the login service (no sudo)
+  monux setup --autostart tray       # install the tray indicator's login service (macOS, no sudo)
   monux setup --autostart status     # report the autostart state (no sudo, read-only)
   monux setup --desktop-shortcut     # install the app-menu tray shortcut (no sudo)")]
     Setup(SetupArgs),
@@ -145,6 +147,16 @@ Examples:
   monux status --json       # machine-readable raw response
   monux status --server     # restrict to one role (or --client)")]
     Status(StatusArgs),
+
+    /// Approves a peer waiting for certificate approval
+    ///
+    /// Peers that connect with an unknown certificate are listed by
+    /// 'monux status' under "awaiting approval"; this approves one by
+    /// fingerprint prefix (any unique prefix; with exactly one request
+    /// pending, no prefix is needed at all). With no daemon running,
+    /// --server/--client persist the fingerprint into the config so the
+    /// daemon approves the peer when it next starts.
+    Approve(ApproveArgs),
 
     /// Collects a bug-report bundle: daemon state, logs, journal, environment
     ///
@@ -447,6 +459,32 @@ pub struct StatusArgs {
     pub json: bool,
 }
 
+/// `monux approve` (see Commands::Approve).
+#[derive(Args)]
+pub struct ApproveArgs {
+    /// The fingerprint prefix of the request to approve (from 'monux status')
+    ///
+    /// Any prefix that matches exactly one pending request. With exactly one
+    /// request pending this can be omitted.
+    #[arg(value_name = "prefix")]
+    pub target: Option<String>,
+
+    /// Persist into the server's config instead of a running daemon
+    ///
+    /// With no daemon running: writes server.fingerprint, so 'monux server'
+    /// approves this peer from its next start.
+    #[arg(long, conflicts_with = "client", help_heading = H_TARGET)]
+    pub server: bool,
+
+    /// Persist into the client's config instead of a running daemon
+    #[arg(long, help_heading = H_TARGET)]
+    pub client: bool,
+
+    /// Use this explicit control socket path
+    #[arg(long, value_name = "path", help_heading = H_TARGET)]
+    pub socket: Option<PathBuf>,
+}
+
 #[derive(Args)]
 pub struct DiagnosticsArgs {
     /// Capture a live reproduction instead of a snapshot (see 'record --help')
@@ -608,14 +646,18 @@ pub enum TrayAction {
 pub struct SetupArgs {
     /// Manage the login service (no sudo) [default: leave it alone]
     ///
-    /// Also (de)activate autostart via a per-user systemd service: 'server' or
-    /// 'client' writes ~/.config/systemd/user/monux-<role>.service and
-    /// enables+starts it (client runs without an address, using mDNS
-    /// auto-discovery); 'off' disables and removes both; 'status' prints a
-    /// read-only report for both roles (unit installed? enabled? running —
-    /// autostarted or manually?) and changes nothing. When omitted, no
-    /// autostart changes are made.
-    #[arg(long, value_enum, value_name = "server|client|status|off")]
+    /// Also (de)activate autostart via a per-user login service: 'server' or
+    /// 'client' installs and starts it (a systemd user unit
+    /// ~/.config/systemd/user/monux-<role>.service on Linux, a LaunchAgent
+    /// ~/Library/LaunchAgents/sh.monux.<role>.plist on macOS; client runs
+    /// without an address, using mDNS auto-discovery — the server role is
+    /// Linux-only); 'tray' installs the tray indicator's login service (a
+    /// LaunchAgent running 'monux gui indicator' — macOS only, where the
+    /// tray is not auto-spawned by the daemon); 'off' disables and removes
+    /// all of them; 'status' prints a read-only report (installed? enabled?
+    /// running — autostarted or manually?) and changes nothing. When
+    /// omitted, no autostart changes are made.
+    #[arg(long, value_enum, value_name = "server|client|tray|status|off")]
     pub autostart: Option<monux::setup::Autostart>,
 
     /// Install the 'monux tray' app-menu shortcut (no sudo)
@@ -699,7 +741,9 @@ pub struct ServerArgs {
     /// Pre-approve a client certificate fingerprint (repeatable)
     ///
     /// A client whose fingerprint is listed connects without the interactive
-    /// approval prompt.
+    /// approval prompt. The full digest (64 hex chars) or any prefix of at
+    /// least 16 hex chars works, so it can be typed by hand from the peer's
+    /// startup banner.
     #[arg(long, alias = "fingerprints", value_name = "fingerprint", help_heading = H_NETWORK)]
     pub fingerprint: Option<Vec<String>>,
 
@@ -781,6 +825,8 @@ impl ServerArgs {
     /// Fills config-capable fields left unset on the command line from the
     /// config file's [server] section: explicit flag > config file > built-in
     /// default (the default is applied at the use sites).
+    // Server-only entry point; macOS builds never construct a server.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn resolve(&mut self, cfg: &monux::config::File) {
         self.shortcut = self.shortcut.take().or_else(|| cfg.get_str("server.shortcut"));
         self.shortcut_prev = self
@@ -847,7 +893,9 @@ pub struct ClientArgs {
     /// Pre-approve a server certificate fingerprint (repeatable)
     ///
     /// A server whose fingerprint is listed connects without the interactive
-    /// approval prompt.
+    /// approval prompt. The full digest (64 hex chars) or any prefix of at
+    /// least 16 hex chars works, so it can be typed by hand from the peer's
+    /// startup banner.
     #[arg(long, alias = "fingerprints", value_name = "fingerprint", help_heading = H_NETWORK)]
     pub fingerprint: Option<Vec<String>>,
 

@@ -3,9 +3,13 @@ use std::path::PathBuf;
 
 use anyhow::{Result};
 use tokio::sync::{mpsc, watch};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
+#[cfg(target_os = "linux")]
+use tracing::warn;
 
-use crate::clipboard::{data, filter_shareable_mime_types, serve, wayland};
+use crate::clipboard::{data, filter_shareable_mime_types, serve};
+#[cfg(target_os = "linux")]
+use crate::clipboard::wayland;
 
 /// Wrapper around client-local clipboard storage, if available.
 pub struct LocalClipboard {
@@ -35,6 +39,9 @@ pub struct LocalClipboard {
 
 impl LocalClipboard {
     pub async fn new(config_dir: PathBuf, max_uncompressed_size_bytes: u64) -> Option<Self> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = (config_dir, max_uncompressed_size_bytes);
+        #[cfg(target_os = "linux")]
         match Self::new_wayland(config_dir, max_uncompressed_size_bytes).await {
             Ok(Some(c)) => {
                 info!("Using wayland clipboard");
@@ -47,10 +54,14 @@ impl LocalClipboard {
                 warn!("Failed to reach wayland clipboard: {}", e);
             }
         };
+        #[cfg(target_os = "linux")]
         warn!("CLIPBOARD SHARING DISABLED: no wayland clipboard is reachable. If monux is running under sudo, start it with 'sudo -E ...' to preserve the session environment (WAYLAND_DISPLAY, XDG_RUNTIME_DIR)");
+        #[cfg(not(target_os = "linux"))]
+        info!("CLIPBOARD SHARING DISABLED: no clipboard backend exists on this platform yet");
         None
     }
 
+    #[cfg(target_os = "linux")]
     async fn new_wayland(config_dir: PathBuf, max_uncompressed_size_bytes: u64) -> Result<Option<Self>> {
         // The watcher call is set up to be permissive of missing wayland, so let's try that first
         let (local_regular_types_tx, local_regular_types_rx) = watch::channel(vec![]);

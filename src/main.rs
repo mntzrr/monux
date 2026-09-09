@@ -6,8 +6,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
+#[cfg(target_os = "linux")]
 use regex::Regex;
+#[cfg(target_os = "linux")]
 use signal_hook::{consts::signal, iterator::Signals};
+#[cfg(target_os = "linux")]
 use tokio::sync::{mpsc, watch as watchchan};
 use tokio::{runtime, task, time};
 use tracing::{debug, error, info, warn};
@@ -19,15 +22,20 @@ use cli::{
     GuiCommands, SystemCommands, TrayAction, VERSION,
 };
 use monux::device::output::OutputHandler;
-use monux::device::{handles, input, output, shortcut, watch, Event};
+use monux::device::output;
+#[cfg(target_os = "linux")]
+use monux::device::{handles, input, shortcut, watch, Event};
 use monux::network::{approval, transport::NetworkMode};
-use monux::{client, clipboard, discovery, logging, rotation, server, single_instance};
+use monux::{client, clipboard, discovery, logging, single_instance};
+#[cfg(target_os = "linux")]
+use monux::{rotation, server};
 
 /// Listens for SIGUSR1 and SIGUSR2, treating them as "switch to next client" and "switch to prev client" respectively.
 /// SIGHUP dumps the server's mirrored diagnostics state to the log for troubleshooting.
 /// The dump reads the mirror directly instead of going through the server event
 /// loop, so it still prints when the loop itself is stalled — the exact scenario
 /// the dump exists to debug.
+#[cfg(target_os = "linux")]
 fn handle_signals(mut signals: Signals, out: mpsc::Sender<Event>, diagnostics: Arc<rotation::DiagnosticsMirror>) {
     let mut iter = signals.into_iter();
     loop {
@@ -64,6 +72,7 @@ fn handle_signals(mut signals: Signals, out: mpsc::Sender<Event>, diagnostics: A
 }
 
 /// Resolves when the process receives SIGINT (ctrl-c) or SIGTERM.
+#[cfg(target_os = "linux")]
 async fn shutdown_signal() {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("Failed to install SIGTERM handler");
@@ -139,6 +148,19 @@ fn main() -> Result<()> {
     // get the die-quietly-on-SIGPIPE disposition; the daemon paths below
     // deliberately don't (see cli_sigpipe_kill).
     match &cli.command {
+        Commands::Approve(args) => {
+            cli_sigpipe_kill();
+            let config_dir = init_config_dir()?;
+            let out = monux::control::approve_cli(
+                args.target.as_deref(),
+                args.server,
+                args.client,
+                args.socket.as_deref(),
+                &config_dir,
+            )?;
+            println!("{}", out);
+            return Ok(());
+        }
         Commands::Daemon(args) => match &args.command {
             DaemonCommands::Switch(args) => {
                 cli_sigpipe_kill();
@@ -188,14 +210,28 @@ fn main() -> Result<()> {
         },
         Commands::Setup(args) => {
             cli_sigpipe_kill();
-            // Elevate only when the selected steps need root: the base set
-            // (a no-flags run) persists root-owned system settings;
-            // --autostart/--desktop-shortcut manage per-user files and must
-            // run as the invoking user instead.
-            if setup_needs_root(&args.autostart, args.desktop_shortcut) {
-                maybe_elevate("to persist system settings")?;
+            #[cfg(target_os = "linux")]
+            {
+                // Elevate only when the selected steps need root: the base set
+                // (a no-flags run) persists root-owned system settings;
+                // --autostart/--desktop-shortcut manage per-user files and must
+                // run as the invoking user instead.
+                if setup_needs_root(&args.autostart, args.desktop_shortcut) {
+                    maybe_elevate("to persist system settings")?;
+                }
+                return monux::setup::run(args.autostart, args.desktop_shortcut);
             }
-            return monux::setup::run(args.autostart, args.desktop_shortcut);
+            #[cfg(target_os = "macos")]
+            {
+                // LaunchAgents are per-user files in the invoking user's home:
+                // macOS setup never elevates (and has no root base set).
+                return monux::setup_macos::run(args.autostart, args.desktop_shortcut);
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                let _ = args;
+                bail!("'monux setup' manages Linux system integration (udev, kernel modules, systemd) and does not exist on this platform");
+            }
         }
         Commands::Update(args) => {
             cli_sigpipe_kill();
@@ -348,43 +384,95 @@ fn main() -> Result<()> {
             GuiCommands::Tray(args) => {
                 cli_sigpipe_kill();
                 let hide = matches!(args.action, TrayAction::Hide);
-                let out = monux::control::tray_cli(hide, args.socket.as_deref())?;
-                println!("{}", out);
-                return Ok(());
+                #[cfg(target_os = "macos")]
+                {
+                    // The tray is a launchd-managed LaunchAgent here, not a
+                    // daemon-supervised child: show/hide drive launchctl.
+                    let out = if hide {
+                        monux::setup_macos::tray_hide()?
+                    } else {
+                        monux::setup_macos::tray_show()?
+                    };
+                    println!("{}", out);
+                    return Ok(());
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let out = monux::control::tray_cli(hide, args.socket.as_deref())?;
+                    println!("{}", out);
+                    return Ok(());
+                }
             }
             GuiCommands::Indicator => {
-                // Headless sessions fail here, before touching the lock: no
-                // point holding (or taking over) the single-instance lock for
-                // an indicator that can't even reach a session bus.
-                if !monux::indicator_spawn::has_desktop_session() {
-                    bail!(
-                        "no D-Bus session bus (DBUS_SESSION_BUS_ADDRESS unset and no /run/user/{}/bus): the indicator needs a desktop session running a StatusNotifierItem host (waybar, KDE Plasma, ...)",
-                        unsafe { libc::geteuid() }
-                    );
-                }
-                // One icon at all times: take over from any already-running
-                // indicator (auto-spawned or manual).
-                let _indicator_lock = match single_instance::acquire("indicator") {
-                    Ok(lock) => lock,
-                    Err(e) => {
-                        // Standing down for a live indicator is an orderly
-                        // outcome, not a failure: exit with the code that
-                        // says so, so a supervising daemon parks instead of
-                        // diagnosing a crash loop (indicator_spawn.rs).
-                        if let Some(yielded) = e.downcast_ref::<single_instance::Yielded>() {
-                            info!("{}; leaving the tray to it", yielded);
-                            std::process::exit(single_instance::EXIT_YIELDED);
+                #[cfg(target_os = "macos")]
+                {
+                    // One icon at all times: take over from any already-running
+                    // indicator (auto-spawned or manual).
+                    let _indicator_lock = match single_instance::acquire("indicator") {
+                        Ok(lock) => lock,
+                        Err(e) => {
+                            // Standing down for a live indicator is an orderly
+                            // outcome, not a failure: exit with the code that
+                            // says so, so a supervising daemon parks instead of
+                            // diagnosing a crash loop (indicator_spawn.rs).
+                            if let Some(yielded) = e.downcast_ref::<single_instance::Yielded>() {
+                                info!("{}; leaving the tray to it", yielded);
+                                std::process::exit(single_instance::EXIT_YIELDED);
+                            }
+                            return Err(e);
                         }
-                        return Err(e);
+                    };
+                    return monux::indicator_macos::run();
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                bail!("the tray indicator does not exist on this platform");
+                #[cfg(target_os = "linux")]
+                {
+                    // Headless sessions fail here, before touching the lock: no
+                    // point holding (or taking over) the single-instance lock for
+                    // an indicator that can't even reach a session bus.
+                    if !monux::indicator_spawn::has_desktop_session() {
+                        bail!(
+                            "no D-Bus session bus (DBUS_SESSION_BUS_ADDRESS unset and no /run/user/{}/bus): the indicator needs a desktop session running a StatusNotifierItem host (waybar, KDE Plasma, ...)",
+                            unsafe { libc::geteuid() }
+                        );
                     }
-                };
-                return monux::indicator::run();
+                    // One icon at all times: take over from any already-running
+                    // indicator (auto-spawned or manual).
+                    let _indicator_lock = match single_instance::acquire("indicator") {
+                        Ok(lock) => lock,
+                        Err(e) => {
+                            // Standing down for a live indicator is an orderly
+                            // outcome, not a failure: exit with the code that
+                            // says so, so a supervising daemon parks instead of
+                            // diagnosing a crash loop (indicator_spawn.rs).
+                            if let Some(yielded) = e.downcast_ref::<single_instance::Yielded>() {
+                                info!("{}; leaving the tray to it", yielded);
+                                std::process::exit(single_instance::EXIT_YIELDED);
+                            }
+                            return Err(e);
+                        }
+                    };
+                    return monux::indicator::run();
+                }
             }
         },
         Commands::System(args) => match &args.command {
             SystemCommands::Uninstall(args) => {
                 cli_sigpipe_kill();
-                return monux::uninstall::run(args.yes);
+                #[cfg(target_os = "linux")]
+                {
+                    return monux::uninstall::run(args.yes);
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    return monux::uninstall_macos::run(args.yes);
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                {
+                    let _ = args;
+                    bail!("'monux system uninstall' removes Linux system integration and does not exist on this platform");
+                }
             }
         },
         _ => {}
@@ -410,172 +498,182 @@ fn main() -> Result<()> {
         Commands::Setup(_)
         | Commands::Update(_)
         | Commands::Status(_)
+        | Commands::Approve(_)
         | Commands::Servers
         | Commands::Config(_)
         | Commands::Gui(_)
         | Commands::System(_)
         | Commands::Diagnostics(_)
         | Commands::Daemon(_) => {
-            unreachable!("setup/update/status/servers/config/gui/system/daemon/diagnostics commands are handled before runtime initialization")
+            unreachable!("setup/update/status/approve/servers/config/gui/system/daemon/diagnostics commands are handled before runtime initialization")
         }
         Commands::Server(mut args) => {
-            // The config file fills whatever the command line left unset.
-            args.resolve(&monux::config::load_for_daemon(&config_dir));
-            let listen = args.listen.unwrap_or(monux::config::DEFAULT_LISTEN);
-            let port = args.port.unwrap_or(monux::config::DEFAULT_PORT);
-            if port == 0 {
-                bail!("--port 0 (ephemeral port) is not supported: the mDNS advertisement must match the actual listen port");
+            #[cfg(not(target_os = "linux"))]
+            {
+                // Input capture is Linux evdev; the macOS build is client-only.
+                let _ = &mut args;
+                bail!("the monux server captures input through the Linux evdev API and cannot run here; only 'monux client' is supported on this platform");
             }
-            let auto_update = !args.no_auto_update.unwrap_or(false);
-            let auto_indicator = !args.no_indicator.unwrap_or(false);
-            let update_mode = update_mode(args.auto_install.unwrap_or(false));
-            let www = args.www.unwrap_or(false);
-            // Validation before the takeover below: single_instance::acquire
-            // SIGTERMs the running daemon, so anything that can reject the
-            // command line has to have rejected it by then. A typo would
-            // otherwise leave the machine with no daemon at all — and the
-            // installed unit's Restart=on-failure will not bring it back,
-            // because the old one exited cleanly on the signal.
-            let max_clipboard_size_bytes = args
-                .max_clipboard_size_kb
-                .unwrap_or(monux::config::DEFAULT_MAX_CLIPBOARD_SIZE_KB)
-                .checked_mul(1024)
-                .context("--max-clipboard-size-kb is too large")?;
-            // Screen-edge switching is opt-in: no --edge-map, no edge manager.
-            let edge_map = match &args.edge_map {
-                Some(specs) => Some(monux::edge::parse_edge_map(specs)?),
-                None => None,
-            };
-            // The shortcut chords are plain strings on the command line, so
-            // clap accepts anything; reject typos here (mirroring --edge-map
-            // above), not in parse_key_combos after the takeover.
-            shortcut::validate_chord(
-                args.shortcut
-                    .as_deref()
-                    .unwrap_or(monux::config::DEFAULT_SHORTCUT),
-            )?;
-            shortcut::validate_chord(
-                args.shortcut_prev
-                    .as_deref()
-                    .unwrap_or(monux::config::DEFAULT_SHORTCUT_PREV),
-            )?;
-            for spec in args.shortcut_goto.as_deref().unwrap_or_default() {
-                shortcut::validate_goto(spec)?;
-            }
-            // An empty --pause-shortcut disables pause/resume.
-            let pause_shortcut = args
-                .pause_shortcut
-                .as_deref()
-                .unwrap_or(monux::config::DEFAULT_PAUSE_SHORTCUT);
-            let pause_shortcut = if pause_shortcut.trim().is_empty() {
-                None
-            } else {
-                shortcut::validate_chord(pause_shortcut)?;
-                Some(pause_shortcut)
-            };
-            let server_lock = single_instance::acquire("server")?;
-            settle_after_takeover(&server_lock);
-            // Before the indicator supervisor spawns anything (see the note
-            // on the pid snapshot there).
-            reap_inherited_children();
-            // A machine running only a server has no use for the client-side
-            // update-gate file: its content can only be stale history (a
-            // client machine's handshakes re-record it), and a stale entry
-            // vetoes manual updates while the daemon is down (mDNS then finds
-            // no live server to refresh it). Clear it unless a client also
-            // runs here.
-            if single_instance::live_holder("client").is_none() {
-                monux::update::clear_protocol_constraint(&config_dir);
-            }
-            if auto_update {
-                // The server leads protocol upgrades: no compatibility gate.
-                rt.spawn(monux::autoupdate::run(None, update_mode));
-            }
-            // Constructed after the takeover on purpose: new() writes a fresh
-            // keypair when none exists (write_new_keypair is not atomic), and
-            // the single-instance lock serializes that between contenders.
-            let verifier = approval::MonuxCertVerification::new(
-                "server",
-                args.fingerprint.take().unwrap_or(vec![]),
-                &config_dir,
-                // No interactive approval prompts when facing the public internet:
-                // unknown peers must be pre-approved via --fingerprints instead.
-                !www,
-            )?;
-            info!(
-                "Our certificate fingerprint: {} (pre-approve this server on clients with '--fingerprints {}')",
-                verifier.our_fingerprint(),
-                verifier.our_fingerprint()
-            );
-            let mode = if www {
-                NetworkMode::Www
-            } else {
-                NetworkMode::Local
-            };
-            let motion_mode = match args.motion_hz {
-                None => {
-                    info!(
-                        "Coalescing pointer motion adaptively: {} updates/s, raised to {} on a sustained close link (pin with --motion-hz; 0 disables)",
-                        monux::rotation::ADAPTIVE_MOTION_NORMAL_HZ,
-                        monux::rotation::ADAPTIVE_MOTION_PROXIMITY_HZ,
-                    );
-                    monux::rotation::MotionMode::Adaptive
+            #[cfg(target_os = "linux")]
+            {
+                // The config file fills whatever the command line left unset.
+                args.resolve(&monux::config::load_for_daemon(&config_dir));
+                let listen = args.listen.unwrap_or(monux::config::DEFAULT_LISTEN);
+                let port = args.port.unwrap_or(monux::config::DEFAULT_PORT);
+                if port == 0 {
+                    bail!("--port 0 (ephemeral port) is not supported: the mDNS advertisement must match the actual listen port");
                 }
-                Some(0) => monux::rotation::MotionMode::Pinned(None),
-                Some(hz) => {
-                    info!("Coalescing pointer motion to {} updates/s (pinned)", hz);
-                    monux::rotation::MotionMode::Pinned(Some(Duration::from_secs_f64(
-                        1.0 / hz as f64,
-                    )))
-                }
-            };
-            let throttle_mode = match args.bulk_throttle_mbps {
-                None => {
-                    info!(
-                        "Pacing bulk transfers adaptively: {} Mbps, raised to {} on a sustained close link (pin with --bulk-throttle-mbps; 0 disables)",
-                        monux::rotation::ADAPTIVE_THROTTLE_NORMAL_MBPS,
-                        monux::rotation::ADAPTIVE_THROTTLE_PROXIMITY_MBPS,
-                    );
-                    monux::rotation::ThrottleMode::Adaptive
-                }
-                Some(mbps) if mbps <= 0.0 => monux::rotation::ThrottleMode::Pinned(None),
-                Some(mbps) => {
-                    info!("Pacing bulk transfers to {} Mbps (pinned)", mbps);
-                    monux::rotation::ThrottleMode::Pinned(Some(mbps))
-                }
-            };
-            rt.block_on(async {
-                server(ServerDaemonArgs {
-                    config_dir,
-                    listen_addr: SocketAddr::new(listen, port),
-                    keys_next: args
-                        .shortcut
+                let auto_update = !args.no_auto_update.unwrap_or(false);
+                let auto_indicator = !args.no_indicator.unwrap_or(false);
+                let update_mode = update_mode(args.auto_install.unwrap_or(false));
+                let www = args.www.unwrap_or(false);
+                // Validation before the takeover below: single_instance::acquire
+                // SIGTERMs the running daemon, so anything that can reject the
+                // command line has to have rejected it by then. A typo would
+                // otherwise leave the machine with no daemon at all — and the
+                // installed unit's Restart=on-failure will not bring it back,
+                // because the old one exited cleanly on the signal.
+                let max_clipboard_size_bytes = args
+                    .max_clipboard_size_kb
+                    .unwrap_or(monux::config::DEFAULT_MAX_CLIPBOARD_SIZE_KB)
+                    .checked_mul(1024)
+                    .context("--max-clipboard-size-kb is too large")?;
+                // Screen-edge switching is opt-in: no --edge-map, no edge manager.
+                let edge_map = match &args.edge_map {
+                    Some(specs) => Some(monux::edge::parse_edge_map(specs)?),
+                    None => None,
+                };
+                // The shortcut chords are plain strings on the command line, so
+                // clap accepts anything; reject typos here (mirroring --edge-map
+                // above), not in parse_key_combos after the takeover.
+                shortcut::validate_chord(
+                    args.shortcut
                         .as_deref()
                         .unwrap_or(monux::config::DEFAULT_SHORTCUT),
-                    keys_prev: Some(
-                        args.shortcut_prev
+                )?;
+                shortcut::validate_chord(
+                    args.shortcut_prev
+                        .as_deref()
+                        .unwrap_or(monux::config::DEFAULT_SHORTCUT_PREV),
+                )?;
+                for spec in args.shortcut_goto.as_deref().unwrap_or_default() {
+                    shortcut::validate_goto(spec)?;
+                }
+                // An empty --pause-shortcut disables pause/resume.
+                let pause_shortcut = args
+                    .pause_shortcut
+                    .as_deref()
+                    .unwrap_or(monux::config::DEFAULT_PAUSE_SHORTCUT);
+                let pause_shortcut = if pause_shortcut.trim().is_empty() {
+                    None
+                } else {
+                    shortcut::validate_chord(pause_shortcut)?;
+                    Some(pause_shortcut)
+                };
+                let server_lock = single_instance::acquire("server")?;
+                settle_after_takeover(&server_lock);
+                // Before the indicator supervisor spawns anything (see the note
+                // on the pid snapshot there).
+                reap_inherited_children();
+                // A machine running only a server has no use for the client-side
+                // update-gate file: its content can only be stale history (a
+                // client machine's handshakes re-record it), and a stale entry
+                // vetoes manual updates while the daemon is down (mDNS then finds
+                // no live server to refresh it). Clear it unless a client also
+                // runs here.
+                if single_instance::live_holder("client").is_none() {
+                    monux::update::clear_protocol_constraint(&config_dir);
+                }
+                if auto_update {
+                    // The server leads protocol upgrades: no compatibility gate.
+                    rt.spawn(monux::autoupdate::run(None, update_mode));
+                }
+                // Constructed after the takeover on purpose: new() writes a fresh
+                // keypair when none exists (write_new_keypair is not atomic), and
+                // the single-instance lock serializes that between contenders.
+                let verifier = approval::MonuxCertVerification::new(
+                    "server",
+                    args.fingerprint.take().unwrap_or(vec![]),
+                    &config_dir,
+                    // No interactive approval prompts when facing the public internet:
+                    // unknown peers must be pre-approved via --fingerprints instead.
+                    !www,
+                )?;
+                info!(
+                    "Our certificate fingerprint: {} (pre-approve this server on clients with '--fingerprints {}')",
+                    verifier.our_fingerprint(),
+                    verifier.our_fingerprint()
+                );
+                let mode = if www {
+                    NetworkMode::Www
+                } else {
+                    NetworkMode::Local
+                };
+                let motion_mode = match args.motion_hz {
+                    None => {
+                        info!(
+                            "Coalescing pointer motion adaptively: {} updates/s, raised to {} on a sustained close link (pin with --motion-hz; 0 disables)",
+                            monux::rotation::ADAPTIVE_MOTION_NORMAL_HZ,
+                            monux::rotation::ADAPTIVE_MOTION_PROXIMITY_HZ,
+                        );
+                        monux::rotation::MotionMode::Adaptive
+                    }
+                    Some(0) => monux::rotation::MotionMode::Pinned(None),
+                    Some(hz) => {
+                        info!("Coalescing pointer motion to {} updates/s (pinned)", hz);
+                        monux::rotation::MotionMode::Pinned(Some(Duration::from_secs_f64(
+                            1.0 / hz as f64,
+                        )))
+                    }
+                };
+                let throttle_mode = match args.bulk_throttle_mbps {
+                    None => {
+                        info!(
+                            "Pacing bulk transfers adaptively: {} Mbps, raised to {} on a sustained close link (pin with --bulk-throttle-mbps; 0 disables)",
+                            monux::rotation::ADAPTIVE_THROTTLE_NORMAL_MBPS,
+                            monux::rotation::ADAPTIVE_THROTTLE_PROXIMITY_MBPS,
+                        );
+                        monux::rotation::ThrottleMode::Adaptive
+                    }
+                    Some(mbps) if mbps <= 0.0 => monux::rotation::ThrottleMode::Pinned(None),
+                    Some(mbps) => {
+                        info!("Pacing bulk transfers to {} Mbps (pinned)", mbps);
+                        monux::rotation::ThrottleMode::Pinned(Some(mbps))
+                    }
+                };
+                rt.block_on(async {
+                    server(ServerDaemonArgs {
+                        config_dir,
+                        listen_addr: SocketAddr::new(listen, port),
+                        keys_next: args
+                            .shortcut
                             .as_deref()
-                            .unwrap_or(monux::config::DEFAULT_SHORTCUT_PREV),
-                    ),
-                    keys_goto: args.shortcut_goto.take().unwrap_or_default(),
-                    keys_pause: pause_shortcut,
-                    device_filters: args.device.take().unwrap_or_default(),
-                    exit_secs: args.exit_secs,
-                    verifier,
-                    max_clipboard_size_bytes,
-                    mode,
-                    motion_mode,
-                    throttle_mode,
-                    edge_map,
-                    edge_dwell: Duration::from_millis(
-                        args.edge_dwell_ms
-                            .unwrap_or(monux::config::DEFAULT_EDGE_DWELL_MS),
-                    ),
-                    auto_update,
-                    auto_indicator,
-                })
-                .await
-            })?;
+                            .unwrap_or(monux::config::DEFAULT_SHORTCUT),
+                        keys_prev: Some(
+                            args.shortcut_prev
+                                .as_deref()
+                                .unwrap_or(monux::config::DEFAULT_SHORTCUT_PREV),
+                        ),
+                        keys_goto: args.shortcut_goto.take().unwrap_or_default(),
+                        keys_pause: pause_shortcut,
+                        device_filters: args.device.take().unwrap_or_default(),
+                        exit_secs: args.exit_secs,
+                        verifier,
+                        max_clipboard_size_bytes,
+                        mode,
+                        motion_mode,
+                        throttle_mode,
+                        edge_map,
+                        edge_dwell: Duration::from_millis(
+                            args.edge_dwell_ms
+                                .unwrap_or(monux::config::DEFAULT_EDGE_DWELL_MS),
+                        ),
+                        auto_update,
+                        auto_indicator,
+                    })
+                    .await
+                })?;
+            }
         }
         Commands::Client(mut args) => {
             // The config file fills whatever the command line left unset.
@@ -844,6 +942,7 @@ fn settle_after_takeover(lock: &single_instance::InstanceLock) {
 /// with no per-user flags) persists root-owned system settings. --autostart
 /// and --desktop-shortcut manage files in the invoking user's home and must
 /// run as that user.
+#[cfg(target_os = "linux")]
 fn setup_needs_root(autostart: &Option<monux::setup::Autostart>, desktop_shortcut: bool) -> bool {
     autostart.is_none() && !desktop_shortcut
 }
@@ -852,6 +951,7 @@ fn setup_needs_root(autostart: &Option<monux::setup::Autostart>, desktop_shortcu
 /// the user type 'sudo monux setup' (which also trips over sudo's restricted
 /// PATH hiding ~/.local/bin), re-exec with sudo -E, prompting for the password.
 /// Opt out with MONUX_NO_ELEVATE=1 to get the manual invocation instead.
+#[cfg(target_os = "linux")]
 fn maybe_elevate(reason: &str) -> Result<()> {
     if unsafe { libc::geteuid() } == 0 || std::env::var_os("MONUX_NO_ELEVATE").is_some() {
         return Ok(());
@@ -914,6 +1014,7 @@ fn init_config_dir() -> Result<PathBuf> {
 /// file. A struct rather than seventeen positional parameters: four of them
 /// are `Option<&str>`/`bool` in a row, which is exactly where a transposed
 /// argument compiles and then misbehaves at runtime.
+#[cfg(target_os = "linux")]
 struct ServerDaemonArgs<'a> {
     config_dir: PathBuf,
     listen_addr: SocketAddr,
@@ -935,6 +1036,7 @@ struct ServerDaemonArgs<'a> {
     auto_indicator: bool,
 }
 
+#[cfg(target_os = "linux")]
 async fn server(args: ServerDaemonArgs<'_>) -> Result<()> {
     let ServerDaemonArgs {
         config_dir,
@@ -1001,6 +1103,7 @@ async fn server(args: ServerDaemonArgs<'_>) -> Result<()> {
                 rotation_tx: rotation_tx.clone(),
                 auto_update,
                 indicator: indicator.handle(),
+                approvals: verifier.clone(),
             });
             spawn_control_listener(listener, handler);
         }
@@ -1183,6 +1286,7 @@ async fn server(args: ServerDaemonArgs<'_>) -> Result<()> {
 
 /// How long the shutdown path lets the QUIC endpoint drain its close frames
 /// to clients before tearing down anyway (see close_loops).
+#[cfg(target_os = "linux")]
 const ENDPOINT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Closes the QUIC endpoint gracefully, then aborts the spawned loop tasks
@@ -1200,6 +1304,7 @@ const ENDPOINT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// socket that outlives the lock makes the next instance's bind fail with
 /// EADDRINUSE (seen in the wild when a manual start took over from an
 /// auto-update restart).
+#[cfg(target_os = "linux")]
 async fn close_loops(
     watch_handle: task::JoinHandle<Result<()>>,
     server_events_handle: task::JoinHandle<Result<()>>,
@@ -1345,12 +1450,13 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
         auto_update,
         auto_indicator,
     } = args;
-    // Try to set up virtual devices up-front - exit early if we can't access uinput
-    let mut output_handler = output::uinput::VirtualUInputDevices::new()
-        .context("Failed to create virtual devices for output, possible solutions:
-- Add your user to the 'input' group and log back in: 'sudo usermod -aG input $USER'
-- Enable uinput and/or evdev in the kernel, check for /dev/uinput and /dev/input/
-- As a fallback, run as root with 'sudo -E monux client ...' (-E keeps clipboard support)")?;
+    // The tray indicator (the only consumer) is Linux-only.
+    #[cfg(not(target_os = "linux"))]
+    let _ = auto_indicator;
+    // Set up the injection backend up-front — on failure, exit with the
+    // platform's remediation text (input group / uinput on Linux, the
+    // Accessibility TCC grant on macOS).
+    let mut output_handler = output::create()?;
     // Saturating for the same reason as the server's ceiling above.
     let max_uncompressed_size_bytes = max_clipboard_size_bytes.saturating_mul(10);
     let mut local_clipboard = clipboard::client::LocalClipboard::new(
@@ -1395,14 +1501,18 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
     // are server concepts). Optional, as on the server. The tray-indicator
     // supervisor is created here so the socket can hide/show it, but only
     // launched once the socket is bound; the guard SIGTERMs and reaps the
-    // child on every exit path out of this function.
+    // child on every exit path out of this function. (Linux only — no tray
+    // indicator exists on macOS.)
+    #[cfg(target_os = "linux")]
     let indicator = monux::indicator_spawn::Supervisor::new(!auto_indicator);
     match monux::control::Listener::bind(monux::control::Role::Client) {
         Ok(listener) => {
             let handler = monux::control::Handler::Client(monux::control::ClientHandler {
                 state: control_state.clone(),
                 auto_update,
+                #[cfg(target_os = "linux")]
                 indicator: indicator.handle(),
+                approvals: verifier.clone(),
                 config_dir: config_dir.clone(),
             });
             spawn_control_listener(listener, handler);
@@ -1411,6 +1521,7 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
     }
     // The daemon is up (control socket bound): start the tray indicator
     // alongside it; it polls until the socket serves.
+    #[cfg(target_os = "linux")]
     indicator.launch();
     // Keep one set of signal handlers registered across reconnect attempts.
     let shutdown = client_shutdown_signal();
@@ -1719,6 +1830,7 @@ mod tests {
         assert!(matches!(cycle[2], Candidate::Discover));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn setup_flags_parse_and_scope_elevation() {
         // No flags: the base set, which needs root.
@@ -1759,6 +1871,27 @@ mod tests {
         assert_eq!(args.autostart, Some(monux::setup::Autostart::Server));
         assert!(args.desktop_shortcut);
         assert!(!setup_needs_root(&args.autostart, args.desktop_shortcut));
+    }
+
+    #[test]
+    fn approve_command_parses_prefix_and_role_flags() {
+        // Bare: approve the sole pending request on whichever daemon answers.
+        let cli = Cli::try_parse_from(["monux", "approve"]).unwrap();
+        let Commands::Approve(args) = cli.command else {
+            panic!("expected the approve command")
+        };
+        assert!(args.target.is_none() && !args.server && !args.client);
+
+        // Prefix + offline persistence into a role's config.
+        let cli = Cli::try_parse_from(["monux", "approve", "aa11bbccaa11bbcc", "--server"]).unwrap();
+        let Commands::Approve(args) = cli.command else {
+            panic!("expected the approve command")
+        };
+        assert_eq!(args.target.as_deref(), Some("aa11bbccaa11bbcc"));
+        assert!(args.server && !args.client);
+
+        // The roles conflict, like everywhere else.
+        assert!(Cli::try_parse_from(["monux", "approve", "--server", "--client"]).is_err());
     }
 
     #[test]

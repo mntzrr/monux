@@ -7,7 +7,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use tracing::{info, warn};
+use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
 use crate::network::certs;
 
@@ -91,6 +92,115 @@ fn peer_fingerprint_from_identity(identity: Box<dyn std::any::Any>) -> Option<St
     chain.first().map(certs::fingerprint)
 }
 
+/// A peer that knocked with an unknown certificate and is waiting to be
+/// approved — the daemon's side of the headless workflow: no prompt can be
+/// shown, so `monux status` lists these and `monux approve <prefix>` clears
+/// them. Serializes onto the control socket as part of the status state.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PendingPeer {
+    pub fingerprint: String,
+    /// Transport address, when known: the address the server was contacted
+    /// from, or the server address a client was trying to reach.
+    pub address: Option<String>,
+    /// Peer-advertised name (mDNS/handshake hint), when known.
+    pub name: Option<String>,
+    /// Knock count: the peer's retry loop re-attempts every few seconds, so
+    /// this grows while it is actively waiting.
+    pub attempts: u32,
+    /// Seconds since the last knock.
+    pub last_seen_secs_ago: u64,
+}
+
+/// How long a knock stays listed after the peer stops retrying. Waiting
+/// peers re-knock every few seconds (the reconnect loop), so anything idle
+/// longer than this has given up or been approved elsewhere.
+const PENDING_PEER_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// How many distinct knocking peers to remember for the status listing.
+const PENDING_PEER_MAX: usize = 16;
+
+/// One recorded knock, with everything needed to approve it later.
+#[derive(Debug)]
+struct PendingRecord {
+    peer: PendingPeer,
+    /// The knocking peer's certificate: approving is persisting this to the
+    /// known-certs dir, exactly as the interactive prompt would.
+    cert: rustls_pki_types::CertificateDer<'static>,
+    last_seen: Instant,
+}
+
+impl PendingRecord {
+    fn new(
+        fingerprint: String,
+        address: Option<String>,
+        name: Option<String>,
+        cert: rustls_pki_types::CertificateDer<'static>,
+        now: Instant,
+    ) -> Self {
+        PendingRecord {
+            peer: PendingPeer {
+                fingerprint,
+                address,
+                name,
+                attempts: 1,
+                last_seen_secs_ago: 0,
+            },
+            cert,
+            last_seen: now,
+        }
+    }
+}
+
+/// Records (or refreshes) a knock from an unknown peer, keeping the list
+/// bounded and freshest-last. Called on every unknown-cert rejection path —
+/// headless (no TTY), --www, pending-prompt, cooldown, and the prompt spawn
+/// itself — so the status listing reflects everyone still waiting.
+fn record_pending(
+    state: &mut ApprovalState,
+    fingerprint: String,
+    address: Option<String>,
+    name: Option<String>,
+    cert: rustls_pki_types::CertificateDer<'static>,
+    now: Instant,
+) {
+    // Expire idle knocks first: they are no longer requests, just history.
+    state
+        .pending
+        .retain(|r| now.duration_since(r.last_seen) < PENDING_PEER_TTL);
+    match state
+        .pending
+        .iter_mut()
+        .find(|r| r.peer.fingerprint == fingerprint)
+    {
+        Some(record) => {
+            record.peer.attempts = record.peer.attempts.saturating_add(1);
+            record.peer.address = address;
+            record.peer.name = name;
+            record.last_seen = now;
+            // Keep the latest cert: a re-knock after a peer reinstalled
+            // means the old DER is not what needs approving.
+            record.cert = cert;
+        }
+        None => {
+            state.pending.push(PendingRecord::new(
+                fingerprint, address, name, cert, now,
+            ));
+            if state.pending.len() > PENDING_PEER_MAX {
+                // Drop the stalest knock: waiting peers refresh constantly,
+                // so the stalest is the one that stopped waiting.
+                let stalest = state
+                    .pending
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, r)| r.last_seen)
+                    .map(|(i, _)| i)
+                    .expect("len > PENDING_PEER_MAX implies non-empty");
+                state.pending.remove(stalest);
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ApprovalState {
     /// Previously-approved certs: loaded from disk at startup, plus certs
@@ -98,6 +208,10 @@ struct ApprovalState {
     /// the peer's retry passes the known-certs check without re-prompting).
     /// Owned so the state can be shared with the prompt thread.
     known_certs: Vec<rustls_pki_types::CertificateDer<'static>>,
+    /// Unknown peers currently knocking (see PendingPeer). Surfaced through
+    /// `monux status` and cleared by `monux approve` (or a prompt answered
+    /// with y).
+    pending: Vec<PendingRecord>,
     /// Whether an approval prompt thread is currently running.
     /// We only allow one prompt to be pending at a time, globally.
     prompt_active: bool,
@@ -183,6 +297,83 @@ impl<'a> MonuxCertVerification<'a> {
         certs::fingerprint(&self.our_cert)
     }
 
+    /// The unknown peers currently waiting for approval, newest knock first.
+    /// Idle knocks past PENDING_PEER_TTL are dropped from the listing (a
+    /// waiting peer re-knocks every few seconds, so idle means gone).
+    pub fn pending_peers(&self) -> Vec<PendingPeer> {
+        let now = Instant::now();
+        // Poison-tolerant, as everywhere this lock is taken.
+        let mut state = self.approval_state.write().unwrap_or_else(|e| e.into_inner());
+        state
+            .pending
+            .retain(|r| now.duration_since(r.last_seen) < PENDING_PEER_TTL);
+        let mut peers: Vec<PendingPeer> = state
+            .pending
+            .iter()
+            .map(|r| {
+                let mut peer = r.peer.clone();
+                peer.last_seen_secs_ago = now.duration_since(r.last_seen).as_secs();
+                peer
+            })
+            .collect();
+        peers.sort_by_key(|p| std::cmp::Reverse(p.last_seen_secs_ago));
+        peers
+    }
+
+    /// Approves the pending request whose fingerprint matches `prefix`
+    /// (colons/case normalized; any length — the match is against the bounded
+    /// pending list, and ambiguity is an error, never a silent pick). The
+    /// peer's certificate is persisted to the known-certs dir exactly as an
+    /// interactive approval would, so the choice survives restarts.
+    /// Returns the full approved fingerprint.
+    pub fn approve_pending(&self, prefix: &str) -> Result<String> {
+        let prefix = normalize_fingerprint(prefix);
+        if prefix.is_empty() {
+            bail!("approve needs a fingerprint prefix; 'monux status' lists the pending requests");
+        }
+        // Take the match out under the lock; the cert write happens below,
+        // outside it.
+        let matched = {
+            let mut state = self.approval_state.write().unwrap_or_else(|e| e.into_inner());
+            let matches: Vec<usize> = state
+                .pending
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.peer.fingerprint.starts_with(&prefix))
+                .map(|(i, _)| i)
+                .collect();
+            match matches.as_slice() {
+                [] => bail!(
+                    "no pending approval request matches '{}'; 'monux status' lists the pending requests",
+                    prefix
+                ),
+                [only] => state.pending.remove(*only),
+                _ => bail!(
+                    "'{}' is ambiguous: {} pending requests match ({}). Use more characters",
+                    prefix,
+                    matches.len(),
+                    matches
+                        .iter()
+                        .map(|&i| state.pending[i].peer.fingerprint[..8].to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }
+        };
+        let fingerprint = matched.peer.fingerprint.clone();
+        certs::write_approved_cert(&matched.cert, &fingerprint, &self.config_dir)?;
+        // Poison-tolerant, as everywhere this lock is taken.
+        let mut state = self.approval_state.write().unwrap_or_else(|e| e.into_inner());
+        state.known_certs.push(matched.cert);
+        state.unanswered_prompts = 0;
+        state.prompt_backoff_until = None;
+        info!(
+            "Approved pending peer {} via 'monux approve'; it connects on its next retry",
+            fingerprint
+        );
+        Ok(fingerprint)
+    }
+
     /// Opens a connection attempt against `addr`, optionally captioned with the
     /// name mDNS gave for it. Called once per attempt, before connecting, so
     /// the prompt can only ever describe the machine currently being verified.
@@ -261,6 +452,7 @@ impl<'a> MonuxCertVerification<'a> {
             approved_cert_fingerprints,
             approval_state: Arc::new(RwLock::new(ApprovalState {
                 known_certs: certs::load_known_certs(config_dir)?,
+                pending: Vec::new(),
                 prompt_active: false,
                 rejection_cooldowns: HashMap::new(),
                 prompt_backoff_until: None,
@@ -304,9 +496,7 @@ impl<'a> MonuxCertVerification<'a> {
                     their_name, their_cert_fingerprint
                 );
                 return Ok(their_cert_fingerprint);
-            } else if self
-                .approved_cert_fingerprints
-                .contains(&their_cert_fingerprint)
+            } else if fingerprint_preapproved(&self.approved_cert_fingerprints, &their_cert_fingerprint)
             {
                 info!(
                     "{} cert approved via --fingerprints: {}",
@@ -317,44 +507,91 @@ impl<'a> MonuxCertVerification<'a> {
                 // Maybe they don't WANT old certs to still be approved if the arg changes? Play it safe.
                 approval_state.known_certs.push(their_cert.clone().into_owned());
                 return Ok(their_cert_fingerprint);
-            } else if !self.allow_interactive_prompts {
-                // Interactive prompts are disabled (--www): unknown peers must be
-                // pre-approved via known_certs or --fingerprints.
-                bail!(
-                    "{} cert rejected: interactive approval disabled (--www); pre-approve it with '--fingerprints {}'",
-                    their_name,
-                    their_cert_fingerprint
+            } else {
+                // Unknown and not pre-approved: whatever happens next (a
+                // prompt, a headless skip, a cooldown), this peer is waiting
+                // on us — record the knock so `monux status` can show it and
+                // `monux approve` can act on it. The address context: the
+                // server side knows who contacted it; the client side knows
+                // who it was trying to reach. The name: the mDNS/handshake
+                // hint when one was learned (client side), else the peer
+                // certificate's hostname CN — that is what lets a server
+                // tell several knocking clients apart beyond their IPs.
+                let (address, name) = if we_are_server {
+                    (
+                        self.incoming_attempt
+                            .lock()
+                            .ok()
+                            .and_then(|slot| *slot)
+                            .map(|a| a.to_string()),
+                        certs::common_name(their_cert),
+                    )
+                } else {
+                    self.server_attempt
+                        .lock()
+                        .ok()
+                        .and_then(|slot| slot.clone())
+                        .map(|attempt| {
+                            (
+                                Some(attempt.addr.to_string()),
+                                attempt.name.or_else(|| certs::common_name(their_cert)),
+                            )
+                        })
+                        .unwrap_or_else(|| (None, certs::common_name(their_cert)))
+                };
+                record_pending(
+                    &mut approval_state,
+                    their_cert_fingerprint.clone(),
+                    address,
+                    name,
+                    their_cert.clone().into_owned(),
+                    Instant::now(),
                 );
-            } else if !(self.stdin_is_tty)() {
-                warn!("Stdin is not a TTY, skipping user certificate approval prompt. Approve this cert by running the {} with '--fingerprints {}'", if we_are_server { "server" } else { "client" }, their_cert_fingerprint);
-                bail!(
-                    "{} cert rejected: unknown certificate and stdin is not a TTY",
-                    their_name
-                );
-            }
+                if !self.allow_interactive_prompts {
+                    // Interactive prompts are disabled (--www): unknown peers must be
+                    // pre-approved via known_certs or --fingerprints.
+                    bail!(
+                        "{} cert rejected: interactive approval disabled (--www); pre-approve it with '--fingerprints {}'",
+                        their_name,
+                        their_cert_fingerprint
+                    );
+                } else if !(self.stdin_is_tty)() {
+                    // Headless: the knock is already recorded above, and the
+                    // status/approve workflow takes over from here.
+                    info!(
+                        "Stdin is not a TTY, skipping user certificate approval prompt. '{}' lists this request and 'monux approve {}' clears it",
+                        if we_are_server { "monux status" } else { "monux status --client" },
+                        &their_cert_fingerprint[..16]
+                    );
+                    bail!(
+                        "{} cert rejected: unknown certificate and stdin is not a TTY",
+                        their_name
+                    );
+                }
 
-            match prompt_decision(&approval_state, &their_cert_fingerprint, Instant::now()) {
-                // Only one prompt at a time, reject other prompts. They will retry connecting anyway.
-                PromptDecision::Pending => bail!(
-                    "{}: {} cert rejected for now, an approval prompt is already pending",
-                    APPROVAL_PENDING_SENTINEL,
-                    their_name
-                ),
-                PromptDecision::Cooldown => bail!(
-                    "{}: {} cert rejected for now, approval of {} was recently declined or timed out",
-                    APPROVAL_PENDING_SENTINEL,
-                    their_name,
-                    their_cert_fingerprint
-                ),
-                PromptDecision::Backoff => bail!(
-                    "{}: {} cert rejected for now, approval prompts are paused after recent unanswered ones",
-                    APPROVAL_PENDING_SENTINEL,
-                    their_name
-                ),
-                PromptDecision::Prompt => {
-                    // Claim the prompt slot under the lock, so a concurrent
-                    // verification sees Pending instead of double-spawning.
-                    approval_state.prompt_active = true;
+                match prompt_decision(&approval_state, &their_cert_fingerprint, Instant::now()) {
+                    // Only one prompt at a time, reject other prompts. They will retry connecting anyway.
+                    PromptDecision::Pending => bail!(
+                        "{}: {} cert rejected for now, an approval prompt is already pending",
+                        APPROVAL_PENDING_SENTINEL,
+                        their_name
+                    ),
+                    PromptDecision::Cooldown => bail!(
+                        "{}: {} cert rejected for now, approval of {} was recently declined or timed out",
+                        APPROVAL_PENDING_SENTINEL,
+                        their_name,
+                        their_cert_fingerprint
+                    ),
+                    PromptDecision::Backoff => bail!(
+                        "{}: {} cert rejected for now, approval prompts are paused after recent unanswered ones",
+                        APPROVAL_PENDING_SENTINEL,
+                        their_name
+                    ),
+                    PromptDecision::Prompt => {
+                        // Claim the prompt slot under the lock, so a concurrent
+                        // verification sees Pending instead of double-spawning.
+                        approval_state.prompt_active = true;
+                    }
                 }
             }
         }
@@ -383,12 +620,20 @@ impl<'a> MonuxCertVerification<'a> {
     }
 }
 
+
+impl crate::control::Approvals for MonuxCertVerification<'static> {
+    fn pending(&self) -> Vec<PendingPeer> {
+        self.pending_peers()
+    }
+
+    fn approve(&self, prefix: &str) -> Result<String> {
+        self.approve_pending(prefix)
+    }
+}
+
 fn default_stdin_is_tty() -> bool {
     io::stdin().is_terminal()
 }
-
-/// Number of hex characters in a certificate fingerprint (a SHA-256 digest).
-const FINGERPRINT_HEX_LEN: usize = 64;
 
 /// Normalizes a user-supplied fingerprint to our storage form: lowercase hex
 /// with the openssl-style colons removed ("18:AE:75:F2..." => "18ae75f2...").
@@ -396,22 +641,44 @@ pub fn normalize_fingerprint(fingerprint: &str) -> String {
     fingerprint.trim().to_lowercase().replace(':', "")
 }
 
+/// A SHA-256 digest is exactly 64 hex characters.
+const FINGERPRINT_HEX_LEN: usize = 64;
+
+/// Shortest accepted fingerprint prefix (hex characters). A prefix this
+/// long keeps an offline cert-grinder at a 64-bit search — hours-to-centries
+/// of GPU time per attempt — while still sparing the user most of the
+/// 64-character hand-typing.
+const FINGERPRINT_MIN_PREFIX_LEN: usize = 16;
+
 /// Rejects a normalized fingerprint that could never match a real certificate.
-/// A SHA-256 digest is exactly 64 hex characters; anything else is a typo, a
-/// truncated paste, or a value copied from the wrong tool, and accepting it
-/// silently only surfaces later as an unexplained refusal.
+/// A value is either a full SHA-256 digest (64 hex characters) or a prefix of
+/// one at least FINGERPRINT_MIN_PREFIX_LEN long — anything else is a typo, a
+/// too-aggressive truncation, or a value copied from the wrong tool, and
+/// accepting it silently only surfaces later as an unexplained refusal.
 pub fn validate_fingerprint(normalized: &str) -> Result<()> {
-    if normalized.len() != FINGERPRINT_HEX_LEN
-        || !normalized.chars().all(|c| c.is_ascii_hexdigit())
+    if !normalized.chars().all(|c| c.is_ascii_hexdigit())
+        || !(FINGERPRINT_MIN_PREFIX_LEN..=FINGERPRINT_HEX_LEN).contains(&normalized.len())
     {
         bail!(
-            "'{}' is not a certificate fingerprint: expected {} hex characters (a SHA-256 digest), got {}. Read the peer's off its startup banner, or from 'monux status'.",
+            "'{}' is not a certificate fingerprint: expected {}..={} hex characters (a SHA-256 digest, or a prefix of one at least {} long), got {}. Read the peer's off its startup banner, or from 'monux status'.",
             normalized,
+            FINGERPRINT_MIN_PREFIX_LEN,
             FINGERPRINT_HEX_LEN,
+            FINGERPRINT_MIN_PREFIX_LEN,
             normalized.len()
         );
     }
     Ok(())
+}
+
+/// Whether a peer's fingerprint is covered by the --fingerprints values: a
+/// value may be a full digest (equals only itself) or a prefix (approves
+/// every cert whose fingerprint starts with it). Values are validated at
+/// startup, so anything shorter than the minimum prefix never gets here.
+fn fingerprint_preapproved(approved: &[String], peer_fingerprint: &str) -> bool {
+    approved
+        .iter()
+        .any(|value| peer_fingerprint.starts_with(value.as_str()))
 }
 
 /// What to do with an unknown certificate that could be prompted for.
@@ -469,6 +736,15 @@ fn global_backoff(unanswered: u32, base: Duration) -> Duration {
 /// clears the global backoff — the user is at the console pairing, which is
 /// the situation the backoff must never obstruct.
 fn record_approval(state: &mut ApprovalState, cert: rustls_pki_types::CertificateDer<'static>) {
+    // Approved is approved: any pending knock for this cert just paid off.
+    if let Some(fp) = state
+        .pending
+        .iter()
+        .position(|r| r.cert == cert)
+        .map(|i| state.pending.remove(i).peer.fingerprint)
+    {
+        debug!("Approval request for {} cleared", fp);
+    }
     state.known_certs.push(cert);
     state.unanswered_prompts = 0;
     state.prompt_backoff_until = None;
@@ -990,6 +1266,7 @@ mod tests {
     fn empty_state() -> ApprovalState {
         ApprovalState {
             known_certs: vec![],
+            pending: vec![],
             prompt_active: false,
             rejection_cooldowns: HashMap::new(),
             prompt_backoff_until: None,
@@ -1014,6 +1291,171 @@ mod tests {
         certs::load_keypair("peer", dir)
             .expect("couldn't generate peer keypair")
             .0
+    }
+
+    #[test]
+    fn prefix_fingerprint_preapproves_without_prompting() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let their_cert = peer_cert(peer_dir.path());
+        let full = certs::fingerprint(&their_cert);
+        // The shortest accepted prefix: hand-typing the whole 64-char digest
+        // is the friction this exists to remove.
+        let prefix = full[..FINGERPRINT_MIN_PREFIX_LEN].to_string();
+        let mut verifier = MonuxCertVerification::new(
+            "test",
+            vec![prefix],
+            dir.path(),
+            true,
+        )
+        .expect("failed to construct verifier");
+        Arc::get_mut(&mut verifier)
+            .expect("fresh verifier should be uniquely owned")
+            .stdin_is_tty = tty_yes;
+        // noop_spawn (not the shared global counter): the pre-approved path
+        // returns before any prompt logic, so a spawn here would only be
+        // observable as the verify failing — and the counting statics race
+        // with the other prompt tests running in parallel.
+        Arc::get_mut(&mut verifier)
+            .expect("fresh verifier should be uniquely owned")
+            .prompt_spawner = noop_spawn;
+
+        let approved = verifier
+            .verify_cert(&their_cert, "Server", false)
+            .expect("a matching prefix pre-approves the cert");
+        assert_eq!(approved, full);
+
+        // A prefix that does not match is still unknown.
+        let other = peer_cert(tempfile::tempdir().unwrap().path());
+        let err = verifier
+            .verify_cert(&other, "Server", false)
+            .expect_err("a non-matching prefix must not approve");
+        assert!(
+            err.to_string().contains(APPROVAL_PENDING_SENTINEL),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn fingerprint_validation_accepts_full_digests_and_long_prefixes() {
+        // Full digest.
+        assert!(validate_fingerprint(&"ab".repeat(32)).is_ok());
+        // Minimum-length prefix (16 chars) and everything up to a full digest.
+        assert!(validate_fingerprint(&"ab".repeat(8)).is_ok());
+        assert!(validate_fingerprint(&"cd".repeat(12)).is_ok());
+        // Shorter than the minimum, non-hex, empty, and over-long all refuse.
+        for bad in [
+            "ab".repeat(7),   // 14 chars
+            "a".repeat(15),   // 15 chars
+            "zz".repeat(8),   // not hex
+            String::new(),
+            "ab".repeat(33),  // 66 chars
+        ] {
+            assert!(validate_fingerprint(&bad).is_err(), "accepted {:?}", bad);
+        }
+    }
+
+    #[test]
+    fn fingerprint_preapproval_matches_full_values_and_prefixes() {
+        let full = "aa11".repeat(16);
+        let approved = vec![full.clone(), "0123456789abcdef".to_string()];
+        // Exact value.
+        assert!(fingerprint_preapproved(&approved, &full));
+        // Prefix match.
+        assert!(fingerprint_preapproved(&approved, "0123456789abcdef7777"));
+        // Non-matching peer.
+        assert!(!fingerprint_preapproved(&approved, &"ffff".repeat(16)));
+        assert!(!fingerprint_preapproved(&[], &full));
+    }
+
+    #[test]
+    fn headless_rejection_records_the_pending_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let mut verifier = test_verifier(dir.path(), true);
+        Arc::get_mut(&mut verifier)
+            .expect("fresh verifier should be uniquely owned")
+            .stdin_is_tty = tty_no;
+        let their_cert = peer_cert(peer_dir.path());
+
+        assert!(verifier.pending_peers().is_empty());
+        let err = verifier
+            .verify_cert(&their_cert, "Client", true)
+            .expect_err("headless must reject the unknown cert");
+        assert!(err.to_string().contains("stdin is not a TTY"));
+        // The knock is recorded with the fingerprint; the address context is
+        // absent (no incoming attempt was recorded).
+        let pending = verifier.pending_peers();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].fingerprint, certs::fingerprint(&their_cert));
+        assert_eq!(pending[0].attempts, 1);
+        // The peer cert's hostname CN captions the request — with several
+        // clients knocking, that is what tells them apart beyond the IPs.
+        assert_eq!(
+            pending[0].name.as_deref(),
+            certs::common_name(&their_cert).as_deref()
+        );
+        assert!(pending[0].name.is_some(), "generated certs carry a CN");
+        // Re-knocks accumulate instead of duplicating entries.
+        verifier
+            .verify_cert(&their_cert, "Client", true)
+            .expect_err("still unknown");
+        assert_eq!(verifier.pending_peers().len(), 1);
+        assert_eq!(verifier.pending_peers()[0].attempts, 2);
+    }
+
+    #[test]
+    fn approve_pending_persists_and_clears_the_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let mut verifier = test_verifier(dir.path(), true);
+        Arc::get_mut(&mut verifier)
+            .expect("fresh verifier should be uniquely owned")
+            .stdin_is_tty = tty_no;
+        let their_cert = peer_cert(peer_dir.path());
+        let fp = certs::fingerprint(&their_cert);
+        verifier
+            .verify_cert(&their_cert, "Client", true)
+            .expect_err("records the knock");
+
+        // Any unique prefix works; a 16-char one is the advertised form.
+        let approved = verifier
+            .approve_pending(&fp[..16])
+            .expect("approves the pending request");
+        assert_eq!(approved, fp);
+        assert!(verifier.pending_peers().is_empty());
+        // The cert file landed where the daemon loads known certs from.
+        assert!(dir.path().join("known_certs").join(format!("{}.pem", fp)).is_file());
+        // And the very next verification of the same cert passes.
+        verifier
+            .verify_cert(&their_cert, "Client", true)
+            .expect("approved cert verifies");
+    }
+
+    #[test]
+    fn approve_pending_rejects_ambiguous_and_unknown_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut verifier = test_verifier(dir.path(), true);
+        Arc::get_mut(&mut verifier)
+            .expect("fresh verifier should be uniquely owned")
+            .stdin_is_tty = tty_no;
+        for _ in 0..2 {
+            verifier
+                .verify_cert(&peer_cert(tempfile::tempdir().unwrap().path()), "Client", true)
+                .expect_err("records a knock");
+        }
+        let err = verifier
+            .approve_pending("")
+            .expect_err("empty prefix cannot pick");
+        assert!(err.to_string().contains("fingerprint prefix"), "{}", err);
+        let err = verifier
+            .approve_pending("zzzz")
+            .expect_err("no such peer");
+        assert!(err.to_string().contains("no pending approval request"), "{}", err);
+        // (Ambiguity — two pendings sharing a prefix — needs colliding
+        // fingerprints random certs won't produce; the dispatch layer's
+        // fake-Approvals test covers how those errors surface.)
     }
 
     #[test]
@@ -1417,8 +1859,11 @@ mod tests {
         let normalized = normalize_fingerprint(&openssl);
         assert_eq!(normalized.len(), 64);
         assert!(validate_fingerprint(&normalized).is_ok());
-        // Too short (a truncated paste), too long, and non-hex all refuse.
-        for bad in ["", "aabbccdd", &"a".repeat(63), &"a".repeat(65), &"z".repeat(64)] {
+        // Prefixes at or above the minimum length are accepted...
+        assert!(validate_fingerprint(&"a".repeat(16)).is_ok());
+        assert!(validate_fingerprint(&"a".repeat(63)).is_ok());
+        // ...while too short (a truncated paste), too long, and non-hex refuse.
+        for bad in ["", "aabbccdd", &"a".repeat(15), &"a".repeat(65), &"z".repeat(64)] {
             let err = validate_fingerprint(bad).unwrap_err().to_string();
             assert!(err.contains("hex characters"), "{}: {}", bad, err);
         }

@@ -3,13 +3,19 @@
 //! may the virtual mouse claim and still be tagged ID_INPUT_MOUSE?", which
 //! decides what libinput will do with it.
 
+#[cfg(target_os = "linux")]
 use std::process::Command;
+#[cfg(target_os = "linux")]
 use std::thread::sleep;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 use evdev::{AttributeSet, KeyCode, RelativeAxisCode};
+#[cfg(target_os = "linux")]
 use evdev::uinput::VirtualDevice;
 
+#[cfg(target_os = "linux")]
 fn tags_for(dev: &mut VirtualDevice) -> String {
     let nodes: Vec<_> = dev
         .enumerate_dev_nodes_blocking()
@@ -39,6 +45,7 @@ fn tags_for(dev: &mut VirtualDevice) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn build(name: &str, keys: AttributeSet<KeyCode>) -> anyhow::Result<VirtualDevice> {
     let mut axes = AttributeSet::<RelativeAxisCode>::new();
     for code in 0..(libc::REL_CNT as u16) {
@@ -51,6 +58,7 @@ fn build(name: &str, keys: AttributeSet<KeyCode>) -> anyhow::Result<VirtualDevic
         .build()?)
 }
 
+#[cfg(target_os = "linux")]
 fn keys_from(ranges: &[std::ops::RangeInclusive<u16>]) -> AttributeSet<KeyCode> {
     let mut keys = AttributeSet::<KeyCode>::new();
     for range in ranges {
@@ -61,6 +69,8 @@ fn keys_from(ranges: &[std::ops::RangeInclusive<u16>]) -> AttributeSet<KeyCode> 
     keys
 }
 
+#[cfg(target_os = "linux")] // evdev/uinput diagnostics: Linux-only
+#[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
     // (a) today's set: every BTN_* except BTN_TOOL_*.
     let mut current = AttributeSet::<KeyCode>::new();
@@ -111,3 +121,6 @@ fn main() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(not(target_os = "linux"))]
+fn main() {}

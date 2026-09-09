@@ -8,8 +8,14 @@ pub mod device;
 pub mod diagnostics;
 pub mod discovery;
 pub mod edge;
-pub mod indicator;
+// Tray indicator: the model layer (poll, view, menu rows, action requests)
+// is platform-agnostic; the ksni/D-Bus rendering inside is Linux-only and
+// macOS gets an NSStatusItem renderer in indicator_macos.
+#[cfg(target_os = "linux")]
 pub mod indicator_spawn;
+#[cfg(target_os = "macos")]
+pub mod indicator_macos;
+pub mod indicator;
 pub mod known_servers;
 pub mod logging;
 pub mod msgs;
@@ -18,9 +24,18 @@ pub mod notify;
 pub mod rotation;
 pub mod server;
 pub mod servers;
+// System integration: the optimization base set (udev rules, kernel modules,
+// systemd units, sysctl) is Linux-only; `setup` also carries the shared
+// autostart helpers, and macOS gets the login service via LaunchAgents in
+// setup_macos. Uninstall (the `system` command) remains Linux-only.
 pub mod setup;
-pub mod single_instance;
+#[cfg(target_os = "macos")]
+pub mod setup_macos;
+#[cfg(target_os = "linux")]
 pub mod uninstall;
+#[cfg(target_os = "macos")]
+pub mod uninstall_macos;
+pub mod single_instance;
 pub mod update;
 
 /// Set when the process begins a graceful shutdown (SIGINT/SIGTERM, control

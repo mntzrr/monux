@@ -32,9 +32,9 @@ const MOTION_HISTORY_LEN: usize = 32;
 /// is immediately superseded by the next one. Buttons, wheel, and absolute axes
 /// must NOT be lost or reordered and always stay on the ordered stream.
 pub fn is_pure_pointer_motion(events: &[event::InputEvent]) -> bool {
-    const EV_REL: u16 = evdev::EventType::RELATIVE.0;
-    const REL_X: u16 = evdev::RelativeAxisCode::REL_X.0;
-    const REL_Y: u16 = evdev::RelativeAxisCode::REL_Y.0;
+    const EV_REL: u16 = crate::msgs::consts::EV_REL;
+    const REL_X: u16 = crate::msgs::consts::REL_X;
+    const REL_Y: u16 = crate::msgs::consts::REL_Y;
     !events.is_empty()
         && events.iter().all(|e| {
             e.inputf64.is_none()
@@ -124,7 +124,7 @@ impl MotionCoalescer {
     pub fn accumulate(&mut self, events: &[event::InputEvent]) {
         for e in events {
             if let Some(i) = &e.inputi32 {
-                if i.code == evdev::RelativeAxisCode::REL_X.0 {
+                if i.code == crate::msgs::consts::REL_X {
                     self.pending.0 = self.pending.0.saturating_add(i.value);
                 } else {
                     self.pending.1 = self.pending.1.saturating_add(i.value);
@@ -211,7 +211,7 @@ mod tests {
     fn rel(code: u16, value: i32) -> event::InputEvent {
         event::InputEvent {
             inputi32: Some(event::InputI32 {
-                type_: evdev::EventType::RELATIVE.0,
+                type_: crate::msgs::consts::EV_REL,
                 code,
                 value,
             }),
@@ -223,8 +223,8 @@ mod tests {
     fn deltas_sum_losslessly_until_taken() {
         let mut m = MotionCoalescer::new(MotionMode::Pinned(Some(Duration::from_millis(4))));
         assert!(!m.dirty());
-        let rel_x = evdev::RelativeAxisCode::REL_X.0;
-        let rel_y = evdev::RelativeAxisCode::REL_Y.0;
+        let rel_x = crate::msgs::consts::REL_X;
+        let rel_y = crate::msgs::consts::REL_Y;
         for (dx, dy) in [(3, -2), (1, 0), (-2, 5)] {
             m.accumulate(&[rel(rel_x, dx), rel(rel_y, dy)]);
         }
@@ -239,12 +239,12 @@ mod tests {
     #[test]
     fn a_frame_that_could_not_be_queued_is_retried_with_newer_motion_on_top() {
         let mut m = MotionCoalescer::new(MotionMode::Pinned(Some(Duration::from_millis(4))));
-        m.accumulate(&[rel(evdev::RelativeAxisCode::REL_X.0, 5)]);
+        m.accumulate(&[rel(crate::msgs::consts::REL_X, 5)]);
         let pending = m.take_pending();
         // The send didn't take it: put it back rather than losing the motion.
         m.restore_pending(pending);
         assert!(m.dirty());
-        m.accumulate(&[rel(evdev::RelativeAxisCode::REL_X.0, 2)]);
+        m.accumulate(&[rel(crate::msgs::consts::REL_X, 2)]);
         assert_eq!(m.take_pending(), (7, 0, 2));
     }
 
@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn a_switch_drops_everything_owed_to_the_old_target() {
         let mut m = MotionCoalescer::new(MotionMode::Pinned(Some(Duration::from_millis(4))));
-        m.accumulate(&[rel(evdev::RelativeAxisCode::REL_X.0, 9)]);
+        m.accumulate(&[rel(crate::msgs::consts::REL_X, 9)]);
         m.record_sent(9, 0, true);
         m.clear();
         assert!(!m.dirty());

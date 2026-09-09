@@ -38,6 +38,34 @@ use tracing::debug;
 
 use crate::control::{self, Diagnostics, Role};
 
+/// Shims over the platform autostart layers for the two probes that reference
+/// them; every other setup integration is already guarded by graceful
+/// runtime probes (journalctl, wl-copy, /dev/uinput, launchctl).
+#[cfg(target_os = "linux")]
+fn autostart_status_text() -> Option<String> {
+    crate::setup::autostart_status_text()
+}
+#[cfg(target_os = "macos")]
+fn autostart_status_text() -> Option<String> {
+    crate::setup_macos::autostart_status_text()
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn autostart_status_text() -> Option<String> {
+    None
+}
+#[cfg(target_os = "linux")]
+fn unit_name_for(role: &str) -> String {
+    crate::setup::unit_name_for(role)
+}
+#[cfg(target_os = "macos")]
+fn unit_name_for(role: &str) -> String {
+    format!("{}.plist", crate::setup_macos::label_for_str(role))
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn unit_name_for(role: &str) -> String {
+    format!("monux-{}.service", role)
+}
+
 /// Where a user files what this module produces.
 pub const ISSUE_URL: &str = "https://github.com/mntzrr/monux/issues";
 
@@ -109,10 +137,12 @@ const JOURNAL_LINE_LIMIT: usize = 400;
 /// Longest we wait for `journalctl` to answer. It reads a local journal, so
 /// this only trips when the journal is enormous or the disk is stalled —
 /// neither should hold a bug report hostage.
+#[cfg(target_os = "linux")]
 const JOURNAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Longest we wait for a short read-only probe (`systemctl`, `id`, `uname`)
 /// while collecting the environment.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // tests use it on every platform
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 // ---------------------------------------------------------------------------
@@ -189,7 +219,7 @@ impl Environment {
             uinput: describe_uinput(),
             input_group: describe_input_group(),
             clipboard_tools: describe_clipboard_tools(),
-            autostart: crate::setup::autostart_status_text(),
+            autostart: autostart_status_text(),
             hostname: hostname(),
             username: username(),
             caveat: None,
@@ -333,6 +363,7 @@ fn path_is_writable(path: &Path) -> bool {
 }
 
 fn describe_input_group() -> String {
+    #[cfg(target_os = "linux")]
     match probe("id", &["-nG"]) {
         Ok(groups) if crate::setup::groups_contain(&groups, "input") => "member".to_string(),
         Ok(_) => "NOT a member — run 'monux setup', then log out and back in".to_string(),
@@ -341,6 +372,8 @@ fn describe_input_group() -> String {
             "could not query".to_string()
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    "not applicable on this platform".to_string()
 }
 
 /// Which clipboard tools the bundle-copy path can use. Absent tools are worth
@@ -352,7 +385,10 @@ fn describe_clipboard_tools() -> String {
         .filter(|tool| which(tool).is_some())
         .collect();
     if found.is_empty() {
-        "none (tried wl-copy, xclip, xsel)".to_string()
+        #[cfg(target_os = "macos")]
+        return "none (tried pbcopy)".to_string();
+        #[cfg(not(target_os = "macos"))]
+        return "none (tried wl-copy, xclip, xsel)".to_string();
     } else {
         found.join(", ")
     }
@@ -390,16 +426,20 @@ pub struct JournalCapture {
     pub note: Option<String>,
 }
 
-/// Pulls the role's unit log out of the user journal.
+/// Pulls the role's unit log out of the user journal (Linux), or tails the
+/// LaunchAgent's own captured log file (macOS).
 ///
 /// This is the half of the log story the in-memory ring cannot tell: the ring
 /// holds a bounded tail of the LIVE daemon, so it covers neither history that
 /// scrolled past nor — the case that matters most — a daemon that crashed,
-/// whose ring died with it. `--user` matches where `setup --autostart`
-/// installs its units; a system-wide or non-systemd install degrades to a
-/// note explaining where to look instead.
+/// whose ring died with it. On Linux `--user` matches where `setup
+/// --autostart` installs its units; a system-wide or non-systemd install
+/// degrades to a note explaining where to look instead. On macOS the same
+/// role is served by the launchd-captured stdout/stderr at
+/// ~/Library/Logs/monux/<role>.log.
+#[cfg(target_os = "linux")]
 pub fn journal_capture(role: Role, since: &str) -> JournalCapture {
-    let unit = crate::setup::unit_name_for(role.as_str());
+    let unit = unit_name_for(role.as_str());
     let mut capture = JournalCapture {
         unit: unit.clone(),
         since: since.to_string(),
@@ -461,6 +501,53 @@ pub fn journal_capture(role: Role, since: &str) -> JournalCapture {
         }
     }
     capture
+}
+
+/// macOS twin of the Linux journal capture: tails the LaunchAgent's
+/// launchd-captured stdout/stderr at ~/Library/Logs/monux/<role>.log — the
+/// only place a crashed daemon's history survives on this platform. The
+/// `--since` window has no file equivalent, so the note says so rather than
+/// silently pretending it applied.
+#[cfg(target_os = "macos")]
+pub fn journal_capture(role: Role, since: &str) -> JournalCapture {
+    let home = home::home_dir().unwrap_or_default();
+    let path = crate::setup_macos::logs_dir(&home).join(format!("{}.log", role.as_str()));
+    let mut capture = JournalCapture {
+        unit: format!("{}.log", crate::setup_macos::label_for_str(role.as_str())),
+        since: since.to_string(),
+        lines: Vec::new(),
+        note: None,
+    };
+    capture.note = Some(format!(
+        "macOS: launchd-captured agent log tail ({}, no --since filtering); for the full log run: tail -n 2000 {}",
+        path.display(),
+        path.display()
+    ));
+    match log_tail(&path, JOURNAL_LINE_LIMIT) {
+        Ok(lines) => capture.lines = lines,
+        Err(e) => {
+            capture.note = Some(format!(
+                "could not read {} ({:?}); attach the agent log by hand",
+                path.display(),
+                e
+            ));
+        }
+    }
+    capture
+}
+
+/// The last `max` lines of a log file (whole file when shorter).
+#[cfg(target_os = "macos")]
+fn log_tail(path: &std::path::Path, max: usize) -> std::io::Result<Vec<String>> {
+    let content = std::fs::read_to_string(path)?;
+    let lines: Vec<String> = content
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    let start = lines.len().saturating_sub(max);
+    Ok(lines[start..].to_vec())
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,6 +1147,11 @@ fn username() -> Option<String> {
 // Delivery
 // ---------------------------------------------------------------------------
 
+/// Clipboard tools in priority order: wl-copy (Wayland), then xclip/xsel
+/// (X11) on Linux; pbcopy on macOS.
+#[cfg(target_os = "macos")]
+const CLIPBOARD_TOOLS: [(&str, &[&str]); 1] = [("pbcopy", &[])];
+#[cfg(not(target_os = "macos"))]
 const CLIPBOARD_TOOLS: [(&str, &[&str]); 3] = [
     ("wl-copy", &[]),
     ("xclip", &["-selection", "clipboard"]),
@@ -1081,6 +1173,9 @@ pub fn copy_to_clipboard(text: &str) -> Result<&'static str> {
             Err(e) => debug!("Diagnostics: {} failed: {:?}", tool, e),
         }
     }
+    #[cfg(target_os = "macos")]
+    bail!("no clipboard tool available (tried pbcopy)");
+    #[cfg(not(target_os = "macos"))]
     bail!("no clipboard tool available (tried wl-copy, xclip, xsel)");
 }
 
@@ -1161,6 +1256,7 @@ fn wait_with_timeout(
 /// Runs a short read-only probe, returning stdout regardless of exit status
 /// (`systemctl is-enabled` answers "disabled" with exit 1). Only a spawn
 /// failure is an error.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // tests use it on every platform
 fn probe(program: &str, args: &[&str]) -> Result<String> {
     probe_with_timeout(program, args, PROBE_TIMEOUT)
 }
@@ -1264,7 +1360,7 @@ pub fn run_cli(opts: &CliOptions) -> Result<String> {
     let journal = match &opts.journal_since {
         Some(since) => journal_capture(role, since),
         None => JournalCapture {
-            unit: crate::setup::unit_name_for(role.as_str()),
+            unit: unit_name_for(role.as_str()),
             since: "skipped".to_string(),
             lines: Vec::new(),
             note: Some("journal collection was disabled with --no-journal".to_string()),

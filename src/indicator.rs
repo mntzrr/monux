@@ -44,43 +44,60 @@
 //!
 //! The tooltip carries the details ("monux: input on 192.168.1.102", per-client
 //! rtt/uptime, clipboard owner, update availability, the last action's error).
+//!
+//! Everything up to and including `menu_rows` is RENDERER-INDEPENDENT and
+//! shared with the macOS tray (indicator_macos.rs): the poll, the view, the
+//! menu model and the action requests. Only the ksni rendering below is
+//! Linux-specific.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
-use tracing::{debug, info, warn};
+use anyhow::{anyhow, Context, Result};
+#[cfg(target_os = "linux")]
+use anyhow::bail;
+use tracing::debug;
+#[cfg(target_os = "linux")]
+use tracing::{info, warn};
 
+#[cfg(target_os = "linux")]
 use ksni::blocking::TrayMethods;
 
+#[cfg(target_os = "linux")]
 use crate::control::{self, Diagnostics, Role, ServerState, State};
+#[cfg(not(target_os = "linux"))]
+use crate::control::{self, Role, ServerState, State};
+#[cfg(target_os = "linux")]
 use crate::diagnostics;
+#[cfg(target_os = "linux")]
 use crate::notify::{self, Urgency};
 
 /// How often the indicator re-queries the daemon's control socket.
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// A client link above this RTT (ms) counts as degraded: RED icon (server
 /// role only; see module docs for the precise color rules).
 const DEGRADED_RTT_MS: u64 = 50;
 
 /// Tray icon edge length in pixels (square ARGB pixmap).
+#[cfg(target_os = "linux")]
 const ICON_SIZE: i32 = 22;
 
 /// Dot colors, as (R, G, B). The alpha channel is always fully opaque.
-const GREEN: (u8, u8, u8) = (0x2e, 0xcc, 0x40);
-const BLUE: (u8, u8, u8) = (0x33, 0x7e, 0xf6);
-const GREY: (u8, u8, u8) = (0x96, 0x96, 0x96);
-const RED: (u8, u8, u8) = (0xe6, 0x28, 0x28);
+/// Shared with the macOS tray, which tints a glyph with these instead of
+/// drawing a pixmap.
+pub(crate) const GREEN: (u8, u8, u8) = (0x2e, 0xcc, 0x40);
+pub(crate) const BLUE: (u8, u8, u8) = (0x33, 0x7e, 0xf6);
+pub(crate) const GREY: (u8, u8, u8) = (0x96, 0x96, 0x96);
+pub(crate) const RED: (u8, u8, u8) = (0xe6, 0x28, 0x28);
 
 /// Notification id for indicator messages (replaces, never stacks — see
 /// notify.rs).
-const NOTIFY_ID: &str = "monux-indicator";
+pub(crate) const NOTIFY_ID: &str = "monux-indicator";
 
 /// The icon's semantic color; mapping rules are in the module docs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IconColor {
+pub(crate) enum IconColor {
     Green,
     Blue,
     Grey,
@@ -90,7 +107,7 @@ enum IconColor {
 }
 
 /// Maps daemon state to the icon color (see module docs).
-fn color_of(state: &State) -> IconColor {
+pub(crate) fn color_of(state: &State) -> IconColor {
     match state {
         State::Server(s) => {
             if s.clients
@@ -120,7 +137,7 @@ fn color_of(state: &State) -> IconColor {
 }
 
 /// How the last status poll went, as far as the view and the menu care.
-enum DaemonStatus {
+pub(crate) enum DaemonStatus {
     /// A full snapshot to render.
     Up(State),
     /// The socket ANSWERED but had no usable state (ok:false, e.g. "state
@@ -135,18 +152,18 @@ enum DaemonStatus {
 }
 
 /// What the indicator renders right now.
-struct View {
-    color: IconColor,
+pub(crate) struct View {
+    pub(crate) color: IconColor,
     /// Tooltip title ("monux: input on 10.0.0.2:1213", ...).
-    title: String,
+    pub(crate) title: String,
     /// Tooltip body: role/version plus per-connection details.
-    details: String,
+    pub(crate) details: String,
     /// The last poll's outcome, for the menu.
-    status: DaemonStatus,
+    pub(crate) status: DaemonStatus,
 }
 
 impl View {
-    fn from_state(state: State) -> View {
+    pub(crate) fn from_state(state: State) -> View {
         View {
             color: color_of(&state),
             title: title_of(&state),
@@ -155,7 +172,7 @@ impl View {
         }
     }
 
-    fn not_running() -> View {
+    pub(crate) fn not_running() -> View {
         View {
             color: IconColor::Unknown,
             title: "monux: not running".to_string(),
@@ -272,7 +289,7 @@ fn details_of(state: &State) -> String {
 /// One row of the tray menu, before conversion to ksni types. Unit tests
 /// check this model; the ksni conversion (to_ksni_menu) is mechanical.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum MenuRow {
+pub(crate) enum MenuRow {
     /// A disabled informative row.
     Label(String),
     /// A row triggering a control-socket action; `enabled: false` renders it
@@ -287,7 +304,7 @@ enum MenuRow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum MenuAction {
+pub(crate) enum MenuAction {
     SwitchLocal,
     /// Switch to the client with this (full) fingerprint.
     SwitchTo(String),
@@ -314,7 +331,8 @@ enum MenuAction {
 
 impl MenuAction {
     /// Short name for error messages and notifications.
-    fn label(&self) -> &'static str {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn label(&self) -> &'static str {
         match self {
             MenuAction::SwitchLocal => "Switch to local",
             MenuAction::SwitchTo(_) => "Switch",
@@ -335,7 +353,7 @@ impl MenuAction {
 /// Builds the menu model for the current poll outcome (see the module docs
 /// and the phase spec: dynamic per state, switch/pause rows on the server
 /// socket only).
-fn menu_rows(status: &DaemonStatus) -> Vec<MenuRow> {
+pub(crate) fn menu_rows(status: &DaemonStatus) -> Vec<MenuRow> {
     let mut rows = Vec::new();
     match status {
         DaemonStatus::Silent => {
@@ -522,6 +540,7 @@ fn menu_rows(status: &DaemonStatus) -> Vec<MenuRow> {
 
 /// Converts the menu model to ksni items; action closures dispatch through
 /// run_action.
+#[cfg(target_os = "linux")]
 fn to_ksni_menu(rows: Vec<MenuRow>) -> Vec<ksni::menu::MenuItem<MonuxTray>> {
     use ksni::menu::{MenuItem, StandardItem};
     rows.into_iter()
@@ -550,6 +569,7 @@ fn to_ksni_menu(rows: Vec<MenuRow>) -> Vec<ksni::menu::MenuItem<MonuxTray>> {
 
 /// Draws a filled circle with a 2px transparent margin. ARGB32 in network
 /// byte order (A, R, G, B per pixel), as the SNI pixmap format requires.
+#[cfg(target_os = "linux")]
 fn dot_pixmap(size: i32, rgb: (u8, u8, u8)) -> Vec<u8> {
     let mut data = vec![0u8; (size * size * 4) as usize];
     let center = (size as f32 - 1.0) / 2.0;
@@ -573,11 +593,13 @@ fn dot_pixmap(size: i32, rgb: (u8, u8, u8)) -> Vec<u8> {
 /// 5x7 bitmap of '?', one bit per pixel (MSB is the leftmost pixel), scaled
 /// up by 2 when rendered — the "hollow" unknown state (no font rendering
 /// involved).
+#[cfg(target_os = "linux")]
 const QUESTION_GLYPH: [u8; 7] = [
     0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b00000, 0b00100,
 ];
 
 /// Draws the grey "?" glyph (scaled 2x, centered) on a transparent canvas.
+#[cfg(target_os = "linux")]
 fn question_pixmap(size: i32, rgb: (u8, u8, u8)) -> Vec<u8> {
     const SCALE: i32 = 2;
     let mut data = vec![0u8; (size * size * 4) as usize];
@@ -604,6 +626,7 @@ fn question_pixmap(size: i32, rgb: (u8, u8, u8)) -> Vec<u8> {
     data
 }
 
+#[cfg(target_os = "linux")]
 fn icon_for(color: IconColor) -> ksni::Icon {
     let data = match color {
         IconColor::Green => dot_pixmap(ICON_SIZE, GREEN),
@@ -622,6 +645,7 @@ fn icon_for(color: IconColor) -> ksni::Icon {
 /// The ksni tray object. Mutated only on ksni's service thread (menu
 /// callbacks and Handle::update closures both run there), so no locking is
 /// needed.
+#[cfg(target_os = "linux")]
 struct MonuxTray {
     view: View,
     /// The control socket that last answered a status poll; menu actions go
@@ -633,6 +657,7 @@ struct MonuxTray {
     note: Option<String>,
 }
 
+#[cfg(target_os = "linux")]
 impl MonuxTray {
     fn new() -> Self {
         MonuxTray {
@@ -650,6 +675,7 @@ impl MonuxTray {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl ksni::Tray for MonuxTray {
     // There is no window to activate: a left click opens the menu.
     const MENU_ON_ACTIVATE: bool = true;
@@ -695,7 +721,7 @@ impl ksni::Tray for MonuxTray {
 /// state (ok:false, e.g. "state not available yet") yields the starting
 /// view with the socket kept bound — the daemon is alive, just not ready.
 /// (None, not-running view) only when no daemon answers at all.
-fn poll() -> (Option<PathBuf>, View) {
+pub(crate) fn poll() -> (Option<PathBuf>, View) {
     for role in [Role::Server, Role::Client] {
         let path = control::socket_path(role);
         if !path.exists() {
@@ -736,7 +762,7 @@ fn poll() -> (Option<PathBuf>, View) {
 
 /// Validates a response line and returns the parsed body. An `ok:false`
 /// response becomes an Err carrying the daemon's error string.
-fn parse_ok(raw: &str, socket: &Path) -> Result<serde_json::Value> {
+pub(crate) fn parse_ok(raw: &str, socket: &Path) -> Result<serde_json::Value> {
     let v: serde_json::Value = serde_json::from_str(raw)
         .with_context(|| format!("Malformed response from {}", socket.display()))?;
     if v.get("ok").and_then(|ok| ok.as_bool()) == Some(true) {
@@ -751,12 +777,12 @@ fn parse_ok(raw: &str, socket: &Path) -> Result<serde_json::Value> {
 }
 
 /// Sends a command and checks the ack; the daemon's error string propagates.
-fn send_command(socket: &Path, request: &str) -> Result<()> {
+pub(crate) fn send_command(socket: &Path, request: &str) -> Result<()> {
     let raw = control::request_line(socket, request)?;
     parse_ok(&raw, socket).map(|_| ())
 }
 
-fn action_request(action: &MenuAction) -> String {
+pub(crate) fn action_request(action: &MenuAction) -> String {
     match action {
         MenuAction::SwitchLocal => r#"{"cmd":"switch","target":"local"}"#.to_string(),
         MenuAction::SwitchTo(fingerprint) => {
@@ -793,10 +819,15 @@ fn action_request(action: &MenuAction) -> String {
 /// icon on screen with the row having reported success, so the indicator
 /// takes itself off the tray instead. The daemon's deferred hide() still
 /// flips `hidden`, so the exit is not mistaken for a crash and respawned.
-fn exits_after_ack(action: &MenuAction) -> bool {
+///
+/// (The macOS renderer encodes the same contract directly in its Hide tag,
+/// so on that platform this helper has no non-test caller.)
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+pub(crate) fn exits_after_ack(action: &MenuAction) -> bool {
     matches!(action, MenuAction::HideTray)
 }
 
+#[cfg(target_os = "linux")]
 /// Runs one menu action against the bound socket, then re-polls immediately
 /// so the icon and menu reflect the effect — including the daemon vanishing
 /// after restart/exit, which simply lands on the not-running view until the
@@ -838,6 +869,7 @@ fn run_action(tray: &mut MonuxTray, action: &MenuAction) {
     tray.refresh();
 }
 
+#[cfg(target_os = "linux")]
 /// How to start a daemon role from the not-running menu: through the
 /// autostart unit when one is installed (systemd then owns restarts and the
 /// login lifecycle), otherwise by spawning `monux <role>` detached.
@@ -849,6 +881,7 @@ enum StartHow {
     Spawn(Role),
 }
 
+#[cfg(target_os = "linux")]
 /// The start decision, pure over the pre-probed unit path (testable without
 /// touching the home dir or systemd).
 fn start_decision(unit_path: Option<&Path>, role: Role) -> StartHow {
@@ -858,6 +891,7 @@ fn start_decision(unit_path: Option<&Path>, role: Role) -> StartHow {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// The autostart unit path for a role (~/.config/systemd/user/monux-<role>.service,
 /// the same path `monux setup --autostart <role>` writes).
 fn unit_path(role: Role) -> Option<PathBuf> {
@@ -868,6 +902,7 @@ fn unit_path(role: Role) -> Option<PathBuf> {
     )
 }
 
+#[cfg(target_os = "linux")]
 /// Starts a daemon role from the not-running menu (see start_decision). On
 /// success nothing more is done: the daemon appears within seconds and the
 /// poll loop transitions to the normal state by itself — and the daemon's
@@ -893,6 +928,7 @@ fn start_daemon(role: Role) -> Result<()> {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// `systemctl --user start <unit>` — starts the autostart-installed daemon.
 /// The stderr text propagates on failure (no user manager, unit failed to
 /// start) so the tray notification says something useful.
@@ -912,12 +948,14 @@ fn start_via_systemctl(unit_name: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 /// A daemon that dies within this long of being spawned never got past
 /// startup — no uinput/evdev permissions, the port already bound, a config
 /// it refused. Anything later is the daemon's own lifecycle and none of the
 /// launcher's business to report.
 const DAEMON_STARTUP_GRACE: Duration = Duration::from_secs(3);
 
+#[cfg(target_os = "linux")]
 /// What to tell the user about a spawned daemon that exited, or None when
 /// the exit is not a failed start. A clean exit never is: the started daemon
 /// spawns its own indicator, which takes the single-instance lock and
@@ -939,6 +977,7 @@ fn startup_failure_note(
     ))
 }
 
+#[cfg(target_os = "linux")]
 /// Spawns `monux <role>` detached: our own binary re-run as the daemon,
 /// stdin null and output dropped (the daemon outlives this indicator, so it
 /// must not hold our stdio handles open). Unsupervised: the indicator is not
@@ -969,6 +1008,7 @@ fn spawn_daemon(role: Role) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 /// Fetches the diagnostics bundle from the daemon and copies it to the
 /// desktop clipboard; returns the clipboard tool that worked.
 ///
@@ -1005,6 +1045,7 @@ fn copy_diagnostics(socket: &Path) -> Result<&'static str> {
     diagnostics::copy_to_clipboard(&text)
 }
 
+#[cfg(target_os = "linux")]
 /// Runs the indicator until the tray service shuts down. With no D-Bus
 /// session bus or no StatusNotifierItem host (headless TTY), fails with a
 /// clean error — main turns that into exit code 1. A missing monux daemon is
@@ -1035,6 +1076,7 @@ mod tests {
 
     fn server_state(paused: bool, target: &str, clients: Vec<(&str, Option<u64>)>) -> State {
         State::Server(ServerState {
+            pending_approvals: Vec::new(),
             version: "1.5.0".to_string(),
             protocol_version: 8,
             listen: "10.0.0.1:1213".to_string(),
@@ -1060,6 +1102,7 @@ mod tests {
 
     fn client_state(connected: bool, active: bool) -> State {
         State::Client(ClientState {
+            pending_approvals: Vec::new(),
             version: "1.5.0".to_string(),
             protocol_version: 8,
             server: "10.0.0.1:1213".to_string(),
@@ -1336,25 +1379,6 @@ mod tests {
     }
 
     #[test]
-    fn start_decision_prefers_the_unit_when_installed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let unit = tmp.path().join("monux-server.service");
-        std::fs::write(&unit, "[Unit]\n").unwrap();
-        // Unit file present: systemd starts the daemon.
-        assert_eq!(
-            start_decision(Some(&unit), Role::Server),
-            StartHow::Systemctl(unit.clone())
-        );
-        // Unit file absent (or the home dir unresolvable): detached spawn.
-        let missing = tmp.path().join("monux-client.service");
-        assert_eq!(
-            start_decision(Some(&missing), Role::Client),
-            StartHow::Spawn(Role::Client)
-        );
-        assert_eq!(start_decision(None, Role::Server), StartHow::Spawn(Role::Server));
-    }
-
-    #[test]
     fn hiding_the_tray_ends_this_process_daemon_or_not() {
         // The daemon acks a hide it may have nothing to enforce with: it only
         // SIGTERMs the indicator it spawned itself, which is nobody under
@@ -1377,6 +1401,35 @@ mod tests {
         ] {
             assert!(!exits_after_ack(&action), "{:?} must not exit", action);
         }
+    }
+
+    // Bundle formatting and the clipboard plumbing moved to diagnostics.rs,
+    // which the CLI shares; their tests moved with them.
+}
+/// Linux-only: the ksni rendering and the systemd launcher, tested here so
+/// `cargo test` on Linux exercises them (the shared model tests above build
+/// on macOS too).
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+
+    #[test]
+    fn start_decision_prefers_the_unit_when_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = tmp.path().join("monux-server.service");
+        std::fs::write(&unit, "[Unit]\n").unwrap();
+        // Unit file present: systemd starts the daemon.
+        assert_eq!(
+            start_decision(Some(&unit), Role::Server),
+            StartHow::Systemctl(unit.clone())
+        );
+        // Unit file absent (or the home dir unresolvable): detached spawn.
+        let missing = tmp.path().join("monux-client.service");
+        assert_eq!(
+            start_decision(Some(&missing), Role::Client),
+            StartHow::Spawn(Role::Client)
+        );
+        assert_eq!(start_decision(None, Role::Server), StartHow::Spawn(Role::Server));
     }
 
     #[test]
@@ -1444,6 +1497,5 @@ mod tests {
         assert_eq!(data[0], 0);
     }
 
-    // Bundle formatting and the clipboard plumbing moved to diagnostics.rs,
-    // which the CLI shares; their tests moved with them.
 }
+

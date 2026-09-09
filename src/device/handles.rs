@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use evdev::{Device, EventStream, KeyCode};
+use evdev::{Device, EventStream};
 use tokio::sync::watch;
 use tokio::task;
 use tracing::debug;
@@ -43,14 +43,14 @@ pub struct DeviceHandles<H: DeviceHandler> {
     grab_tx: watch::Sender<device::GrabState>,
 
     /// All distinct keys used in client switch key combos, for internal accounting.
-    all_combo_keys: HashSet<KeyCode>,
+    all_combo_keys: HashSet<u16>,
 }
 
 impl<H: DeviceHandler> DeviceHandles<H> {
     pub fn new(
         handler: H,
         grab_tx: watch::Sender<device::GrabState>,
-        all_combo_keys: HashSet<KeyCode>,
+        all_combo_keys: HashSet<u16>,
     ) -> DeviceHandles<H> {
         DeviceHandles {
             always_grabbed_devices: HashMap::<PathBuf, DeviceHandle>::new(),
@@ -132,10 +132,10 @@ impl<H: DeviceHandler> DeviceHandles<H> {
     }
 }
 
-fn supports_any_keys(d: &Device, all_combo_keys: &HashSet<KeyCode>) -> bool {
+fn supports_any_keys(d: &Device, all_combo_keys: &HashSet<u16>) -> bool {
     if let Some(device_keys) = d.supported_keys() {
         for key in all_combo_keys.iter() {
-            if device_keys.contains(*key) {
+            if device_keys.contains(evdev::KeyCode::new(*key)) {
                 return true;
             }
         }

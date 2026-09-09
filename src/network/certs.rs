@@ -132,7 +132,19 @@ fn write_new_keypair<'a>(
     splash_label: &str,
     file_path: &PathBuf,
 ) -> Result<(rustls_pki_types::CertificateDer<'a>, rustls_pki_types::PrivateKeyDer<'a>)> {
-    let pair = rcgen::generate_simple_self_signed(vec![])
+    // The CN carries this machine's hostname so a peer can caption an
+    // approval request with more than an IP address (see common_name). It is
+    // a display hint, not an identity: peers authenticate by fingerprint.
+    let mut params = rcgen::CertificateParams::new(vec![])
+        .context("Failed to set up certificate parameters")?;
+    if let Ok(host) = crate::discovery::get_hostname() {
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::CommonName, host);
+        params.distinguished_name = dn;
+    }
+    let signing_key = rcgen::KeyPair::generate().context("Failed to generate key")?;
+    let cert = params
+        .self_signed(&signing_key)
         .context("Failed to generate self-signed cert")?;
 
     info!("Writing a new keypair to {}", file_path.display());
@@ -161,10 +173,10 @@ fn write_new_keypair<'a>(
         )
     })?;
     outfile
-        .write_all(pair.cert.pem().as_bytes())
+        .write_all(cert.pem().as_bytes())
         .with_context(|| format!("Failed to write public key to file: {}", tmp_path.display()))?;
     outfile
-        .write_all(pair.signing_key.serialize_pem().as_bytes())
+        .write_all(signing_key.serialize_pem().as_bytes())
         .with_context(|| format!("Failed to write private key to file: {}", tmp_path.display()))?;
     fs::rename(&tmp_path, file_path).with_context(|| {
         format!(
@@ -173,12 +185,47 @@ fn write_new_keypair<'a>(
         )
     })?;
 
-    let rustls_cert = rustls_pki_types::CertificateDer::from(pair.cert.der().to_vec());
+    let rustls_cert = rustls_pki_types::CertificateDer::from(cert.der().to_vec());
     splash(splash_label, &fingerprint(&rustls_cert));
     Ok((
         rustls_cert,
-        rustls_pki_types::PrivateKeyDer::from(rustls_pki_types::PrivatePkcs8KeyDer::from(pair.signing_key.serialize_der())),
+        rustls_pki_types::PrivateKeyDer::from(rustls_pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der())),
     ))
+}
+
+/// The CommonName of a certificate, when it carries a meaningful one.
+///
+/// New keypairs get this machine's hostname as CN (see write_new_keypair), so
+/// approval listings can caption a knocking peer with more than an address.
+/// Keypairs from before that carry rcgen's placeholder CN, which identifies
+/// nothing — those report None rather than a name every old cert shares.
+///
+/// Hand-rolled DER scan (the CN's attribute value directly follows its
+/// 2.5.4.3 OID; the x509-parser dependency isn't worth one field): bounded
+/// reads throughout, anything malformed simply reports None. Display hint
+/// only — identity is the fingerprint.
+pub fn common_name(cert: &rustls_pki_types::CertificateDer) -> Option<String> {
+    const CN_OID: &[u8] = &[0x06, 0x03, 0x55, 0x04, 0x03];
+    const PLACEHOLDER: &str = "rcgen self signed cert";
+    let der = cert.as_ref();
+    let mut i = 0;
+    while i + CN_OID.len() < der.len() {
+        if &der[i..i + CN_OID.len()] == CN_OID {
+            let tag = der[i + CN_OID.len()];
+            // UTF8String / PrintableString / IA5String values only.
+            if matches!(tag, 0x0C | 0x13 | 0x16) {
+                let len = *der.get(i + CN_OID.len() + 1)? as usize;
+                let start = i + CN_OID.len() + 2;
+                let end = start.checked_add(len)?;
+                let name = std::str::from_utf8(der.get(start..end)?).ok()?;
+                if !name.is_empty() && name != PLACEHOLDER {
+                    return Some(name.to_string());
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Returns the sha256 fingerprint of this certificate.
@@ -279,6 +326,25 @@ mod tests {
         assert!(privkey1 == privkey2);
         // The atomic tmp+rename must not leave scratch files behind.
         assert!(!dir.path().join("private.pem.tmp").exists());
+    }
+
+    #[test]
+    fn new_keypairs_carry_the_hostname_as_common_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, _) = load_keypair("test", dir.path()).expect("couldn't generate");
+        let host = crate::discovery::get_hostname().expect("hostname");
+        assert_eq!(common_name(&cert).as_deref(), Some(host.as_str()));
+    }
+
+    #[test]
+    fn placeholder_and_malformed_common_names_report_none() {
+        // Old keypairs: rcgen's default placeholder identifies nothing.
+        let old = rcgen::generate_simple_self_signed(vec![]).unwrap();
+        let old_der = rustls_pki_types::CertificateDer::from(old.cert.der().to_vec());
+        assert_eq!(common_name(&old_der), None);
+        // Garbage DER: bounded reads degrade to None, never panic.
+        assert_eq!(common_name(&rustls_pki_types::CertificateDer::from(vec![0x06, 0x03, 0x55, 0x04, 0x03, 0x0C])), None);
+        assert_eq!(common_name(&rustls_pki_types::CertificateDer::from(vec![])), None);
     }
 
     #[test]
