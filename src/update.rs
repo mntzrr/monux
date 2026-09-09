@@ -746,11 +746,16 @@ pub fn run(
         bail!("cargo install failed");
     }
     let _ = std::fs::remove_dir_all(&build_dir);
-    place_binary_atomically(
-        &staging.join("bin").join("monux"),
-        &root.join("bin").join("monux"),
-    )?;
+    let installed = root.join("bin").join("monux");
+    place_binary_atomically(&staging.join("bin").join("monux"), &installed)?;
     let _ = std::fs::remove_dir_all(&staging);
+    // macOS: re-sign with the stable self-signed identity install.sh creates.
+    // The Accessibility (TCC) grant is keyed to the code signature, so
+    // skipping this silently kills keyboard/mouse control after the update.
+    #[cfg(target_os = "macos")]
+    if let Err(warning) = resign_installed_binary(&installed) {
+        warn!("{}", warning);
+    }
     // The 'mx' shorthand lives next to the binary (a relative symlink, so the
     // atomic rename above keeps it valid). Never fail the update over it.
     match crate::alias::ensure(&root.join("bin")) {
@@ -1291,6 +1296,60 @@ fn install_root() -> PathBuf {
 /// old or the new binary intact, never a partial one. The staging dir lives
 /// inside the install root, so the two paths are always on the same
 /// filesystem (renames across filesystems would fail rather than copy).
+/// macOS: re-sign the freshly installed binary with the stable self-signed
+/// identity install.sh creates (`monux-code-signing`). The Accessibility
+/// (TCC) grant is keyed to the code signature: the cargo-installed binary is
+/// ad-hoc signed, which launches fine but no longer matches any earlier
+/// grant — input injection would die silently. Ad-hoc re-signing is the
+/// fallback (it at least keeps the binary launchable); the error text is
+/// what the user sees, so it carries the fix, not just the failure.
+#[cfg(target_os = "macos")]
+fn resign_installed_binary(path: &Path) -> Result<()> {
+    const IDENTITY: &str = "monux-code-signing";
+    let signed = Command::new("codesign")
+        .args(["--force", "-s", IDENTITY])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .status();
+    match signed {
+        Ok(status) if status.success() => {
+            info!(
+                "Re-signed {} with '{}' (the Accessibility grant survives updates)",
+                path.display(),
+                IDENTITY
+            );
+            Ok(())
+        }
+        signed => {
+            // No identity (fresh machine, or install.sh never ran): fall back
+            // to ad-hoc so the binary stays launchable, and say what was lost.
+            let adhoc = Command::new("codesign")
+                .args(["--force", "-s", "-"])
+                .arg(path)
+                .stdin(std::process::Stdio::null())
+                .status();
+            let launchable = matches!(adhoc, Ok(s) if s.success());
+            let hint =
+                "re-run install.sh once to create the signing identity, then re-grant monux in System Settings → Privacy & Security → Accessibility";
+            match signed {
+                Ok(status) => bail!(
+                    "could not sign with '{}' (codesign exited with {}); {}{}",
+                    IDENTITY,
+                    status,
+                    if launchable { "the binary is ad-hoc signed but the Accessibility permission was LOST — " } else { "the binary could not be signed — " },
+                    hint
+                ),
+                Err(e) => bail!(
+                    "could not run codesign ({}); the binary is unsigned and {} — {}",
+                    e,
+                    if launchable { "the Accessibility permission was lost" } else { "may be killed by the kernel on arm64" },
+                    hint
+                ),
+            }
+        }
+    }
+}
+
 fn place_binary_atomically(from: &Path, to: &Path) -> Result<()> {
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)

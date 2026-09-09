@@ -102,16 +102,18 @@ Examples:
 
     /// Optimizes this machine for local KVM, persisting machine-local settings
     ///
-    /// No flags: applies everything ('input' group membership, /dev/uinput
-    /// permissions, WiFi power saving off, raised UDP socket buffers, DSCP
-    /// QoS marking) and re-executes with sudo automatically. ANY flag scopes
-    /// the run to that flag's actions only; '--autostart' manages a per-user
-    /// systemd unit and '--desktop-shortcut' a per-user app-menu entry, both
-    /// WITHOUT elevating.
+    /// Linux, no flags: applies everything ('input' group membership,
+    /// /dev/uinput permissions, WiFi power saving off, raised UDP socket
+    /// buffers, DSCP QoS marking) and re-executes with sudo automatically.
+    /// ANY flag scopes the run to that flag's actions only; '--autostart'
+    /// manages the per-user login service (a systemd unit on Linux, a
+    /// LaunchAgent on macOS) and '--desktop-shortcut' a per-user app-menu
+    /// entry, both WITHOUT elevating.
     #[command(after_long_help = "\
 Examples:
   monux setup                        # apply everything (elevates via sudo)
   monux setup --autostart server     # only install the login service (no sudo)
+  monux setup --autostart tray       # install the tray indicator's login service (macOS, no sudo)
   monux setup --autostart status     # report the autostart state (no sudo, read-only)
   monux setup --desktop-shortcut     # install the app-menu tray shortcut (no sudo)")]
     Setup(SetupArgs),
@@ -644,15 +646,18 @@ pub enum TrayAction {
 pub struct SetupArgs {
     /// Manage the login service (no sudo) [default: leave it alone]
     ///
-    /// Also (de)activate autostart via a per-user systemd service: 'server' or
-    /// 'client' writes ~/.config/systemd/user/monux-<role>.service and
-    /// enables+starts it (client runs without an address, using mDNS
-    /// auto-discovery); 'off' disables and removes both; 'status' prints a
-    /// read-only report for both roles (unit installed? enabled? running —
-    /// autostarted or manually?) and changes nothing. When omitted, no
-    /// autostart changes are made.
-    #[cfg(target_os = "linux")]
-    #[arg(long, value_enum, value_name = "server|client|status|off")]
+    /// Also (de)activate autostart via a per-user login service: 'server' or
+    /// 'client' installs and starts it (a systemd user unit
+    /// ~/.config/systemd/user/monux-<role>.service on Linux, a LaunchAgent
+    /// ~/Library/LaunchAgents/sh.monux.<role>.plist on macOS; client runs
+    /// without an address, using mDNS auto-discovery — the server role is
+    /// Linux-only); 'tray' installs the tray indicator's login service (a
+    /// LaunchAgent running 'monux gui indicator' — macOS only, where the
+    /// tray is not auto-spawned by the daemon); 'off' disables and removes
+    /// all of them; 'status' prints a read-only report (installed? enabled?
+    /// running — autostarted or manually?) and changes nothing. When
+    /// omitted, no autostart changes are made.
+    #[arg(long, value_enum, value_name = "server|client|tray|status|off")]
     pub autostart: Option<monux::setup::Autostart>,
 
     /// Install the 'monux tray' app-menu shortcut (no sudo)

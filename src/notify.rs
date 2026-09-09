@@ -27,6 +27,7 @@ pub enum Urgency {
 
 impl Urgency {
     #[cfg(not(test))]
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     fn as_str(self) -> &'static str {
         match self {
             Urgency::Low => "low",
@@ -44,28 +45,64 @@ impl Urgency {
 /// plain threads such as the tray indicator's menu-action callbacks.
 #[cfg(not(test))]
 pub fn notify(id: &str, urgency: Urgency, timeout_ms: u32, summary: &str, body: &str) {
-    let timeout = timeout_ms.to_string();
-    let hint = format!("string:x-canonical-private-synchronous:{}", id);
-    if let Ok(mut child) = Command::new("notify-send")
-        .args([
-            "-a",
-            "monux",
-            "-u",
-            urgency.as_str(),
-            "-t",
-            &timeout,
-            "-h",
-            &hint,
-            summary,
-            body,
-        ])
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (id, urgency, timeout_ms);
+        notify_macos(summary, body);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let timeout = timeout_ms.to_string();
+        let hint = format!("string:x-canonical-private-synchronous:{}", id);
+        if let Ok(mut child) = Command::new("notify-send")
+            .args([
+                "-a",
+                "monux",
+                "-u",
+                urgency.as_str(),
+                "-t",
+                &timeout,
+                "-h",
+                &hint,
+                summary,
+                body,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            // Reap the child so notify-send doesn't linger as a zombie for the
+            // lifetime of long-lived daemons (tokio::process used to reap for us).
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+}
+
+/// macOS delivery: osascript Notification Center, fire-and-forget like
+/// notify-send. The script text is escaped, not quoted raw — a body with a
+/// quote or backslash would otherwise break out of the AppleScript string.
+#[cfg(all(not(test), target_os = "macos"))]
+fn notify_macos(summary: &str, body: &str) {
+    let escape = |s: &str| {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    };
+    let script = format!(
+        "display notification {} with title {}",
+        escape(body),
+        escape(summary)
+    );
+    if let Ok(mut child) = Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
     {
-        // Reap the child so notify-send doesn't linger as a zombie for the
-        // lifetime of long-lived daemons (tokio::process used to reap for us).
+        // Reap, as with notify-send.
         std::thread::spawn(move || {
             let _ = child.wait();
         });

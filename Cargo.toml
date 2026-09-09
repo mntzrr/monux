@@ -79,6 +79,14 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 core-graphics = { version = "0.24", features = ["highsierra"] }
+# macOS tray indicator (indicator_macos.rs): NSStatusItem menu-bar app.
+# objc2-app-kit pulls its superclass features (NSResponder/NSControl/NSView)
+# transitively; dispatch2 services UI updates from the poll thread on the
+# main queue.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSDictionary", "NSAttributedString", "NSString", "NSTimer"] }
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSButton", "NSColor", "NSMenu", "NSMenuItem", "NSResponder", "NSStatusBar", "NSStatusItem", "NSText", "NSView"] }
+dispatch2 = "0.3"
 
 [dev-dependencies]
 tempfile = "3.10"

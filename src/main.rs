@@ -209,9 +209,9 @@ fn main() -> Result<()> {
             }
         },
         Commands::Setup(args) => {
+            cli_sigpipe_kill();
             #[cfg(target_os = "linux")]
             {
-                cli_sigpipe_kill();
                 // Elevate only when the selected steps need root: the base set
                 // (a no-flags run) persists root-owned system settings;
                 // --autostart/--desktop-shortcut manage per-user files and must
@@ -221,7 +221,13 @@ fn main() -> Result<()> {
                 }
                 return monux::setup::run(args.autostart, args.desktop_shortcut);
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            {
+                // LaunchAgents are per-user files in the invoking user's home:
+                // macOS setup never elevates (and has no root base set).
+                return monux::setup_macos::run(args.autostart, args.desktop_shortcut);
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             {
                 let _ = args;
                 bail!("'monux setup' manages Linux system integration (udev, kernel modules, systemd) and does not exist on this platform");
@@ -378,11 +384,48 @@ fn main() -> Result<()> {
             GuiCommands::Tray(args) => {
                 cli_sigpipe_kill();
                 let hide = matches!(args.action, TrayAction::Hide);
-                let out = monux::control::tray_cli(hide, args.socket.as_deref())?;
-                println!("{}", out);
-                return Ok(());
+                #[cfg(target_os = "macos")]
+                {
+                    // The tray is a launchd-managed LaunchAgent here, not a
+                    // daemon-supervised child: show/hide drive launchctl.
+                    let out = if hide {
+                        monux::setup_macos::tray_hide()?
+                    } else {
+                        monux::setup_macos::tray_show()?
+                    };
+                    println!("{}", out);
+                    return Ok(());
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let out = monux::control::tray_cli(hide, args.socket.as_deref())?;
+                    println!("{}", out);
+                    return Ok(());
+                }
             }
             GuiCommands::Indicator => {
+                #[cfg(target_os = "macos")]
+                {
+                    // One icon at all times: take over from any already-running
+                    // indicator (auto-spawned or manual).
+                    let _indicator_lock = match single_instance::acquire("indicator") {
+                        Ok(lock) => lock,
+                        Err(e) => {
+                            // Standing down for a live indicator is an orderly
+                            // outcome, not a failure: exit with the code that
+                            // says so, so a supervising daemon parks instead of
+                            // diagnosing a crash loop (indicator_spawn.rs).
+                            if let Some(yielded) = e.downcast_ref::<single_instance::Yielded>() {
+                                info!("{}; leaving the tray to it", yielded);
+                                std::process::exit(single_instance::EXIT_YIELDED);
+                            }
+                            return Err(e);
+                        }
+                    };
+                    return monux::indicator_macos::run();
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                bail!("the tray indicator does not exist on this platform");
                 #[cfg(target_os = "linux")]
                 {
                     // Headless sessions fail here, before touching the lock: no
@@ -412,18 +455,20 @@ fn main() -> Result<()> {
                     };
                     return monux::indicator::run();
                 }
-                #[cfg(not(target_os = "linux"))]
-                bail!("the tray indicator does not exist on this platform");
             }
         },
         Commands::System(args) => match &args.command {
             SystemCommands::Uninstall(args) => {
+                cli_sigpipe_kill();
                 #[cfg(target_os = "linux")]
                 {
-                    cli_sigpipe_kill();
                     return monux::uninstall::run(args.yes);
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(target_os = "macos")]
+                {
+                    return monux::uninstall_macos::run(args.yes);
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 {
                     let _ = args;
                     bail!("'monux system uninstall' removes Linux system integration and does not exist on this platform");
