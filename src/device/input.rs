@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use evdev::{EventStream, EventType, KeyCode};
+use evdev::{EventStream, EventType};
 use tokio::sync::{mpsc, watch};
 use tokio::task;
 use tokio::time;
@@ -124,7 +124,7 @@ impl InputHandler {
 }
 
 fn add_key_combo(
-    keymap: &mut HashMap<Vec<KeyCode>, Event>,
+    keymap: &mut HashMap<Vec<u16>, Event>,
     keysaction: &shortcut::KeyCombo,
 ) -> Result<()> {
     // Add combo to keymap, complain if an identical combo already exists
@@ -426,7 +426,7 @@ async fn handle_input_event(
         let mut any_consume = false;
         let mut fired: Vec<(usize, Event)> = Vec::new();
         for cs in c.combo_states.iter_mut() {
-            match cs.check_combo(&event) {
+            match cs.check_combo((event.event_type().0, event.code(), event.value())) {
                 shortcut::ComboAction::ConsumeEvent => {
                     any_consume = true;
                 }

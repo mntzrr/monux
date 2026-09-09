@@ -615,6 +615,7 @@ pub struct SetupArgs {
     /// read-only report for both roles (unit installed? enabled? running —
     /// autostarted or manually?) and changes nothing. When omitted, no
     /// autostart changes are made.
+    #[cfg(target_os = "linux")]
     #[arg(long, value_enum, value_name = "server|client|status|off")]
     pub autostart: Option<monux::setup::Autostart>,
 
@@ -781,6 +782,8 @@ impl ServerArgs {
     /// Fills config-capable fields left unset on the command line from the
     /// config file's [server] section: explicit flag > config file > built-in
     /// default (the default is applied at the use sites).
+    // Server-only entry point; macOS builds never construct a server.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn resolve(&mut self, cfg: &monux::config::File) {
         self.shortcut = self.shortcut.take().or_else(|| cfg.get_str("server.shortcut"));
         self.shortcut_prev = self

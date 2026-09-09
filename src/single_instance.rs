@@ -209,8 +209,7 @@ pub fn acquire(kind: &str) -> Result<InstanceLock> {
     // The executable name (resolved through symlinks by the kernel) rules
     // out wrapper shells whose cmdline merely contains the monux invocation.
     let exe = proc_exe_name(pid);
-    let cmdline =
-        fs::read_to_string(format!("/proc/{}/cmdline", pid)).map(|s| s.replace('\0', " "));
+    let cmdline = proc_cmdline(pid);
     let verified = matches!(
         (&exe, &cmdline),
         (Ok(e), Ok(cl)) if e == "monux" && cl.split_whitespace().any(|tok| tok == kind)
@@ -315,6 +314,7 @@ fn read_pid(path: &PathBuf) -> Option<i32> {
 /// there, misidentifying an alias-started daemon as not-monux. Using the
 /// executable name rather than the cmdline also rules out wrapper shells that
 /// merely contain the monux invocation.
+#[cfg(target_os = "linux")]
 fn proc_exe_name(pid: i32) -> std::io::Result<String> {
     let target = fs::read_link(format!("/proc/{}/exe", pid))?;
     let name = target
@@ -324,6 +324,64 @@ fn proc_exe_name(pid: i32) -> std::io::Result<String> {
     // A daemon whose binary was replaced on disk after exec (an auto-update
     // downloaded while it keeps running) reads back as "monux (deleted)".
     Ok(name.strip_suffix(" (deleted)").map(str::to_owned).unwrap_or(name))
+}
+
+/// macOS counterpart of the /proc/<pid>/exe read: proc_pidpath(3) returns the
+/// kernel-resolved executable path of the pid, so the basename is "monux" even
+/// for an `mx`-alias launch, exactly like the Linux mechanism. Unreadable for
+/// another user's process, which callers treat as "can't verify".
+#[cfg(target_os = "macos")]
+fn proc_exe_name(pid: i32) -> std::io::Result<String> {
+    extern "C" {
+        // libSystem: the documented proc_pidpath(3). Not in the libc crate,
+        // so declared here against its stable C ABI.
+        fn proc_pidpath(pid: libc::pid_t, buffer: *mut libc::c_char, size: u32)
+            -> libc::c_int;
+    }
+    const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
+    let mut buf = vec![0 as libc::c_char; PROC_PIDPATHINFO_MAXSIZE];
+    // SAFETY: buf is a live buffer of exactly the size passed, and the call
+    // only writes into it for the lifetime of the invocation.
+    let n = unsafe { proc_pidpath(pid, buf.as_mut_ptr(), buf.len() as u32) };
+    if n <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    use std::os::unix::ffi::OsStringExt;
+    // The returned length is the path's byte count; some libSystem builds
+    // also count the trailing NUL, so stop at the first one either way.
+    let bytes: Vec<u8> = buf
+        .into_iter()
+        .map(|c| c as u8)
+        .take_while(|b| *b != 0)
+        .collect();
+    let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes));
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no basename"))
+}
+
+/// The full command line of a process, NUL-separated tokens joined with
+/// spaces (matching the Linux reader's shape).
+#[cfg(target_os = "linux")]
+fn proc_cmdline(pid: i32) -> std::io::Result<String> {
+    fs::read_to_string(format!("/proc/{}/cmdline", pid)).map(|s| s.replace('\0', " "))
+}
+
+/// macOS counterpart of the /proc/<pid>/cmdline read. argv isn't exposed by
+/// a simple syscall, so this reads it from `ps` — fine for these call sites,
+/// which run once per takeover/role-probe, never in a hot path.
+#[cfg(target_os = "macos")]
+fn proc_cmdline(pid: i32) -> std::io::Result<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "ps: no such process",
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_owned())
 }
 
 /// The pid of the live holder of the `kind` lock, if there is one: the lock
@@ -371,9 +429,7 @@ pub fn live_holder(kind: &str) -> Option<i32> {
         return None;
     }
     let exe = proc_exe_name(pid).ok()?;
-    let cmdline = fs::read_to_string(format!("/proc/{}/cmdline", pid))
-        .map(|s| s.replace('\0', " "))
-        .ok()?;
+    let cmdline = proc_cmdline(pid).ok()?;
     // Exact argv-token match: `monux client my-server-host` must NOT match
     // live_holder("server") — a bare substring check would.
     if exe == "monux" && cmdline.split_whitespace().any(|tok| tok == kind) {

@@ -38,6 +38,26 @@ use tracing::debug;
 
 use crate::control::{self, Diagnostics, Role};
 
+/// Shims over the Linux-only setup layer for the two probes that reference
+/// it; every other setup integration is already guarded by graceful
+/// runtime probes (journalctl, wl-copy, /dev/uinput).
+#[cfg(target_os = "linux")]
+fn autostart_status_text() -> Option<String> {
+    crate::setup::autostart_status_text()
+}
+#[cfg(not(target_os = "linux"))]
+fn autostart_status_text() -> Option<String> {
+    None
+}
+#[cfg(target_os = "linux")]
+fn unit_name_for(role: &str) -> String {
+    crate::setup::unit_name_for(role)
+}
+#[cfg(not(target_os = "linux"))]
+fn unit_name_for(role: &str) -> String {
+    format!("monux-{}.service", role)
+}
+
 /// Where a user files what this module produces.
 pub const ISSUE_URL: &str = "https://github.com/mntzrr/monux/issues";
 
@@ -113,6 +133,7 @@ const JOURNAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Longest we wait for a short read-only probe (`systemctl`, `id`, `uname`)
 /// while collecting the environment.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // tests use it on every platform
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 // ---------------------------------------------------------------------------
@@ -189,7 +210,7 @@ impl Environment {
             uinput: describe_uinput(),
             input_group: describe_input_group(),
             clipboard_tools: describe_clipboard_tools(),
-            autostart: crate::setup::autostart_status_text(),
+            autostart: autostart_status_text(),
             hostname: hostname(),
             username: username(),
             caveat: None,
@@ -333,6 +354,7 @@ fn path_is_writable(path: &Path) -> bool {
 }
 
 fn describe_input_group() -> String {
+    #[cfg(target_os = "linux")]
     match probe("id", &["-nG"]) {
         Ok(groups) if crate::setup::groups_contain(&groups, "input") => "member".to_string(),
         Ok(_) => "NOT a member — run 'monux setup', then log out and back in".to_string(),
@@ -341,6 +363,8 @@ fn describe_input_group() -> String {
             "could not query".to_string()
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    "not applicable on this platform".to_string()
 }
 
 /// Which clipboard tools the bundle-copy path can use. Absent tools are worth
@@ -399,7 +423,7 @@ pub struct JournalCapture {
 /// installs its units; a system-wide or non-systemd install degrades to a
 /// note explaining where to look instead.
 pub fn journal_capture(role: Role, since: &str) -> JournalCapture {
-    let unit = crate::setup::unit_name_for(role.as_str());
+    let unit = unit_name_for(role.as_str());
     let mut capture = JournalCapture {
         unit: unit.clone(),
         since: since.to_string(),
@@ -1161,6 +1185,7 @@ fn wait_with_timeout(
 /// Runs a short read-only probe, returning stdout regardless of exit status
 /// (`systemctl is-enabled` answers "disabled" with exit 1). Only a spawn
 /// failure is an error.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // tests use it on every platform
 fn probe(program: &str, args: &[&str]) -> Result<String> {
     probe_with_timeout(program, args, PROBE_TIMEOUT)
 }
@@ -1264,7 +1289,7 @@ pub fn run_cli(opts: &CliOptions) -> Result<String> {
     let journal = match &opts.journal_since {
         Some(since) => journal_capture(role, since),
         None => JournalCapture {
-            unit: crate::setup::unit_name_for(role.as_str()),
+            unit: unit_name_for(role.as_str()),
             since: "skipped".to_string(),
             lines: Vec::new(),
             note: Some("journal collection was disabled with --no-journal".to_string()),

@@ -3,13 +3,19 @@
 //! compositor's cursor moved. Isolates the client's emit path from the
 //! network and from the capture side.
 
+#[cfg(target_os = "linux")]
 use std::process::Command;
+#[cfg(target_os = "linux")]
 use std::thread::sleep;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 use evdev::{AbsoluteAxisCode, EventType, InputEvent, KeyCode};
+#[cfg(target_os = "linux")]
 use monux::device::output::uinput::{touchpad, SCALED_DIM_MAX};
 
+#[cfg(target_os = "linux")]
 fn cursor_pos() -> String {
     Command::new("hyprctl")
         .arg("cursorpos")
@@ -18,14 +24,18 @@ fn cursor_pos() -> String {
         .unwrap_or_else(|e| format!("(hyprctl failed: {e})"))
 }
 
+#[cfg(target_os = "linux")]
 fn abs(axis: AbsoluteAxisCode, value: i32) -> InputEvent {
     InputEvent::new(EventType::ABSOLUTE.0, axis.0, value)
 }
 
+#[cfg(target_os = "linux")]
 fn key(code: KeyCode, value: i32) -> InputEvent {
     InputEvent::new(EventType::KEY.0, code.0, value)
 }
 
+#[cfg(target_os = "linux")] // evdev/uinput diagnostics: Linux-only
+#[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
     // "merged" replays the whole stroke as ONE frame (a single trailing
     // SYN_REPORT), reproducing what the client's pending_input coalescing
@@ -124,3 +134,6 @@ fn main() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[cfg(not(target_os = "linux"))]
+fn main() {}

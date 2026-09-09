@@ -2,11 +2,20 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Result};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
+#[cfg(target_os = "linux")]
+use tokio::sync::watch;
+#[cfg(target_os = "linux")]
 use tokio::task;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info};
+#[cfg(target_os = "linux")]
+use tracing::{error, warn};
 
-use crate::clipboard::{ClipboardReader, ClipboardWriter, data, filter_shareable_mime_types, serve, wayland};
+#[cfg(target_os = "linux")]
+use crate::clipboard::wayland;
+#[cfg(target_os = "linux")]
+use crate::clipboard::{ClipboardReader, ClipboardWriter, data};
+use crate::clipboard::{filter_shareable_mime_types, serve};
 use crate::rotation;
 
 /// Wrapper around server-local clipboard storage, if available.
@@ -30,6 +39,14 @@ impl LocalClipboard {
         max_clipboard_size_bytes: u64,
         max_uncompressed_size_bytes: u64,
     ) -> Option<Self> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = (
+            config_dir,
+            rotation_tx,
+            max_clipboard_size_bytes,
+            max_uncompressed_size_bytes,
+        );
+        #[cfg(target_os = "linux")]
         match Self::new_wayland(config_dir, rotation_tx, max_clipboard_size_bytes, max_uncompressed_size_bytes).await {
             Ok(Some(c)) => {
                 info!("Using wayland clipboard");
@@ -42,10 +59,14 @@ impl LocalClipboard {
                 warn!("Failed to reach wayland clipboard: {}", e);
             }
         };
+        #[cfg(target_os = "linux")]
         warn!("CLIPBOARD SHARING DISABLED: no wayland clipboard is reachable. If monux is running under sudo, start it with 'sudo -E ...' to preserve the session environment (WAYLAND_DISPLAY, XDG_RUNTIME_DIR)");
+        #[cfg(not(target_os = "linux"))]
+        info!("CLIPBOARD SHARING DISABLED: no clipboard backend exists on this platform yet");
         None
     }
 
+    #[cfg(target_os = "linux")]
     async fn new_wayland(
         config_dir: PathBuf,
         rotation_tx: mpsc::Sender<rotation::RotationEvent>,
@@ -75,6 +96,7 @@ impl LocalClipboard {
         ).await?))
     }
 
+    #[cfg(target_os = "linux")]
     async fn start_impl(
         reader: Box<dyn ClipboardReader>,
         writer: Box<dyn ClipboardWriter>,

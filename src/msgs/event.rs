@@ -275,7 +275,7 @@ impl MotionDatagram {
 pub fn motion_event(code: u16, value: i32) -> InputEvent {
     InputEvent {
         inputi32: Some(InputI32 {
-            type_: evdev::EventType::RELATIVE.0,
+            type_: crate::msgs::consts::EV_REL,
             code,
             value,
         }),
@@ -300,7 +300,7 @@ const MASKED_KEY_CODE: &str = "<key>";
 /// Whether an event type carries a keystroke, and so must have its code
 /// masked in any human-readable rendering.
 fn is_key_type(type_: u16) -> bool {
-    type_ == evdev::EventType::KEY.0
+    type_ == crate::msgs::consts::EV_KEY
 }
 
 /// The scancode in an `EV_MSC` / `MSC_SCAN` event, masked for exactly the
@@ -317,7 +317,7 @@ const MASKED_SCANCODE: &str = "<scancode>";
 /// Whether an event carries a keystroke in its value rather than its code.
 /// See MASKED_SCANCODE.
 fn is_scancode(type_: u16, code: u16) -> bool {
-    type_ == evdev::EventType::MISC.0 && code == evdev::MiscCode::MSC_SCAN.0
+    type_ == crate::msgs::consts::EV_MSC && code == crate::msgs::consts::MSC_SCAN
 }
 
 /// An input event to be written to a virtual device indicated by the target.
@@ -410,6 +410,11 @@ impl std::fmt::Debug for InputI32 {
 }
 
 impl InputI32 {
+    /// Conversions to/from the Linux evdev device type. Only the Linux
+    /// device modules (capture on the server, uinput injection on the
+    /// client) ever touch evdev types; everywhere else, including all
+    /// non-Linux builds, the wire structs carry plain integers.
+    #[cfg(target_os = "linux")]
     pub fn from_evdev(e: evdev::InputEvent) -> InputI32 {
         InputI32 {
             type_: e.event_type().0,
@@ -418,6 +423,7 @@ impl InputI32 {
         }
     }
 
+    #[cfg(target_os = "linux")]
     pub fn to_evdev(&self) -> evdev::InputEvent {
         evdev::InputEvent::new(self.type_, self.code, self.value)
     }
@@ -471,6 +477,7 @@ impl std::fmt::Debug for InputF64 {
 }
 
 impl InputF64 {
+    #[cfg(target_os = "linux")]
     pub fn from_evdev(e: evdev::InputEvent, min: i32, max: i32) -> InputF64 {
         InputF64 {
             type_: e.event_type().0,
@@ -492,6 +499,7 @@ impl InputF64 {
         }
     }
 
+    #[cfg(target_os = "linux")]
     pub fn to_evdev(&self, min: i32, max: i32) -> evdev::InputEvent {
         // Inverse of from_evdev math. The value is remote-controlled, so
         // enforce the scaled 0.0..=1.0 invariant before unscaling: a buggy
@@ -683,7 +691,7 @@ mod tests {
         const SECRET: u16 = 30; // KEY_A
         let key = InputEvent {
             inputi32: Some(InputI32 {
-                type_: evdev::EventType::KEY.0,
+                type_: crate::msgs::consts::EV_KEY,
                 code: SECRET,
                 value: 1,
             }),
@@ -716,7 +724,7 @@ mod tests {
         }
         // A non-key event keeps its code: masking everything would blind the
         // pointer/axis debugging these lines also exist for.
-        let motion = motion_event(evdev::RelativeAxisCode::REL_X.0, 5);
+        let motion = motion_event(crate::msgs::consts::REL_X, 5);
         let rendering = format!("{:?}", motion);
         assert!(rendering.contains("code=0"), "{}", rendering);
         assert!(!rendering.contains(MASKED_KEY_CODE), "{}", rendering);
@@ -955,29 +963,32 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn inputf64_degenerate_range_does_not_divide_by_zero() {
         // A broken device advertising min==max must not emit NaN/inf.
-        let e = evdev::InputEvent::new(evdev::EventType::ABSOLUTE.0, 0, 5);
+        let e = evdev::InputEvent::new(crate::msgs::consts::EV_ABS, 0, 5);
         assert_eq!(InputF64::from_evdev(e, 3, 3).value, 0.0);
         // And the normal case keeps its math.
         assert_eq!(InputF64::from_evdev(e, -10, 10).value, 0.75);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn inputf64_from_evdev_extreme_absinfo_does_not_overflow() {
         // min/max come unvalidated from kernel absinfo: a broken device (or
         // any local uinput process) can advertise the full i32 range, where
         // i32 subtraction would overflow. The widened i64 math must hold.
-        let e = evdev::InputEvent::new(evdev::EventType::ABSOLUTE.0, 0, i32::MAX);
+        let e = evdev::InputEvent::new(crate::msgs::consts::EV_ABS, 0, i32::MAX);
         assert_eq!(InputF64::from_evdev(e, i32::MIN, i32::MAX).value, 1.0);
-        let e = evdev::InputEvent::new(evdev::EventType::ABSOLUTE.0, 0, i32::MIN);
+        let e = evdev::InputEvent::new(crate::msgs::consts::EV_ABS, 0, i32::MIN);
         assert_eq!(InputF64::from_evdev(e, i32::MIN, i32::MAX).value, 0.0);
-        let e = evdev::InputEvent::new(evdev::EventType::ABSOLUTE.0, 0, 0);
+        let e = evdev::InputEvent::new(crate::msgs::consts::EV_ABS, 0, 0);
         let v = InputF64::from_evdev(e, i32::MIN, i32::MAX).value;
         assert!((v - 0.5).abs() < 1e-9, "{}", v);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn inputf64_to_evdev_clamps_remote_values_to_the_scaled_range() {
         // The value is remote-controlled: NaN/inf/out-of-range must clamp

@@ -96,6 +96,7 @@ pub(crate) struct RingBufferLayer;
 /// carry (see device::input's keystroke-masking guard). Test-only: the daemon
 /// installs the layer through init_logging.
 #[cfg(test)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the evdev capture tests use it
 pub(crate) fn ring_layer_for_tests() -> RingBufferLayer {
     RingBufferLayer
 }

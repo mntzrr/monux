@@ -293,6 +293,7 @@ fn ensure_dir_owner(
 /// socket path's permissions this says nothing about who created the path, so
 /// it holds even when the directory itself cannot be trusted — which is what
 /// makes it the right check for both halves of this protocol.
+#[cfg(target_os = "linux")]
 fn peer_uid(fd: std::os::unix::io::RawFd) -> Result<libc::uid_t> {
     let mut cred = libc::ucred {
         pid: 0,
@@ -317,6 +318,23 @@ fn peer_uid(fd: std::os::unix::io::RawFd) -> Result<libc::uid_t> {
             .context("Failed to read the control socket peer's credentials");
     }
     Ok(cred.uid)
+}
+
+/// macOS counterpart of the SO_PEERCRED check: getpeereid(2) returns the
+/// effective uid/gid of the connected peer's socket. Same trust property —
+/// the kernel reports the connected process, not the path's owner.
+#[cfg(target_os = "macos")]
+fn peer_uid(fd: std::os::unix::io::RawFd) -> Result<libc::uid_t> {
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    // SAFETY: `fd` is a live connected socket borrowed from its owner for the
+    // duration of the call; uid/gid are plain out-parameters.
+    let rc = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("Failed to read the control socket peer's credentials");
+    }
+    Ok(uid)
 }
 
 /// Whether a control-socket peer running as `peer` may be trusted by a
@@ -961,6 +979,7 @@ enum PostAction {
     /// usually the indicator itself (its "Hide tray icon" menu action): the
     /// ack must be on the wire before the requester is killed, or it would
     /// report its own hide as a failure.
+    #[cfg(target_os = "linux")]
     IndicatorHide,
 }
 
@@ -979,6 +998,7 @@ pub struct ServerHandler {
     /// errors clearly instead of silently doing nothing).
     pub auto_update: bool,
     /// Hide/show control for the auto-spawned tray indicator.
+    #[cfg(target_os = "linux")]
     pub indicator: crate::indicator_spawn::SupervisorHandle,
 }
 
@@ -987,6 +1007,7 @@ pub struct ClientHandler {
     pub state: Arc<ClientStateMirror>,
     pub auto_update: bool,
     /// Hide/show control for the auto-spawned tray indicator.
+    #[cfg(target_os = "linux")]
     pub indicator: crate::indicator_spawn::SupervisorHandle,
     /// Where client.link-notify persists when the socket toggles it
     /// (config::path(config_dir) is the file).
@@ -1068,29 +1089,39 @@ impl Handler {
                 (Response::ok_empty(), Some(PostAction::Exit))
             }
             "indicator" => {
-                let indicator = match self {
-                    Handler::Server(h) => &h.indicator,
-                    Handler::Client(h) => &h.indicator,
-                };
-                match req.action.as_deref() {
-                    // Deferred (see PostAction::IndicatorHide): the requester
-                    // is usually the indicator about to be killed.
-                    Some("hide") => {
-                        info!("Control socket: tray indicator hide requested");
-                        (Response::ok_empty(), Some(PostAction::IndicatorHide))
-                    }
-                    // Synchronous: spawn errors belong in the response.
-                    Some("show") => {
-                        info!("Control socket: tray indicator show requested");
-                        match indicator.show() {
-                            Ok(()) => (Response::ok_empty(), None),
-                            Err(e) => (Response::err(format!("{:#}", e)), None),
+                #[cfg(target_os = "linux")]
+                {
+                    let indicator = match self {
+                        Handler::Server(h) => &h.indicator,
+                        Handler::Client(h) => &h.indicator,
+                    };
+                    match req.action.as_deref() {
+                        // Deferred (see PostAction::IndicatorHide): the requester
+                        // is usually the indicator about to be killed.
+                        Some("hide") => {
+                            info!("Control socket: tray indicator hide requested");
+                            (Response::ok_empty(), Some(PostAction::IndicatorHide))
                         }
+                        // Synchronous: spawn errors belong in the response.
+                        Some("show") => {
+                            info!("Control socket: tray indicator show requested");
+                            match indicator.show() {
+                                Ok(()) => (Response::ok_empty(), None),
+                                Err(e) => (Response::err(format!("{:#}", e)), None),
+                            }
+                        }
+                        _ => (
+                            Response::err("indicator needs an action: hide|show"),
+                            None,
+                        ),
                     }
-                    _ => (
-                        Response::err("indicator needs an action: hide|show"),
-                        None,
-                    ),
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // No tray indicator exists on this platform; the command
+                    // stays in the protocol so peers and tooling behave the
+                    // same, but there is nothing to hide or show.
+                    (Response::err("tray indicator is not supported on this platform"), None)
                 }
             }
             "link-notify" => match self {
@@ -1351,15 +1382,19 @@ async fn serve_connection(stream: tokio::net::UnixStream, handler: Arc<Handler>)
                     libc::kill(std::process::id() as i32, libc::SIGTERM);
                 }
             }
+            #[cfg(target_os = "linux")]
             Some(PostAction::IndicatorHide) => {
                 // hide() reaps the indicator child with a blocking wait (up
                 // to TERM_GRACE of thread::sleep in terminate_and_reap), so
                 // it must not run on this connection's async task.
-                let indicator = match &*handler {
-                    Handler::Server(h) => h.indicator.clone(),
-                    Handler::Client(h) => h.indicator.clone(),
-                };
-                tokio::task::spawn_blocking(move || indicator.hide());
+                #[cfg(target_os = "linux")]
+                {
+                    let indicator = match &*handler {
+                        Handler::Server(h) => h.indicator.clone(),
+                        Handler::Client(h) => h.indicator.clone(),
+                    };
+                    tokio::task::spawn_blocking(move || indicator.hide());
+                }
             }
             None => {}
         }
@@ -1628,8 +1663,13 @@ pub fn tray_cli(hide: bool, socket: Option<&Path>) -> Result<String> {
             })
         }
         (TrayDecision::Standalone, Err(_)) => {
-            crate::indicator_spawn::spawn_standalone()?;
-            Ok("Tray indicator shown (standalone; no monux daemon running)".to_string())
+            #[cfg(target_os = "linux")]
+            {
+                crate::indicator_spawn::spawn_standalone()?;
+                Ok("Tray indicator shown (standalone; no monux daemon running)".to_string())
+            }
+            #[cfg(not(target_os = "linux"))]
+            Err(anyhow::anyhow!("tray indicator is not supported on this platform"))
         }
         (TrayDecision::Error, Err(e)) => Err(e),
         // tray_decision agrees with the query outcome by construction.
@@ -1759,6 +1799,7 @@ mod tests {
     /// A supervisor handle whose daemon opted out of the indicator: no
     /// child, no task, and show() refuses — all without touching the
     /// environment or spawning processes.
+    #[cfg(target_os = "linux")]
     fn opted_out_indicator() -> crate::indicator_spawn::SupervisorHandle {
         let supervisor = crate::indicator_spawn::Supervisor::new(true);
         let handle = supervisor.handle();
@@ -1786,6 +1827,7 @@ mod tests {
                 event_tx,
                 rotation_tx,
                 auto_update,
+                #[cfg(target_os = "linux")]
                 indicator: opted_out_indicator(),
             }),
             rotation_rx,
@@ -1804,6 +1846,7 @@ mod tests {
             Handler::Client(ClientHandler {
                 state: mirror.clone(),
                 auto_update,
+                #[cfg(target_os = "linux")]
                 indicator: opted_out_indicator(),
                 config_dir: dir.path().to_path_buf(),
             }),
@@ -2144,6 +2187,7 @@ mod tests {
         assert!(resp.error.unwrap().contains("client-side"));
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn indicator_command_maps_to_the_supervisor_handle() {
         // Both roles serve it (the test handles sit on opted-out

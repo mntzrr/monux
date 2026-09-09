@@ -7,6 +7,11 @@ pub mod convert;
 pub mod data;
 pub mod serve;
 pub mod server;
+// The only sharing backend is the Wayland data-control protocol; macOS has
+// no backend yet, so the daemon there runs with sharing disabled (the
+// LocalClipboard constructors already degrade to None when no backend
+// answers).
+#[cfg(target_os = "linux")]
 pub mod wayland;
 
 mod limited;
@@ -58,6 +63,7 @@ pub const CLIPBOARD_SERVE_TIMEOUT_SECS: u64 = 4;
 /// giving up. store_types does wayland roundtrips that can hang on a wedged
 /// compositor; without a bound, one hung advertisement blocks every
 /// subsequent one forever (and grows the channel unboundedly while waiting).
+#[cfg(target_os = "linux")]
 const WRITER_DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// After a store is abandoned (dispatch timeout — wedged compositor),
@@ -67,14 +73,17 @@ const WRITER_DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// compositor stays wedged bleeds ~3 threads per WRITER_DISPATCH_TIMEOUT.
 /// One probe advertisement is allowed through every WEDGE_PROBE_INTERVAL;
 /// when a store completes again the wedge is declared over.
+#[cfg(target_os = "linux")]
 const WEDGE_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The dispatcher's wedge gate (see WEDGE_PROBE_INTERVAL). Pure bookkeeping
 /// over store outcomes; the clock is injected for testing.
+#[cfg(target_os = "linux")]
 struct WedgeGate {
     wedged_since: Option<std::time::Instant>,
 }
 
+#[cfg(target_os = "linux")]
 impl WedgeGate {
     fn new() -> Self {
         WedgeGate { wedged_since: None }
@@ -116,6 +125,7 @@ impl WedgeGate {
 /// store_types call (wedged compositor) is abandoned after WRITER_DISPATCH_TIMEOUT
 /// so the dispatcher doesn't deadlock, and flagged superseded so a late
 /// completion can't publish its stale type list over a newer advertisement.
+#[cfg(target_os = "linux")]
 pub(crate) fn spawn_writer_dispatcher(
     writer: Box<dyn ClipboardWriter>,
 ) -> std::sync::mpsc::Sender<Vec<String>> {
@@ -254,12 +264,14 @@ mod tests {
         assert!(filter_shareable_mime_types(vec![]).is_empty());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn wedge_gate_attempts_everything_while_healthy() {
         let gate = WedgeGate::new();
         assert!(gate.should_attempt(std::time::Instant::now()));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn wedge_gate_drops_until_a_probe_window_after_abandonment() {
         let mut gate = WedgeGate::new();
@@ -273,6 +285,7 @@ mod tests {
         assert!(gate.should_attempt(t0 + WEDGE_PROBE_INTERVAL));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn wedge_gate_recovers_when_a_store_completes() {
         let mut gate = WedgeGate::new();

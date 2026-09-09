@@ -1,8 +1,16 @@
+// Input capture is a Linux evdev story (/dev/input, EVIOCGRAB, udev); macOS
+// builds keep only the output side (CGEvent injection) and the shared types.
+// shortcut.rs stays portable: chord parsing backs the config validators, and
+// its combo state machine works on plain (type, code, value) triples.
+#[cfg(target_os = "linux")]
 pub mod handles;
+#[cfg(target_os = "linux")]
 pub mod input;
 pub mod output;
 pub mod shortcut;
+#[cfg(target_os = "linux")]
 pub mod util;
+#[cfg(target_os = "linux")]
 pub mod watch;
 
 use crate::msgs::event;

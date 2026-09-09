@@ -8,7 +8,11 @@ pub mod device;
 pub mod diagnostics;
 pub mod discovery;
 pub mod edge;
+// The tray indicator is a D-Bus StatusNotifierItem; macOS builds have no
+// indicator yet (the daemon runs fine without it).
+#[cfg(target_os = "linux")]
 pub mod indicator;
+#[cfg(target_os = "linux")]
 pub mod indicator_spawn;
 pub mod known_servers;
 pub mod logging;
@@ -18,9 +22,13 @@ pub mod notify;
 pub mod rotation;
 pub mod server;
 pub mod servers;
+// System integration (udev rules, kernel modules, systemd units, sysctl) is
+// inherently Linux; the macOS build has no setup/uninstall commands.
+#[cfg(target_os = "linux")]
 pub mod setup;
-pub mod single_instance;
+#[cfg(target_os = "linux")]
 pub mod uninstall;
+pub mod single_instance;
 pub mod update;
 
 /// Set when the process begins a graceful shutdown (SIGINT/SIGTERM, control

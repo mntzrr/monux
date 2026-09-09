@@ -41,6 +41,7 @@ const WWW_KEEPALIVE_MILLIS: u64 = 10_000;
 const SOCKET_BUF_SIZE: libc::c_int = 2 * 1024 * 1024;
 
 /// Linux socket priority for interactive/low-latency traffic.
+#[cfg(target_os = "linux")]
 const SOCKET_PRIORITY: libc::c_int = 6;
 
 /// Ceiling on connection attempts quinn buffers before the accept loop takes
@@ -114,6 +115,9 @@ pub fn build_server(
 }
 
 fn create_socket(bind_addr: SocketAddr, mode: NetworkMode) -> Result<std::net::UdpSocket> {
+    // mode only steers the Linux WMM socket option; other platforms ignore it.
+    #[cfg(not(target_os = "linux"))]
+    let _ = mode;
     let domain = if bind_addr.is_ipv6() {
         libc::AF_INET6
     } else {
@@ -121,8 +125,23 @@ fn create_socket(bind_addr: SocketAddr, mode: NetworkMode) -> Result<std::net::U
     };
     // SOCK_CLOEXEC: the auto-update restart re-execs the binary, and this
     // socket must not leak into the new image — it would keep the listen
-    // port bound, failing the new endpoint with EADDRINUSE.
+    // port bound, failing the new endpoint with EADDRINUSE. Linux accepts
+    // SOCK_CLOEXEC at socket() time (atomic, race-free); macOS has no such
+    // flag, so the CLOEXEC fd flag is set right after creation instead —
+    // still ahead of any exec on this single-threaded path.
+    #[cfg(target_os = "linux")]
     let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    #[cfg(target_os = "macos")]
+    let fd = {
+        let raw = unsafe { libc::socket(domain, libc::SOCK_DGRAM, 0) };
+        if raw >= 0 {
+            // Best-effort to match the Linux semantics above: a failure here
+            // is inconceivable on a fresh descriptor, and the consequence is
+            // a fd leaked only across a re-exec, never during normal runs.
+            unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+        raw
+    };
     if fd < 0 {
         bail!("Failed to create UDP socket: {}", std::io::Error::last_os_error());
     }
@@ -146,12 +165,25 @@ fn create_socket(bind_addr: SocketAddr, mode: NetworkMode) -> Result<std::net::U
             libc::SO_RCVBUF,
             &SOCKET_BUF_SIZE,
         );
-        // The kernel silently clamps these to net.core.{w,r}mem_max (~208 KiB
-        // on a stock system), inviting drops during clipboard bursts. Verify
-        // what we actually got and point at the fix if clamped.
-        verify_socket_buf(fd, libc::SO_SNDBUF, "net.core.wmem_max");
-        verify_socket_buf(fd, libc::SO_RCVBUF, "net.core.rmem_max");
+        // The kernel silently clamps these (Linux: net.core.{w,r}mem_max,
+        // ~208 KiB stock; macOS: kern.ipc.maxsockbuf), inviting drops during
+        // clipboard bursts. Verify what we actually got and point at the
+        // platform's fix if clamped.
+        #[cfg(target_os = "linux")]
+        {
+            verify_socket_buf(fd, libc::SO_SNDBUF, "net.core.wmem_max (e.g. via 'sudo monux setup')");
+            verify_socket_buf(fd, libc::SO_RCVBUF, "net.core.rmem_max (e.g. via 'sudo monux setup')");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            verify_socket_buf(fd, libc::SO_SNDBUF, "kern.ipc.maxsockbuf (e.g. 'sudo sysctl -w kern.ipc.maxsockbuf=4194304')");
+            verify_socket_buf(fd, libc::SO_RCVBUF, "kern.ipc.maxsockbuf (e.g. 'sudo sysctl -w kern.ipc.maxsockbuf=4194304')");
+        }
 
+        // SO_PRIORITY is the WiFi WMM voice-category mark (Linux WMM, see
+        // below). macOS has no SO_PRIORITY; Apple's own WiFi stack manages
+        // airtime prioritization, so there is nothing to set there.
+        #[cfg(target_os = "linux")]
         if mode == NetworkMode::Local {
             setsockopt(
                 fd,
@@ -175,15 +207,28 @@ fn create_socket(bind_addr: SocketAddr, mode: NetworkMode) -> Result<std::net::U
     apply_socket_opts();
 
     // Bind using libc so that we keep control of the fd until the UdpSocket takes ownership.
+    // (sin_len/sin6_len are BSD-only fields macOS's bind inspects; Linux has
+    // no such fields, hence the cfg blocks.)
     let bind_ret = match bind_addr {
         SocketAddr::V4(v4) => {
+            #[cfg(target_os = "macos")]
             let sa = libc::sockaddr_in {
+                sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
                 sin_family: libc::AF_INET as libc::sa_family_t,
                 sin_port: v4.port().to_be(),
                 sin_addr: libc::in_addr {
                     // s_addr must hold the octets in network (memory) order;
                     // from_ne_bytes preserves the in-memory octet order on any
                     // host endianness (from_be_bytes would byte-swap them).
+                    s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            #[cfg(target_os = "linux")]
+            let sa = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: v4.port().to_be(),
+                sin_addr: libc::in_addr {
                     s_addr: u32::from_ne_bytes(v4.ip().octets()),
                 },
                 sin_zero: [0; 8],
@@ -197,6 +242,18 @@ fn create_socket(bind_addr: SocketAddr, mode: NetworkMode) -> Result<std::net::U
             }
         }
         SocketAddr::V6(v6) => {
+            #[cfg(target_os = "macos")]
+            let sa = libc::sockaddr_in6 {
+                sin6_len: std::mem::size_of::<libc::sockaddr_in6>() as u8,
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: v6.port().to_be(),
+                sin6_flowinfo: v6.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: v6.ip().octets(),
+                },
+                sin6_scope_id: v6.scope_id(),
+            };
+            #[cfg(target_os = "linux")]
             let sa = libc::sockaddr_in6 {
                 sin6_family: libc::AF_INET6 as libc::sa_family_t,
                 sin6_port: v6.port().to_be(),
@@ -266,7 +323,7 @@ fn verify_socket_buf(fd: libc::c_int, opt: libc::c_int, sysctl: &str) {
     }
     if value < SOCKET_BUF_SIZE {
         warn!(
-            "UDP socket buffer clamped to {} bytes (wanted {}): raise {} (e.g. via 'sudo monux setup') to avoid drops during clipboard bursts",
+            "UDP socket buffer clamped to {} bytes (wanted {}): raise {} to avoid drops during clipboard bursts",
             value, SOCKET_BUF_SIZE, sysctl
         );
     }

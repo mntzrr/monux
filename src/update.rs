@@ -761,13 +761,17 @@ pub fn run(
     }
     // Per-user install artifacts install.sh owns but the updater path never
     // sees: ensure the tray desktop shortcut exists (create-if-missing only;
-    // a user's edited copy is left alone).
+    // a user's edited copy is left alone). Linux-only: the .desktop shortcut
+    // is part of the Linux desktop integration.
     if let Some(home) = home::home_dir() {
+        #[cfg(target_os = "linux")]
         match crate::setup::ensure_desktop_shortcut(&home, std::env::var_os("XDG_DATA_HOME").as_deref()) {
             Ok(true) => info!("Wrote the 'monux tray' desktop shortcut"),
             Ok(false) => {}
             Err(e) => warn!("Couldn't write the desktop shortcut: {:#}", e),
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = home;
     }
     // Record the build this install replaced (the running one), so
     // '--rollback' can return to it. A build without a revision (built
