@@ -700,7 +700,9 @@ pub struct ServerArgs {
     /// Pre-approve a client certificate fingerprint (repeatable)
     ///
     /// A client whose fingerprint is listed connects without the interactive
-    /// approval prompt.
+    /// approval prompt. The full digest (64 hex chars) or any prefix of at
+    /// least 16 hex chars works, so it can be typed by hand from the peer's
+    /// startup banner.
     #[arg(long, alias = "fingerprints", value_name = "fingerprint", help_heading = H_NETWORK)]
     pub fingerprint: Option<Vec<String>>,
 
@@ -850,7 +852,9 @@ pub struct ClientArgs {
     /// Pre-approve a server certificate fingerprint (repeatable)
     ///
     /// A server whose fingerprint is listed connects without the interactive
-    /// approval prompt.
+    /// approval prompt. The full digest (64 hex chars) or any prefix of at
+    /// least 16 hex chars works, so it can be typed by hand from the peer's
+    /// startup banner.
     #[arg(long, alias = "fingerprints", value_name = "fingerprint", help_heading = H_NETWORK)]
     pub fingerprint: Option<Vec<String>>,
 

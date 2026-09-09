@@ -220,7 +220,7 @@ pub static REGISTRY: &[KeySpec] = &[
         key: "server.fingerprint",
         section: Section::Server,
         flag: "fingerprint",
-        expects: "certificate fingerprint (64 hex chars, ':' allowed)",
+        expects: "certificate fingerprint (64 hex chars, ':' allowed; a >=16-char prefix works)",
         default_display: "none",
         help: "client certificate fingerprint pre-approved without prompting",
         kind: Kind::StrArray,
@@ -353,7 +353,7 @@ pub static REGISTRY: &[KeySpec] = &[
         key: "client.fingerprint",
         section: Section::Client,
         flag: "fingerprint",
-        expects: "certificate fingerprint (64 hex chars, ':' allowed)",
+        expects: "certificate fingerprint (64 hex chars, ':' allowed; a >=16-char prefix works)",
         default_display: "none",
         help: "server certificate fingerprint pre-approved without prompting",
         kind: Kind::StrArray,
@@ -3455,25 +3455,27 @@ mod tests {
 
     #[test]
     fn fingerprint_validation_matches_the_daemon_startup_rule() {
-        // The daemon hard-fails on anything but a normalized 64-hex SHA-256
-        // digest (MonuxCertVerification::new); the validator must not accept
-        // what the daemon then refuses — a config problem must never prevent
-        // a daemon from starting.
+        // The daemon accepts a normalized 16..=64-hex value (full SHA-256
+        // digest or an unambiguous prefix — MonuxCertVerification::new); the
+        // validator must not accept what the daemon then refuses — a config
+        // problem must never prevent a daemon from starting.
         let fp = "ab".repeat(32);
         let colon_fp = (0..32).map(|_| "AB").collect::<Vec<_>>().join(":");
         assert!(v_fingerprints(&[&fp]).is_ok());
         assert!(v_fingerprints(&[&colon_fp]).is_ok(), "colons and uppercase normalize");
         assert!(v_fingerprints(&[&fp, &colon_fp]).is_ok());
+        // A prefix of at least 16 hex chars is accepted, matching the daemon.
+        assert!(v_fingerprints(&[&"ab".repeat(8)]).is_ok());
         for bad in [
             String::new(),
-            "aa11bbcc".to_string(), // a prefix, not a digest: the old validator took it
-            "ab".repeat(31),
-            "ab".repeat(33),
+            "aa11bbcc".to_string(), // 8 chars: below the minimum prefix length
+            "a".repeat(15),         // 15 chars: still below it
+            "ab".repeat(33),        // 66 chars: over a full digest
             "zz".repeat(32),
         ] {
             assert!(v_fingerprints(&[&bad]).is_err(), "accepted {:?}", bad);
         }
-        // `set` rejects the short prefix, `validate` flags it in the file.
+        // `set` rejects the too-short prefix, `validate` flags it in the file.
         let (_dir, path) = tmp_config();
         assert!(set_value(&path, "server.fingerprint", &["aa11bbcc".to_string()]).is_err());
         set_value(&path, "server.fingerprint", std::slice::from_ref(&fp)).unwrap();

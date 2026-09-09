@@ -304,9 +304,7 @@ impl<'a> MonuxCertVerification<'a> {
                     their_name, their_cert_fingerprint
                 );
                 return Ok(their_cert_fingerprint);
-            } else if self
-                .approved_cert_fingerprints
-                .contains(&their_cert_fingerprint)
+            } else if fingerprint_preapproved(&self.approved_cert_fingerprints, &their_cert_fingerprint)
             {
                 info!(
                     "{} cert approved via --fingerprints: {}",
@@ -387,31 +385,50 @@ fn default_stdin_is_tty() -> bool {
     io::stdin().is_terminal()
 }
 
-/// Number of hex characters in a certificate fingerprint (a SHA-256 digest).
-const FINGERPRINT_HEX_LEN: usize = 64;
-
 /// Normalizes a user-supplied fingerprint to our storage form: lowercase hex
 /// with the openssl-style colons removed ("18:AE:75:F2..." => "18ae75f2...").
 pub fn normalize_fingerprint(fingerprint: &str) -> String {
     fingerprint.trim().to_lowercase().replace(':', "")
 }
 
+/// A SHA-256 digest is exactly 64 hex characters.
+const FINGERPRINT_HEX_LEN: usize = 64;
+
+/// Shortest accepted fingerprint prefix (hex characters). A prefix this
+/// long keeps an offline cert-grinder at a 64-bit search — hours-to-centries
+/// of GPU time per attempt — while still sparing the user most of the
+/// 64-character hand-typing.
+const FINGERPRINT_MIN_PREFIX_LEN: usize = 16;
+
 /// Rejects a normalized fingerprint that could never match a real certificate.
-/// A SHA-256 digest is exactly 64 hex characters; anything else is a typo, a
-/// truncated paste, or a value copied from the wrong tool, and accepting it
-/// silently only surfaces later as an unexplained refusal.
+/// A value is either a full SHA-256 digest (64 hex characters) or a prefix of
+/// one at least FINGERPRINT_MIN_PREFIX_LEN long — anything else is a typo, a
+/// too-aggressive truncation, or a value copied from the wrong tool, and
+/// accepting it silently only surfaces later as an unexplained refusal.
 pub fn validate_fingerprint(normalized: &str) -> Result<()> {
-    if normalized.len() != FINGERPRINT_HEX_LEN
-        || !normalized.chars().all(|c| c.is_ascii_hexdigit())
+    if !normalized.chars().all(|c| c.is_ascii_hexdigit())
+        || !(FINGERPRINT_MIN_PREFIX_LEN..=FINGERPRINT_HEX_LEN).contains(&normalized.len())
     {
         bail!(
-            "'{}' is not a certificate fingerprint: expected {} hex characters (a SHA-256 digest), got {}. Read the peer's off its startup banner, or from 'monux status'.",
+            "'{}' is not a certificate fingerprint: expected {}..={} hex characters (a SHA-256 digest, or a prefix of one at least {} long), got {}. Read the peer's off its startup banner, or from 'monux status'.",
             normalized,
+            FINGERPRINT_MIN_PREFIX_LEN,
             FINGERPRINT_HEX_LEN,
+            FINGERPRINT_MIN_PREFIX_LEN,
             normalized.len()
         );
     }
     Ok(())
+}
+
+/// Whether a peer's fingerprint is covered by the --fingerprints values: a
+/// value may be a full digest (equals only itself) or a prefix (approves
+/// every cert whose fingerprint starts with it). Values are validated at
+/// startup, so anything shorter than the minimum prefix never gets here.
+fn fingerprint_preapproved(approved: &[String], peer_fingerprint: &str) -> bool {
+    approved
+        .iter()
+        .any(|value| peer_fingerprint.starts_with(value.as_str()))
 }
 
 /// What to do with an unknown certificate that could be prompted for.
@@ -1017,6 +1034,82 @@ mod tests {
     }
 
     #[test]
+    fn prefix_fingerprint_preapproves_without_prompting() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let their_cert = peer_cert(peer_dir.path());
+        let full = certs::fingerprint(&their_cert);
+        // The shortest accepted prefix: hand-typing the whole 64-char digest
+        // is the friction this exists to remove.
+        let prefix = full[..FINGERPRINT_MIN_PREFIX_LEN].to_string();
+        let mut verifier = MonuxCertVerification::new(
+            "test",
+            vec![prefix],
+            dir.path(),
+            true,
+        )
+        .expect("failed to construct verifier");
+        Arc::get_mut(&mut verifier)
+            .expect("fresh verifier should be uniquely owned")
+            .stdin_is_tty = tty_yes;
+        // noop_spawn (not the shared global counter): the pre-approved path
+        // returns before any prompt logic, so a spawn here would only be
+        // observable as the verify failing — and the counting statics race
+        // with the other prompt tests running in parallel.
+        Arc::get_mut(&mut verifier)
+            .expect("fresh verifier should be uniquely owned")
+            .prompt_spawner = noop_spawn;
+
+        let approved = verifier
+            .verify_cert(&their_cert, "Server", false)
+            .expect("a matching prefix pre-approves the cert");
+        assert_eq!(approved, full);
+
+        // A prefix that does not match is still unknown.
+        let other = peer_cert(tempfile::tempdir().unwrap().path());
+        let err = verifier
+            .verify_cert(&other, "Server", false)
+            .expect_err("a non-matching prefix must not approve");
+        assert!(
+            err.to_string().contains(APPROVAL_PENDING_SENTINEL),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn fingerprint_validation_accepts_full_digests_and_long_prefixes() {
+        // Full digest.
+        assert!(validate_fingerprint(&"ab".repeat(32)).is_ok());
+        // Minimum-length prefix (16 chars) and everything up to a full digest.
+        assert!(validate_fingerprint(&"ab".repeat(8)).is_ok());
+        assert!(validate_fingerprint(&"cd".repeat(12)).is_ok());
+        // Shorter than the minimum, non-hex, empty, and over-long all refuse.
+        for bad in [
+            "ab".repeat(7),   // 14 chars
+            "a".repeat(15),   // 15 chars
+            "zz".repeat(8),   // not hex
+            String::new(),
+            "ab".repeat(33),  // 66 chars
+        ] {
+            assert!(validate_fingerprint(&bad).is_err(), "accepted {:?}", bad);
+        }
+    }
+
+    #[test]
+    fn fingerprint_preapproval_matches_full_values_and_prefixes() {
+        let full = "aa11".repeat(16);
+        let approved = vec![full.clone(), "0123456789abcdef".to_string()];
+        // Exact value.
+        assert!(fingerprint_preapproved(&approved, &full));
+        // Prefix match.
+        assert!(fingerprint_preapproved(&approved, "0123456789abcdef7777"));
+        // Non-matching peer.
+        assert!(!fingerprint_preapproved(&approved, &"ffff".repeat(16)));
+        assert!(!fingerprint_preapproved(&[], &full));
+    }
+
+    #[test]
     fn unknown_cert_rejects_with_approval_pending_and_spawns_once() {
         PROMPT_SPAWNS.store(0, Ordering::SeqCst);
         let dir = tempfile::tempdir().unwrap();
@@ -1417,8 +1510,11 @@ mod tests {
         let normalized = normalize_fingerprint(&openssl);
         assert_eq!(normalized.len(), 64);
         assert!(validate_fingerprint(&normalized).is_ok());
-        // Too short (a truncated paste), too long, and non-hex all refuse.
-        for bad in ["", "aabbccdd", &"a".repeat(63), &"a".repeat(65), &"z".repeat(64)] {
+        // Prefixes at or above the minimum length are accepted...
+        assert!(validate_fingerprint(&"a".repeat(16)).is_ok());
+        assert!(validate_fingerprint(&"a".repeat(63)).is_ok());
+        // ...while too short (a truncated paste), too long, and non-hex refuse.
+        for bad in ["", "aabbccdd", &"a".repeat(15), &"a".repeat(65), &"z".repeat(64)] {
             let err = validate_fingerprint(bad).unwrap_err().to_string();
             assert!(err.contains("hex characters"), "{}: {}", bad, err);
         }
