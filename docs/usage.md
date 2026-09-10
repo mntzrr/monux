@@ -95,7 +95,7 @@ By default the server coalesces pointer motion **adaptively**: **250 updates per
 
 ## Pointer and scroll sensitivity (client)
 
-When the server's mouse and the client's machine disagree on DPI/sensitivity, scale the deltas on the client: `--mouse-scale 0.5` halves pointer motion, `--scroll-scale 2` doubles scroll steps (including hi-res wheels). Both default to `1.0` and accept values from 0.05 to 20. Fractional remainders are carried between events per axis, so small scales lose no motion over time — 0.5x emits exactly one tick per two input ticks. The scaling applies only where the client injects into its own virtual devices; the server machine's local input always stays 1:1.
+When the server's mouse and the client's machine disagree on DPI/sensitivity, scale the deltas on the client: `--mouse-scale 0.5` halves pointer motion, `--scroll-scale 2` doubles scroll steps (including hi-res wheels). Both accept values from 0.05 to 20; `--mouse-scale` defaults to `1.0`, and `--scroll-scale` defaults to `1.0` on Linux clients but `3.0` on macOS — macOS posts scroll as line units and feeds real wheel hardware ~3 lines per detent, so 1.0 reads as a third of local speed. Fractional remainders are carried between events per axis, so small scales lose no motion over time — 0.5x emits exactly one tick per two input ticks. The scaling applies only where the client injects into its own virtual devices; the server machine's local input always stays 1:1.
 
 ## Control socket and `monux status`
 
