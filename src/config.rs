@@ -167,7 +167,7 @@ pub static REGISTRY: &[KeySpec] = &[
         flag: "shortcut-goto",
         expects: "key1,key2,key3=[fingerprint-prefix]",
         default_display: "none",
-        help: "chord switching directly to a client by fingerprint prefix ('' = the server)",
+        help: "chord switching directly to a client by fingerprint prefix ('' = the server; pressing it again toggles back to the server)",
         kind: Kind::StrArray,
         validate: v_goto,
         since: BASELINE_SINCE,

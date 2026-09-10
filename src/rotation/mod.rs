@@ -1307,8 +1307,10 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     }
 
     /// Switches to the specified client by fingerprint, or to the server if the fingerprint is empty.
-    /// If a matching client isn't connected, does nothing — except run the held-key
-    /// cleanup, since the chord fired and its modifier releases are being consumed.
+    /// Pressing a chord for the client that is already current toggles back to the
+    /// server, so one chord round-trips. If a matching client isn't connected, does
+    /// nothing — except run the held-key cleanup, since the chord fired and its
+    /// modifier releases are being consumed.
     pub async fn set_client(&mut self, fingerprint: String) {
         if self.paused {
             // Paused: switch chords are not acted on (see prev_client).
@@ -1347,9 +1349,16 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 self.update_current_client(target).await;
             }
             Ok(_) => {
-                // Already on the target (no-op switch).
-                debug!("Ignoring goto request: already on the target");
-                self.release_current_target_keys().await;
+                // Already on the goto target. A goto naming a client toggles
+                // back to the local machine — one chord round-trips. goto-local
+                // while already local stays a no-op.
+                if fingerprint.is_empty() {
+                    debug!("Ignoring goto request: already on the local machine");
+                    self.release_current_target_keys().await;
+                } else {
+                    info!("Toggling to the local machine: goto target is the current client");
+                    self.update_current_client(None).await;
+                }
             }
             Err(()) => {
                 self.release_current_target_keys().await;
@@ -4121,6 +4130,35 @@ mod tests {
         assert_eq!(rotation.output_handler.released, 3);
         rotation.set_client("".to_string()).await;
         assert_eq!(rotation.output_handler.released, 4);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A goto chord naming the client that is already current toggles back to
+    /// the local machine, and pressing it again returns to the client: one
+    /// chord round-trips between a client and the server.
+    #[tokio::test]
+    async fn goto_chord_for_the_current_client_toggles_back_to_local() {
+        let (mut rotation, grab_rx, dir) = test_rotation("goto-toggle").await;
+        let a = addr("10.0.0.1:1001");
+        add_fake_client(&mut rotation, a, "aaaa1111").await;
+
+        // Local -> client via the goto chord.
+        rotation.set_client("aaaa1111".to_string()).await;
+        assert_eq!(rotation.current_client, Some(a));
+        assert!(grab_rx.borrow().client_active, "devices must grab");
+
+        // Same chord again: back to the server, devices ungrabbed.
+        rotation.set_client("aaaa1111".to_string()).await;
+        assert_eq!(rotation.current_client, None);
+        assert!(!grab_rx.borrow().client_active, "devices must ungrab");
+
+        // And again: back to the client.
+        rotation.set_client("aaaa11".to_string()).await;
+        assert_eq!(rotation.current_client, Some(a));
+
+        // goto-local while already local stays a no-op.
+        rotation.set_client(String::new()).await;
+        assert_eq!(rotation.current_client, None);
         let _ = fs::remove_dir_all(&dir);
     }
 
