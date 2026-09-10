@@ -20,8 +20,12 @@
 //!   buttons; BTN_TOUCH/BTN_TOOL_* are mac-no-ops.
 //!
 //! MVP limitations, to revisit with on-device tuning:
-//! - ANSI key layout assumed; non-ANSI/JIS-specific keys and consumer/
-//!   media keys are unmapped (logged at DEBUG and dropped).
+//! - ANSI key layout assumed; non-ANSI/JIS-specific keys are unmapped
+//!   (logged at DEBUG and dropped; KEYTRACE-promotable via MONUX_TRACE_
+//!   KEYS). Consumer keys map only where a macOS target exists AND the OS
+//!   actually honors it synthetically: macOS 26 ignores NX media events
+//!   and F-key media roles for brightness/media/eject, but the keycode-160
+//!   launcher slot works (see the SCALE and APPSELECT entries).
 //! - Only REL_WHEEL/REL_HWHEEL detents are injected; hi-res wheel axes
 //!   (REL_*_HI_RES) are dropped.
 //! - No repeat coalescing (the server's repeat rate is a keyboard-native
@@ -160,7 +164,17 @@ static KEY_TABLE: &[(u16, u16)] = &[
     (114, 0x49),  // VOLUMEDOWN
     (115, 0x48),  // VOLUMEUP
     (117, 0x51),  // KPEQUAL
-    (121, 0x5E),  // KPCOMMA
+    // Apple keyboards' Mission Control key and several Mac-layout boards'
+    // launchpad key emit consumer usage 0x0083, which Linux surfaces as
+    // KEY_SCALE (120) — NOT 0x0082/KEY_APPSELECT (580). On macOS 26 the
+    // 0x0083 hardware event opens the Apps pane, so keycode 160 is the
+    // faithful target; Mission Control has no working synthetic path at
+    // all (NX_SYSDEFINED media events and plain F3 media roles are both
+    // ignored by 26), so the launcher is strictly better than dropping.
+    (120, 0xA0),  // SCALE (Apple mission-control / Mac-board launchpad)
+    // kVK_JIS_KeypadComma, the PC numpad comma (JIS/ABNT layouts) — NOT
+    // 0x5E, which is kVK_JIS_Underscore.
+    (121, 0x5F),  // KPCOMMA
     (125, 0x37),  // LEFTMETA (Command)
     (126, 0x36),  // RIGHTMETA
     (183, 0x69),  // F13
@@ -172,6 +186,16 @@ static KEY_TABLE: &[(u16, u16)] = &[
     (189, 0x50),  // F19
     (190, 0x5A),  // F20
     (464, 0x3F),  // FN
+    // Not a kVK_* constant: 160 is the NX media-keycode slot (NX_KEYTYPE_
+    // LAUNCHPAD, IOKit hidsystem/ev_keymap.h; same slot AppleScript's
+    // `key code 160` targets). The WindowServer resolves it to the launcher
+    // toggle — Launchpad, or the Apps pane on macOS 26+ — exactly as for the
+    // hardware key, which Linux exposes as KEY_APPSELECT (HID consumer usage
+    // 0x0082). Posting it beats synthesizing F4, which only opens the
+    // launcher while the system-wide "media role" of F4 is in effect — and
+    // it ONLY works from the combined session source on macOS 26 (see
+    // needs_session_source).
+    (580, 0xA0),  // APPSELECT (Apple Launchpad/apps-revealer key)
 ];
 
 fn map_key(code: u16) -> Option<u16> {
@@ -179,6 +203,17 @@ fn map_key(code: u16) -> Option<u16> {
         .binary_search_by(|(evdev, _)| (*evdev).cmp(&code))
         .ok()
         .map(|idx| KEY_TABLE[idx].1)
+}
+
+/// Virtual keycodes the WindowServer only honors when the event carries the
+/// combined session source: macOS 26 drops synthetic media-slot keycodes
+/// (160 = Launchpad/Apps) posted from the HID-system-state source, but
+/// accepts them from the session source (verified on 26.6 — see the
+/// session_source field docs).
+static SESSION_SOURCE_KEYS: &[u16] = &[0xA0];
+
+fn needs_session_source(vk: u16) -> bool {
+    SESSION_SOURCE_KEYS.binary_search(&vk).is_ok()
 }
 
 /// The CGEventFlags bit an evdev modifier code contributes, if any.
@@ -199,6 +234,14 @@ fn modifier_of(code: u16) -> Option<CGEventFlags> {
 fn is_touchpad_marker(code: u16) -> bool {
     (0x140..=0x14f).contains(&code)
 }
+
+// NX media keys (NX_SYSDEFINED subtype-8 events) were implemented and
+// reverted: macOS 26 ignores synthetic NX media events for brightness,
+// media transport, eject, and keyboard illumination, no matter the poster
+// (verified from an Accessibility-trusted process — volume did not move).
+// Real Apple keyboards map those keys onto kVK_*-representable codes or
+// the 160 media slot instead; consumer-only codes stay dropped (KEYTRACE-
+// visible). Reintroduce only with an on-machine verification story.
 
 // AXIsProcessTrustedWithOptions: prompt=true asks macOS to put up the
 // Accessibility grant dialog naming this process.
@@ -231,6 +274,14 @@ pub struct MacOutputHandler {
     /// Events are created against the HID system state, the layer physical
     /// devices feed — posted events land where real input would.
     source: SendEventSource,
+    /// Source in the combined session state, used ONLY for the launcher-slot
+    /// keycodes (see needs_session_source): macOS 26 filters synthetic
+    /// special keycodes claimed from the HID system state — an anti-spoof
+    /// stance toward fake hardware input — but honors them from the session
+    /// state. Normal keys keep the HID source; only special slots need the
+    /// session source (verified live on 26.6: keycode 160 opened the Apps
+    /// pane from the session source and did nothing from the HID source).
+    session_source: SendEventSource,
     /// Evdev codes of keys currently held (for release_all).
     held_keys: HashSet<u16>,
     /// Accumulated modifier mask implied by held modifier keys; stamped on
@@ -259,8 +310,13 @@ impl MacOutputHandler {
             CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                 .map_err(|_| anyhow!("Failed to create the CGEvent source"))?,
         );
+        let session_source = SendEventSource(
+            CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+                .map_err(|_| anyhow!("Failed to create the session CGEvent source"))?,
+        );
         Ok(Self {
             source,
+            session_source,
             held_keys: HashSet::new(),
             held_flags: CGEventFlags::empty(),
             left_down: false,
@@ -290,7 +346,14 @@ impl MacOutputHandler {
             return Ok(());
         }
         let Some(vk) = map_key(code) else {
-            tracing::debug!("macOS output: no mapping for key code {}, dropped", code);
+            if crate::device::key_traced(code) {
+                tracing::info!(
+                    "KEYTRACE macOS output: no mapping for key code {}, dropped",
+                    code
+                );
+            } else {
+                tracing::debug!("macOS output: no mapping for key code {}, dropped", code);
+            }
             return Ok(());
         };
         let (down, repeat) = match value {
@@ -313,9 +376,33 @@ impl MacOutputHandler {
         } else {
             self.held_keys.remove(&code);
         }
-        let event = CGEvent::new_keyboard_event(self.source.0.clone(), vk, down)
+        // Launcher-slot keycodes must come from the session source (see the
+        // session_source field docs); everything else posts from the HID
+        // source as before.
+        let session = needs_session_source(vk);
+        let source = if session {
+            &self.session_source.0
+        } else {
+            &self.source.0
+        };
+        if crate::device::key_traced(code) {
+            tracing::info!(
+                "KEYTRACE macOS output: posting code {} as keycode {:#x} from {} source",
+                code,
+                vk,
+                if session { "session" } else { "hid" }
+            );
+        }
+        let event = CGEvent::new_keyboard_event(source.clone(), vk, down)
             .map_err(|_| anyhow!("CGEventCreateKeyboardEvent failed"))?;
-        event.set_flags(self.held_flags);
+        // Launcher-slot keys must keep the event's default flag bits:
+        // stamping a zero mask (the no-modifier case) strips device-state
+        // bits the WindowServer's special-keycode handler requires, which
+        // leaves keycode 160 inert (verified on 26.6). They carry no
+        // modifier semantics, so nothing is lost by leaving them alone.
+        if !session {
+            event.set_flags(self.held_flags);
+        }
         if repeat {
             event.set_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT, 1);
         }
@@ -557,8 +644,18 @@ mod tests {
         assert_eq!(map_key(1), Some(0x35)); // ESC
         assert_eq!(map_key(125), Some(0x37)); // LEFTMETA -> Command
         assert_eq!(map_key(464), Some(0x3F)); // FN
+        assert_eq!(map_key(580), Some(0xA0)); // APPSELECT -> NX Launchpad slot
+        assert_eq!(map_key(120), Some(0xA0)); // SCALE -> same launcher slot
+        assert_eq!(map_key(121), Some(0x5F)); // KPCOMMA -> kVK_JIS_KeypadComma (not 0x5E)
         assert_eq!(map_key(0x110), None); // BTN_LEFT is not a keyboard key
         assert_eq!(map_key(9999), None);
+    }
+
+    #[test]
+    fn launcher_slot_posts_from_the_session_source() {
+        assert!(needs_session_source(0xA0));
+        assert!(!needs_session_source(0x00)); // plain A posts from the HID source
+        assert!(!needs_session_source(0x76)); // F4 likewise
     }
 
     #[test]
