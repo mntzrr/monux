@@ -685,7 +685,8 @@ pub struct ServerArgs {
     /// Chord that switches straight to one client, by fingerprint prefix
     ///
     /// An empty fingerprint targets the server itself. Repeatable, one chord
-    /// per target.
+    /// per target. Pressing a chord while already on its target toggles back
+    /// to the server.
     #[arg(long, value_name = "key1,key2,key3=[fingerprint-prefix]", help_heading = H_SWITCHING)]
     pub shortcut_goto: Option<Vec<String>>,
 
