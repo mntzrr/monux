@@ -12,13 +12,17 @@ use async_trait::async_trait;
 /// Builds the platform's input-injection backend.
 ///
 /// - Linux: the three uinput virtual devices (keyboard, mouse, touchpad).
-/// - macOS: CGEvent injection into the window server (see macos.rs).
+/// - macOS: CGEvent injection into the window server (see macos.rs), plus
+///   display wake-on-input (`wake_display`).
 ///
 /// Errors carry platform-appropriate remediation text (input group / uinput
 /// on Linux, the Accessibility TCC permission on macOS).
-pub fn create() -> Result<std::boxed::Box<dyn OutputHandler>> {
+pub fn create(wake_display: bool) -> Result<std::boxed::Box<dyn OutputHandler>> {
     #[cfg(target_os = "linux")]
     {
+        // Injected input already reaches the kernel's input layer like
+        // physical input; displays wake on their own.
+        let _ = wake_display;
         Ok(Box::new(uinput::VirtualUInputDevices::new().context(
             "Failed to create virtual devices for output, possible solutions:
 - Add your user to the 'input' group and log back in: 'sudo usermod -aG input $USER'
@@ -28,7 +32,7 @@ pub fn create() -> Result<std::boxed::Box<dyn OutputHandler>> {
     }
     #[cfg(target_os = "macos")]
     {
-        Ok(Box::new(macos::MacOutputHandler::new()?))
+        Ok(Box::new(macos::MacOutputHandler::new(wake_display)?))
     }
 }
 

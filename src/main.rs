@@ -796,6 +796,7 @@ fn main() -> Result<()> {
                     ),
                     auto_update,
                     auto_indicator,
+                    wake_display: !args.no_wake_display.unwrap_or(false),
                 })
                 .await
             })?;
@@ -1432,6 +1433,9 @@ struct ClientDaemonArgs {
     edge_dwell: Duration,
     auto_update: bool,
     auto_indicator: bool,
+    /// Declare user activity on remote input so a sleeping display wakes
+    /// (macOS; see device::output::macos).
+    wake_display: bool,
 }
 
 async fn client(args: ClientDaemonArgs) -> Result<()> {
@@ -1449,6 +1453,7 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
         edge_dwell,
         auto_update,
         auto_indicator,
+        wake_display,
     } = args;
     // The tray indicator (the only consumer) is Linux-only.
     #[cfg(not(target_os = "linux"))]
@@ -1456,7 +1461,7 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
     // Set up the injection backend up-front — on failure, exit with the
     // platform's remediation text (input group / uinput on Linux, the
     // Accessibility TCC grant on macOS).
-    let mut output_handler = output::create()?;
+    let mut output_handler = output::create(wake_display)?;
     // Saturating for the same reason as the server's ceiling above.
     let max_uncompressed_size_bytes = max_clipboard_size_bytes.saturating_mul(10);
     let mut local_clipboard = clipboard::client::LocalClipboard::new(

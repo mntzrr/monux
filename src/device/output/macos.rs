@@ -35,8 +35,18 @@
 //!
 //! Injection requires the Accessibility TCC grant; `new()` checks it (with
 //! the system prompt) and bails with instructions when missing.
+//!
+//! Display wake: synthetic CGEvents do NOT wake a sleeping display — the
+//! WindowServer path is below the power manager's display sleep, and a dark
+//! screen greets every switch to the Mac after an idle period. So the first
+//! remote input after a quiet stretch declares user activity
+//! (`caffeinate -u`, Apple's own binary, non-blocking spawn, throttled to
+//! once per WAKE_DISPLAY_EVERY), which turns the display on. Opt out with
+//! --no-wake-display.
 
 use std::collections::HashSet;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
@@ -243,6 +253,28 @@ fn is_touchpad_marker(code: u16) -> bool {
 // the 160 media slot instead; consumer-only codes stay dropped (KEYTRACE-
 // visible). Reintroduce only with an on-machine verification story.
 
+/// How long the wake throttle holds after a wake: while input flows, at most
+/// one user-activity assertion per interval is needed — a display that just
+/// woke (or never slept) ignores the extra ones anyway.
+const WAKE_DISPLAY_EVERY: Duration = Duration::from_secs(30);
+
+/// How long the caffeinate user-activity assertion is held: comfortably past
+/// the display's wake-up, and cheap.
+const WAKE_ASSERT_SECS: &str = "2";
+
+/// Apple's caffeinate binary: `-u` declares user activity, which wakes the
+/// display (unlike synthetic CGEvents, which the power manager ignores).
+const CAFFEINATE: &str = "/usr/bin/caffeinate";
+
+/// Whether a wake is due. Pure so the throttle is testable without a clock
+/// or a process spawn.
+fn should_wake_display(last_wake: Option<Instant>, now: Instant) -> bool {
+    match last_wake {
+        None => true,
+        Some(t) => now.duration_since(t) >= WAKE_DISPLAY_EVERY,
+    }
+}
+
 // AXIsProcessTrustedWithOptions: prompt=true asks macOS to put up the
 // Accessibility grant dialog naming this process.
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -295,10 +327,18 @@ pub struct MacOutputHandler {
     /// Last touchpad contact position (normalized), while a contact is
     /// active; deltas against it become pointer motion.
     touchpad_last: Option<(f64, f64)>,
+    /// Wake the display on remote input (see the module docs). Off with
+    /// --no-wake-display.
+    wake_display: bool,
+    /// When the last user-activity assertion was fired (throttle).
+    last_wake: Option<Instant>,
+    /// Set after the first caffeinate spawn failure, so a broken install
+    /// logs one warning instead of one per throttle interval.
+    wake_spawn_failed: bool,
 }
 
 impl MacOutputHandler {
-    pub fn new() -> Result<Self> {
+    pub fn new(wake_display: bool) -> Result<Self> {
         if !ax_trusted_with_prompt() {
             bail!(
                 "macOS has not granted monux the Accessibility permission, so it cannot inject keyboard or mouse input.\n\
@@ -323,7 +363,43 @@ impl MacOutputHandler {
             right_down: false,
             other_down: None,
             touchpad_last: None,
+            wake_display,
+            last_wake: None,
+            wake_spawn_failed: false,
         })
+    }
+
+    /// Declares user activity when the throttle allows it, so a sleeping
+    /// display turns on as remote input arrives. The spawn is fire-and-
+    /// forget: caffeinate holds the assertion for WAKE_ASSERT_SECS on its
+    /// own, and the input path must never block on a child process.
+    fn wake_display_maybe(&mut self) {
+        if !should_wake_display(self.last_wake, Instant::now()) {
+            return;
+        }
+        self.last_wake = Some(Instant::now());
+        let spawned = Command::new(CAFFEINATE)
+            .arg("-u")
+            .args(["-t", WAKE_ASSERT_SECS])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(_) => {
+                if self.wake_spawn_failed {
+                    tracing::info!("caffeinate spawn recovered; display wake is working again");
+                    self.wake_spawn_failed = false;
+                }
+            }
+            Err(e) if !self.wake_spawn_failed => {
+                self.wake_spawn_failed = true;
+                tracing::warn!(
+                    "Failed to spawn {CAFFEINATE} to wake the display (display wake disabled until it works): {e}"
+                );
+            }
+            Err(_) => {}
+        }
     }
 
     /// The current pointer location (a fresh null CGEvent carries it).
@@ -514,6 +590,11 @@ impl MacOutputHandler {
     /// scrolls post as they come.
     fn apply_batch(&mut self, events: Vec<event::InputEvent>, class: Option<DeviceClass>) -> Result<()> {
         let _ = class; // routing is event-type driven; the class is advisory here
+        // Input means a human is working on this screen: if the display
+        // drifted off, bring it back first (throttled; see the module docs).
+        if self.wake_display {
+            self.wake_display_maybe();
+        }
         let mut dx = 0f64;
         let mut dy = 0f64;
         // Touchpad contact position seen in this batch, and whether the
@@ -629,6 +710,26 @@ impl OutputHandler for MacOutputHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wake_throttle_fires_once_per_interval() {
+        let start = Instant::now();
+        // Never woken: first input wakes.
+        assert!(should_wake_display(None, start));
+        // Just woken: held back (the interval must fully elapse).
+        let last = Some(start);
+        assert!(!should_wake_display(last, start + Duration::from_secs(1)));
+        assert!(!should_wake_display(
+            last,
+            start + WAKE_DISPLAY_EVERY - Duration::from_secs(1)
+        ));
+        // Throttle lapsed: wakes again.
+        assert!(should_wake_display(last, start + WAKE_DISPLAY_EVERY));
+        assert!(should_wake_display(
+            last,
+            start + WAKE_DISPLAY_EVERY + Duration::from_secs(1)
+        ));
+    }
 
     #[test]
     fn key_table_is_sorted_and_unique() {

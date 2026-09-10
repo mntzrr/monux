@@ -996,6 +996,16 @@ pub struct ClientArgs {
     /// also be disabled with MONUX_NO_INDICATOR=1.
     #[arg(long, num_args = 0, default_missing_value = "true", help_heading = H_DAEMON)]
     pub no_indicator: Option<bool>,
+
+    /// Do not wake a sleeping display when remote input arrives
+    ///
+    /// On by default on macOS: the first remote input after a quiet stretch
+    /// declares user activity ('caffeinate -u'), which turns the display back
+    /// on — without it, switching to the Mac means staring at a dark screen
+    /// until something local stirs. No-op on Linux, where injected input
+    /// reaches the kernel's input layer like physical input.
+    #[arg(long, num_args = 0, default_missing_value = "true", help_heading = H_DAEMON)]
+    pub no_wake_display: Option<bool>,
 }
 
 impl ClientArgs {
@@ -1043,6 +1053,10 @@ impl ClientArgs {
             .no_indicator
             .take()
             .or_else(|| cfg.get_bool("client.no-indicator"));
+        self.no_wake_display = self
+            .no_wake_display
+            .take()
+            .or_else(|| cfg.get_bool("client.no-wake-display"));
         self.auto_install = self
             .auto_install
             .take()

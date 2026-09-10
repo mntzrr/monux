@@ -489,6 +489,17 @@ pub static REGISTRY: &[KeySpec] = &[
         since: BASELINE_SINCE,
     },
     KeySpec {
+        key: "client.no-wake-display",
+        section: Section::Client,
+        flag: "no-wake-display",
+        expects: "true|false",
+        default_display: "false (remote input wakes the display)",
+        help: "do not declare user activity on remote input, so a sleeping display stays dark (macOS)",
+        kind: Kind::Bool,
+        validate: v_bool,
+        since: "14.3.0",
+    },
+    KeySpec {
         key: "client.link-notify",
         section: Section::Client,
         flag: "link-notify",
