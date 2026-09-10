@@ -85,6 +85,24 @@ pub const MAX_CLIPBOARD_SIZE_KB: u64 = u64::MAX / 1024;
 pub const DEFAULT_EDGE_DWELL_MS: u64 = 250;
 pub const DEFAULT_INPUT_SCALE: f64 = 1.0;
 
+/// Default multiplier on client scroll deltas (--scroll-scale). Linux
+/// clients replay wheel detents 1:1 into their virtual device, which is
+/// already the native feel; macOS clients post LINE-unit CGEvents, and
+/// macOS feeds real wheel hardware ~3 lines per detent — at 1.0, remote
+/// scrolling reads as a third of local speed. Keep in sync with
+/// DEFAULT_SCROLL_SCALE_DISPLAY.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_SCROLL_SCALE: f64 = 3.0;
+#[cfg(not(target_os = "macos"))]
+pub const DEFAULT_SCROLL_SCALE: f64 = 1.0;
+
+/// What `monux config` shows as the scroll-scale default; mirrors
+/// DEFAULT_SCROLL_SCALE per platform.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_SCROLL_SCALE_DISPLAY: &str = "3.0";
+#[cfg(not(target_os = "macos"))]
+pub const DEFAULT_SCROLL_SCALE_DISPLAY: &str = "1.0";
+
 /// Which daemon section of the file a key belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Section {
@@ -398,8 +416,8 @@ pub static REGISTRY: &[KeySpec] = &[
         section: Section::Client,
         flag: "scroll-scale",
         expects: "number 0.05-20",
-        default_display: "1.0",
-        help: "multiplier on scroll wheel deltas (including hi-res wheel axes)",
+        default_display: DEFAULT_SCROLL_SCALE_DISPLAY,
+        help: "multiplier on scroll wheel deltas (including hi-res wheel axes; 3.0 on macOS, 1.0 elsewhere)",
         kind: Kind::Float,
         validate: v_scale,
         since: BASELINE_SINCE,

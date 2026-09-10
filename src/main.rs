@@ -686,7 +686,7 @@ fn main() -> Result<()> {
             let mouse_scale = args.mouse_scale.unwrap_or(monux::config::DEFAULT_INPUT_SCALE);
             let scroll_scale = args
                 .scroll_scale
-                .unwrap_or(monux::config::DEFAULT_INPUT_SCALE);
+                .unwrap_or(monux::config::DEFAULT_SCROLL_SCALE);
             // Validation before the takeover below: single_instance::acquire
             // SIGTERMs the running daemon, so anything that can reject the
             // command line has to have rejected it by then. A typo would
