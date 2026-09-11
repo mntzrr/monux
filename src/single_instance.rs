@@ -35,12 +35,13 @@ const TAKEOVER_TIMEOUT: Duration = Duration::from_secs(5);
 /// Environment variable overriding the lock directory; used by tests to
 /// avoid colliding with real instances on the same machine.
 ///
-/// Honored in debug builds only. It is a test hook, and in a release build it
-/// is also a redirect: anything that can set the daemon's environment could
-/// point the lock somewhere harmless and start a second instance alongside the
-/// first, which is exactly the state the lock exists to prevent (two monuxes
-/// fighting over keyboard grabs and virtual devices).
-#[cfg(debug_assertions)]
+/// Honored in debug and test builds only. It is a test hook, and in a release
+/// build it is also a redirect: anything that can set the daemon's environment
+/// could point the lock somewhere harmless and start a second instance
+/// alongside the first, which is exactly the state the lock exists to prevent
+/// (two monuxes fighting over keyboard grabs and virtual devices). Test builds
+/// are never shipped, so they may honor it.
+#[cfg(any(debug_assertions, test))]
 const LOCK_DIR_ENV: &str = "MONUX_LOCK_DIR";
 
 /// Holds the single-instance flock for the lifetime of the process.
@@ -60,10 +61,10 @@ fn lock_path(kind: &str) -> PathBuf {
     dir.join(format!("monux-{}.lock", kind))
 }
 
-/// The directory holding the lock files. The override is debug-only (see
-/// LOCK_DIR_ENV); release builds always use /tmp.
+/// The directory holding the lock files. The override is debug/test-only (see
+/// LOCK_DIR_ENV); non-test release builds always use /tmp.
 fn lock_dir() -> PathBuf {
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, test))]
     if let Some(dir) = std::env::var_os(LOCK_DIR_ENV) {
         return PathBuf::from(dir);
     }
