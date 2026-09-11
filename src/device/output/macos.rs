@@ -41,7 +41,11 @@
 //! screen greets every switch to the Mac after an idle period. So the first
 //! remote input after a quiet stretch declares user activity
 //! (`caffeinate -u`, Apple's own binary, non-blocking spawn, throttled to
-//! once per WAKE_DISPLAY_EVERY), which turns the display on. Opt out with
+//! once per WAKE_DISPLAY_EVERY), which turns the display on. The assertion
+//! outlives the renewal interval (see WAKE_ASSERT_SECS) so the rolling
+//! renewals overlap into continuous coverage — synthetic input does not
+//! reset the power manager's idle clock, and a lapsed assertion between
+//! renewals let idle sleep reclaim the display right back. Opt out with
 //! --no-wake-display.
 
 use std::collections::HashSet;
@@ -258,9 +262,15 @@ fn is_touchpad_marker(code: u16) -> bool {
 /// woke (or never slept) ignores the extra ones anyway.
 const WAKE_DISPLAY_EVERY: Duration = Duration::from_secs(30);
 
-/// How long the caffeinate user-activity assertion is held: comfortably past
-/// the display's wake-up, and cheap.
-const WAKE_ASSERT_SECS: &str = "2";
+/// How long the caffeinate user-activity assertion is held: past the
+/// renewal interval, so rolling renewals overlap into continuous coverage
+/// and an input pause shorter than an interval cannot lapse the assertion.
+/// A 2s assertion here was the display-wake bug: powerd re-evaluates idle
+/// sleep on a clock that keeps running through sleep and is never reset by
+/// synthetic input, so in every gap between renewals it reclaimed the
+/// display — the screen came up and fell dark again at once, and any pause
+/// in input turned into sleep, jiggling required.
+const WAKE_ASSERT_SECS: u64 = 2 * WAKE_DISPLAY_EVERY.as_secs();
 
 /// Apple's caffeinate binary: `-u` declares user activity, which wakes the
 /// display (unlike synthetic CGEvents, which the power manager ignores).
@@ -380,7 +390,8 @@ impl MacOutputHandler {
         self.last_wake = Some(Instant::now());
         let spawned = Command::new(CAFFEINATE)
             .arg("-u")
-            .args(["-t", WAKE_ASSERT_SECS])
+            .arg("-t")
+            .arg(WAKE_ASSERT_SECS.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -710,6 +721,15 @@ impl OutputHandler for MacOutputHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wake_assertion_outlives_the_renewal_interval() {
+        // The assertion must still be held when the next renewal fires
+        // (overlapping coverage) and after the last input batch (grace);
+        // a shorter one let idle sleep reclaim the display between
+        // renewals — see WAKE_ASSERT_SECS.
+        assert!(WAKE_ASSERT_SECS > WAKE_DISPLAY_EVERY.as_secs());
+    }
 
     #[test]
     fn wake_throttle_fires_once_per_interval() {
