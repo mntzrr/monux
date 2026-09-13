@@ -1117,18 +1117,17 @@ async fn server(args: ServerDaemonArgs<'_>) -> Result<()> {
     });
     let grab_tx2 = grab_tx.clone();
 
-    // Screen-edge switching (opt-in via --edge-map): the edge manager owns the
-    // cursorpos poller and dwell timers, resolves targets against the live
-    // client list that the rotation loop publishes through this watch channel,
-    // and fires switches as Event::SwitchTo — the same entry point as goto
-    // chords, so debounce/pause/no-op cleanup all apply. The rotation loop
-    // also keeps a copy of the map itself, to tell each mapped client which
-    // edge it sits beyond (ServerEvent::EdgeInfo; see rotation.rs add_client).
+    // Screen-edge switching is disabled (slated for removal): the edge
+    // manager never starts, and neither the client-list publisher nor an edge
+    // map reaches the events loop — so no EdgeInfo is advertised to clients
+    // either. A configured --edge-map is inert; the warning says so once.
     let (edge_client_tx, edge_map) = match edge_map {
-        Some(map) => {
-            let (tx, rx) = watchchan::channel(Vec::new());
-            task::spawn(monux::edge::run(map.clone(), edge_dwell, event_tx.clone(), rx));
-            (Some(tx), Some(map))
+        Some(_) => {
+            warn!(
+                "Screen-edge switching is disabled and slated for removal: ignoring --edge-map/--edge-dwell-ms ({:?})",
+                edge_dwell
+            );
+            (None, None)
         }
         None => (None, None),
     };

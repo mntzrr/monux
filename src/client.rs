@@ -210,16 +210,12 @@ pub async fn run<O: output::OutputHandler>(
             cfg.link_notify.clone(),
         ));
     }
-    // Screen-edge switching back to the server: either an explicit --edge-map
-    // (spawned here per connection), or inferred from the server's EdgeInfo
-    // advertisement (see handle_event_messages) — explicit wins. The detector
-    // runs per connection and queues the edge-crossing fraction here; the
-    // step loop turns it into a SwitchRequest on the events stream. Dropping
-    // the receiver (connection teardown) quiets it.
-    if let Some(map) = cfg.edge_map.clone() {
-        let (request_tx, request_rx) = mpsc::unbounded_channel::<f64>();
-        task::spawn(crate::edge::run_client(map, cfg.edge_dwell, request_tx));
-        client.switch_request_rx = Some(request_rx);
+    // Screen-edge switching is disabled (slated for removal): no return-edge
+    // detector runs, so switch_request_rx stays None and the step loop never
+    // sends a SwitchRequest — the round trip is via the goto chords only. A
+    // configured --edge-map is inert; the warning prompts its removal.
+    if cfg.edge_map.is_some() {
+        warn!("Screen-edge switching is disabled and slated for removal: ignoring --edge-map/--edge-dwell-ms");
     }
     loop {
         if let Err(e) = client
@@ -304,16 +300,14 @@ struct Connection {
     /// update `active`; the lifecycle in main.rs drives (dis)connected.
     control_state: Arc<crate::control::ClientStateMirror>,
     /// Receives edge-crossing fractions from the screen-edge detector
-    /// (edge.rs, --edge-map), which the step loop turns into SwitchRequest
-    /// messages on the events stream. None when the feature is off (no
-    /// --edge-map, or the detector exited on an unavailable Hyprland IPC).
+    /// (edge.rs), which the step loop turns into SwitchRequest messages on
+    /// the events stream. Always None: screen-edge switching is disabled
+    /// (slated for removal), so no detector is ever spawned.
     switch_request_rx: Option<mpsc::UnboundedReceiver<f64>>,
     /// Server-driven return-edge inference (see ServerEvent::EdgeInfo):
     /// rebuilt per connection, so a reconnect re-applies whatever the new
     /// connection's EdgeInfo says.
     edge_inference: EdgeInference,
-    /// Dwell for the inferred edge detector (--edge-dwell-ms).
-    edge_dwell: Duration,
     /// The server's hostname, learned from the v15+ handshake (None from an
     /// older server): feeds the approval prompt and the remembered-servers
     /// store (known_servers.rs).
@@ -451,11 +445,9 @@ impl Connection {
             scroll_scale,
             control_state,
             throttle_mode,
-            edge_dwell,
             ..
         } = cfg;
-        let (max_clipboard_size_bytes, mode, edge_dwell) =
-            (*max_clipboard_size_bytes, *mode, *edge_dwell);
+        let (max_clipboard_size_bytes, mode) = (*max_clipboard_size_bytes, *mode);
         // An explicit --edge-map wins over the server's EdgeInfo inference.
         let edge_map_explicit = cfg.edge_map.is_some();
         let bind_addr: SocketAddr = match server_addr {
@@ -643,7 +635,6 @@ impl Connection {
                 control_state: control_state.clone(),
                 switch_request_rx: None,
                 edge_inference: EdgeInference::new(edge_map_explicit),
-                edge_dwell,
                 server_hostname,
             },
             connect_time,
@@ -1106,51 +1097,37 @@ impl Connection {
                         .context("Failed to send pong message")?;
                 }
                 event::ServerEvent::EdgeInfo { direction } => {
-                    // Server-driven edge inference: the server told us which
-                    // of ITS edges we sit beyond, so we watch the OPPOSITE
-                    // edge of this machine for the return trip. Carries no
-                    // input state, so no pending_input flush.
-                    match self.edge_inference.apply(direction) {
-                        Some(map) => {
-                            info!(
-                                "Server says we're its {}-hand client: watching the {} edge (inferred)",
-                                direction.as_str(),
-                                direction.opposite().as_str()
-                            );
-                            // (Re)start the detector with the updated inferred
-                            // map: dropping the old receiver quiets the
-                            // previous detector (edge.rs client mode).
-                            let (request_tx, request_rx) = mpsc::unbounded_channel::<f64>();
-                            task::spawn(crate::edge::run_client(map, self.edge_dwell, request_tx));
-                            self.switch_request_rx = Some(request_rx);
-                        }
-                        None => debug!(
-                            "Server says we're its {}-hand client, but --edge-map was given explicitly: keeping it",
-                            direction.as_str()
-                        ),
+                    // Screen-edge switching is disabled (slated for removal):
+                    // the inference state is still tracked, but no detector is
+                    // spawned, so the advertisement changes nothing. Carries
+                    // no input state, so no pending_input flush.
+                    if self.edge_inference.apply(direction).is_some() {
+                        debug!(
+                            "Server says we're its {}-hand client, but edge switching is disabled: not watching the {} edge",
+                            direction.as_str(),
+                            direction.opposite().as_str()
+                        );
                     }
                 }
                 event::ServerEvent::EdgeInfoRevoke { direction } => {
                     // The target on the server's side for `direction`
-                    // disconnected (or 'auto' became ambiguous). Stop
-                    // watching the opposite edge.
+                    // disconnected (or 'auto' became ambiguous). Edge
+                    // switching is disabled (slated for removal): the
+                    // inference state is still tracked, but no detector was
+                    // (or will be) spawned either way.
                     match self.edge_inference.revoke(direction) {
                         Some(map) => {
                             if map.targets.is_empty() {
-                                info!(
-                                    "Server revoked our {}-hand edge: no inferred edges left, stopping detector",
+                                debug!(
+                                    "Server revoked our {}-hand edge: no inferred edges left",
                                     direction.opposite().as_str()
                                 );
-                                self.switch_request_rx = None;
                             } else {
-                                info!(
-                                    "Server revoked our {}-hand edge: respawning detector with {} remaining",
+                                debug!(
+                                    "Server revoked our {}-hand edge: {} remaining (not watched, edge switching disabled)",
                                     direction.opposite().as_str(),
                                     map.targets.len()
                                 );
-                                let (request_tx, request_rx) = mpsc::unbounded_channel::<f64>();
-                                task::spawn(crate::edge::run_client(map, self.edge_dwell, request_tx));
-                                self.switch_request_rx = Some(request_rx);
                             }
                         }
                         None => debug!(

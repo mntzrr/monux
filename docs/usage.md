@@ -38,6 +38,8 @@ Every switch also shows a desktop notification (via `notify-send`), so an unexpe
 
 ## Screen-edge switching (Hyprland)
 
+> **Disabled and slated for removal.** Screen-edge switching no longer runs: neither the server-side detector nor the clients' return-edge detection starts, and no edge advertisement is sent to clients. The `--edge-map` / `--edge-dwell-ms` flags are still accepted but inert (a startup warning reminds you to drop them) — switch with the goto chords instead. This section is kept for reference until the feature is removed.
+
 As an alternative to shortcuts, the server can switch input when you push the cursor against a screen edge and hold it there briefly — the classic "screen-edge KVM" behavior. It's opt-in: map an edge to a client with `--edge-map` (repeatable, and values may be comma-separated):
 
 ```bash
