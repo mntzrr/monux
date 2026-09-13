@@ -413,12 +413,46 @@ impl MacOutputHandler {
         }
     }
 
-    /// The current pointer location (a fresh null CGEvent carries it).
+    /// The desktop rect every active display covers, as (min_x, min_y,
+    /// max_x, max_y) in global coordinates — the region the pointer hotspot
+    /// can occupy.
+    fn desktop_bounds(&self) -> (f64, f64, f64, f64) {
+        let mut union = CGDisplay::main().bounds();
+        if let Ok(displays) = CGDisplay::active_displays() {
+            for id in displays {
+                let b = CGDisplay::new(id).bounds();
+                union.origin.x = union.origin.x.min(b.origin.x);
+                union.origin.y = union.origin.y.min(b.origin.y);
+                union.size.width = union
+                    .size
+                    .width
+                    .max(b.origin.x + b.size.width - union.origin.x);
+                union.size.height = union
+                    .size
+                    .height
+                    .max(b.origin.y + b.size.height - union.origin.y);
+            }
+        }
+        (
+            union.origin.x,
+            union.origin.y,
+            union.origin.x + union.size.width,
+            union.origin.y + union.size.height,
+        )
+    }
+
+    /// The current pointer location (a fresh null CGEvent carries it),
+    /// clamped to the desktop (see move_by for why the clamp matters).
     fn cursor(&self) -> CGPoint {
-        CGEvent::new(self.source.0.clone())
+        let p = CGEvent::new(self.source.0.clone())
             .ok()
             .map(|e| e.location())
-            .unwrap_or(CGPoint { x: 0.0, y: 0.0 })
+            .unwrap_or(CGPoint { x: 0.0, y: 0.0 });
+        let (min_x, min_y, max_x, max_y) = self.desktop_bounds();
+        CGPoint {
+            x: p.x.clamp(min_x, max_x - 1.0),
+            y: p.y.clamp(min_y, max_y - 1.0),
+        }
     }
 
     /// Posts a keyboard event for an evdev key code, maintaining held-key
@@ -558,13 +592,25 @@ impl MacOutputHandler {
     }
 
     /// Moves the pointer by a delta in CG points.
+    ///
+    /// The window server clamps the RENDERED cursor to the desktop but keeps
+    /// the reported (virtual) position unclamped: pushing against an edge
+    /// piles every outward delta up past the boundary invisibly, and each
+    /// inward delta is then spent unwinding that overshoot, so the cursor
+    /// feels glued to the edge until a yank big enough to outrun it (probe
+    /// data point: reported x reached -1805 on a 1920-wide display while the
+    /// cursor sat pinned at the left edge). The kernel-clamped uinput path on
+    /// Linux clients never leaves the screen, so this is macOS-only. Clamping
+    /// both the read-back (in cursor) and the target keeps the virtual
+    /// position on the rendered one, making a direction reversal instant.
     fn move_by(&self, dx: f64, dy: f64) -> Result<()> {
         if dx == 0.0 && dy == 0.0 {
             return Ok(());
         }
         let mut loc = self.cursor();
-        loc.x += dx;
-        loc.y += dy;
+        let (min_x, min_y, max_x, max_y) = self.desktop_bounds();
+        loc.x = (loc.x + dx).clamp(min_x, max_x - 1.0);
+        loc.y = (loc.y + dy).clamp(min_y, max_y - 1.0);
         let (ty, button) = self.move_type();
         let event = CGEvent::new_mouse_event(self.source.0.clone(), ty, loc, button)
             .map_err(|_| anyhow!("CGEventCreateMouseEvent failed"))?;
