@@ -28,17 +28,19 @@ pub struct LinkStats {
 
 /// Why a bulk frame could not be queued. The distinction matters: a FULL
 /// queue is ordinary during a large clipboard transfer (the writer sleeps
-/// between paced frames), while a CLOSED one means the writer task is gone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// between paced frames) and is waited out with bounded backpressure, while
+/// a CLOSED one means the writer task is gone. Full hands the frame back so
+/// the caller can retry with backpressure instead of dropping it.
+#[derive(Debug, PartialEq, Eq)]
 pub enum BulkQueueError {
-    Full,
+    Full(Vec<u8>),
     Closed,
 }
 
 impl std::fmt::Display for BulkQueueError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(match self {
-            BulkQueueError::Full => "bulk queue full",
+            BulkQueueError::Full(_) => "bulk queue full",
             BulkQueueError::Closed => "bulk queue closed (writer task gone)",
         })
     }
@@ -57,15 +59,24 @@ impl std::fmt::Display for BulkQueueError {
 /// Dyn rather than a generic parameter: it matches how the clipboard traits in
 /// this crate are already used, and it keeps the type parameter off five
 /// signatures. The cost is one vtable dispatch per forwarded frame, which is
-/// nothing beside the QUIC write it precedes.
+/// nothing beside the QUIC write it precedes. Sync as well as Send because
+/// push_bulk holds a shared reference across its await (the backpressure
+/// wait), which the event loop's Send future then carries.
 #[async_trait::async_trait]
-pub trait ClientLink: Send {
+pub trait ClientLink: Send + Sync {
     /// Writes one serialized message to the ordered, reliable events stream.
     async fn send_events(&mut self, bytes: &[u8]) -> Result<()>;
 
     /// Queues one whole bulk frame (a header glued to its payload) for the
-    /// connection's writer task. Never blocks.
+    /// connection's writer task. Never blocks; a Full refusal hands the frame
+    /// back so the caller can push_bulk it with backpressure.
     fn queue_bulk(&self, frame: Vec<u8>) -> std::result::Result<(), BulkQueueError>;
+
+    /// The backpressure counterpart of queue_bulk: waits for a free slot and
+    /// queues one whole bulk frame. Used by the clipboard paths, which would
+    /// rather wait out a paced writer than sever the connection; only a
+    /// closed queue (the writer task is gone) errors — a full one never does.
+    async fn push_bulk(&self, frame: Vec<u8>) -> std::result::Result<(), BulkQueueError>;
 
     /// Free slots in the bulk queue, for the state dump.
     fn bulk_queue_free(&self) -> usize;
@@ -83,8 +94,9 @@ pub struct QuicClientLink {
     /// Queue for the client's bulk writer task, which owns the actual bulk
     /// stream. Keeping large clipboard writes out of the rotation loop means
     /// they never stall input forwarding. Bounded (bulk::BULK_QUEUE_CAPACITY):
-    /// a client that can't drain is dropped like a write failure rather than
-    /// queueing clipboard payloads without limit.
+    /// caps the memory a peer that stops draining can tie up; a full queue is
+    /// waited out with bounded backpressure, a closed one drops the client
+    /// like a write failure.
     pub(crate) bulk_tx: mpsc::Sender<Vec<u8>>,
     pub(crate) conn: quinn::Connection,
 }
@@ -100,9 +112,16 @@ impl ClientLink for QuicClientLink {
 
     fn queue_bulk(&self, frame: Vec<u8>) -> std::result::Result<(), BulkQueueError> {
         self.bulk_tx.try_send(frame).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => BulkQueueError::Full,
+            mpsc::error::TrySendError::Full(frame) => BulkQueueError::Full(frame),
             mpsc::error::TrySendError::Closed(_) => BulkQueueError::Closed,
         })
+    }
+
+    async fn push_bulk(&self, frame: Vec<u8>) -> std::result::Result<(), BulkQueueError> {
+        self.bulk_tx
+            .send(frame)
+            .await
+            .map_err(|_| BulkQueueError::Closed)
     }
 
     fn bulk_queue_free(&self) -> usize {
@@ -202,6 +221,9 @@ pub mod test_support {
             Ok(())
         }
         fn queue_bulk(&self, _frame: Vec<u8>) -> std::result::Result<(), BulkQueueError> {
+            Ok(())
+        }
+        async fn push_bulk(&self, _frame: Vec<u8>) -> std::result::Result<(), BulkQueueError> {
             Ok(())
         }
         fn bulk_queue_free(&self) -> usize {

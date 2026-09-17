@@ -47,6 +47,17 @@ use crate::network::transport::NetworkMode;
 /// attempt; 45s leaves margin for a couple of backoff steps on top of that worst case.
 const REMOVED_CLIENT_RECOVERY_DEADLINE: Duration = Duration::from_secs(45);
 
+/// How long a full bulk queue is waited for a free slot before the client is
+/// removed over it (see Rotation::queue_bulk_with_backpressure). A full queue
+/// is ordinary mid-transfer: the bulk writer paces large frames and sleeps
+/// between them (network::throttle), so a slot frees at least every
+/// max-frame transmit time — ~1s for a 5 MB frame at the 40 Mbps adaptive
+/// floor. The grace gives the writer many such chances before severing; a
+/// peer that hasn't drained one frame past it was going to die on the QUIC
+/// idle timeout anyway, and the wait bounds how long the rotation loop can
+/// stall on a wedged client.
+const BULK_BACKPRESSURE_GRACE: Duration = Duration::from_secs(5);
+
 /// How the pointer-motion flush rate is chosen (see --motion-hz).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MotionMode {
@@ -511,6 +522,10 @@ pub struct Rotation<O: device::output::OutputHandler> {
 
     /// How the per-client bulk pacing rates are chosen (see ThrottleMode).
     throttle_mode: ThrottleMode,
+    /// How long a full bulk queue is waited before the client is removed
+    /// (see BULK_BACKPRESSURE_GRACE). Overridable so a test can exercise the
+    /// timeout without serving the full grace.
+    bulk_grace: Duration,
     /// Per-client adaptive-fidelity state, keyed by endpoint in lockstep with
     /// the roster (inserted on add, removed on removal).
     link_quality: HashMap<SocketAddr, ClientLinkState>,
@@ -661,6 +676,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             serialize_scratch: Vec::new(),
             motion: MotionCoalescer::new(motion_mode),
             throttle_mode,
+            bulk_grace: BULK_BACKPRESSURE_GRACE,
             link_quality: HashMap::new(),
             last_switch_at: None,
             liveness: LivenessTracker::new(match mode {
@@ -883,8 +899,12 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         // can be megabytes, and writing them inline would stall input forwarding
         // for the whole rotation. The task also keeps each header glued to its
         // payload by writing queued byte blobs sequentially. The queue is
-        // bounded (bulk::BULK_QUEUE_CAPACITY): senders fail fast when the
-        // client can't drain, and the client is dropped like a write failure.
+        // bounded (bulk::BULK_QUEUE_CAPACITY): it caps the memory a peer that
+        // stops draining can tie up. A full queue is ordinary while the writer
+        // paces a large transfer, so senders don't drop the client over it —
+        // they wait out a bounded backpressure grace (see
+        // queue_bulk_with_backpressure); only a closed queue, or one that
+        // outlasts the grace, drops the client like a write failure.
         // Fresh adaptive-fidelity state for the (re)connection, kept in
         // lockstep with the clients entry (see handle_client_removal): the
         // bulk pacing cell starts at the Normal-tier rate and is rewritten by
@@ -3071,10 +3091,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// RotationEvent::SendBulkFrame). A stale token means the endpoint was
     /// reused by a newer connection and this frame belongs to the dead one.
     async fn send_bulk_frame(&mut self, endpoint: &SocketAddr, frame: Vec<u8>, conn_token: u64) {
-        let queued = match self.roster.get(endpoint) {
-            Some(client) if client.conn_token == conn_token => {
-                Some(client.link.queue_bulk(frame))
-            }
+        match self.roster.get(endpoint) {
+            Some(client) if client.conn_token == conn_token => {}
             Some(_) => {
                 debug!("Dropping a bulk frame for {}: its connection was replaced", endpoint);
                 return;
@@ -3083,13 +3101,84 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 debug!("Dropping a bulk frame for {}: no longer connected", endpoint);
                 return;
             }
+        }
+        self.queue_bulk_with_backpressure(endpoint, frame).await;
+    }
+
+    /// The full-queue policy shared by the inline (send_bulk) and deferred
+    /// (send_bulk_frame) clipboard paths. A whole frame goes onto the client's
+    /// bounded bulk queue; the network write itself happens in the client's
+    /// writer task, so the rotation loop never writes to the network here.
+    /// try_send keeps the loop non-blocking on an empty queue, and each queued
+    /// blob is a whole frame, so nothing is dropped mid-message.
+    ///
+    /// A FULL queue is not an error: it is the ordinary state while the
+    /// writer paces a large clipboard transfer, and severing the client there
+    /// is what flickered machines out of and back into the rotation (the
+    /// immediate reconnect and the 45s re-adoption window re-ran the very
+    /// transfer that had filled the queue, looping). So a full queue waits
+    /// out BULK_BACKPRESSURE_GRACE for a slot — worst case the loop stalls
+    /// that long for a frame, where the old policy removed the client
+    /// outright. Removal stays the last resort, for the cases it was written
+    /// for: a CLOSED queue (the writer task died) or a queue that outlasts
+    /// the grace (the peer is not draining and must not stall the loop
+    /// forever — and an undeliverable clipboard frame must not leave the two
+    /// sides disagreeing about who owns the clipboard). In both cases the
+    /// client is dropped like a write failure: it would die on the QUIC idle
+    /// timeout anyway.
+    ///
+    /// Returns true when the frame was queued, false when it was not (client
+    /// unknown, or removed over a dead/stuck queue).
+    async fn queue_bulk_with_backpressure(&mut self, endpoint: &SocketAddr, frame: Vec<u8>) -> bool {
+        let refused = match self
+            .roster
+            .get(endpoint)
+            .map(|client| client.link.queue_bulk(frame))
+        {
+            Some(Ok(())) => return true,
+            Some(Err(e)) => e,
+            None => {
+                warn!(
+                    "Bulk client {} not found in the roster: {:?}",
+                    endpoint, self.roster
+                );
+                return false;
+            }
         };
-        if let Some(Err(e)) = queued {
-            warn!("Bulk queue to {} failed ({}), removing client", endpoint, e);
-            if self.handle_client_removal(endpoint).await {
-                self.clipboard_clear().await;
+        match refused {
+            BulkQueueError::Closed => {
+                warn!("Bulk queue to {} failed ({}), removing client", endpoint, refused);
+            }
+            BulkQueueError::Full(frame) => {
+                let grace = self.bulk_grace;
+                let pushed = tokio::time::timeout(grace, async {
+                    match self.roster.get(endpoint) {
+                        Some(client) => client.link.push_bulk(frame).await,
+                        None => Err(BulkQueueError::Closed),
+                    }
+                })
+                .await;
+                match pushed {
+                    Ok(Ok(())) => return true,
+                    Ok(Err(e)) => {
+                        warn!(
+                            "Bulk queue to {} failed while waiting for space ({}), removing client",
+                            endpoint, e
+                        );
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Bulk queue to {} stayed full past the {:?} backpressure grace (peer not draining?), removing client",
+                            endpoint, grace
+                        );
+                    }
+                }
             }
         }
+        if self.handle_client_removal(endpoint).await {
+            self.clipboard_clear().await;
+        }
+        false
     }
 
     async fn send_bulk(
@@ -3106,33 +3195,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             trace!("Queueing {} byte payload for {}", payload.len(), endpoint);
             bytes.extend_from_slice(&payload);
         }
-        // The network write happens in the client's bulk writer task, so large
-        // payloads never block the rotation loop. try_send keeps it that way
-        // with a bounded queue, and each queued blob is a whole frame, so
-        // nothing is dropped mid-message. A FULL queue means the client isn't
-        // draining (a closed one means its writer task died): drop the client
-        // like a write failure — it would die on the QUIC idle timeout anyway.
-        let sent = self
-            .roster
-            .get(endpoint)
-            .map(|client| client.link.queue_bulk(bytes));
-        match sent {
-            Some(Ok(())) => Ok(true),
-            Some(Err(e)) => {
-                warn!("Bulk queue to {} failed ({}), removing client", endpoint, e);
-                if self.handle_client_removal(endpoint).await {
-                    self.clipboard_clear().await;
-                }
-                Ok(false)
-            }
-            None => {
-                warn!(
-                    "Bulk client {} not found in the roster: {:?}",
-                    endpoint, self.roster
-                );
-                Ok(false)
-            }
-        }
+        Ok(self.queue_bulk_with_backpressure(endpoint, bytes).await)
     }
 
     /// Removes the client and switches to the server if it was the active client.
@@ -3351,7 +3414,7 @@ fn queue_diagnostics_frame(
     link.queue_bulk(bytes).map_err(|e| match e {
         // The common case, and the reason this path exists: the writer is
         // pacing a large clipboard transfer and hasn't drained the queue yet.
-        BulkQueueError::Full => "its bulk queue is busy — a large clipboard \
+        BulkQueueError::Full(_) => "its bulk queue is busy — a large clipboard \
              transfer is probably in flight; retry the report once it finishes"
             .to_string(),
         BulkQueueError::Closed => {
@@ -3525,11 +3588,25 @@ mod tests {
 
         fn queue_bulk(&self, frame: Vec<u8>) -> std::result::Result<(), BulkQueueError> {
             if self.bulk_capacity.load(Ordering::SeqCst) == 0 {
-                return Err(BulkQueueError::Full);
+                return Err(BulkQueueError::Full(frame));
             }
             self.bulk_capacity.fetch_sub(1, Ordering::SeqCst);
             crate::lock(&self.bulk).push(frame);
             Ok(())
+        }
+
+        /// Emulates the real writer task's backpressure: waits for a free
+        /// slot, which a test frees by raising bulk_capacity. send_bulk's
+        /// bulk_grace timeout is what bounds this wait in production.
+        async fn push_bulk(&self, frame: Vec<u8>) -> std::result::Result<(), BulkQueueError> {
+            loop {
+                if self.bulk_capacity.load(Ordering::SeqCst) > 0 {
+                    self.bulk_capacity.fetch_sub(1, Ordering::SeqCst);
+                    crate::lock(&self.bulk).push(frame);
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
         }
 
         fn bulk_queue_free(&self) -> usize {
@@ -3555,6 +3632,9 @@ mod tests {
             Ok(())
         }
         fn queue_bulk(&self, _frame: Vec<u8>) -> std::result::Result<(), BulkQueueError> {
+            Err(BulkQueueError::Closed)
+        }
+        async fn push_bulk(&self, _frame: Vec<u8>) -> std::result::Result<(), BulkQueueError> {
             Err(BulkQueueError::Closed)
         }
         fn bulk_queue_free(&self) -> usize {
@@ -5085,6 +5165,63 @@ mod tests {
         rotation.send_bulk_frame(&a, vec![9, 9, 9], token - 1).await;
         assert_eq!(probe.bulk_sent(), vec![vec![1, 2, 3]]);
         assert_eq!(rotation.roster.len(), 1, "and the client is untouched");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A full bulk queue is the ordinary state while the writer paces a large
+    /// transfer: the frame waits for a slot instead of removing the client.
+    /// This is the regression test for the join→leave→join flicker, where a
+    /// mid-copy full queue severed the client, the immediate reconnect
+    /// re-ran the transfer, and the loop repeated.
+    #[tokio::test]
+    async fn a_full_bulk_queue_waits_out_the_paced_writer() {
+        let (mut rotation, _grab_rx, dir) = test_rotation("bulk-backpressure").await;
+        let a = addr("10.0.0.1:1001");
+        let probe = add_fake_client(&mut rotation, a, "aaaa1111").await;
+        // The writer is mid-pacing: the queue takes nothing right now.
+        probe.bulk_capacity.store(0, Ordering::SeqCst);
+
+        // The pace sleep ends a moment later and frees a slot.
+        let capacity = Arc::clone(&probe.bulk_capacity);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            capacity.store(1, Ordering::SeqCst);
+        });
+
+        let msg = bulk::ServerBulk::DiagnosticsRequest(bulk::DiagnosticsRequest {
+            request_id: 1,
+            lines: 1,
+        });
+        let sent = rotation.send_bulk(&a, msg, None).await;
+        assert!(sent.unwrap(), "frame queued once the writer drained");
+        assert_eq!(probe.bulk_sent().len(), 1);
+        assert_eq!(rotation.roster.len(), 1, "the client survives a full queue");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A queue that outlasts the backpressure grace means the peer is not
+    /// draining; only then does the full queue remove the client, like a
+    /// write failure.
+    #[tokio::test]
+    async fn a_bulk_queue_full_past_the_grace_removes_the_client() {
+        let (mut rotation, _grab_rx, dir) = test_rotation("bulk-grace").await;
+        let a = addr("10.0.0.1:1001");
+        let probe = add_fake_client(&mut rotation, a, "aaaa1111").await;
+        probe.bulk_capacity.store(0, Ordering::SeqCst);
+        rotation.bulk_grace = Duration::from_millis(30);
+
+        let msg = bulk::ServerBulk::DiagnosticsRequest(bulk::DiagnosticsRequest {
+            request_id: 1,
+            lines: 1,
+        });
+        let sent = rotation.send_bulk(&a, msg, None).await;
+        assert!(!sent.unwrap(), "the frame never got queued");
+        assert_eq!(
+            rotation.roster.len(),
+            0,
+            "a queue that outlasts the grace is a dead client"
+        );
+        assert!(probe.bulk_sent().is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

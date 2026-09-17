@@ -5,12 +5,14 @@ use serde::{Deserialize, Serialize};
 /// Capacity (in whole frames) of the per-connection bulk writer queue, on
 /// both the server (per client) and the client. Each queued blob is one
 /// complete frame — a serialized header glued to its payload — so nothing is
-/// ever dropped mid-message. The bound keeps a peer that stops draining from
-/// queueing clipboard payloads (potentially megabytes each) without limit;
-/// a full queue fails the send fast, and the sender drops the CONNECTION,
-/// exactly like a write failure: a peer that isn't draining would die on the
-/// QUIC idle timeout anyway. Event loops never block on the queue.
-pub const BULK_QUEUE_CAPACITY: usize = 4;
+/// ever dropped mid-message. The bound caps the memory a peer that stops
+/// draining can tie up (capacity × max clipboard size, 16 × 5 MB by default).
+/// A full queue is ordinary mid-transfer — the writer paces large frames and
+/// sleeps between them (network::throttle) — so it is not an error: the
+/// clipboard paths wait a bounded grace for a free slot (see
+/// Rotation::queue_bulk_with_backpressure), and only the diagnostics path
+/// refuses fast instead of waiting.
+pub const BULK_QUEUE_CAPACITY: usize = 16;
 
 /// A serialized bulk message sent from the server to the client.
 /// This is sent on a separate 'bulk' stream from the main 'events' stream, to avoid blocking events.
