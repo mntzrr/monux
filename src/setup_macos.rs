@@ -387,6 +387,14 @@ fn enable_agent(
         // restart. The freshly written plist applies at the next restart.
         println!("[ok]   autostart: {job} is already bootstrapped; leaving it running as-is");
         println!("       Restart it into the new plist with: launchctl kickstart -k {job}");
+        // A binary swapped under a loaded job (a manual upgrade) can leave
+        // launchd unable to spawn the new image at all: every respawn fails
+        // with "last exit code = 78 (EX_CONFIG)" while the agent's log stays
+        // silent, and kickstart does not clear the state — only booting the
+        // job out and bootstrapping it back does (install.sh does this
+        // automatically; a manual binary replacement has to do it by hand).
+        println!("       If the daemon will not start after a binary upgrade ('launchctl list' shows status 78):");
+        println!("       $ launchctl bootout {job} && launchctl bootstrap {} {}", lc.domain(), agent.plist_path.display());
     } else {
         let bootstrap = lc.spec(&["bootstrap", &lc.domain(), &agent.plist_path.display().to_string()]);
         if let Err(e) = run(&bootstrap) {
