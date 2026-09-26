@@ -483,7 +483,11 @@ impl MacOutputHandler {
             _ => (false, false),
         };
         // Update state first so a modifier's own press carries its flag and
-        // its release doesn't.
+        // its release doesn't. `was_tracked`/`flags_before` snapshot the
+        // pre-call state so a failed CGEvent creation below can roll the
+        // bookkeeping back to what the window server actually saw.
+        let was_tracked = self.held_keys.contains(&code);
+        let flags_before = self.held_flags;
         if let Some(bit) = modifier_of(code) {
             if down {
                 self.held_flags |= bit;
@@ -514,8 +518,24 @@ impl MacOutputHandler {
                 if session { "session" } else { "hid" }
             );
         }
-        let event = CGEvent::new_keyboard_event(source.clone(), vk, down)
-            .map_err(|_| anyhow!("CGEventCreateKeyboardEvent failed"))?;
+        let event = match CGEvent::new_keyboard_event(source.clone(), vk, down) {
+            Ok(event) => event,
+            Err(_) => {
+                // The post never happened, so the tracking must not claim it
+                // did. A failed press stays untracked (nothing was delivered,
+                // so nothing to release later); a failed release stays tracked
+                // (the key is still physically down, and a later release_all
+                // retries it) — the same invariant the uinput backend keeps,
+                // and the property release_all's retry safety relies on.
+                if was_tracked {
+                    self.held_keys.insert(code);
+                } else {
+                    self.held_keys.remove(&code);
+                }
+                self.held_flags = flags_before;
+                return Err(anyhow!("CGEventCreateKeyboardEvent failed"));
+            }
+        };
         // Launcher-slot keys must keep the event's default flag bits:
         // stamping a zero mask (the no-modifier case) strips device-state
         // bits the WindowServer's special-keycode handler requires, which
@@ -645,7 +665,22 @@ impl MacOutputHandler {
     /// Applies one batch of wire events. Motion deltas accumulate and post
     /// once per batch (a batch is one device frame); keys, buttons, and
     /// scrolls post as they come.
+    ///
+    /// A failed batch leaves no half-applied bookkeeping behind: the
+    /// touchpad contact seed is dropped along with the batch, because the
+    /// failed batch may have carried the contact's end markers (BTN_TOUCH
+    /// transition / tracking-id -1) — a stale seed would turn the next
+    /// contact's first frame into a spurious full-display-width jump (see
+    /// the touchpad motion path below).
     fn apply_batch(&mut self, events: Vec<event::InputEvent>, class: Option<DeviceClass>) -> Result<()> {
+        let result = self.apply_batch_inner(events, class);
+        if result.is_err() {
+            self.touchpad_last = None;
+        }
+        result
+    }
+
+    fn apply_batch_inner(&mut self, events: Vec<event::InputEvent>, class: Option<DeviceClass>) -> Result<()> {
         let _ = class; // routing is event-type driven; the class is advisory here
         // Input means a human is working on this screen: if the display
         // drifted off, bring it back first (throttled; see the module docs).
@@ -745,8 +780,13 @@ impl OutputHandler for MacOutputHandler {
         // Release keys first (with modifier flags collapsing as they go),
         // then buttons — the same order a client switch wants: nothing may
         // arrive on the new target held down.
-        let held: Vec<u16> = self.held_keys.drain().collect();
-        for code in held {
+        //
+        // The loop runs over a snapshot, not a drain: a failed release
+        // re-tracks its key (see key_event's rollback) and aborts here, so
+        // everything still held stays tracked for the next release_all to
+        // retry. Draining upfront would strand the not-yet-released keys
+        // untracked and physically stuck on the failure path.
+        for code in self.held_keys.iter().copied().collect::<Vec<u16>>() {
             self.key_event(code, 0)?;
         }
         self.held_flags = CGEventFlags::empty();
