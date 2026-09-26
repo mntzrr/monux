@@ -139,6 +139,11 @@ pub fn save(config_dir: &Path, servers: &[RememberedServer]) -> Result<()> {
 /// (dedup on addr), the least recently connected server beyond
 /// [`MAX_REMEMBERED`] falls off. `hostname` is the mDNS instance name or the
 /// v15+ handshake name when known.
+///
+/// The fingerprint is the server's stable identity, so a success recorded at
+/// a NEW address — the machines moved subnets and the server re-addressed —
+/// retires the server's older endpoints instead of letting the store fill
+/// with dead addresses for the same machine.
 pub fn record(
     config_dir: &Path,
     addr: SocketAddr,
@@ -147,6 +152,10 @@ pub fn record(
     now_secs: u64,
 ) -> Result<()> {
     let mut servers = load(config_dir);
+    // One server, one address: drop this fingerprint's other endpoints first
+    // (case-insensitive — the store holds the lowercase canonical form, but
+    // the comparison must not depend on it).
+    servers.retain(|s| !s.fingerprint.eq_ignore_ascii_case(fingerprint));
     servers.retain(|s| s.addr != addr);
     servers.insert(
         0,
@@ -159,6 +168,21 @@ pub fn record(
     );
     servers.truncate(MAX_REMEMBERED);
     save(config_dir, &servers)
+}
+
+/// The fingerprint recorded for `addr`, when this machine has connected to
+/// the server there before. Feeds the explicit-host re-discovery in main.rs:
+/// a configured address with a remembered fingerprint can follow the server
+/// after a subnet move re-addresses it, because the identity is known even
+/// when the address is stale.
+pub fn fingerprint_recorded_for(
+    remembered: &[RememberedServer],
+    addr: SocketAddr,
+) -> Option<String> {
+    remembered
+        .iter()
+        .find(|s| s.addr == addr)
+        .map(|s| s.fingerprint.clone())
 }
 
 /// The hostname arrives over the wire (mDNS or the v15 handshake) and goes
@@ -339,11 +363,15 @@ mod tests {
     #[test]
     fn record_caps_at_max_remembered() {
         let dir = tempfile::tempdir().unwrap();
-        for i in 0..MAX_REMEMBERED + 3 {
+        // Distinct fingerprints: each record is a different server (same
+        // fingerprint would retire the previous endpoint — see
+        // rerecording_a_server_at_a_new_address_retires_the_old_endpoint).
+        let fps = ["aa", "bb", "cc", "dd", "ee", "ff", "11", "22"];
+        for (i, fp) in fps.iter().enumerate() {
             record(
                 dir.path(),
                 format!("10.0.0.{}:1213", i + 1).parse().unwrap(),
-                "aa",
+                fp,
                 None,
                 100 + i as u64,
             )
@@ -354,6 +382,45 @@ mod tests {
         // Most recent first; the three oldest fell off.
         assert_eq!(servers[0].addr, "10.0.0.8:1213".parse().unwrap());
         assert_eq!(servers[4].addr, "10.0.0.4:1213".parse().unwrap());
+    }
+
+    /// A success at a new address retires the server's old endpoint: the
+    /// fingerprint is the identity, so a subnet move (the server
+    /// re-addresses) leaves one record instead of a dead one and a live one.
+    #[test]
+    fn rerecording_a_server_at_a_new_address_retires_the_old_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        record(dir.path(), "10.0.0.1:1213".parse().unwrap(), "aa", Some("srv"), 100).unwrap();
+        record(dir.path(), "10.9.9.9:1213".parse().unwrap(), "aa", Some("srv"), 200).unwrap();
+        assert_eq!(
+            load(dir.path()),
+            vec![server("10.9.9.9:1213", "aa", Some("srv"), 200)]
+        );
+        // Case-insensitive: the store holds lowercase fingerprints, but the
+        // retirement must not depend on the case the new record arrives in.
+        record(dir.path(), "10.5.5.5:1213".parse().unwrap(), "AA", Some("srv"), 300).unwrap();
+        assert_eq!(
+            load(dir.path()),
+            vec![server("10.5.5.5:1213", "AA", Some("srv"), 300)]
+        );
+        // A different server's record is untouched.
+        record(dir.path(), "10.1.1.1:1213".parse().unwrap(), "bb", None, 400).unwrap();
+        assert_eq!(load(dir.path()).len(), 2);
+    }
+
+    /// The lookup behind the explicit-host re-discovery in main.rs: the
+    /// fingerprint of the server this machine connected to at `addr`.
+    #[test]
+    fn fingerprint_recorded_for_finds_the_addrs_server() {
+        let remembered = vec![server("10.1.1.1:1213", "aabb", Some("one"), 100)];
+        assert_eq!(
+            fingerprint_recorded_for(&remembered, "10.1.1.1:1213".parse().unwrap()).as_deref(),
+            Some("aabb")
+        );
+        assert_eq!(
+            fingerprint_recorded_for(&remembered, "10.2.2.2:1213".parse().unwrap()),
+            None
+        );
     }
 
     #[test]
