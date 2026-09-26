@@ -102,6 +102,20 @@ A subnet move re-addresses both machines, and mDNS discovery is link-local multi
 
 If you are setting up after a move and nothing connects: check `monux servers` on the client (lists live mDNS advertisements and remembered entries), confirm the server is running, and connect once with `monux client <new-ip>` — the new address is remembered thereafter.
 
+## The daemon won't start after a manual binary upgrade (macOS)
+
+If you replaced the monux binary under a loaded LaunchAgent — a manual upgrade rather than `./install.sh` or `mx update` — launchd can refuse to spawn the new image at all: `launchctl list` shows the job with exit status `78`, the daemon is gone, and its log stays silent (launchd never got as far as running it). `launchctl kickstart -k` does **not** clear this; the job must be bootstrapped anew:
+
+```bash
+launchctl bootout gui/$(id -u)/sh.monux.client
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/sh.monux.client.plist
+# and, if the tray agent is loaded:
+launchctl bootout gui/$(id -u)/sh.monux.tray
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/sh.monux.tray.plist
+```
+
+`./install.sh` does this automatically after replacing the binary. Two more upgrade rules on macOS: re-sign after rebuilding (`codesign --force -s monux-code-signing ~/.local/bin/monux`) — the Accessibility grant keys on the code signature, and an ad-hoc-signed binary loses it — and re-check the tray/daemon after an upgrade with `monux status --client`, since the tray keeps running the old image and hides exactly this failure.
+
 ---
 
 ← Back to [wiki index](README.md) · [project README](../README.md)

@@ -199,6 +199,43 @@ EOF
     fi
 
     # ------------------------------------------------------------------
+    # macOS: re-bootstrap any loaded monux agents.
+    #
+    # A binary replaced under a loaded LaunchAgent (this install, or a
+    # manual upgrade) can leave launchd unable to spawn the new image at
+    # all: every respawn fails with "last exit code = 78 (EX_CONFIG)",
+    # nothing is written to the agent's log, and 'launchctl kickstart -k'
+    # does not clear the state — only booting the job out and
+    # bootstrapping it back does. An install is an upgrade, so restarting
+    # the agents into the fresh binary is the expected outcome; agents
+    # that are not loaded are left alone (autostart is opt-in via setup).
+    # ------------------------------------------------------------------
+    install_uid=$(id -u)
+    for plist in "$HOME"/Library/LaunchAgents/sh.monux.*.plist; do
+        [ -e "$plist" ] || continue
+        label=$(basename "$plist" .plist)
+        job="gui/$install_uid/$label"
+        if launchctl print "$job" >/dev/null 2>&1; then
+            launchctl bootout "$job" || true
+            # launchd tears the previous instance down asynchronously, and a
+            # bootstrap that races it fails with "5: Input/output error"
+            # (seen on the client agent, whose teardown takes longer than
+            # the tray's). Wait — bounded — until the job is really gone.
+            waits=0
+            while launchctl print "$job" >/dev/null 2>&1 && [ "$waits" -lt 50 ]; do
+                sleep 0.1
+                waits=$((waits + 1))
+            done
+            if launchctl bootstrap "gui/$install_uid" "$plist"; then
+                echo "Restarted agent: $label (bootstrapped into the new binary)"
+            else
+                echo "warning: could not bootstrap $label back; run:" >&2
+                echo "         launchctl bootstrap gui/$install_uid $plist" >&2
+            fi
+        fi
+    done
+
+    # ------------------------------------------------------------------
     # macOS: the Accessibility (TCC) grant.
     #
     # The toggle itself cannot be scripted — that is the point of TCC — but
