@@ -1223,6 +1223,13 @@ impl Connection {
                 self.bulk_recv_bytes
                     .extend_from_slice(&(*resp_bytes)[c.remaining_bytes..]);
                 c.remaining_bytes = 0;
+                // The trailing tail is subject to the same ceiling as the
+                // not-streaming branch below: a peer appending garbage after
+                // each raw chunk must hit the same wall instead of growing
+                // this buffer without limit for the length of the transfer.
+                if self.bulk_recv_bytes.len() > shared::MAX_FRAME_BUFFER_BYTES {
+                    bail!("Server sent an oversized bulk frame ({} bytes without a COBS terminator)", self.bulk_recv_bytes.len());
+                }
             }
 
             if c.remaining_bytes == 0 {
