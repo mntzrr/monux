@@ -761,6 +761,13 @@ async fn handle_connection(
                         c.bytes.extend_from_slice(&(*resp.bytes)[..c.remaining_bytes]);
                         bulk_bytes.extend_from_slice(&(*resp.bytes)[c.remaining_bytes..]);
                         c.remaining_bytes = 0;
+                        // Same ceiling as the not-streaming branch below: a
+                        // client appending garbage after each raw chunk must
+                        // hit the same wall instead of growing this buffer
+                        // without limit for the length of the transfer.
+                        if bulk_bytes.len() > shared::MAX_FRAME_BUFFER_BYTES {
+                            bail!("Client {} sent an oversized bulk frame ({} bytes without a COBS terminator)", conn.remote_address(), bulk_bytes.len());
+                        }
                     }
 
                     if c.remaining_bytes == 0 {

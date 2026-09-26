@@ -729,6 +729,17 @@ fn main() -> Result<()> {
                     None
                 }
             };
+            // A configured address this machine has connected to before
+            // carries its server's fingerprint (known_servers.rs). With it,
+            // the reconnect loop can follow the server via mDNS after a
+            // subnet move re-addresses it, instead of dialing the stale
+            // address forever (see the reconnect loop in client()).
+            let anchored_server_fingerprint = initial_addr.as_ref().and_then(|addr| {
+                monux::known_servers::fingerprint_recorded_for(
+                    &monux::known_servers::load(&config_dir),
+                    *addr,
+                )
+            });
             let client_lock = single_instance::acquire("client")?;
             settle_after_takeover(&client_lock);
             reap_inherited_children();
@@ -782,6 +793,7 @@ fn main() -> Result<()> {
                 client(ClientDaemonArgs {
                     config_dir,
                     initial_addr,
+                    anchored_server_fingerprint,
                     verifier,
                     max_clipboard_size_bytes,
                     mode,
@@ -1357,42 +1369,57 @@ const HEALTHY_SESSION: Duration = Duration::from_secs(60);
 /// then the delay doubles (1s, 2s, ...) up to this.
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 
-/// One candidate in the reconnect cycle of a discovery-mode client (no
-/// --host).
+/// After this many consecutive fast failures, a plain explicit-host client
+/// (no anchored fingerprint, so no re-discovery) gets a one-time hint that
+/// its configured address may be stale.
+const STALE_ADDRESS_HINT_AFTER: u32 = 3;
+
+/// One candidate in the reconnect cycle of a client that may re-discover
+/// (no --host, or an explicit host with a remembered fingerprint).
 enum Candidate {
     /// A remembered server address (known_servers.rs), most recent first.
     Remembered(SocketAddr),
-    /// One mDNS discovery attempt.
-    Discover,
+    /// One mDNS discovery attempt. When a fingerprint is carried, only
+    /// servers advertising it are acceptable: an explicitly configured host
+    /// whose address went stale (subnet move) re-finds ITS server, it does
+    /// not roam to whichever server answers first.
+    Discover { fingerprint: Option<String> },
 }
 
 /// Builds one pass of the reconnect candidate cycle: the remembered servers,
 /// most recent first, then a single mDNS discovery attempt. The cycle is
 /// rebuilt from a fresh store read every pass, so a server just recorded by
-/// a successful connect leads the next one.
+/// a successful connect leads the next one. `anchored` is Some when an
+/// explicitly configured host carries a remembered fingerprint (see
+/// fingerprint_recorded_for): the mDNS attempt then scopes itself to that
+/// server instead of accepting any.
 fn candidate_cycle(
     remembered: &[monux::known_servers::RememberedServer],
+    anchored: Option<&str>,
 ) -> std::collections::VecDeque<Candidate> {
     remembered
         .iter()
         .map(|server| Candidate::Remembered(server.addr))
-        .chain(std::iter::once(Candidate::Discover))
+        .chain(std::iter::once(Candidate::Discover {
+            fingerprint: anchored.map(str::to_string),
+        }))
         .collect()
 }
 
-/// Draws the next reconnect candidate for a discovery-mode client, rebuilding
-/// the cycle from a fresh read of the remembered store when the current pass
-/// is exhausted. Returns None when the pass's mDNS attempt found no server;
-/// the caller then retries the current address.
+/// Draws the next reconnect candidate for a client that may re-discover,
+/// rebuilding the cycle from a fresh read of the remembered store when the
+/// current pass is exhausted. Returns None when the pass's mDNS attempt
+/// found no server; the caller then retries the current address.
 /// The mDNS name, when there is one, is returned alongside the address rather
 /// than written to the shared verifier: it describes THIS candidate, and the
 /// verifier outlives every attempt (see MonuxCertVerification::begin_attempt).
 async fn draw_candidate(
     cycle: &mut std::collections::VecDeque<Candidate>,
     config_dir: &std::path::Path,
+    anchored: Option<&str>,
 ) -> Option<(SocketAddr, Option<String>)> {
     if cycle.is_empty() {
-        *cycle = candidate_cycle(&monux::known_servers::load(config_dir));
+        *cycle = candidate_cycle(&monux::known_servers::load(config_dir), anchored);
     }
     match cycle
         .pop_front()
@@ -1401,12 +1428,31 @@ async fn draw_candidate(
         // A remembered address carries no name of its own; the handshake
         // supplies one once the far end answers.
         Candidate::Remembered(addr) => Some((addr, None)),
-        Candidate::Discover => {
+        Candidate::Discover { fingerprint: None } => {
             info!("Discovering the server via mDNS...");
             match discovery::discover_server(None, &monux::known_servers::load(config_dir)).await {
                 Ok((addr, name)) => Some((addr, Some(name))),
                 Err(e) => {
                     warn!("mDNS discovery found no server: {:?}", e);
+                    None
+                }
+            }
+        }
+        Candidate::Discover {
+            fingerprint: Some(fingerprint),
+        } => {
+            let short = &fingerprint[..fingerprint.len().min(8)];
+            info!(
+                "Discovering the server via mDNS (fingerprint {}…) — its configured address may be stale...",
+                short
+            );
+            match discovery::discover_server_by_fingerprint(None, &fingerprint).await {
+                Ok((addr, name)) => Some((addr, Some(name))),
+                Err(e) => {
+                    warn!(
+                        "mDNS re-discovery found no server with fingerprint {}…: {:?}",
+                        short, e
+                    );
                     None
                 }
             }
@@ -1421,6 +1467,14 @@ struct ClientDaemonArgs {
     /// The address to try first; None puts the reconnect loop in discovery
     /// mode (remembered servers, then mDNS).
     initial_addr: Option<SocketAddr>,
+    /// The fingerprint remembered for `initial_addr`'s server (None when the
+    /// address was never connected to, or there is no explicit address).
+    /// Lets the reconnect loop re-find the configured server via mDNS when
+    /// its address went stale — a subnet move re-addresses both machines,
+    /// and mDNS is the only channel that survives on a shared new subnet.
+    /// Trust is unchanged: the QUIC handshake still verifies the certificate
+    /// against the approved set; the mDNS fingerprint only routes the dial.
+    anchored_server_fingerprint: Option<String>,
     verifier: Arc<approval::MonuxCertVerification<'static>>,
     max_clipboard_size_bytes: u64,
     mode: NetworkMode,
@@ -1441,6 +1495,7 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
     let ClientDaemonArgs {
         config_dir,
         initial_addr,
+        anchored_server_fingerprint,
         verifier,
         max_clipboard_size_bytes,
         mode,
@@ -1468,19 +1523,25 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
         max_uncompressed_size_bytes,
     ).await;
 
-    // An explicit --host keeps retrying its own address; without one
-    // (discovery mode) the reconnect loop cycles: the remembered servers
-    // (most recent first), one mDNS attempt, then a fresh pass. The first
-    // draw is the startup connection attempt; when nothing is remembered it
-    // IS the mDNS discovery — fatal when it finds nothing, as before.
+    // An explicit --host keeps retrying its own address — unless a
+    // fingerprint is anchored to it (a server connected to before): the
+    // reconnect loop then also runs fingerprint-scoped mDNS re-discovery, so
+    // a subnet move that re-addressed the server heals itself instead of
+    // dialing the dead address forever. Without an explicit host (discovery
+    // mode) the loop cycles: the remembered servers (most recent first), one
+    // mDNS attempt, then a fresh pass. The first draw is the startup
+    // connection attempt; when nothing is remembered it IS the mDNS
+    // discovery — fatal when it finds nothing, as before.
     let discovery_mode = initial_addr.is_none();
+    let anchored = anchored_server_fingerprint.as_deref();
+    let may_cycle = discovery_mode || anchored.is_some();
     let mut cycle: std::collections::VecDeque<Candidate> = std::collections::VecDeque::new();
     // The name mDNS gave for the current candidate, if any: it captions the
     // approval prompt for THIS attempt only (see begin_attempt below).
     let mut discovered_name: Option<String> = None;
     let mut connect_addr = match initial_addr {
         Some(addr) => addr,
-        None => match draw_candidate(&mut cycle, &config_dir).await {
+        None => match draw_candidate(&mut cycle, &config_dir, anchored).await {
             Some((addr, name)) => {
                 discovered_name = name;
                 addr
@@ -1587,13 +1648,30 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
                     reconnect_backoff = Duration::ZERO;
                 } else {
                     consecutive_failures += 1;
-                    if discovery_mode {
+                    // A plain explicit address (never connected to, so no
+                    // anchored fingerprint) retries forever by design — but
+                    // the most common cause is exactly the one the anchored
+                    // path heals: the server re-addressed with a subnet
+                    // move. Say so once, past the point where transient
+                    // network flaps are the likely explanation.
+                    if !may_cycle && consecutive_failures == STALE_ADDRESS_HINT_AFTER {
+                        warn!(
+                            "Still failing to reach {} after {} attempts; if the server changed networks its address may have changed — run 'monux servers' to list candidates and reconnect with 'monux client <ip|name>'",
+                            connect_addr, consecutive_failures
+                        );
+                    }
+                    if may_cycle {
                         // A fast failure means this candidate is probably
                         // stale: advance to the next one (the remembered
                         // servers, most recent first, then one mDNS attempt,
                         // then a fresh pass — see draw_candidate). A failed
                         // mDNS attempt keeps the current address.
-                        if let Some((next, name)) = draw_candidate(&mut cycle, &config_dir).await
+                        if let Some((next, name)) = draw_candidate(
+                            &mut cycle,
+                            &config_dir,
+                            anchored,
+                        )
+                        .await
                         {
                             if next != connect_addr {
                                 info!(
@@ -1808,9 +1886,9 @@ mod tests {
     #[test]
     fn candidate_cycle_is_remembered_first_then_one_mdns_attempt() {
         // Empty store: a pass is exactly one mDNS attempt.
-        let cycle = candidate_cycle(&[]);
+        let cycle = candidate_cycle(&[], None);
         assert_eq!(cycle.len(), 1);
-        assert!(matches!(cycle[0], Candidate::Discover));
+        assert!(matches!(cycle[0], Candidate::Discover { fingerprint: None }));
 
         // The remembered servers lead, most recent first, then the mDNS attempt.
         let remembered = vec![
@@ -1827,11 +1905,41 @@ mod tests {
                 last_connected: 100,
             },
         ];
-        let cycle = candidate_cycle(&remembered);
+        let cycle = candidate_cycle(&remembered, None);
         assert_eq!(cycle.len(), 3);
         assert!(matches!(&cycle[0], Candidate::Remembered(addr) if *addr == "10.0.0.1:1213".parse().unwrap()));
         assert!(matches!(&cycle[1], Candidate::Remembered(addr) if *addr == "10.0.0.2:1213".parse().unwrap()));
-        assert!(matches!(cycle[2], Candidate::Discover));
+        assert!(matches!(cycle[2], Candidate::Discover { fingerprint: None }));
+    }
+
+    /// An anchored explicit host (a configured address with a remembered
+    /// fingerprint, i.e. a server connected to before): the cycle keeps the
+    /// remembered servers first, but the mDNS attempt is scoped to THAT
+    /// server — re-finding it after a subnet move, not roaming to whoever
+    /// answers.
+    #[test]
+    fn an_anchored_explicit_host_scopes_the_mdns_attempt_to_its_fingerprint() {
+        let cycle = candidate_cycle(&[], Some("aabbccdd"));
+        assert_eq!(cycle.len(), 1);
+        assert!(
+            matches!(&cycle[0], Candidate::Discover { fingerprint: Some(fp) } if fp == "aabbccdd")
+        );
+
+        let remembered = vec![monux::known_servers::RememberedServer {
+            addr: "10.0.0.1:1213".parse().unwrap(),
+            fingerprint: "aabbccdd".to_string(),
+            hostname: Some("srv".to_string()),
+            last_connected: 100,
+        }];
+        let cycle = candidate_cycle(&remembered, Some("aabbccdd"));
+        assert_eq!(cycle.len(), 2);
+        // The (usually still valid) configured address leads; the scoped
+        // discovery is the fallback.
+        assert!(matches!(&cycle[0], Candidate::Remembered(addr) if *addr == "10.0.0.1:1213".parse().unwrap()));
+        assert!(matches!(
+            &cycle[1],
+            Candidate::Discover { fingerprint: Some(fp) } if fp == "aabbccdd"
+        ));
     }
 
     #[cfg(target_os = "linux")]

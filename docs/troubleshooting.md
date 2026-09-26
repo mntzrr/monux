@@ -93,6 +93,15 @@ sudo iptables -t mangle -A OUTPUT -p udp --sport 1213 -j DSCP --set-dscp-class C
 sudo iptables -t mangle -A OUTPUT -p udp --dport 1213 -j DSCP --set-dscp-class CS6
 ```
 
+## Both machines moved to a new network (subnet change)
+
+A subnet move re-addresses both machines, and mDNS discovery is link-local multicast — it cannot follow them across routers. What happens then depends on how the client is configured:
+
+- **Auto-discovery** (`monux client` with no address): once both machines sit on the SAME new subnet, mDNS finds the server again by itself. Recovery may take a few reconnect passes, because the client first re-dials the addresses remembered from the old network before discovering.
+- **Configured address** (`monux client <ip>`, or an autostart unit with one): the client keeps dialing the configured address — but since v14.4.0, if it has connected to that server before, the reconnect loop also re-finds it via mDNS by its remembered certificate fingerprint, so the connection follows the server to its new address on its own. The first success updates the remembered address; trust is unchanged (the handshake still verifies the server's certificate against the approved set).
+
+If you are setting up after a move and nothing connects: check `monux servers` on the client (lists live mDNS advertisements and remembered entries), confirm the server is running, and connect once with `monux client <new-ip>` — the new address is remembered thereafter.
+
 ---
 
 ← Back to [wiki index](README.md) · [project README](../README.md)

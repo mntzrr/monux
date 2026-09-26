@@ -318,6 +318,65 @@ pub async fn discover_server(
     Ok((addr, chosen.name.clone()))
 }
 
+/// Discovers a Monux server on the local network whose advertisement names
+/// `fingerprint` — the fingerprint-anchored variant of [`discover_server`],
+/// used when a client's explicitly configured server address has gone stale
+/// (the machines moved subnets and the server re-addressed): the identity is
+/// known, only the current address is missing. The advertisement is a routing
+/// hint only — the unauthenticated TXT record could name any fingerprint —
+/// the connection's certificate handshake is what actually proves the server
+/// is the remembered one.
+pub async fn discover_server_by_fingerprint(
+    timeout: Option<Duration>,
+    fingerprint: &str,
+) -> Result<(SocketAddr, String)> {
+    let instances = discover_servers(timeout).await?;
+    let matched: Vec<&DiscoveredServer> = instances
+        .iter()
+        .filter(|instance| matches_fingerprint(instance, fingerprint))
+        .collect();
+    let short_fp = &fingerprint[..fingerprint.len().min(8)];
+    let Some(chosen) = matched.first() else {
+        bail!(
+            "No Monux server advertising fingerprint {}… answered on this network",
+            short_fp
+        );
+    };
+    if matched.len() > 1 {
+        let others: Vec<&str> = matched
+            .iter()
+            .skip(1)
+            .map(|instance| instance.name.as_str())
+            .collect();
+        warn!(
+            "Multiple servers advertise fingerprint {}…; connecting to: {}, also seen as: {}",
+            short_fp,
+            chosen.name,
+            others.join(", ")
+        );
+    }
+    let addr =
+        pick_addr(&chosen.addrs, chosen.port).ok_or_else(|| anyhow!("Discovered server has no addresses"))?;
+    info!(
+        "Discovered {} address(es) for the server with fingerprint {}…, connecting to: {}",
+        chosen.addrs.len(),
+        short_fp,
+        addr
+    );
+    Ok((addr, chosen.name.clone()))
+}
+
+/// Whether a discovered instance's advertised fingerprint (`fp` TXT property)
+/// names the server we are looking for. Case-insensitive: fingerprints are
+/// stored lowercase, but the TXT record is peer-chosen data and the comparison
+/// must not depend on its case.
+fn matches_fingerprint(instance: &DiscoveredServer, fingerprint: &str) -> bool {
+    instance
+        .fingerprint
+        .as_deref()
+        .is_some_and(|fp| fp.eq_ignore_ascii_case(fingerprint))
+}
+
 /// Extracts a server's advertised protocol version from its mDNS TXT
 /// properties: `None` when the property is absent (servers predate the
 /// advertisement) or isn't a number — both mean "no information".
@@ -694,6 +753,27 @@ mod tests {
         assert!(!is_remembered(&anonymous, &remembered));
         // Nothing paired yet: nothing can gate.
         assert!(!is_remembered(&ours, &[]));
+    }
+
+    /// The fingerprint-anchored re-discovery matches the advertised `fp`
+    /// case-insensitively, and only when the advertisement carries one at
+    /// all: an anonymous or differently-fingerprinted server is not the
+    /// remembered one, however eager the match.
+    #[test]
+    fn fingerprint_matching_is_case_insensitive_and_requires_the_property() {
+        let server = |fp: Option<&str>| DiscoveredServer {
+            name: "host".to_string(),
+            addrs: vec!["192.168.1.2".parse().unwrap()],
+            port: 1213,
+            protocol_version: None,
+            fingerprint: fp.map(str::to_string),
+        };
+        assert!(matches_fingerprint(&server(Some("aabbccdd")), "aabbccdd"));
+        assert!(matches_fingerprint(&server(Some("AABBCCDD")), "aabbccdd"));
+        assert!(matches_fingerprint(&server(Some("aabbccdd")), "AABBCCDD"));
+        assert!(!matches_fingerprint(&server(Some("deadbeef")), "aabbccdd"));
+        // No `fp` property (a pre-advertisement server): no match.
+        assert!(!matches_fingerprint(&server(None), "aabbccdd"));
     }
 
     #[test]
