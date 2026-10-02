@@ -24,8 +24,8 @@ mod golden_tests {
     /// The update gate keys on the protocol version: bumping it must be a
     /// conscious red test (and per AGENTS.md a MAJOR crate version bump).
     #[test]
-    fn protocol_version_is_19() {
-        assert_eq!(shared::PROTOCOL_VERSION, 19);
+    fn protocol_version_is_20() {
+        assert_eq!(shared::PROTOCOL_VERSION, 20);
     }
 
     #[test]
@@ -155,6 +155,27 @@ mod golden_tests {
         assert_eq!(
             cobs_hex(&msg),
             "1903065369676e616c0268690b68656c6c6f2074686572650200"
+        );
+    }
+
+    #[test]
+    fn golden_client_event_device_notification() {
+        // Appended variant (protocol v20): variant index 4, then the nested
+        // notification's fields flattened (postcard encodes struct fields
+        // sequentially — no length prefix on the nesting), then the hostname
+        // string. Pins the v19 shape above staying unchanged for old pairs.
+        let msg = event::ClientEvent::DeviceNotification(event::DeviceNotification {
+            notification: event::Notification {
+                app_name: "Signal",
+                summary: "hi",
+                body: "hello there",
+                urgency: 2,
+            },
+            hostname: "krokedil-monox",
+        });
+        assert_eq!(
+            cobs_hex(&msg),
+            "2804065369676e616c0268690b68656c6c6f207468657265020e6b726f6b6564696c2d6d6f6e6f7800"
         );
     }
 

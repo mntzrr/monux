@@ -521,6 +521,17 @@ pub static REGISTRY: &[KeySpec] = &[
         validate: v_bool,
         since: "15.0.0",
     },
+    KeySpec {
+        key: "client.forward-name",
+        section: Section::Client,
+        flag: "forward-name",
+        expects: "name",
+        default_display: "this machine's hostname",
+        help: "device name shown in the [name] prefix of forwarded notifications on the server (needs monux 16.x on both sides)",
+        kind: Kind::Str,
+        validate: v_name,
+        since: "16.0.0",
+    },
 ];
 
 /// Renamed keys honored for a deprecation window: (old name, new name).
@@ -2203,6 +2214,17 @@ fn v_bool(values: &[&str]) -> std::result::Result<(), String> {
     v.parse::<bool>()
         .map(|_| ())
         .map_err(|_| format!("'{}' is not a boolean (true/false)", v))
+}
+
+/// A non-empty display name (client.forward-name): an empty value is
+/// rejected because unsetting the key is the way back to the hostname.
+fn v_name(values: &[&str]) -> std::result::Result<(), String> {
+    let v = expect_one(values)?;
+    if v.trim().is_empty() {
+        Err("the name must not be empty (unset the key to use the hostname)".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 fn v_chord(values: &[&str]) -> std::result::Result<(), String> {

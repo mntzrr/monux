@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 /// The protocol version exchanged between client and server on each stream.
 /// This is compared on initial connection between client and server.
 /// If the event/bulk definitions change, then this should change.
-pub const PROTOCOL_VERSION: u64 = 19;
+pub const PROTOCOL_VERSION: u64 = 20;
 
 /// The oldest protocol a peer may speak. Below this, a peer predates version
 /// negotiation entirely: it refuses any bootstrap that isn't its exact
@@ -37,6 +37,7 @@ const FEATURES: &[(u64, &str)] = &[
     (17, "input device class"),
     (18, "peer diagnostics in bug reports"),
     (19, "client notification forwarding"),
+    (20, "device names on forwarded notifications"),
 ];
 
 /// The features a version misses out on: every feature newer than `v`,
@@ -107,24 +108,44 @@ pub fn supports_notification_forwarding(negotiated: u64) -> bool {
     negotiated >= PROTOCOL_VERSION_NOTIFICATION_FORWARDING
 }
 
+/// The protocol version that added the client's hostname to forwarded
+/// notifications (ClientEvent::DeviceNotification, protocol v20): the server
+/// labels the re-display with the device name instead of the bare address.
+/// Sent only when the pair negotiated v20+: an older server has no variant
+/// for it and would fail to deserialize the frame, so v19 pairs keep the
+/// plain ClientEvent::Notification.
+pub const PROTOCOL_VERSION_NOTIFICATION_DEVICE_NAMES: u64 = 20;
+
+/// Whether a client sends DeviceNotification instead of Notification: only
+/// when the pair's NEGOTIATED version is v20+.
+pub fn sends_notification_device_names(negotiated: u64) -> bool {
+    negotiated >= PROTOCOL_VERSION_NOTIFICATION_DEVICE_NAMES
+}
+
 /// Cap on the hostname as sent on the wire: gethostname(2) allows at most 64
 /// bytes (HOST_NAME_MAX); a longer one is cut on a char boundary.
 pub const MAX_HOSTNAME_BYTES: usize = 64;
+
+/// Cuts `s` to at most `max` bytes on a char boundary. Shared by the wire
+/// encoders (hostnames, forwarded-notification fields) so the boundary logic
+/// lives in exactly one place.
+pub fn truncate_str(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
 
 /// Encodes the server hostname for the events stream: a u16 big-endian
 /// length prefix followed by the UTF-8 bytes, truncated to
 /// [`MAX_HOSTNAME_BYTES`]. Plain bytes, not postcard — the frame rides the
 /// version gate, so it needs no self-describing format.
 pub fn encode_hostname(hostname: &str) -> Vec<u8> {
-    let mut bytes = hostname.as_bytes();
-    if bytes.len() > MAX_HOSTNAME_BYTES {
-        // Cut on a char boundary so the wire form stays valid UTF-8.
-        let mut end = MAX_HOSTNAME_BYTES;
-        while !hostname.is_char_boundary(end) {
-            end -= 1;
-        }
-        bytes = &bytes[..end];
-    }
+    let bytes = truncate_str(hostname, MAX_HOSTNAME_BYTES).as_bytes();
     let mut out = Vec::with_capacity(2 + bytes.len());
     out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
     out.extend_from_slice(bytes);
@@ -194,16 +215,25 @@ mod tests {
     #[test]
     fn features_above_content() {
         // Nothing is newer than our own version.
-        assert_eq!(features_above(19), vec![]);
+        assert_eq!(features_above(20), vec![]);
         assert_eq!(features_above(u64::MAX), vec![]);
-        // A v18 pair misses only the v19 notification forwarding.
-        assert_eq!(features_above(18), vec![(19, "client notification forwarding")]);
+        // A v19 pair misses only the v20 device names.
+        assert_eq!(features_above(19), vec![(20, "device names on forwarded notifications")]);
+        // A v18 pair misses the v19 notification forwarding as well.
+        assert_eq!(
+            features_above(18),
+            vec![
+                (19, "client notification forwarding"),
+                (20, "device names on forwarded notifications")
+            ]
+        );
         // A v17 pair misses the v18 peer diagnostics as well.
         assert_eq!(
             features_above(17),
             vec![
                 (18, "peer diagnostics in bug reports"),
-                (19, "client notification forwarding")
+                (19, "client notification forwarding"),
+                (20, "device names on forwarded notifications")
             ]
         );
         // v16 rode no wire feature of its own, so a pair landing on it misses
@@ -214,7 +244,8 @@ mod tests {
             vec![
                 (17, "input device class"),
                 (18, "peer diagnostics in bug reports"),
-                (19, "client notification forwarding")
+                (19, "client notification forwarding"),
+                (20, "device names on forwarded notifications")
             ]
         );
     }
@@ -233,15 +264,19 @@ mod tests {
 
     #[test]
     fn disabled_features_list_for_logs() {
-        assert_eq!(disabled_features(19), "nothing");
-        assert_eq!(disabled_features(18), "client notification forwarding");
+        assert_eq!(disabled_features(20), "nothing");
+        assert_eq!(disabled_features(19), "device names on forwarded notifications");
+        assert_eq!(
+            disabled_features(18),
+            "client notification forwarding, device names on forwarded notifications"
+        );
         assert_eq!(
             disabled_features(17),
-            "peer diagnostics in bug reports, client notification forwarding"
+            "peer diagnostics in bug reports, client notification forwarding, device names on forwarded notifications"
         );
         assert_eq!(
             disabled_features(16),
-            "input device class, peer diagnostics in bug reports, client notification forwarding"
+            "input device class, peer diagnostics in bug reports, client notification forwarding, device names on forwarded notifications"
         );
     }
 
@@ -266,11 +301,35 @@ mod tests {
     }
 
     #[test]
+    fn notification_device_names_are_gated_on_v20() {
+        assert!(sends_notification_device_names(PROTOCOL_VERSION));
+        assert!(sends_notification_device_names(20));
+        // A v19 pair predates the appended variant: sending would fail its
+        // deserialization and drop a working connection.
+        assert!(!sends_notification_device_names(19));
+        assert!(!sends_notification_device_names(18));
+    }
+
+    #[test]
     fn cobs_frame_detection() {
         assert!(!has_complete_cobs_frame(&[]));
         assert!(!has_complete_cobs_frame(&[1, 2, 3]));
         assert!(has_complete_cobs_frame(&[1, 2, 0]));
         assert!(has_complete_cobs_frame(&[1, 0, 5, 6, 0]));
+    }
+
+    #[test]
+    fn truncate_str_cuts_on_char_boundaries() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+        assert_eq!(truncate_str("hello", 5), "hello");
+        // 21 '€' = 63 bytes; the 22nd would straddle a 64-byte cut.
+        let euro = "\u{20ac}".repeat(30);
+        assert_eq!(truncate_str(&euro, 64), "\u{20ac}".repeat(21));
+        // A cut landing between a multi-byte char's bytes backs up to the
+        // last boundary, never producing invalid UTF-8.
+        let cut = truncate_str(&euro, 65);
+        assert_eq!(cut, "\u{20ac}".repeat(21));
+        assert!(str::from_utf8(cut.as_bytes()).is_ok());
     }
 
     #[test]

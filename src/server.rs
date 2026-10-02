@@ -871,10 +871,15 @@ async fn handle_event_messages(
                 // (client-side forwarding, protocol v19; the client only
                 // sends these when the pair negotiated v19+, see
                 // shared::supports_notification_forwarding). Handled inline
-                // like Pong: display needs no rotation state, and the roster
-                // labels clients by IP anyway.
+                // like Pong: display needs no rotation state.
                 debug!("Got forwarded notification from client {}: {}", source, n);
-                notify_forwarded(source, &n);
+                notify_forwarded(source, &n, None);
+            }
+            event::ClientEvent::DeviceNotification(d) => {
+                // The v20 form: same display, but the client's hostname
+                // labels the re-display instead of the bare address.
+                debug!("Got forwarded notification from client {}: {}", source, d);
+                notify_forwarded(source, &d.notification, Some(d.hostname));
             }
         }
         offset += consumed;
@@ -885,14 +890,24 @@ async fn handle_event_messages(
 }
 
 /// Displays a client-forwarded desktop notification locally. The synchronous
-/// id namespaces by client IP and app so repeats of the same notification
+/// id namespaces by label and app so repeats of the same notification
 /// replace in place while different apps and clients never clobber each
-/// other; the summary is prefixed with the sender's IP, matching how the
-/// rotation's roster notifications label clients. The re-display always uses
-/// the notify-send app name "monux", which the client's watcher excludes —
-/// so in a mutual-KVM setup a forwarded notification is never re-forwarded
-/// back and forth.
-fn notify_forwarded(source: SocketAddr, n: &event::Notification) {
+/// other. `hostname` (protocol v20+) labels the re-display with the device
+/// name; the v19 shape and an empty hostname fall back to the sender's
+/// address. The re-display always uses the notify-send app name "monux",
+/// which the client's watcher excludes — so in a mutual-KVM setup a
+/// forwarded notification is never re-forwarded back and forth.
+fn notify_forwarded(source: SocketAddr, n: &event::Notification, hostname: Option<&str>) {
+    let ip_label;
+    let label = match hostname {
+        Some(h) if !h.is_empty() => h,
+        // v19 shape, or a client that couldn't read its own hostname: fall
+        // back to the sender's address.
+        _ => {
+            ip_label = source.ip().to_string();
+            ip_label.as_str()
+        }
+    };
     let (urgency, timeout_ms) = if n.urgency >= 2 {
         // Critical: the two-tier Urgency enum has no critical tier, so keep
         // Normal and let the longer timeout carry the weight.
@@ -901,10 +916,10 @@ fn notify_forwarded(source: SocketAddr, n: &event::Notification) {
         (crate::notify::Urgency::Low, 5000)
     };
     crate::notify::notify(
-        &format!("monux-remote:{}:{}", source.ip(), n.app_name),
+        &format!("monux-remote:{}:{}", label, n.app_name),
         urgency,
         timeout_ms,
-        &format!("[{}] {}", source.ip(), n.summary),
+        &format!("[{}] {}", label, n.summary),
         n.body,
     );
 }

@@ -176,6 +176,10 @@ pub struct ClientConfig {
     /// daemon startup: a change takes effect when the client daemon
     /// restarts, not on reconnect.
     pub forward_notifications: bool,
+    /// Device name shown in the [name] prefix of forwarded notifications
+    /// (--forward-name; `client.forward-name`). Empty uses the machine's
+    /// hostname; read once at daemon startup like forward_notifications.
+    pub forward_name: String,
     /// An explicit --edge-map. None leaves the return edge to the server's
     /// EdgeInfo inference (see EdgeInference).
     pub edge_map: Option<crate::edge::EdgeMap>,
@@ -348,8 +352,15 @@ struct Connection {
     /// forwarding is off or the pair negotiated below the v19 gate.
     notification_rx: Option<mpsc::UnboundedReceiver<ForwardedNotification>>,
     /// The protocol version this pair negotiated at (the lower of the two
-    /// peers): gates v19+ features (notification forwarding).
+    /// peers): gates v19+ features (notification forwarding, v20 device
+    /// names on forwarded notifications).
     negotiated_version: u64,
+    /// This machine's hostname, read once per connection and sent with each
+    /// forwarded notification on v20+ pairs so the server can label the
+    /// re-display with the device name (see ClientEvent::DeviceNotification).
+    /// Empty when gethostname fails; the server then falls back to the
+    /// address label.
+    hostname: String,
     /// Server-driven return-edge inference (see ServerEvent::EdgeInfo):
     /// rebuilt per connection, so a reconnect re-applies whatever the new
     /// connection's EdgeInfo says.
@@ -491,6 +502,7 @@ impl Connection {
             scroll_scale,
             control_state,
             throttle_mode,
+            forward_name,
             ..
         } = cfg;
         let (max_clipboard_size_bytes, mode) = (*max_clipboard_size_bytes, *mode);
@@ -682,6 +694,13 @@ impl Connection {
                 switch_request_rx: None,
                 notification_rx: None,
                 negotiated_version: negotiated,
+                hostname: if forward_name.is_empty() {
+                    crate::discovery::get_hostname()
+                        .map(|h| shared::truncate_str(&h, shared::MAX_HOSTNAME_BYTES).to_string())
+                        .unwrap_or_default()
+                } else {
+                    shared::truncate_str(forward_name, shared::MAX_HOSTNAME_BYTES).to_string()
+                },
                 edge_inference: EdgeInference::new(edge_map_explicit),
                 server_hostname,
             },
@@ -960,19 +979,30 @@ impl Connection {
         Ok(())
     }
 
-    /// Forwards a local desktop notification to the server (see
-    /// ClientEvent::Notification), on the ordered, reliable events stream.
+    /// Forwards a local desktop notification to the server, on the ordered,
+    /// reliable events stream. v20+ pairs get ClientEvent::DeviceNotification
+    /// (adds this machine's hostname so the server can label the re-display
+    /// with the device name); v19 pairs keep the four-field Notification
+    /// shape the older server can deserialize.
     async fn send_notification(&mut self, n: &ForwardedNotification) -> Result<()> {
         debug!(
             "Sending notification to server: app=[{}] summary=[{}]",
             n.app_name, n.summary
         );
-        let msg = event::ClientEvent::Notification(event::Notification {
+        let notification = event::Notification {
             app_name: &n.app_name,
             summary: &n.summary,
             body: &n.body,
             urgency: n.urgency,
-        });
+        };
+        let msg = if shared::sends_notification_device_names(self.negotiated_version) {
+            event::ClientEvent::DeviceNotification(event::DeviceNotification {
+                notification,
+                hostname: &self.hostname,
+            })
+        } else {
+            event::ClientEvent::Notification(notification)
+        };
         let serializedmsg = postcard::to_stdvec_cobs(&msg)
             .map_err(|e| anyhow!("Failed to serialize notification message: {:?}", e))?;
         self.events_send

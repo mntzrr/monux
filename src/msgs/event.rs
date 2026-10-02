@@ -169,8 +169,22 @@ pub enum ClientEvent<'a> {
     /// negotiated v19+. The server never sends this variant; it rides the
     /// events stream because the frame is small (the fields are length-capped
     /// client-side) and rare. Appended variant.
+    ///
+    /// v19 pairs send this four-field shape; v20+ pairs send
+    /// DeviceNotification instead, which adds the client's hostname (see
+    /// shared::sends_notification_device_names). The shapes are separate
+    /// variants rather than an appended field because postcard encodes
+    /// structs field-sequentially: a v19 server handed a five-field frame
+    /// would mis-parse the trailing bytes as another frame.
     #[serde(borrow)]
     Notification(Notification<'a>),
+
+    /// As Notification (protocol v19), plus the client's hostname (protocol
+    /// v20): the server labels the re-display with the device name instead of
+    /// the bare address. Sent only when the pair negotiated v20+; a v19 pair
+    /// keeps the plain Notification. Appended variant.
+    #[serde(borrow)]
+    DeviceNotification(DeviceNotification<'a>),
 }
 
 impl<'a> std::fmt::Display for ClientEvent<'a> {
@@ -182,6 +196,7 @@ impl<'a> std::fmt::Display for ClientEvent<'a> {
                 write!(f, "SwitchRequest(y_fraction={})", y_fraction)
             }
             ClientEvent::Notification(e) => e.fmt(f),
+            ClientEvent::DeviceNotification(e) => e.fmt(f),
         }
     }
 }
@@ -600,6 +615,31 @@ impl<'a> std::fmt::Display for Notification<'a> {
     }
 }
 
+// DeviceNotification
+
+/// The v20 form of ClientEvent::Notification (client-side notification
+/// forwarding): identical payload plus `hostname`, the name the client
+/// machine reports for itself, so the server can label the re-display with
+/// the device name instead of the bare address. Serialization note: the
+/// nested Notification is NOT length-prefixed on the wire — postcard encodes
+/// struct fields sequentially, so the nesting is a source-level grouping
+/// only, and the shape stays a flat field sequence per variant.
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+pub struct DeviceNotification<'a> {
+    #[serde(borrow)]
+    pub notification: Notification<'a>,
+    /// The client's own hostname (gethostname), truncated to
+    /// shared::MAX_HOSTNAME_BYTES; empty when the client couldn't read it, in
+    /// which case the server falls back to the address label.
+    pub hostname: &'a str,
+}
+
+impl<'a> std::fmt::Display for DeviceNotification<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "DeviceNotification({}, hostname=[{}])", self.notification, self.hostname)
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -672,6 +712,37 @@ mod tests {
     }
 
     #[test]
+    fn device_notification_roundtrip() {
+        // The v20 frame: the nested notification flattens into the same field
+        // sequence, with the hostname appended; an empty hostname must
+        // survive too (the server's IP-fallback signal).
+        assert_cobs_roundtrip!(
+            ClientEvent,
+            ClientEvent::DeviceNotification(DeviceNotification {
+                notification: Notification {
+                    app_name: "Signal",
+                    summary: "hi",
+                    body: "there",
+                    urgency: 1,
+                },
+                hostname: "krokedil-monox",
+            })
+        );
+        assert_cobs_roundtrip!(
+            ClientEvent,
+            ClientEvent::DeviceNotification(DeviceNotification {
+                notification: Notification {
+                    app_name: "",
+                    summary: "s",
+                    body: "",
+                    urgency: 2,
+                },
+                hostname: "",
+            })
+        );
+    }
+
+    #[test]
     fn classed_input_roundtrips_for_every_class() {
         // The v17 frame (see ServerEvent::ClassedInput), which took the wire
         // index freed by dropping the deprecated HotspotInfo variant.
@@ -731,6 +802,21 @@ mod tests {
                 })
             ),
             "Notification(app=[Signal], summary=[hi], body=[hello there] (11 bytes), urgency=2)"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                ClientEvent::DeviceNotification(DeviceNotification {
+                    notification: Notification {
+                        app_name: "Signal",
+                        summary: "hi",
+                        body: "",
+                        urgency: 1,
+                    },
+                    hostname: "krokedil-monox",
+                })
+            ),
+            "DeviceNotification(Notification(app=[Signal], summary=[hi], body=[] (0 bytes), urgency=1), hostname=[krokedil-monox])"
         );
         // EV_KEY (type 1): the code is a keystroke and is masked; the value
         // (press/release/repeat) is what the line is read for and stays.

@@ -982,6 +982,15 @@ pub struct ClientArgs {
     #[arg(long, num_args = 0, default_missing_value = "true", help_heading = H_TUNING)]
     pub forward_notifications: Option<bool>,
 
+    /// Device name shown on notifications this client forwards
+    ///
+    /// Sets the [name] prefix the server puts on forwarded notifications,
+    /// overriding this machine's hostname. Empty (the default): the hostname
+    /// is used. Needs monux 16.x (protocol v20) on both sides; on 15.x pairs
+    /// the label stays the address.
+    #[arg(long, value_name = "name", help_heading = H_TUNING)]
+    pub forward_name: Option<String>,
+
     /// Turn off the automatic background update
     ///
     /// The background update is on by default: a daily check at low CPU
@@ -1055,6 +1064,10 @@ impl ClientArgs {
             .forward_notifications
             .take()
             .or_else(|| cfg.get_bool("client.forward-notifications"));
+        self.forward_name = self
+            .forward_name
+            .take()
+            .or_else(|| cfg.get_str("client.forward-name"));
         self.edge_map = self.edge_map.take().or_else(|| cfg.get_str_vec("client.edge-map"));
         self.edge_dwell_ms = self
             .edge_dwell_ms
