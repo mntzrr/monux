@@ -1051,6 +1051,10 @@ impl ClientArgs {
             .link_notify
             .take()
             .or_else(|| cfg.get_bool("client.link-notify"));
+        self.forward_notifications = self
+            .forward_notifications
+            .take()
+            .or_else(|| cfg.get_bool("client.forward-notifications"));
         self.edge_map = self.edge_map.take().or_else(|| cfg.get_str_vec("client.edge-map"));
         self.edge_dwell_ms = self
             .edge_dwell_ms

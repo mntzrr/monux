@@ -2350,7 +2350,7 @@ mod tests {
     #[test]
     fn client_args_resolve_flag_beats_config_beats_default() {
         let cfg = monux::config::File::parse(
-            "[client]\nmouse-scale = 0.5\nedge-dwell-ms = 400\nlink-notify = true\n",
+            "[client]\nmouse-scale = 0.5\nedge-dwell-ms = 400\nlink-notify = true\nforward-notifications = true\n",
         )
         .unwrap();
 
@@ -2363,6 +2363,7 @@ mod tests {
         assert_eq!(args.mouse_scale, Some(2.0));
         assert_eq!(args.edge_dwell_ms, Some(400));
         assert_eq!(args.link_notify, Some(true));
+        assert_eq!(args.forward_notifications, Some(true));
 
         // Without a config file the use sites fall back to the built-ins.
         let cli = Cli::try_parse_from(["monux", "client"]).unwrap();
@@ -2378,6 +2379,9 @@ mod tests {
         assert!(args.edge_dwell_ms.is_none());
         // Link notifications are opt-in: unset means off.
         assert!(!args.link_notify.unwrap_or(false));
+        // Same for notification forwarding (regression: the config key was
+        // registered but never resolved into the args).
+        assert!(!args.forward_notifications.unwrap_or(false));
         assert!(args.host.is_none(), "the positional host is not configurable");
     }
 }

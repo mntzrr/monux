@@ -107,7 +107,7 @@ A Linux client can forward its own desktop notifications to the server, so a not
 monux config set client.forward-notifications true
 ```
 
-Off by default. The client watches the session bus for freedesktop notifications (`org.freedesktop.Notifications`) and re-displays each one on the server, prefixed with the client's address so the origin machine is clear. monux's own notifications (switch, connection, update, link) are never forwarded — that exclusion is also what keeps a mutual-KVM setup from forwarding a forwarded notification back and forth forever. Duplicates and bursts are capped (identical notifications within 10 s are dropped; at most 20 per minute), and long bodies are truncated. Both sides need monux 15.x (protocol v19): against an older server the client logs once that forwarding is disabled. The change applies on the client's next reconnect.
+Off by default. The client watches the session bus for freedesktop notifications (`org.freedesktop.Notifications`) and re-displays each one on the server, prefixed with the client's address so the origin machine is clear. monux's own notifications (switch, connection, update, link) are never forwarded — that exclusion is also what keeps a mutual-KVM setup from forwarding a forwarded notification back and forth forever. Duplicates and bursts are capped (identical notifications within 10 s are dropped; at most 20 per minute), and long bodies are truncated. Both sides need monux 15.x (protocol v19): against an older server the client logs once that forwarding is disabled. The change takes effect when the client daemon restarts (`monux daemon restart --client`), not on reconnect.
 
 ## Control socket and `monux status`
 

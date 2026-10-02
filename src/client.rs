@@ -171,9 +171,10 @@ pub struct ClientConfig {
     /// notifications" toggle flips it live, without a reconnect.
     pub link_notify: Arc<AtomicBool>,
     /// Forward local desktop notifications to the server, opt-in
-    /// (--forward-notifications; `client.forward-notifications`). Applied per
-    /// connection: a change takes effect on the next reconnect. Linux only;
-    /// on other platforms the flag is accepted and inert.
+    /// (--forward-notifications; `client.forward-notifications`). Linux only;
+    /// on other platforms the flag is accepted and inert. Read once at
+    /// daemon startup: a change takes effect when the client daemon
+    /// restarts, not on reconnect.
     pub forward_notifications: bool,
     /// An explicit --edge-map. None leaves the return edge to the server's
     /// EdgeInfo inference (see EdgeInference).
