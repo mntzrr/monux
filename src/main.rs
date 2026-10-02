@@ -684,7 +684,7 @@ fn main() -> Result<()> {
             let www = args.www.unwrap_or(false);
             let link_notify = args.link_notify.unwrap_or(false);
             let forward_notifications = args.forward_notifications.unwrap_or(false);
-            let forward_name = args.forward_name.unwrap_or_default();
+            let device_name = args.device_name.unwrap_or_default();
             #[cfg(not(target_os = "linux"))]
             if forward_notifications {
                 info!("--forward-notifications is Linux-only: ignoring it on this platform");
@@ -808,7 +808,7 @@ fn main() -> Result<()> {
                     throttle_mode,
                     link_notify,
                     forward_notifications,
-                    forward_name,
+                    device_name,
                     edge_map,
                     edge_dwell: Duration::from_millis(
                         args.edge_dwell_ms
@@ -1492,8 +1492,8 @@ struct ClientDaemonArgs {
     link_notify: bool,
     forward_notifications: bool,
     /// Device name shown in the [name] prefix of forwarded notifications
-    /// (client.forward-name); empty = the machine's hostname.
-    forward_name: String,
+    /// (client.device-name); empty = the machine's hostname.
+    device_name: String,
     edge_map: Option<monux::edge::EdgeMap>,
     edge_dwell: Duration,
     auto_update: bool,
@@ -1516,7 +1516,7 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
         throttle_mode,
         link_notify,
         forward_notifications,
-        forward_name,
+        device_name,
         edge_map,
         edge_dwell,
         auto_update,
@@ -1620,7 +1620,7 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
         throttle_mode,
         link_notify: control_state.link_notify(),
         forward_notifications,
-        forward_name,
+        device_name,
         edge_map,
         edge_dwell,
     };
@@ -2357,7 +2357,7 @@ mod tests {
     #[test]
     fn client_args_resolve_flag_beats_config_beats_default() {
         let cfg = monux::config::File::parse(
-            "[client]\nmouse-scale = 0.5\nedge-dwell-ms = 400\nlink-notify = true\nforward-notifications = true\nforward-name = \"testbox\"\n",
+            "[client]\nmouse-scale = 0.5\nedge-dwell-ms = 400\nlink-notify = true\nforward-notifications = true\ndevice-name = \"testbox\"\n",
         )
         .unwrap();
 
@@ -2371,7 +2371,7 @@ mod tests {
         assert_eq!(args.edge_dwell_ms, Some(400));
         assert_eq!(args.link_notify, Some(true));
         assert_eq!(args.forward_notifications, Some(true));
-        assert_eq!(args.forward_name.as_deref(), Some("testbox"));
+        assert_eq!(args.device_name.as_deref(), Some("testbox"));
 
         // Without a config file the use sites fall back to the built-ins.
         let cli = Cli::try_parse_from(["monux", "client"]).unwrap();
@@ -2390,7 +2390,7 @@ mod tests {
         // Same for notification forwarding (regression: the config key was
         // registered but never resolved into the args).
         assert!(!args.forward_notifications.unwrap_or(false));
-        assert!(args.forward_name.is_none());
+        assert!(args.device_name.is_none());
         assert!(args.host.is_none(), "the positional host is not configurable");
     }
 }

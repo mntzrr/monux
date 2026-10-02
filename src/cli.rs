@@ -989,7 +989,7 @@ pub struct ClientArgs {
     /// is used. Needs monux 16.x (protocol v20) on both sides; on 15.x pairs
     /// the label stays the address.
     #[arg(long, value_name = "name", help_heading = H_TUNING)]
-    pub forward_name: Option<String>,
+    pub device_name: Option<String>,
 
     /// Turn off the automatic background update
     ///
@@ -1064,10 +1064,10 @@ impl ClientArgs {
             .forward_notifications
             .take()
             .or_else(|| cfg.get_bool("client.forward-notifications"));
-        self.forward_name = self
-            .forward_name
+        self.device_name = self
+            .device_name
             .take()
-            .or_else(|| cfg.get_str("client.forward-name"));
+            .or_else(|| cfg.get_str("client.device-name"));
         self.edge_map = self.edge_map.take().or_else(|| cfg.get_str_vec("client.edge-map"));
         self.edge_dwell_ms = self
             .edge_dwell_ms

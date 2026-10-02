@@ -177,9 +177,9 @@ pub struct ClientConfig {
     /// restarts, not on reconnect.
     pub forward_notifications: bool,
     /// Device name shown in the [name] prefix of forwarded notifications
-    /// (--forward-name; `client.forward-name`). Empty uses the machine's
+    /// (--device-name; `client.device-name`). Empty uses the machine's
     /// hostname; read once at daemon startup like forward_notifications.
-    pub forward_name: String,
+    pub device_name: String,
     /// An explicit --edge-map. None leaves the return edge to the server's
     /// EdgeInfo inference (see EdgeInference).
     pub edge_map: Option<crate::edge::EdgeMap>,
@@ -502,7 +502,7 @@ impl Connection {
             scroll_scale,
             control_state,
             throttle_mode,
-            forward_name,
+            device_name,
             ..
         } = cfg;
         let (max_clipboard_size_bytes, mode) = (*max_clipboard_size_bytes, *mode);
@@ -694,12 +694,12 @@ impl Connection {
                 switch_request_rx: None,
                 notification_rx: None,
                 negotiated_version: negotiated,
-                hostname: if forward_name.is_empty() {
+                hostname: if device_name.is_empty() {
                     crate::discovery::get_hostname()
                         .map(|h| shared::truncate_str(&h, shared::MAX_HOSTNAME_BYTES).to_string())
                         .unwrap_or_default()
                 } else {
-                    shared::truncate_str(forward_name, shared::MAX_HOSTNAME_BYTES).to_string()
+                    shared::truncate_str(device_name, shared::MAX_HOSTNAME_BYTES).to_string()
                 },
                 edge_inference: EdgeInference::new(edge_map_explicit),
                 server_hostname,
