@@ -161,6 +161,16 @@ pub enum ClientEvent<'a> {
     /// honors the request only when this client is the current one.
     /// Appended variant (protocol v11).
     SwitchRequest { y_fraction: f64 },
+
+    /// A desktop notification the client saw on its own session bus, for the
+    /// server to display locally (client-side notification forwarding;
+    /// protocol v19, see shared::supports_notification_forwarding). Sent only
+    /// when the client enables `client.forward-notifications` and the pair
+    /// negotiated v19+. The server never sends this variant; it rides the
+    /// events stream because the frame is small (the fields are length-capped
+    /// client-side) and rare. Appended variant.
+    #[serde(borrow)]
+    Notification(Notification<'a>),
 }
 
 impl<'a> std::fmt::Display for ClientEvent<'a> {
@@ -171,6 +181,7 @@ impl<'a> std::fmt::Display for ClientEvent<'a> {
             ClientEvent::SwitchRequest { y_fraction } => {
                 write!(f, "SwitchRequest(y_fraction={})", y_fraction)
             }
+            ClientEvent::Notification(e) => e.fmt(f),
         }
     }
 }
@@ -555,6 +566,40 @@ impl<'a> std::fmt::Display for ClipboardTypes<'a> {
     }
 }
 
+// Notification
+
+/// A desktop notification forwarded by a client (ClientEvent::Notification,
+/// protocol v19). Mirrors the freedesktop `org.freedesktop.Notifications.Notify`
+/// call: `app_name`, `summary`, and `body` are the sender's fields
+/// length-capped on the client, and `urgency` is the spec's hints.urgency
+/// byte (0 low, 1 normal, 2 critical).
+///
+/// Deliberately omits everything else Notify carries (icon, actions, hints
+/// other than urgency): icons are raw image data no LAN notification wants,
+/// actions can't be honored remotely, and the remaining hints are display
+/// policy a re-display shouldn't inherit.
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+pub struct Notification<'a> {
+    pub app_name: &'a str,
+    pub summary: &'a str,
+    pub body: &'a str,
+    pub urgency: u8,
+}
+
+impl<'a> std::fmt::Display for Notification<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "Notification(app=[{}], summary=[{}], body=[{}] ({} bytes), urgency={})",
+            self.app_name,
+            self.summary,
+            self.body,
+            self.body.len(),
+            self.urgency
+        )
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -599,6 +644,31 @@ mod tests {
         for y_fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
             assert_cobs_roundtrip!(ClientEvent, ClientEvent::SwitchRequest { y_fraction });
         }
+    }
+
+    #[test]
+    fn notification_roundtrip() {
+        // The v19 forwarded-notification frame: unicode in summary, an empty
+        // body, an empty app name, and the urgency range extremes must all
+        // survive the postcard + COBS round trip.
+        assert_cobs_roundtrip!(
+            ClientEvent,
+            ClientEvent::Notification(Notification {
+                app_name: "Signal",
+                summary: "3 new messages — ünïcödé ✓",
+                body: "",
+                urgency: 0,
+            })
+        );
+        assert_cobs_roundtrip!(
+            ClientEvent,
+            ClientEvent::Notification(Notification {
+                app_name: "",
+                summary: "battery low",
+                body: "15% remaining",
+                urgency: 2,
+            })
+        );
     }
 
     #[test]
@@ -650,6 +720,18 @@ mod tests {
             "SwitchRequest(y_fraction=0.5)"
         );
         assert_eq!(format!("{}", ClientEvent::Pong), "Pong");
+        assert_eq!(
+            format!(
+                "{}",
+                ClientEvent::Notification(Notification {
+                    app_name: "Signal",
+                    summary: "hi",
+                    body: "hello there",
+                    urgency: 2,
+                })
+            ),
+            "Notification(app=[Signal], summary=[hi], body=[hello there] (11 bytes), urgency=2)"
+        );
         // EV_KEY (type 1): the code is a keystroke and is masked; the value
         // (press/release/repeat) is what the line is read for and stays.
         assert_eq!(

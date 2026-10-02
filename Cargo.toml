@@ -1,6 +1,6 @@
 [package]
 name = "monux"
-version = "14.4.1"
+version = "15.0.0"
 authors = ["Montazar <github.mdtk4@passmail.com>"]
 license = "AGPL-3.0-or-later"
 edition = "2021"
@@ -62,16 +62,24 @@ zstd = "0.13"
 os_pipe = { version = "1.1" }
 
 # Linux-only platform layers: evdev input capture / uinput injection, the
-# Wayland clipboard backend, the D-Bus tray, and the inotify device hotplug
-# watch. macOS replaces the output path with CGEvent injection (see
-# device/output/macos.rs) and gates the rest off.
+# Wayland clipboard backend, the D-Bus tray, the notification-forwarding
+# session-bus monitor, and the inotify device hotplug watch. macOS replaces
+# the output path with CGEvent injection (see device/output/macos.rs) and
+# gates the rest off.
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = { version = "0.13", features = ["tokio"] }
+# zvariant::Value/HashMap iteration for the Notify hints map and
+# zbus::MessageStream: the watcher in notify_watch.rs reads Notify method
+# calls off the monitor stream.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 ksni = { version = "0.3", features = ["blocking"] }
 notify = "8.2"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# Session-bus monitor for notification forwarding (notify_watch.rs): already
+# in the tree transitively via ksni, so this only makes the use direct.
+zbus = "5.18"
 
 # macOS input injection: pure-Rust bindings to CoreGraphics/CoreFoundation
 # (CGEvent posting, cursor position, TCC accessibility check). "highsierra"

@@ -866,12 +866,47 @@ async fn handle_event_messages(
                     ))
                     .await?;
             }
+            event::ClientEvent::Notification(n) => {
+                // A desktop notification the client saw on its session bus
+                // (client-side forwarding, protocol v19; the client only
+                // sends these when the pair negotiated v19+, see
+                // shared::supports_notification_forwarding). Handled inline
+                // like Pong: display needs no rotation state, and the roster
+                // labels clients by IP anyway.
+                debug!("Got forwarded notification from client {}: {}", source, n);
+                notify_forwarded(source, &n);
+            }
         }
         offset += consumed;
     }
     // Retain any unconsumed partial frame for the next chunk.
     bytes.drain(..offset);
     Ok(())
+}
+
+/// Displays a client-forwarded desktop notification locally. The synchronous
+/// id namespaces by client IP and app so repeats of the same notification
+/// replace in place while different apps and clients never clobber each
+/// other; the summary is prefixed with the sender's IP, matching how the
+/// rotation's roster notifications label clients. The re-display always uses
+/// the notify-send app name "monux", which the client's watcher excludes —
+/// so in a mutual-KVM setup a forwarded notification is never re-forwarded
+/// back and forth.
+fn notify_forwarded(source: SocketAddr, n: &event::Notification) {
+    let (urgency, timeout_ms) = if n.urgency >= 2 {
+        // Critical: the two-tier Urgency enum has no critical tier, so keep
+        // Normal and let the longer timeout carry the weight.
+        (crate::notify::Urgency::Normal, 8000)
+    } else {
+        (crate::notify::Urgency::Low, 5000)
+    };
+    crate::notify::notify(
+        &format!("monux-remote:{}:{}", source.ip(), n.app_name),
+        urgency,
+        timeout_ms,
+        &format!("[{}] {}", source.ip(), n.summary),
+        n.body,
+    );
 }
 
 /// Largest capacity a peer-declared content length may reserve up front. The

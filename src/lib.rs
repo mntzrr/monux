@@ -21,6 +21,8 @@ pub mod logging;
 pub mod msgs;
 pub mod network;
 pub mod notify;
+#[cfg(target_os = "linux")]
+pub mod notify_watch;
 pub mod rotation;
 pub mod server;
 pub mod servers;

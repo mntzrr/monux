@@ -24,8 +24,8 @@ mod golden_tests {
     /// The update gate keys on the protocol version: bumping it must be a
     /// conscious red test (and per AGENTS.md a MAJOR crate version bump).
     #[test]
-    fn protocol_version_is_18() {
-        assert_eq!(shared::PROTOCOL_VERSION, 18);
+    fn protocol_version_is_19() {
+        assert_eq!(shared::PROTOCOL_VERSION, 19);
     }
 
     #[test]
@@ -138,6 +138,24 @@ mod golden_tests {
         // f64 fraction little-endian.
         let msg = event::ClientEvent::SwitchRequest { y_fraction: 0.5 };
         assert_eq!(cobs_hex(&msg), "0202010101010103e03f00");
+    }
+
+    #[test]
+    fn golden_client_event_notification() {
+        // Appended variant (protocol v19): variant index 3 followed by four
+        // length-prefixed strings (app_name, summary, body) and the urgency
+        // byte. The frame is small (fields are capped client-side), so it
+        // rides the events stream.
+        let msg = event::ClientEvent::Notification(event::Notification {
+            app_name: "Signal",
+            summary: "hi",
+            body: "hello there",
+            urgency: 2,
+        });
+        assert_eq!(
+            cobs_hex(&msg),
+            "1903065369676e616c0268690b68656c6c6f2074686572650200"
+        );
     }
 
     #[test]

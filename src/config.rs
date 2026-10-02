@@ -510,6 +510,17 @@ pub static REGISTRY: &[KeySpec] = &[
         validate: v_bool,
         since: "13.2.0",
     },
+    KeySpec {
+        key: "client.forward-notifications",
+        section: Section::Client,
+        flag: "forward-notifications",
+        expects: "true|false",
+        default_display: "false (notifications stay local)",
+        help: "forward this machine's desktop notifications to the server (Linux only; monux's own are never forwarded; needs monux 15.x on both sides)",
+        kind: Kind::Bool,
+        validate: v_bool,
+        since: "15.0.0",
+    },
 ];
 
 /// Renamed keys honored for a deprecation window: (old name, new name).

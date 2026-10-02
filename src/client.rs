@@ -15,8 +15,21 @@ use crate::clipboard::{CLIPBOARD_SERVE_TIMEOUT_SECS, client, data};
 use crate::device::output;
 use crate::msgs::{bulk, event, shared};
 use crate::network::{approval, link_quality::LinkQuality, link_quality::Tier, throttle, transport};
+#[cfg(target_os = "linux")]
+use crate::notify_watch;
 use crate::rotation::ThrottleMode;
 use crate::notify;
+
+/// A desktop notification the local watcher saw on the session bus, in the
+/// owned form the client carries internally (the wire form,
+/// event::Notification, borrows). Produced by notify_watch.rs (Linux) and
+/// consumed by the step loop, which frames it as ClientEvent::Notification.
+pub struct ForwardedNotification {
+    pub app_name: String,
+    pub summary: String,
+    pub body: String,
+    pub urgency: u8,
+}
 
 /// Whether this frame must be written on its own rather than coalesced with
 /// its neighbours.
@@ -157,6 +170,11 @@ pub struct ClientConfig {
     /// with the control socket's state mirror, so the tray's "Link
     /// notifications" toggle flips it live, without a reconnect.
     pub link_notify: Arc<AtomicBool>,
+    /// Forward local desktop notifications to the server, opt-in
+    /// (--forward-notifications; `client.forward-notifications`). Applied per
+    /// connection: a change takes effect on the next reconnect. Linux only;
+    /// on other platforms the flag is accepted and inert.
+    pub forward_notifications: bool,
     /// An explicit --edge-map. None leaves the return edge to the server's
     /// EdgeInfo inference (see EdgeInference).
     pub edge_map: Option<crate::edge::EdgeMap>,
@@ -209,6 +227,25 @@ pub async fn run<O: output::OutputHandler>(
             cfg.throttle_mode,
             cfg.link_notify.clone(),
         ));
+    }
+    // Client-side notification forwarding (opt-in, Linux only): the watcher
+    // monitors the session bus and feeds the step loop, which frames each
+    // notification as a ClientEvent::Notification on the events stream. A
+    // pair below the v19 gate would fail to deserialize the frame (and drop
+    // the connection over it), so the watcher is not started there.
+    #[cfg(target_os = "linux")]
+    if cfg.forward_notifications {
+        if shared::supports_notification_forwarding(client.negotiated_version) {
+            let (tx, rx) = mpsc::unbounded_channel();
+            task::spawn(notify_watch::watch(tx));
+            client.notification_rx = Some(rx);
+        } else {
+            info!(
+                "The server is too old for notification forwarding (pair negotiated protocol v{} < v{}): not forwarding",
+                client.negotiated_version,
+                shared::PROTOCOL_VERSION_NOTIFICATION_FORWARDING,
+            );
+        }
     }
     // Screen-edge switching is disabled (slated for removal): no return-edge
     // detector runs, so switch_request_rx stays None and the step loop never
@@ -304,6 +341,14 @@ struct Connection {
     /// the events stream. Always None: screen-edge switching is disabled
     /// (slated for removal), so no detector is ever spawned.
     switch_request_rx: Option<mpsc::UnboundedReceiver<f64>>,
+    /// Receives desktop notifications from the notify_watch watcher task
+    /// (Linux, `client.forward-notifications` on), which the step loop turns
+    /// into ClientEvent::Notification frames on the events stream. None when
+    /// forwarding is off or the pair negotiated below the v19 gate.
+    notification_rx: Option<mpsc::UnboundedReceiver<ForwardedNotification>>,
+    /// The protocol version this pair negotiated at (the lower of the two
+    /// peers): gates v19+ features (notification forwarding).
+    negotiated_version: u64,
     /// Server-driven return-edge inference (see ServerEvent::EdgeInfo):
     /// rebuilt per connection, so a reconnect re-applies whatever the new
     /// connection's EdgeInfo says.
@@ -634,6 +679,8 @@ impl Connection {
                 scaler: DeltaScaler::new(*mouse_scale, *scroll_scale),
                 control_state: control_state.clone(),
                 switch_request_rx: None,
+                notification_rx: None,
+                negotiated_version: negotiated,
                 edge_inference: EdgeInference::new(edge_map_explicit),
                 server_hostname,
             },
@@ -892,8 +939,45 @@ impl Connection {
                     None => self.switch_request_rx = None,
                 }
             },
+            notification = async {
+                match &mut self.notification_rx {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match notification {
+                    // A desktop notification the local watcher saw on the
+                    // session bus: forward it (see ClientEvent::Notification).
+                    Some(n) => self.send_notification(&n).await?,
+                    // The watcher is gone (bus restarted, or monitor mode
+                    // refused): degrade like the switch detector above — the
+                    // feature turns off, the connection is unaffected.
+                    None => self.notification_rx = None,
+                }
+            },
         }
         Ok(())
+    }
+
+    /// Forwards a local desktop notification to the server (see
+    /// ClientEvent::Notification), on the ordered, reliable events stream.
+    async fn send_notification(&mut self, n: &ForwardedNotification) -> Result<()> {
+        debug!(
+            "Sending notification to server: app=[{}] summary=[{}]",
+            n.app_name, n.summary
+        );
+        let msg = event::ClientEvent::Notification(event::Notification {
+            app_name: &n.app_name,
+            summary: &n.summary,
+            body: &n.body,
+            urgency: n.urgency,
+        });
+        let serializedmsg = postcard::to_stdvec_cobs(&msg)
+            .map_err(|e| anyhow!("Failed to serialize notification message: {:?}", e))?;
+        self.events_send
+            .write_all(&serializedmsg)
+            .await
+            .context("Failed to send notification message")
     }
 
     /// Asks the server to switch input back to the local machine (see

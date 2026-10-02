@@ -683,6 +683,11 @@ fn main() -> Result<()> {
             let update_mode = update_mode(args.auto_install.unwrap_or(false));
             let www = args.www.unwrap_or(false);
             let link_notify = args.link_notify.unwrap_or(false);
+            let forward_notifications = args.forward_notifications.unwrap_or(false);
+            #[cfg(not(target_os = "linux"))]
+            if forward_notifications {
+                info!("--forward-notifications is Linux-only: ignoring it on this platform");
+            }
             let mouse_scale = args.mouse_scale.unwrap_or(monux::config::DEFAULT_INPUT_SCALE);
             let scroll_scale = args
                 .scroll_scale
@@ -801,6 +806,7 @@ fn main() -> Result<()> {
                     scroll_scale,
                     throttle_mode,
                     link_notify,
+                    forward_notifications,
                     edge_map,
                     edge_dwell: Duration::from_millis(
                         args.edge_dwell_ms
@@ -1482,6 +1488,7 @@ struct ClientDaemonArgs {
     scroll_scale: f64,
     throttle_mode: monux::rotation::ThrottleMode,
     link_notify: bool,
+    forward_notifications: bool,
     edge_map: Option<monux::edge::EdgeMap>,
     edge_dwell: Duration,
     auto_update: bool,
@@ -1503,6 +1510,7 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
         scroll_scale,
         throttle_mode,
         link_notify,
+        forward_notifications,
         edge_map,
         edge_dwell,
         auto_update,
@@ -1605,6 +1613,7 @@ async fn client(args: ClientDaemonArgs) -> Result<()> {
         control_state: control_state.clone(),
         throttle_mode,
         link_notify: control_state.link_notify(),
+        forward_notifications,
         edge_map,
         edge_dwell,
     };

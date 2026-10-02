@@ -971,6 +971,17 @@ pub struct ClientArgs {
     #[arg(long, num_args = 0, default_missing_value = "true", help_heading = H_TUNING)]
     pub link_notify: Option<bool>,
 
+    /// Forward this machine's desktop notifications to the server
+    ///
+    /// Off by default. When on, the client watches the session bus for
+    /// freedesktop notifications (org.freedesktop.Notifications) and re-displays
+    /// them on the server, so a notification on the client machine is visible
+    /// while you work on the server's screen. Notifications monux itself shows
+    /// are never forwarded, and duplicates/runs are rate-limited. Linux only;
+    /// both sides need protocol v19 (monux 15.x) or nothing is forwarded.
+    #[arg(long, num_args = 0, default_missing_value = "true", help_heading = H_TUNING)]
+    pub forward_notifications: Option<bool>,
+
     /// Turn off the automatic background update
     ///
     /// The background update is on by default: a daily check at low CPU

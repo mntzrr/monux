@@ -99,6 +99,16 @@ By default the server coalesces pointer motion **adaptively**: **250 updates per
 
 When the server's mouse and the client's machine disagree on DPI/sensitivity, scale the deltas on the client: `--mouse-scale 0.5` halves pointer motion, `--scroll-scale 2` doubles scroll steps (including hi-res wheels). Both accept values from 0.05 to 20; `--mouse-scale` defaults to `1.0`, and `--scroll-scale` defaults to `1.0` on Linux clients but `3.0` on macOS — macOS posts scroll as line units and feeds real wheel hardware ~3 lines per detent, so 1.0 reads as a third of local speed. Fractional remainders are carried between events per axis, so small scales lose no motion over time — 0.5x emits exactly one tick per two input ticks. The scaling applies only where the client injects into its own virtual devices; the server machine's local input always stays 1:1.
 
+## Forwarding client notifications to the server
+
+A Linux client can forward its own desktop notifications to the server, so a notification that pops up on the client machine is also visible while you work on the server's screen:
+
+```bash
+monux config set client.forward-notifications true
+```
+
+Off by default. The client watches the session bus for freedesktop notifications (`org.freedesktop.Notifications`) and re-displays each one on the server, prefixed with the client's address so the origin machine is clear. monux's own notifications (switch, connection, update, link) are never forwarded — that exclusion is also what keeps a mutual-KVM setup from forwarding a forwarded notification back and forth forever. Duplicates and bursts are capped (identical notifications within 10 s are dropped; at most 20 per minute), and long bodies are truncated. Both sides need monux 15.x (protocol v19): against an older server the client logs once that forwarding is disabled. The change applies on the client's next reconnect.
+
 ## Control socket and `monux status`
 
 Both daemons publish their live state and accept a small command set over a per-user unix socket: `$XDG_RUNTIME_DIR/monux/server.sock` and `$XDG_RUNTIME_DIR/monux/client.sock` (under `/tmp/monux-<uid>/` when XDG_RUNTIME_DIR is unset). The socket is same-user only — the directory is 0700, there is no further authentication — and the file is removed again on shutdown.

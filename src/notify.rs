@@ -7,7 +7,9 @@
 //! each other. Current ids: `monux-switch`, `monux-update`, `monux-client`
 //! (server-side roster changes), `monux-connection` (client-side
 //! connect/lost), `monux-link` (degradation/recovery), `monux-indicator`
-//! (tray indicator action feedback).
+//! (tray indicator action feedback), and the `monux-remote:<ip>:<app>` family
+//! (client-forwarded notifications, one id per client per app — see
+//! server::notify_forwarded).
 //!
 //! Under `cargo test` (the lib's cfg(test) build) notifications are
 //! suppressed: unit tests exercise call sites that notify for real (the

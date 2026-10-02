@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 /// The protocol version exchanged between client and server on each stream.
 /// This is compared on initial connection between client and server.
 /// If the event/bulk definitions change, then this should change.
-pub const PROTOCOL_VERSION: u64 = 18;
+pub const PROTOCOL_VERSION: u64 = 19;
 
 /// The oldest protocol a peer may speak. Below this, a peer predates version
 /// negotiation entirely: it refuses any bootstrap that isn't its exact
@@ -36,6 +36,7 @@ pub fn negotiate(theirs: u64, ours: u64) -> Option<u64> {
 const FEATURES: &[(u64, &str)] = &[
     (17, "input device class"),
     (18, "peer diagnostics in bug reports"),
+    (19, "client notification forwarding"),
 ];
 
 /// The features a version misses out on: every feature newer than `v`,
@@ -90,6 +91,20 @@ pub const PROTOCOL_VERSION_PEER_DIAGNOSTICS: u64 = 18;
 /// and says so in the bundle instead.
 pub fn supports_peer_diagnostics(negotiated: u64) -> bool {
     negotiated >= PROTOCOL_VERSION_PEER_DIAGNOSTICS
+}
+
+/// The protocol version that introduced client notification forwarding: an
+/// enabled client forwards desktop notifications from its session bus to the
+/// server, which displays them locally (see notify_watch.rs). Appended
+/// ClientEvent variant (event::ClientEvent::Notification).
+pub const PROTOCOL_VERSION_NOTIFICATION_FORWARDING: u64 = 19;
+
+/// Whether a client may send ClientEvent::Notification to the server: only
+/// when the pair's NEGOTIATED version is v19+. An older server has no variant
+/// for it and would fail to deserialize the frame, which would drop a
+/// working connection — so a client paired below v19 stays silent.
+pub fn supports_notification_forwarding(negotiated: u64) -> bool {
+    negotiated >= PROTOCOL_VERSION_NOTIFICATION_FORWARDING
 }
 
 /// Cap on the hostname as sent on the wire: gethostname(2) allows at most 64
@@ -179,21 +194,27 @@ mod tests {
     #[test]
     fn features_above_content() {
         // Nothing is newer than our own version.
-        assert_eq!(features_above(18), vec![]);
+        assert_eq!(features_above(19), vec![]);
         assert_eq!(features_above(u64::MAX), vec![]);
-        // A v17 pair misses only the v18 peer diagnostics.
+        // A v18 pair misses only the v19 notification forwarding.
+        assert_eq!(features_above(18), vec![(19, "client notification forwarding")]);
+        // A v17 pair misses the v18 peer diagnostics as well.
         assert_eq!(
             features_above(17),
-            vec![(18, "peer diagnostics in bug reports")]
+            vec![
+                (18, "peer diagnostics in bug reports"),
+                (19, "client notification forwarding")
+            ]
         );
         // v16 rode no wire feature of its own, so a pair landing on it misses
-        // the v17 device class as well. (v16 is the floor now; nothing below
+        // the v17 device class too. (v16 is the floor now; nothing below
         // it can pair at all.)
         assert_eq!(
             features_above(16),
             vec![
                 (17, "input device class"),
-                (18, "peer diagnostics in bug reports")
+                (18, "peer diagnostics in bug reports"),
+                (19, "client notification forwarding")
             ]
         );
     }
@@ -212,11 +233,15 @@ mod tests {
 
     #[test]
     fn disabled_features_list_for_logs() {
-        assert_eq!(disabled_features(18), "nothing");
-        assert_eq!(disabled_features(17), "peer diagnostics in bug reports");
+        assert_eq!(disabled_features(19), "nothing");
+        assert_eq!(disabled_features(18), "client notification forwarding");
+        assert_eq!(
+            disabled_features(17),
+            "peer diagnostics in bug reports, client notification forwarding"
+        );
         assert_eq!(
             disabled_features(16),
-            "input device class, peer diagnostics in bug reports"
+            "input device class, peer diagnostics in bug reports, client notification forwarding"
         );
     }
 
@@ -228,6 +253,16 @@ mod tests {
         // deserialization and drop a working connection.
         assert!(!supports_peer_diagnostics(17));
         assert!(!supports_peer_diagnostics(15));
+    }
+
+    #[test]
+    fn notification_forwarding_is_gated_on_v19() {
+        assert!(supports_notification_forwarding(PROTOCOL_VERSION));
+        assert!(supports_notification_forwarding(19));
+        // A v18 pair predates the events-stream variant: sending would fail
+        // its deserialization and drop a working connection.
+        assert!(!supports_notification_forwarding(18));
+        assert!(!supports_notification_forwarding(17));
     }
 
     #[test]
